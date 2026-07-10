@@ -59,6 +59,7 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
     #[derive(Deserialize)]
     struct Pr {
         title: Option<String>,
+        description: Option<String>,
         destination: Option<Destination>,
     }
 
@@ -85,7 +86,78 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
             .and_then(|d| d.branch)
             .and_then(|b| b.name),
         head_sha: None, // Bitbucket inline comments don't need a commit id
+        body: pr_data.description,
     })
+}
+
+/// Post a standalone PR comment (NOT deduped) — used for `/ask` answers and
+/// `/describe` confirmations. Returns the new comment's URL.
+///
+/// # Errors
+/// If credentials are missing or the request fails.
+pub async fn post_comment(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    body: &str,
+) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Html {
+        href: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Links {
+        html: Option<Html>,
+    }
+    #[derive(Deserialize)]
+    struct Created {
+        links: Option<Links>,
+    }
+    let marked = format!("{body}\n\n_{}_", cfg.comment_marker);
+    let res = client
+        .post(format!("{}/comments", pr_base(cfg, repo, pr)))
+        .header(reqwest::header::AUTHORIZATION, auth_header(cfg)?)
+        .json(&serde_json::json!({ "content": { "raw": marked } }))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "Bitbucket postComment {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    let c: Created = res.json().await?;
+    Ok(c.links.and_then(|l| l.html).and_then(|h| h.href))
+}
+
+/// Replace the PR description (the `/describe` command). Bitbucket's PR update
+/// requires the `title`, so it's sent alongside (from `meta`).
+///
+/// # Errors
+/// If credentials are missing or the request fails.
+pub async fn update_pr_description(
+    client: &Client,
+    cfg: &Config,
+    meta: &PrMeta,
+    description: &str,
+) -> Result<()> {
+    let title = meta.title.clone().unwrap_or_default();
+    let res = client
+        .put(pr_base(cfg, &meta.repo, meta.pr))
+        .header(reqwest::header::AUTHORIZATION, auth_header(cfg)?)
+        .json(&serde_json::json!({ "title": title, "description": description }))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "Bitbucket updatePrDescription {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    Ok(())
 }
 
 /// Fetch a repo file's text at a git ref via the `src` endpoint.

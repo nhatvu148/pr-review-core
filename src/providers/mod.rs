@@ -112,6 +112,45 @@ impl Provider {
         }
     }
 
+    /// Post a standalone comment on the PR (NOT deduped) — used for `/ask`
+    /// answers and `/describe` confirmations. Returns the new comment's URL.
+    pub async fn post_comment(
+        &self,
+        client: &Client,
+        cfg: &Config,
+        repo: &str,
+        pr: u64,
+        body: &str,
+    ) -> Result<Option<String>> {
+        match self {
+            Provider::Github => github::post_comment(client, cfg, repo, pr, body).await,
+            Provider::Bitbucket => bitbucket::post_comment(client, cfg, repo, pr, body).await,
+            Provider::Gitlab => gitlab::post_comment(client, cfg, repo, pr, body).await,
+        }
+    }
+
+    /// Replace the PR/MR description body (the `/describe` command). `meta`
+    /// supplies the title Bitbucket requires alongside the description.
+    pub async fn update_pr_description(
+        &self,
+        client: &Client,
+        cfg: &Config,
+        meta: &PrMeta,
+        description: &str,
+    ) -> Result<()> {
+        match self {
+            Provider::Github => {
+                github::update_pr_description(client, cfg, &meta.repo, meta.pr, description).await
+            }
+            Provider::Bitbucket => {
+                bitbucket::update_pr_description(client, cfg, meta, description).await
+            }
+            Provider::Gitlab => {
+                gitlab::update_pr_description(client, cfg, &meta.repo, meta.pr, description).await
+            }
+        }
+    }
+
     /// Post the review: upsert the summary comment, and refresh the inline
     /// comments (delete the bot's prior inline comments, post the new set).
     /// Returns the summary comment URL when available.

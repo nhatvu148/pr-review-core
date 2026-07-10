@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0
+
+Tier 3 — bigger bets.
+
+- **Dependency vulnerability scan** (OSV.dev): parses the versions added by a PR
+  from changed lockfiles (`Cargo.lock`, `package-lock.json`, `yarn.lock`,
+  `pnpm-lock.yaml`, `go.sum`, `requirements.txt`, `Gemfile.lock`, `composer.lock`)
+  and appends a known-CVE advisory block (severity, summary, fix version, link) to
+  the review — even on a lockfile-only PR. HTTP-only, no local resolver.
+  `CVE_SCAN`, `CVE_MAX_PACKAGES`, `OSV_API_BASE`; per-repo `cve_scan`.
+- **`/ask` and `/describe` commands**: `/ask <question>` answers a question about
+  the PR grounded in its diff; `/describe` (re)generates the PR description and
+  merges it into the body idempotently, preserving human-written content. New
+  provider capabilities (`post_comment`, `update_pr_description`) across GitHub,
+  GitLab, and Bitbucket, driven by `command::run_command`.
+
 ## 0.3.0
 
 Tier 2 — differentiate.

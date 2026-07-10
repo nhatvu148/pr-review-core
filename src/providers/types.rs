@@ -15,6 +15,9 @@ pub struct PrMeta {
     pub base_branch: Option<String>,
     /// Head commit SHA — required by GitHub to anchor inline review comments.
     pub head_sha: Option<String>,
+    /// The PR/MR description body, when fetched. Used by the `/describe` command
+    /// to preserve any human-written content around the generated section.
+    pub body: Option<String>,
 }
 
 /// One inline comment anchored to a file + line on the new side of the diff.

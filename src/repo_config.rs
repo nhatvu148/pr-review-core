@@ -24,6 +24,8 @@ pub struct RepoConfig {
     pub max_findings: Option<usize>,
     pub self_critique: Option<bool>,
     pub agentic: Option<bool>,
+    /// Toggle the OSV.dev dependency vulnerability scan for this repo.
+    pub cve_scan: Option<bool>,
     /// Extra review instructions in plain language, appended to the system prompt.
     pub instructions: Option<String>,
 }

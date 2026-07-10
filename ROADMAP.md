@@ -24,10 +24,10 @@ bumping `pr-review-core = "0.x"`.
 6. **Smart large-diff handling** — rank + pack files instead of blunt truncation.
 7. **GitLab provider** — biggest missing platform by market share.
 
-## Tier 3 — bigger bets (v0.4)
-8. **CVE / dependency scan** — OSV.dev API (HTTP-only, no embeddings) on changed
-   lockfiles; surface severity + advisory + fix version inline.
-9. **`/ask` and `/describe` commands** — Q&A on the PR; auto PR description.
+## Tier 3 — bigger bets (v0.4) — SHIPPED
+8. ✅ **CVE / dependency scan** — OSV.dev API (HTTP-only, no embeddings) on changed
+   lockfiles; surfaces severity + advisory + fix version in the summary.
+9. ✅ **`/ask` and `/describe` commands** — Q&A on the PR; idempotent PR description.
 
 ## Non-goals (for now)
 Full-repo embedding index, learning-loop rule synthesis — heavy; revisit only if

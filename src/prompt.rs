@@ -43,6 +43,24 @@ Output only the JSON object."#;
 /// keeps, returning ONLY a JSON array of the surviving findings.
 pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence}. If all should be dropped, return []."#;
 
+/// System prompt for the `/ask` command: answer a free-form question about the
+/// PR, grounded strictly in its diff.
+pub const ASK_SYSTEM_PROMPT: &str = r#"You are an expert software engineer answering a question about a pull request, given its unified diff and any structural context. Answer the question directly and concisely in GitHub-flavored markdown. Ground every claim in what the diff actually shows — if the diff doesn't contain enough information to answer, say so plainly rather than guessing. Do not invent code, files, or behavior that isn't present. Keep it focused; no preamble like "Great question"."#;
+
+/// System prompt for the `/describe` command: write a PR description from the diff.
+pub const DESCRIBE_SYSTEM_PROMPT: &str = r#"You are writing a clear, factual pull request description from its unified diff. Return GitHub-flavored markdown with these sections:
+
+## Summary
+One short paragraph on what this PR does and why.
+
+## Changes
+A bullet list of the notable changes (group related files; skip trivia like lockfile churn).
+
+## Notes for reviewers
+(Optional) Anything a reviewer should focus on — risky areas, follow-ups, or things intentionally out of scope. Omit this section if there's nothing useful to say.
+
+Describe ONLY what the diff shows — do not speculate about intent you can't see or invent testing that isn't present. Do not add a top-level title header (the PR already has a title). Be concise."#;
+
 /// Build the user message: PR metadata header + the (possibly truncated) diff.
 ///
 /// `omitted_note`, when `Some`, describes whole files that were dropped to fit the

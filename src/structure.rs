@@ -294,7 +294,12 @@ fn symbols_for_file(lang: Lang, source: &str, changed: &HashSet<u64>) -> Vec<Sym
 fn format_symbols(path: &str, syms: &[Sym]) -> String {
     let parts: Vec<String> = syms
         .iter()
-        .map(|s| format!("{} {} (lines {}\u{2013}{})", s.label, s.name, s.start, s.end))
+        .map(|s| {
+            format!(
+                "{} {} (lines {}\u{2013}{})",
+                s.label, s.name, s.start, s.end
+            )
+        })
         .collect();
     format!("- {}: {}", path, parts.join(", "))
 }
@@ -523,9 +528,15 @@ func processOrder(o Order) int {
     #[test]
     fn language_for_path_maps_extensions() {
         assert!(matches!(language_for_path("a/b.rs"), Some(Lang::Rust)));
-        assert!(matches!(language_for_path("a/b.ts"), Some(Lang::TypeScript)));
+        assert!(matches!(
+            language_for_path("a/b.ts"),
+            Some(Lang::TypeScript)
+        ));
         assert!(matches!(language_for_path("a/b.tsx"), Some(Lang::Tsx)));
-        assert!(matches!(language_for_path("a/b.jsx"), Some(Lang::JavaScript)));
+        assert!(matches!(
+            language_for_path("a/b.jsx"),
+            Some(Lang::JavaScript)
+        ));
         assert!(matches!(language_for_path("a/b.py"), Some(Lang::Python)));
         assert!(matches!(language_for_path("a/b.go"), Some(Lang::Go)));
         assert!(language_for_path("a/b.md").is_none());
