@@ -23,7 +23,8 @@ Return ONLY a JSON object — no markdown fences, no prose around it — with ex
       "severity": "BLOCKING" | "HIGH" | "MEDIUM" | "LOW",
       "file": "<path EXACTLY as it appears in the diff, new side>",
       "line": <integer line number in the NEW version of the file, or null if not line-specific>,
-      "body": "<one sentence describing the problem, then ' Fix: ' and a concrete fix>"
+      "body": "<one sentence describing the problem, then ' Fix: ' and a concrete fix>",
+      "confidence": <integer 0-100 — your confidence a senior reviewer would flag this>
     }
   ]
 }
@@ -31,10 +32,16 @@ Return ONLY a JSON object — no markdown fences, no prose around it — with ex
 Rules:
 - `file` MUST match a path shown in the diff. `line` MUST be a line shown in the diff (an added or context line) on the new side — if you cannot pin an exact line, set `line` to null (it will be folded into the summary).
 - Prioritize high-severity and security issues. Be specific and concise.
+- Assign confidence honestly; reserve 90+ for clear correctness/security issues. Do NOT report style nits or speculative concerns.
 - Do NOT invent problems. If the diff is clean, return "findings": [].
 - Only judge what the diff shows; you cannot see the rest of the repo.
 
 Output only the JSON object."#;
+
+/// System prompt for the optional second-pass self-critique. Given the diff and a
+/// JSON array of proposed findings, the model prunes noise and re-scores what it
+/// keeps, returning ONLY a JSON array of the surviving findings.
+pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence}. If all should be dropped, return []."#;
 
 /// Build the user message: PR metadata header + the (possibly truncated) diff.
 pub fn build_user_prompt(meta: &PrMeta, diff: &str, truncated: bool) -> String {

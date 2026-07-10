@@ -28,7 +28,8 @@ When done, respond with ONLY a JSON object (no tools, no prose) of this shape:
     { "severity": "BLOCKING"|"HIGH"|"MEDIUM"|"LOW",
       "file": "<path exactly as in the diff>",
       "line": <new-side line number shown in the diff, or null>,
-      "body": "<one sentence problem, then ' Fix: ' and the fix>" }
+      "body": "<one sentence problem, then ' Fix: ' and the fix>",
+      "confidence": <integer 0-100 — your confidence a senior reviewer would flag this> }
   ]
 }
 Rules: only raise findings on lines shown in the diff (set line=null if you can't pin one — it folds into the summary). Use the repo context to catch cross-file issues (a change that breaks a caller, a wrong type, a missing update elsewhere). Don't invent problems."#;

@@ -40,6 +40,17 @@ pub struct RunReviewOutput {
     pub usage: Option<Usage>,
 }
 
+/// Rank a severity for sorting (higher = more urgent). Unknown severities rank 0.
+fn severity_rank(sev: &str) -> u8 {
+    match sev.to_uppercase().as_str() {
+        "BLOCKING" => 3,
+        "HIGH" => 2,
+        "MEDIUM" => 1,
+        "LOW" => 0,
+        _ => 0,
+    }
+}
+
 fn severity_emoji(sev: &str) -> &'static str {
     match sev.to_uppercase().as_str() {
         "BLOCKING" => "🚨",
@@ -147,8 +158,17 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
     let diff = provider
         .get_diff(&client, cfg, &input.repo, input.pr)
         .await?;
+
+    // Drop noisy files (lockfiles, generated, vendored, minified) before the LLM
+    // sees the diff — saves tokens and noise. Fail-open: never loses the review.
+    let (diff, dropped) =
+        crate::diff::filter_diff_by_globs(&diff, &cfg.include_globs, &cfg.exclude_globs);
+    if !dropped.is_empty() {
+        tracing::info!("skipped {} file(s) by glob: {:?}", dropped.len(), dropped);
+    }
+
     if diff.trim().is_empty() {
-        anyhow::bail!("PR diff is empty — nothing to review.");
+        anyhow::bail!("PR diff is empty (all files excluded by globs, or no changes) — nothing to review.");
     }
 
     // Agentic path (clone + tools) when enabled; falls back to diff-only on any
@@ -168,13 +188,33 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
     } else {
         review_diff(&client, cfg, &meta, &diff).await?
     };
+    // Post-process findings before anchoring: optional self-critique pass, then a
+    // confidence floor, severity sort, and a hard cap — cuts noise before posting.
+    let mut findings = result.review.findings.clone();
+    if cfg.self_critique && !findings.is_empty() {
+        findings = match crate::llm::critique_findings(&client, cfg, &meta, &diff, &findings).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("self-critique failed ({e:#}); keeping original findings");
+                findings
+            }
+        };
+    }
+    findings.retain(|f| f.confidence.unwrap_or(100) >= cfg.min_confidence);
+    findings.sort_by(|a, b| {
+        severity_rank(&b.severity)
+            .cmp(&severity_rank(&a.severity))
+            .then(b.confidence.unwrap_or(0).cmp(&a.confidence.unwrap_or(0)))
+    });
+    findings.truncate(cfg.max_findings);
+
     let valid = parse_valid_lines(&diff);
 
     // Anchor findings whose (file, line) is actually in the diff; the rest fold
     // into the summary so the provider never rejects an out-of-diff anchor.
     let mut inline: Vec<InlineComment> = Vec::new();
     let mut unanchored: Vec<&Finding> = Vec::new();
-    for f in &result.review.findings {
+    for f in &findings {
         let anchored = f
             .line
             .is_some_and(|l| valid.get(&f.file).is_some_and(|s| s.contains(&l)));
@@ -201,7 +241,7 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
         pr: input.pr,
         model: result.model,
         recommendation: result.review.recommendation.clone(),
-        findings: result.review.findings.len(),
+        findings: findings.len(),
         inline_posted: inline_count,
         posted: false,
         comment_url: None,

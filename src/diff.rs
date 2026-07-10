@@ -5,6 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use globset::{Glob, GlobSet, GlobSetBuilder};
+
 /// Map each new-side file path to the set of line numbers present in the diff
 /// (added or context lines). Removed lines don't advance the new-side counter.
 ///
@@ -53,9 +55,145 @@ pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
     map
 }
 
+/// Build a [`GlobSet`] from patterns, returning `None` if any pattern is invalid
+/// (so callers can fail-open and skip filtering rather than lose the review).
+fn build_globset(patterns: &[String]) -> Option<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        builder.add(Glob::new(p).ok()?);
+    }
+    builder.build().ok()
+}
+
+/// Extract the new-side (`b/`) path from a `diff --git a/PATH b/PATH` header line.
+fn git_header_path(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("diff --git ")?;
+    let idx = rest.find(" b/")?;
+    let p = rest[idx + 3..].trim();
+    (!p.is_empty()).then(|| p.to_string())
+}
+
+/// Derive a section's new-side path, preferring the `diff --git` header (when the
+/// diff has git headers) and falling back to the `+++ b/PATH` line. Returns `None`
+/// for `/dev/null` (deletions) or when no path can be found.
+fn section_path(section: &[&str], has_git: bool) -> Option<String> {
+    if has_git {
+        if let Some(p) = section.first().and_then(|l| git_header_path(l)) {
+            return Some(p);
+        }
+    }
+    for l in section {
+        if let Some(rest) = l.strip_prefix("+++ ") {
+            let p = rest.trim();
+            let p = p.strip_prefix("b/").unwrap_or(p);
+            return (p != "/dev/null").then(|| p.to_string());
+        }
+    }
+    None
+}
+
+/// Drop per-file sections of a unified diff that don't pass the include/exclude
+/// glob filters — removing lockfiles, generated, vendored, and minified files
+/// before the diff is sent to the LLM (saves tokens and noise).
+///
+/// A file section is KEPT iff `(include is empty OR include matches path) AND NOT
+/// exclude matches path`. Sections whose path can't be derived are kept
+/// (fail-open). If the diff can't be parsed into sections at all, the original
+/// diff is returned unchanged with an empty dropped list — the review is never
+/// lost to a parse failure.
+///
+/// Returns `(kept_diff, dropped_paths)`.
+///
+/// # Examples
+/// ```
+/// # use pr_review_core::diff::filter_diff_by_globs;
+/// let d = "diff --git a/Cargo.lock b/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n+x\n\
+///          diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+y\n";
+/// let (kept, dropped) = filter_diff_by_globs(d, &[], &["**/Cargo.lock".to_string()]);
+/// assert_eq!(dropped, vec!["Cargo.lock".to_string()]);
+/// assert!(kept.contains("src/a.rs") && !kept.contains("Cargo.lock"));
+/// ```
+pub fn filter_diff_by_globs(
+    diff: &str,
+    include: &[String],
+    exclude: &[String],
+) -> (String, Vec<String>) {
+    // Bad glob in either set -> fail-open (skip filtering, keep the whole diff).
+    let (include_set, exclude_set) = match (build_globset(include), build_globset(exclude)) {
+        (Some(i), Some(e)) => (i, e),
+        _ => return (diff.to_string(), Vec::new()),
+    };
+
+    let lines: Vec<&str> = diff.lines().collect();
+    let has_git = lines.iter().any(|l| l.starts_with("diff --git "));
+
+    // Section start indices: `diff --git` lines, or (fallback) the `--- ` line
+    // preceding each `+++ ` marker — or the `+++ ` line itself if none precedes.
+    let starts: Vec<usize> = if has_git {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("diff --git "))
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        let mut s = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if l.starts_with("+++ ") {
+                if i > 0 && lines[i - 1].starts_with("--- ") {
+                    s.push(i - 1);
+                } else {
+                    s.push(i);
+                }
+            }
+        }
+        s
+    };
+
+    // Nothing parseable -> fail-open.
+    if starts.is_empty() {
+        return (diff.to_string(), Vec::new());
+    }
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+
+    // Any preamble before the first section is always kept.
+    kept.extend_from_slice(&lines[..starts[0]]);
+
+    for (idx, &start) in starts.iter().enumerate() {
+        let end = starts.get(idx + 1).copied().unwrap_or(lines.len());
+        let section = &lines[start..end];
+        match section_path(section, has_git) {
+            Some(path) => {
+                let keep = (include.is_empty() || include_set.is_match(&path))
+                    && !exclude_set.is_match(&path);
+                if keep {
+                    kept.extend_from_slice(section);
+                } else {
+                    dropped.push(path);
+                }
+            }
+            // Unknown path -> fail-open, keep the section.
+            None => kept.extend_from_slice(section),
+        }
+    }
+
+    // Nothing dropped -> return the original untouched (preserve exact bytes).
+    if dropped.is_empty() {
+        return (diff.to_string(), Vec::new());
+    }
+
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    (out, dropped)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_valid_lines;
+    use super::{filter_diff_by_globs, parse_valid_lines};
 
     #[test]
     fn anchors_added_and_context_lines() {
@@ -90,5 +228,47 @@ mod tests {
         let d = "+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n";
         let m = parse_valid_lines(d);
         assert!(m.is_empty());
+    }
+
+    #[test]
+    fn drops_lockfile_section_keeps_source_section() {
+        let d = "diff --git a/package-lock.json b/package-lock.json\n\
+                 index abc..def 100644\n\
+                 --- a/package-lock.json\n\
+                 +++ b/package-lock.json\n\
+                 @@ -1 +1 @@\n\
+                 -old\n\
+                 +new\n\
+                 diff --git a/src/x.ts b/src/x.ts\n\
+                 index 111..222 100644\n\
+                 --- a/src/x.ts\n\
+                 +++ b/src/x.ts\n\
+                 @@ -1 +1 @@\n\
+                 -a\n\
+                 +b\n";
+        let exclude = vec!["**/package-lock.json".to_string()];
+        let (kept, dropped) = filter_diff_by_globs(d, &[], &exclude);
+        assert_eq!(dropped, vec!["package-lock.json".to_string()]);
+        assert!(kept.contains("src/x.ts"));
+        assert!(!kept.contains("package-lock.json"));
+    }
+
+    #[test]
+    fn fallback_splits_on_plusplusplus_when_no_git_headers() {
+        let d = "--- a/foo.js\n\
+                 +++ b/foo.js\n\
+                 @@ -1 +1 @@\n\
+                 -x\n\
+                 +y\n\
+                 --- a/bar.min.js\n\
+                 +++ b/bar.min.js\n\
+                 @@ -1 +1 @@\n\
+                 -a\n\
+                 +b\n";
+        let exclude = vec!["**/*.min.js".to_string()];
+        let (kept, dropped) = filter_diff_by_globs(d, &[], &exclude);
+        assert_eq!(dropped, vec!["bar.min.js".to_string()]);
+        assert!(kept.contains("foo.js"));
+        assert!(!kept.contains("bar.min.js"));
     }
 }

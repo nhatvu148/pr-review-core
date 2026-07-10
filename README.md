@@ -20,6 +20,13 @@ prompt through [`Config`].
   will accept (out-of-diff findings fold into the summary).
 - Optional agentic reviewer with a two-tier model split (cheap explore model +
   stronger synthesis model).
+- **Noise control**: an optional self-critique pass drops false positives / nits,
+  a per-finding confidence score drives ranking, and a per-PR cap keeps reviews
+  focused.
+- **File globs**: lockfiles, generated, vendored, and minified files are excluded
+  from the diff before the model ever sees them (saves tokens and noise).
+- **Any OpenAI-compatible endpoint**: point it at OpenRouter, or Ollama / vLLM /
+  Together / Groq / a local server via `LLM_BASE_URL` + `LLM_API_KEY`.
 - Webhook signature verification and payload parsing helpers.
 - Dedupe: the bot updates its own prior comments on re-review instead of stacking.
 
@@ -45,6 +52,18 @@ Nothing about the bot's identity is hardcoded. `Config::from_env()` reads:
 Other operational settings (OpenRouter key/models, provider tokens, agentic mode,
 size caps) are also read from the environment — see `src/config.rs`.
 
+## Review quality & cost controls
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `SELF_CRITIQUE` | `true` | Second skeptical pass that removes false positives / low-value nits. |
+| `MIN_CONFIDENCE` | `0` | Drop findings below this confidence (0–100). |
+| `MAX_FINDINGS` | `20` | Cap findings per PR (ranked by severity then confidence). |
+| `EXCLUDE_GLOBS` | lockfiles, generated, vendored, minified | Comma-separated globs skipped before the LLM call. |
+| `INCLUDE_GLOBS` | *(empty = all)* | If set, only files matching these globs are reviewed. |
+| `LLM_BASE_URL` | `OPENROUTER_BASE_URL` → openrouter | OpenAI-compatible endpoint (e.g. `http://localhost:11434/v1` for Ollama). |
+| `LLM_API_KEY` | `OPENROUTER_API_KEY` | API key for the endpoint above. |
+
 ## License
 
 Licensed under either of
@@ -53,5 +72,11 @@ Licensed under either of
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
 
 at your option.
+
+## Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
 
 [`Config`]: src/config.rs

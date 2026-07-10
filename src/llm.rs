@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clip;
 use crate::config::{require, Config};
-use crate::prompt::{build_user_prompt, SYSTEM_PROMPT};
+use crate::prompt::{build_user_prompt, CRITIQUE_SYSTEM_PROMPT, SYSTEM_PROMPT};
 use crate::providers::PrMeta;
 
 #[derive(Serialize)]
@@ -33,13 +33,17 @@ pub struct Usage {
 }
 
 /// One review finding from the model.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub severity: String,
     pub file: String,
     #[serde(default)]
     pub line: Option<u64>,
     pub body: String,
+    /// Model's confidence (0–100) that this is a real, actionable issue a senior
+    /// reviewer would flag. Absent on older responses; treated as full confidence.
+    #[serde(default)]
+    pub confidence: Option<u8>,
 }
 
 /// The structured review the model returns.
@@ -82,6 +86,18 @@ pub struct ReviewResult {
 pub(crate) fn extract_json(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
+    if end > start {
+        Some(&text[start..=end])
+    } else {
+        None
+    }
+}
+
+/// Pull the first JSON array out of a model response that may be wrapped in prose
+/// or ```json fences — take the first `[` through the last `]`.
+pub(crate) fn extract_json_array(text: &str) -> Option<&str> {
+    let start = text.find('[')?;
+    let end = text.rfind(']')?;
     if end > start {
         Some(&text[start..=end])
     } else {
@@ -178,4 +194,90 @@ pub async fn review_diff(
         model: cfg.openrouter_model.clone(),
         usage: data.usage,
     })
+}
+
+/// Second-pass "self-critique": ask the model to prune false positives, duplicates,
+/// and out-of-scope nits from a set of proposed findings, and to assign an honest
+/// confidence to each survivor. Uses the same OpenRouter call pattern as
+/// [`review_diff`] (same headers, base URL, and synthesis model).
+///
+/// The caller MUST treat any error as fail-open (keep the original findings) — a
+/// critique hiccup must never drop the review.
+///
+/// # Errors
+/// If `OPENROUTER_API_KEY` is missing, OpenRouter returns an error status, or the
+/// response can't be parsed as a JSON array of findings.
+pub async fn critique_findings(
+    client: &Client,
+    cfg: &Config,
+    meta: &PrMeta,
+    diff: &str,
+    findings: &[Finding],
+) -> Result<Vec<Finding>> {
+    require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
+
+    let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
+    let findings_json = serde_json::to_string_pretty(findings)
+        .map_err(|e| anyhow::anyhow!("could not serialize findings for critique: {e}"))?;
+    let user = format!(
+        "Repository: {}\nPull request: #{}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---\n\n--- PROPOSED FINDINGS (JSON) ---\n{findings_json}",
+        meta.repo, meta.pr,
+    );
+
+    let req = ChatReq {
+        model: cfg.openrouter_model.clone(),
+        max_tokens: cfg.openrouter_max_tokens,
+        temperature: cfg.openrouter_temperature,
+        messages: vec![
+            Msg {
+                role: "system".into(),
+                content: CRITIQUE_SYSTEM_PROMPT.to_string(),
+            },
+            Msg {
+                role: "user".into(),
+                content: user,
+            },
+        ],
+    };
+
+    let res = client
+        .post(format!("{}/chat/completions", cfg.openrouter_base_url))
+        .bearer_auth(&cfg.openrouter_api_key)
+        .header("HTTP-Referer", &cfg.http_referer)
+        .header("X-Title", &cfg.x_title)
+        .json(&req)
+        .send()
+        .await?;
+
+    let status = res.status();
+    let text = res.text().await?;
+    let data: ChatRes = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "OpenRouter {status}: non-JSON response ({e}): {}",
+            clip(&text, 300)
+        )
+    })?;
+
+    if !status.is_success() || data.error.is_some() {
+        let msg = data
+            .error
+            .and_then(|e| e.message)
+            .unwrap_or_else(|| clip(&text, 500));
+        anyhow::bail!("OpenRouter {status}: {msg}");
+    }
+
+    let content = data
+        .choices
+        .and_then(|c| c.into_iter().next())
+        .and_then(|c| c.message)
+        .and_then(|m| m.content)
+        .ok_or_else(|| anyhow::anyhow!("OpenRouter returned an empty critique response."))?;
+
+    let json = extract_json_array(&content).ok_or_else(|| {
+        anyhow::anyhow!("Critique did not return a JSON array: {}", clip(&content, 300))
+    })?;
+    let kept: Vec<Finding> = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("Could not parse critique JSON ({e}): {}", clip(json, 300)))?;
+
+    Ok(kept)
 }

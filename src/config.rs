@@ -16,17 +16,38 @@ pub struct Config {
     /// Shared secret Bitbucket signs webhook deliveries with (X-Hub-Signature).
     pub bitbucket_webhook_secret: String,
 
+    /// OpenRouter (or any OpenAI-compatible) API key. Resolved from
+    /// `OPENROUTER_API_KEY`, falling back to `LLM_API_KEY` — the alias lets
+    /// Ollama/vLLM/local OpenAI-compatible servers reuse a generic var name.
     pub openrouter_api_key: String,
     /// Synthesis model: writes the final review findings (quality matters here).
     pub openrouter_model: String,
     /// Exploration model: drives the agentic tool loop (grep/read_file/list_dir)
     /// to gather context. Cheaper — it navigates files, it doesn't judge.
     pub openrouter_model_explore: String,
+    /// Base URL of the OpenAI-compatible chat-completions API. Resolved from
+    /// `LLM_BASE_URL`, then `OPENROUTER_BASE_URL`, defaulting to OpenRouter — the
+    /// `LLM_BASE_URL` alias lets Ollama/vLLM/local OpenAI-compatible servers work.
     pub openrouter_base_url: String,
     pub openrouter_max_tokens: u32,
     pub openrouter_temperature: f32,
 
     pub max_diff_chars: usize,
+
+    /// Glob patterns of files to INCLUDE in the diff before it's sent to the LLM.
+    /// Empty means include everything (subject to `exclude_globs`).
+    pub include_globs: Vec<String>,
+    /// Glob patterns of files to EXCLUDE from the diff (lockfiles, generated,
+    /// vendored, minified) — drops noise and saves tokens before the LLM call.
+    pub exclude_globs: Vec<String>,
+
+    /// Run a second, skeptical "self-critique" pass that removes false positives
+    /// and out-of-scope nits from the findings before posting.
+    pub self_critique: bool,
+    /// Drop findings whose model-reported `confidence` is below this threshold.
+    pub min_confidence: u8,
+    /// Hard cap on the number of findings posted (after sorting by severity).
+    pub max_findings: usize,
 
     /// Use the agentic reviewer: clone the repo and let the model investigate
     /// cross-file context with tools, instead of a single diff-only call.
@@ -78,10 +99,14 @@ impl Config {
             github_webhook_secret: env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default(),
             bitbucket_webhook_secret: env::var("BITBUCKET_WEBHOOK_SECRET").unwrap_or_default(),
 
-            openrouter_api_key: env::var("OPENROUTER_API_KEY").unwrap_or_default(),
+            openrouter_api_key: env::var("OPENROUTER_API_KEY")
+                .or_else(|_| env::var("LLM_API_KEY"))
+                .unwrap_or_default(),
             openrouter_model: env_or("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5"),
             openrouter_model_explore: env_or("OPENROUTER_MODEL_EXPLORE", "moonshotai/kimi-k2-0905"),
-            openrouter_base_url: env_or("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+            openrouter_base_url: env::var("LLM_BASE_URL")
+                .or_else(|_| env::var("OPENROUTER_BASE_URL"))
+                .unwrap_or_else(|_| "https://openrouter.ai/api/v1".to_string()),
             openrouter_max_tokens: env_or("OPENROUTER_MAX_TOKENS", "4000")
                 .parse()
                 .unwrap_or(4000),
@@ -92,6 +117,38 @@ impl Config {
             max_diff_chars: env_or("MAX_DIFF_CHARS", "200000")
                 .parse()
                 .unwrap_or(200_000),
+
+            include_globs: env_globs("INCLUDE_GLOBS", &[]),
+            exclude_globs: env_globs(
+                "EXCLUDE_GLOBS",
+                &[
+                    "**/*.lock",
+                    "**/package-lock.json",
+                    "**/pnpm-lock.yaml",
+                    "**/yarn.lock",
+                    "**/bun.lockb",
+                    "**/Cargo.lock",
+                    "**/go.sum",
+                    "**/composer.lock",
+                    "**/Gemfile.lock",
+                    "**/poetry.lock",
+                    "**/*.min.js",
+                    "**/*.min.css",
+                    "**/dist/**",
+                    "**/build/**",
+                    "**/vendor/**",
+                    "**/node_modules/**",
+                    "**/*.snap",
+                    "**/__snapshots__/**",
+                    "**/*.pb.go",
+                    "**/*_generated.*",
+                    "**/*.generated.*",
+                ],
+            ),
+
+            self_critique: env_or("SELF_CRITIQUE", "true").parse().unwrap_or(true),
+            min_confidence: env_or("MIN_CONFIDENCE", "0").parse().unwrap_or(0),
+            max_findings: env_or("MAX_FINDINGS", "20").parse().unwrap_or(20),
 
             agentic: env_or("AGENTIC", "false").parse().unwrap_or(false),
             max_turns: env_or("MAX_TURNS", "6").parse().unwrap_or(6),
@@ -135,6 +192,20 @@ fn resolve_extra_system_prompt() -> String {
 
 fn env_or(name: &str, default: &str) -> String {
     env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+/// Parse a comma-separated list of glob patterns from `name`, trimming each entry
+/// and dropping empties. Falls back to `default` when the var is unset or empty.
+fn env_globs(name: &str, default: &[&str]) -> Vec<String> {
+    match env::var(name) {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => default.iter().map(|s| s.to_string()).collect(),
+    }
 }
 
 /// Ensure a required value is present, with a clear error naming the env var.
