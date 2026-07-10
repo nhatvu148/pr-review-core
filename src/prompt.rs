@@ -44,13 +44,26 @@ Output only the JSON object."#;
 pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence}. If all should be dropped, return []."#;
 
 /// Build the user message: PR metadata header + the (possibly truncated) diff.
-pub fn build_user_prompt(meta: &PrMeta, diff: &str, truncated: bool) -> String {
+///
+/// `omitted_note`, when `Some`, describes whole files that were dropped to fit the
+/// size budget (packed out before this call) and is surfaced to the model so it
+/// knows those files were NOT reviewed. This is distinct from `truncated`, which
+/// flags a hard character clamp of a single oversized file.
+pub fn build_user_prompt(
+    meta: &PrMeta,
+    diff: &str,
+    truncated: bool,
+    omitted_note: Option<&str>,
+) -> String {
     let mut header = format!("Repository: {}\nPull request: #{}", meta.repo, meta.pr);
     if let Some(title) = &meta.title {
         header.push_str(&format!(" — {title}"));
     }
     if let Some(base) = &meta.base_branch {
         header.push_str(&format!("\nTarget branch: {base}"));
+    }
+    if let Some(note) = omitted_note {
+        header.push_str(&format!("\n\n[NOTE: {note}]"));
     }
     if truncated {
         header.push_str(

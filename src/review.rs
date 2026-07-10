@@ -119,13 +119,14 @@ async fn run_agentic(
     cfg: &Config,
     meta: &PrMeta,
     diff: &str,
+    omitted_note: Option<&str>,
     repo: &str,
 ) -> Result<ReviewResult> {
     let url = provider.clone_url(cfg, repo)?;
     let sha = meta.head_sha.clone();
     // git clone is blocking — keep it off the async worker threads.
     let ws = tokio::task::spawn_blocking(move || Workspace::clone(&url, sha.as_deref())).await??;
-    agentic_review(client, cfg, meta, diff, &ws).await
+    agentic_review(client, cfg, meta, diff, omitted_note, &ws).await
 }
 
 /// Load an optional per-repo `.prbot.toml` and merge it over `base`, returning the
@@ -222,10 +223,40 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
         anyhow::bail!("PR diff is empty (all files excluded by globs, or no changes) — nothing to review.");
     }
 
+    // Smart size handling: keep whole files, dropping the lowest-priority ones
+    // first, until the diff fits `max_diff_chars` — instead of a blunt mid-file
+    // char cut. Applied ONCE here so both review paths get the same packed diff.
+    let (diff, packed_dropped) = crate::diff::pack_diff(&diff, cfg.max_diff_chars);
+    if !packed_dropped.is_empty() {
+        tracing::info!(
+            "packed diff: omitted {} lower-priority file(s) to fit budget: {:?}",
+            packed_dropped.len(),
+            packed_dropped
+        );
+    }
+    // Surfaced to the model so it knows these files were NOT reviewed.
+    let omitted_note = (!packed_dropped.is_empty()).then(|| {
+        format!(
+            "{} file(s) were omitted to fit the size limit and were NOT reviewed: {}",
+            packed_dropped.len(),
+            packed_dropped.join(", ")
+        )
+    });
+
     // Agentic path (clone + tools) when enabled; falls back to diff-only on any
     // failure so a clone/agent hiccup never drops the review entirely.
     let result = if cfg.agentic {
-        match run_agentic(&provider, &client, cfg, &meta, &diff, &input.repo).await {
+        match run_agentic(
+            &provider,
+            &client,
+            cfg,
+            &meta,
+            &diff,
+            omitted_note.as_deref(),
+            &input.repo,
+        )
+        .await
+        {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(
@@ -233,11 +264,11 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
                     input.repo,
                     input.pr
                 );
-                review_diff(&client, cfg, &meta, &diff).await?
+                review_diff(&client, cfg, &meta, &diff, omitted_note.clone()).await?
             }
         }
     } else {
-        review_diff(&client, cfg, &meta, &diff).await?
+        review_diff(&client, cfg, &meta, &diff, omitted_note.clone()).await?
     };
     // Post-process findings before anchoring: optional self-critique pass, then a
     // confidence floor, severity sort, and a hard cap — cuts noise before posting.

@@ -105,7 +105,13 @@ pub(crate) fn extract_json_array(text: &str) -> Option<&str> {
     }
 }
 
-/// Clamp the diff to the size cap, call OpenRouter, parse the structured review.
+/// Call OpenRouter and parse the structured review.
+///
+/// The diff is expected to be pre-packed to fit the size budget (whole files
+/// dropped, lowest-priority first) by [`crate::diff::pack_diff`]; `omitted_note`
+/// carries the human-readable list of those dropped files so the model is told
+/// they were NOT reviewed. A SAFETY clamp (`take(max_diff_chars)`) still applies
+/// so a single un-packable oversized file can't blow the budget.
 ///
 /// # Errors
 /// If `OPENROUTER_API_KEY` is missing, OpenRouter returns an error status, or the
@@ -115,9 +121,12 @@ pub async fn review_diff(
     cfg: &Config,
     meta: &PrMeta,
     diff: &str,
+    omitted_note: Option<String>,
 ) -> Result<ReviewResult> {
     require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
 
+    // Safety clamp: the diff is already packed to fit, but a lone giant file can
+    // still exceed the cap — hard-trim it and flag the truncation.
     let truncated = diff.chars().count() > cfg.max_diff_chars;
     let clipped: String = if truncated {
         diff.chars().take(cfg.max_diff_chars).collect()
@@ -142,7 +151,7 @@ pub async fn review_diff(
             },
             Msg {
                 role: "user".into(),
-                content: build_user_prompt(meta, &clipped, truncated),
+                content: build_user_prompt(meta, &clipped, truncated, omitted_note.as_deref()),
             },
         ],
     };

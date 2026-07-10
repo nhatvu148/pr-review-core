@@ -92,6 +92,192 @@ fn section_path(section: &[&str], has_git: bool) -> Option<String> {
     None
 }
 
+/// Split a unified diff into per-file sections, returning `(path, section_text)`
+/// for each. Sections start at `diff --git ` lines (primary) or, when the diff
+/// carries no git headers, at the `--- ` line preceding each `+++ ` marker (or
+/// the `+++ ` line itself). This is the same splitting the glob filter and the
+/// size packer both build on.
+///
+/// The derived `path` is the new-side (`b/`) path; it is the empty string for a
+/// section whose path can't be determined (a `/dev/null` deletion or a leading
+/// preamble). `section_text` reproduces the section's lines with a trailing
+/// newline, so concatenating every section reconstructs the diff.
+///
+/// If the diff can't be parsed into any section, a single entry
+/// `("".to_string(), diff.to_string())` is returned so callers degrade
+/// gracefully rather than losing the diff.
+///
+/// # Examples
+/// ```
+/// # use pr_review_core::diff::split_diff_sections;
+/// let d = "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+y\n";
+/// let secs = split_diff_sections(d);
+/// assert_eq!(secs.len(), 1);
+/// assert_eq!(secs[0].0, "src/a.rs");
+/// ```
+pub fn split_diff_sections(diff: &str) -> Vec<(String, String)> {
+    let lines: Vec<&str> = diff.lines().collect();
+    let has_git = lines.iter().any(|l| l.starts_with("diff --git "));
+
+    // Section start indices: `diff --git` lines, or (fallback) the `--- ` line
+    // preceding each `+++ ` marker — or the `+++ ` line itself if none precedes.
+    let starts: Vec<usize> = if has_git {
+        lines
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with("diff --git "))
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        let mut s = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if l.starts_with("+++ ") {
+                if i > 0 && lines[i - 1].starts_with("--- ") {
+                    s.push(i - 1);
+                } else {
+                    s.push(i);
+                }
+            }
+        }
+        s
+    };
+
+    // Nothing parseable -> single fallback entry so callers never lose the diff.
+    if starts.is_empty() {
+        return vec![(String::new(), diff.to_string())];
+    }
+
+    // Reproduce a slice of lines as text with a trailing newline; concatenating
+    // every section's text reconstructs the original diff.
+    let emit = |slice: &[&str]| -> String {
+        let mut t = slice.join("\n");
+        if !t.is_empty() {
+            t.push('\n');
+        }
+        t
+    };
+
+    let mut sections: Vec<(String, String)> = Vec::new();
+
+    // Any preamble before the first section is carried as an empty-path section.
+    if starts[0] > 0 {
+        sections.push((String::new(), emit(&lines[..starts[0]])));
+    }
+
+    for (idx, &start) in starts.iter().enumerate() {
+        let end = starts.get(idx + 1).copied().unwrap_or(lines.len());
+        let section = &lines[start..end];
+        let path = section_path(section, has_git).unwrap_or_default();
+        sections.push((path, emit(section)));
+    }
+
+    sections
+}
+
+/// Priority score for a file path, used to decide which whole files to keep when
+/// a diff is too large: source code = 2, tests/specs/fixtures/snapshots = 1,
+/// docs/config/other = 0. An empty (preamble/unknown) path scores 2 so it's
+/// preserved. Deliberately a simple, documented heuristic.
+fn file_priority(path: &str) -> u8 {
+    let p = path.to_ascii_lowercase();
+    // Tests, specs, fixtures, snapshots — useful context but lower value.
+    if p.contains("test")
+        || p.contains("spec")
+        || p.contains("__tests__")
+        || p.contains(".snap")
+        || p.contains("fixtures")
+    {
+        return 1;
+    }
+    // Docs, config, and other low-signal files.
+    if p.ends_with(".md")
+        || p.ends_with(".txt")
+        || p.starts_with("docs/")
+        || p.contains("/docs/")
+        || p.ends_with(".lock")
+        || (p.ends_with(".json") && !p.contains('/'))
+    {
+        return 0;
+    }
+    // Everything else (including source and unknown/preamble) is highest value.
+    2
+}
+
+/// Fit `diff` within `max_chars` by keeping whole file sections, dropping the
+/// lowest-priority files first. Returns `(packed_diff, dropped_paths)`. If the
+/// diff already fits, returns it unchanged with an empty dropped list.
+///
+/// Sections are ranked by [`file_priority`] (DESC) then by char-length (ASC, so
+/// more small high-value files fit), then greedily accumulated while the running
+/// total stays within budget. Kept sections are re-emitted in their ORIGINAL
+/// diff order so the packed diff still reads top-to-bottom. If not even the
+/// smallest single section fits, the best one is kept anyway (never returns
+/// empty for a non-empty diff — a downstream safety clamp trims the hard cap).
+///
+/// # Examples
+/// ```
+/// # use pr_review_core::diff::pack_diff;
+/// let d = "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+y\n";
+/// let (packed, dropped) = pack_diff(d, 10_000);
+/// assert_eq!(packed, d);
+/// assert!(dropped.is_empty());
+/// ```
+pub fn pack_diff(diff: &str, max_chars: usize) -> (String, Vec<String>) {
+    if diff.chars().count() <= max_chars {
+        return (diff.to_string(), Vec::new());
+    }
+
+    let sections = split_diff_sections(diff);
+
+    // Rank order: priority DESC, then section length ASC (prefer more, smaller
+    // high-value files). Original indices are preserved for output ordering.
+    let mut order: Vec<usize> = (0..sections.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (pa, pb) = (file_priority(&sections[a].0), file_priority(&sections[b].0));
+        pb.cmp(&pa).then_with(|| {
+            sections[a]
+                .1
+                .chars()
+                .count()
+                .cmp(&sections[b].1.chars().count())
+        })
+    });
+
+    // Greedily keep sections whose cumulative length stays within budget; skip
+    // (drop) any that would overflow, still trying smaller later ones.
+    let mut keep = vec![false; sections.len()];
+    let mut used = 0usize;
+    for &i in &order {
+        let len = sections[i].1.chars().count();
+        if used + len <= max_chars {
+            keep[i] = true;
+            used += len;
+        }
+    }
+
+    // Fail-safe: if nothing fit (a single file larger than the whole budget),
+    // keep the best-ranked section so we never return empty — the caller's
+    // safety clamp trims it to the hard cap.
+    if !keep.iter().any(|&k| k) {
+        if let Some(&best) = order.first() {
+            keep[best] = true;
+        }
+    }
+
+    // Re-emit kept sections in original order; report dropped (named) paths.
+    let mut out = String::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (i, (path, text)) in sections.iter().enumerate() {
+        if keep[i] {
+            out.push_str(text);
+        } else if !path.is_empty() {
+            dropped.push(path.clone());
+        }
+    }
+
+    (out, dropped)
+}
+
 /// Drop per-file sections of a unified diff that don't pass the include/exclude
 /// glob filters — removing lockfiles, generated, vendored, and minified files
 /// before the diff is sent to the LLM (saves tokens and noise).
@@ -124,58 +310,18 @@ pub fn filter_diff_by_globs(
         _ => return (diff.to_string(), Vec::new()),
     };
 
-    let lines: Vec<&str> = diff.lines().collect();
-    let has_git = lines.iter().any(|l| l.starts_with("diff --git "));
+    let sections = split_diff_sections(diff);
 
-    // Section start indices: `diff --git` lines, or (fallback) the `--- ` line
-    // preceding each `+++ ` marker — or the `+++ ` line itself if none precedes.
-    let starts: Vec<usize> = if has_git {
-        lines
-            .iter()
-            .enumerate()
-            .filter(|(_, l)| l.starts_with("diff --git "))
-            .map(|(i, _)| i)
-            .collect()
-    } else {
-        let mut s = Vec::new();
-        for (i, l) in lines.iter().enumerate() {
-            if l.starts_with("+++ ") {
-                if i > 0 && lines[i - 1].starts_with("--- ") {
-                    s.push(i - 1);
-                } else {
-                    s.push(i);
-                }
-            }
-        }
-        s
-    };
-
-    // Nothing parseable -> fail-open.
-    if starts.is_empty() {
-        return (diff.to_string(), Vec::new());
-    }
-
-    let mut kept: Vec<&str> = Vec::new();
+    let mut out = String::new();
     let mut dropped: Vec<String> = Vec::new();
-
-    // Any preamble before the first section is always kept.
-    kept.extend_from_slice(&lines[..starts[0]]);
-
-    for (idx, &start) in starts.iter().enumerate() {
-        let end = starts.get(idx + 1).copied().unwrap_or(lines.len());
-        let section = &lines[start..end];
-        match section_path(section, has_git) {
-            Some(path) => {
-                let keep = (include.is_empty() || include_set.is_match(&path))
-                    && !exclude_set.is_match(&path);
-                if keep {
-                    kept.extend_from_slice(section);
-                } else {
-                    dropped.push(path);
-                }
-            }
-            // Unknown path -> fail-open, keep the section.
-            None => kept.extend_from_slice(section),
+    for (path, text) in &sections {
+        // Empty path = preamble / undetermined section -> fail-open, keep it.
+        let keep = path.is_empty()
+            || ((include.is_empty() || include_set.is_match(path)) && !exclude_set.is_match(path));
+        if keep {
+            out.push_str(text);
+        } else {
+            dropped.push(path.clone());
         }
     }
 
@@ -184,16 +330,12 @@ pub fn filter_diff_by_globs(
         return (diff.to_string(), Vec::new());
     }
 
-    let mut out = kept.join("\n");
-    if !out.is_empty() {
-        out.push('\n');
-    }
     (out, dropped)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_diff_by_globs, parse_valid_lines};
+    use super::{filter_diff_by_globs, pack_diff, parse_valid_lines, split_diff_sections};
 
     #[test]
     fn anchors_added_and_context_lines() {
@@ -270,5 +412,89 @@ mod tests {
         assert_eq!(dropped, vec!["bar.min.js".to_string()]);
         assert!(kept.contains("foo.js"));
         assert!(!kept.contains("bar.min.js"));
+    }
+
+    #[test]
+    fn split_sections_roundtrips_multi_file_diff() {
+        let d = "diff --git a/src/a.rs b/src/a.rs\n\
+                 +++ b/src/a.rs\n\
+                 @@ -1 +1 @@\n\
+                 +a\n\
+                 diff --git a/README.md b/README.md\n\
+                 +++ b/README.md\n\
+                 @@ -1 +1 @@\n\
+                 +docs\n";
+        let secs = split_diff_sections(d);
+        assert_eq!(secs.len(), 2);
+        assert_eq!(secs[0].0, "src/a.rs");
+        assert_eq!(secs[1].0, "README.md");
+        // Concatenating the section texts reconstructs the diff.
+        let joined: String = secs.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(joined, d);
+    }
+
+    #[test]
+    fn pack_under_budget_returns_unchanged() {
+        let d = "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+a\n";
+        let (packed, dropped) = pack_diff(d, 10_000);
+        assert_eq!(packed, d);
+        assert!(dropped.is_empty());
+    }
+
+    #[test]
+    fn pack_drops_low_priority_large_file_keeps_small_source() {
+        // A big low-priority docs file and a small source file. Budget only fits
+        // the small source section, so README.md must be dropped.
+        let big_docs = "x".repeat(500);
+        let d = format!(
+            "diff --git a/README.md b/README.md\n\
+             +++ b/README.md\n\
+             @@ -1 +1 @@\n\
+             +{big_docs}\n\
+             diff --git a/src/a.rs b/src/a.rs\n\
+             +++ b/src/a.rs\n\
+             @@ -1 +1 @@\n\
+             +small\n"
+        );
+        let (packed, dropped) = pack_diff(&d, 120);
+        assert_eq!(dropped, vec!["README.md".to_string()]);
+        assert!(packed.contains("src/a.rs"));
+        assert!(!packed.contains("README.md"));
+    }
+
+    #[test]
+    fn pack_preserves_original_file_order() {
+        // Small source file first, small test file second. A tiny docs file is
+        // dropped. Kept sections must come back in original (source, test) order
+        // even though the ranking would sort the test section differently.
+        let d = "diff --git a/src/a.rs b/src/a.rs\n\
+                 +++ b/src/a.rs\n\
+                 @@ -1 +1 @@\n\
+                 +alpha\n\
+                 diff --git a/src/a.spec.rs b/src/a.spec.rs\n\
+                 +++ b/src/a.spec.rs\n\
+                 @@ -1 +1 @@\n\
+                 +beta\n\
+                 diff --git a/README.md b/README.md\n\
+                 +++ b/README.md\n\
+                 @@ -1 +1 @@\n\
+                 +gammagammagammagammagammagamma\n";
+        let (packed, dropped) = pack_diff(d, 160);
+        assert_eq!(dropped, vec!["README.md".to_string()]);
+        let a = packed.find("src/a.rs").expect("source kept");
+        let b = packed.find("src/a.spec.rs").expect("spec kept");
+        assert!(a < b, "kept sections should be in original diff order");
+    }
+
+    #[test]
+    fn pack_keeps_single_oversized_file_rather_than_empty() {
+        // One file, larger than the budget: must still be returned (safety clamp
+        // downstream trims it) — never empty, nothing reported as dropped.
+        let big = "y".repeat(400);
+        let d = format!("diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+{big}\n");
+        let (packed, dropped) = pack_diff(&d, 50);
+        assert!(!packed.is_empty());
+        assert!(packed.contains("src/a.rs"));
+        assert!(dropped.is_empty());
     }
 }
