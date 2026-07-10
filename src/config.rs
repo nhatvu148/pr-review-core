@@ -15,6 +15,9 @@ pub struct Config {
     pub github_webhook_secret: String,
     /// Shared secret Bitbucket signs webhook deliveries with (X-Hub-Signature).
     pub bitbucket_webhook_secret: String,
+    /// Shared token GitLab sends webhook deliveries with (X-Gitlab-Token). Unlike
+    /// GitHub/Bitbucket this is a plain token compared verbatim, not an HMAC.
+    pub gitlab_webhook_secret: String,
 
     /// OpenRouter (or any OpenAI-compatible) API key. Resolved from
     /// `OPENROUTER_API_KEY`, falling back to `LLM_API_KEY` — the alias lets
@@ -72,6 +75,9 @@ pub struct Config {
     pub bitbucket_token: String,
     pub bitbucket_api_base: String,
 
+    pub gitlab_token: String,
+    pub gitlab_api_base: String,
+
     /// Signature appended to every comment the bot posts and used as the dedupe
     /// key to find/update its own comments. Injected so the library carries no
     /// hardcoded bot identity.
@@ -105,6 +111,7 @@ impl Config {
             worker_token: env::var("WORKER_TOKEN").unwrap_or_default(),
             github_webhook_secret: env::var("GITHUB_WEBHOOK_SECRET").unwrap_or_default(),
             bitbucket_webhook_secret: env::var("BITBUCKET_WEBHOOK_SECRET").unwrap_or_default(),
+            gitlab_webhook_secret: env::var("GITLAB_WEBHOOK_SECRET").unwrap_or_default(),
 
             openrouter_api_key: env::var("OPENROUTER_API_KEY")
                 .or_else(|_| env::var("LLM_API_KEY"))
@@ -171,6 +178,9 @@ impl Config {
             bitbucket_email: env::var("BB_EMAIL").unwrap_or_default(),
             bitbucket_token: env::var("BB_API_TOKEN").unwrap_or_default(),
             bitbucket_api_base: "https://api.bitbucket.org/2.0".to_string(),
+
+            gitlab_token: env::var("GITLAB_TOKEN").unwrap_or_default(),
+            gitlab_api_base: env_or("GITLAB_API_BASE", "https://gitlab.com/api/v4"),
 
             comment_marker: env_or("COMMENT_MARKER", "🤖 ai-pr-review"),
             user_agent: env_or("USER_AGENT", "pr-review-core"),

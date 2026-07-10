@@ -36,11 +36,80 @@ pub fn verify_signature(secret: &str, body: &[u8], signature_header: Option<&str
     mac.verify_slice(&expected).is_ok()
 }
 
+/// Verify GitLab's `X-Gitlab-Token` header. Unlike GitHub/Bitbucket, GitLab does
+/// NOT HMAC-sign the body — it echoes the configured secret verbatim in the
+/// header, so this is a plain (constant-time) equality check.
+///
+/// Returns `false` if the secret is empty or the header is missing.
+///
+/// # Examples
+/// ```
+/// # use pr_review_core::webhook::verify_gitlab_token;
+/// assert!(verify_gitlab_token("s3cret", Some("s3cret")));
+/// assert!(!verify_gitlab_token("s3cret", Some("nope")));
+/// assert!(!verify_gitlab_token("s3cret", None));
+/// assert!(!verify_gitlab_token("", Some("")));
+/// ```
+pub fn verify_gitlab_token(secret: &str, presented: Option<&str>) -> bool {
+    if secret.is_empty() {
+        return false;
+    }
+    let Some(presented) = presented else {
+        return false;
+    };
+    // Constant-time-ish comparison: fold length + byte differences into one flag.
+    let a = secret.as_bytes();
+    let b = presented.as_bytes();
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for (i, &byte) in a.iter().enumerate() {
+        diff |= byte ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
+}
+
 /// The bits of a `pull_request` event we act on.
 pub struct WebhookPr {
     pub repo: String,
     pub pr: u64,
     pub action: String,
+}
+
+/// Parse a GitLab "Merge Request Hook" payload. The MR is identified by its
+/// `iid` (project-scoped), and the action lives under `object_attributes.action`
+/// (`open`/`reopen`/`update`/`merge`/`close`). Mirrors [`WebhookPr`] so server
+/// code can treat all providers uniformly.
+pub fn parse_gitlab_mr_event(body: &[u8]) -> anyhow::Result<WebhookPr> {
+    #[derive(Deserialize)]
+    struct Project {
+        path_with_namespace: String,
+    }
+    #[derive(Deserialize)]
+    struct ObjectAttributes {
+        iid: u64,
+        action: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Event {
+        project: Project,
+        object_attributes: ObjectAttributes,
+    }
+    let ev: Event = serde_json::from_slice(body)?;
+    Ok(WebhookPr {
+        repo: ev.project.path_with_namespace,
+        pr: ev.object_attributes.iid,
+        action: ev.object_attributes.action.unwrap_or_default(),
+    })
+}
+
+/// Which GitLab merge-request actions should trigger a review. `open`/`reopen`
+/// always review; `update` (new commits pushed) only when `review_on_update` is
+/// set. Mirrors GitHub's opened/synchronize split.
+pub fn should_review_gitlab(action: &str, review_on_update: bool) -> bool {
+    match action {
+        "open" | "reopen" => true,
+        "update" => review_on_update,
+        _ => false,
+    }
 }
 
 /// Parse a `pull_request` webhook payload.
@@ -202,7 +271,8 @@ pub fn is_review_command(action: &str, is_pull_request: bool, body: &str) -> boo
 #[cfg(test)]
 mod tests {
     use super::{
-        is_review_command, parse_bitbucket_comment_event, should_review, should_review_bitbucket,
+        is_review_command, parse_bitbucket_comment_event, parse_gitlab_mr_event, should_review,
+        should_review_bitbucket, should_review_gitlab, verify_gitlab_token,
     };
 
     #[test]
@@ -241,6 +311,43 @@ mod tests {
         assert!(!is_review_command("created", false, "/review")); // plain issue, not a PR
         assert!(!is_review_command("created", true, "please /review")); // not the command
         assert!(!is_review_command("created", true, "/reviews")); // no fuzzy match
+    }
+
+    #[test]
+    fn gitlab_token_matches_only_on_exact_secret() {
+        assert!(verify_gitlab_token("s3cret", Some("s3cret")));
+        assert!(!verify_gitlab_token("s3cret", Some("s3cre"))); // shorter
+        assert!(!verify_gitlab_token("s3cret", Some("s3cretx"))); // longer
+        assert!(!verify_gitlab_token("s3cret", Some("nope")));
+        assert!(!verify_gitlab_token("s3cret", None)); // missing header
+        assert!(!verify_gitlab_token("", Some(""))); // empty secret never verifies
+        assert!(!verify_gitlab_token("", Some("anything")));
+    }
+
+    #[test]
+    fn gitlab_update_is_gated_by_flag() {
+        for action in ["open", "reopen"] {
+            assert!(should_review_gitlab(action, false), "{action} should review");
+            assert!(should_review_gitlab(action, true), "{action} should review");
+        }
+        assert!(!should_review_gitlab("update", false));
+        assert!(should_review_gitlab("update", true));
+        assert!(!should_review_gitlab("merge", false));
+        assert!(!should_review_gitlab("close", true));
+    }
+
+    #[test]
+    fn parse_gitlab_mr_extracts_repo_iid_and_action() {
+        let body = br#"{
+            "object_kind": "merge_request",
+            "project": { "path_with_namespace": "group/sub/project" },
+            "object_attributes": { "iid": 7, "action": "open" }
+        }"#;
+        let ev = parse_gitlab_mr_event(body).unwrap();
+        assert_eq!(ev.repo, "group/sub/project");
+        assert_eq!(ev.pr, 7);
+        assert_eq!(ev.action, "open");
+        assert!(should_review_gitlab(&ev.action, false));
     }
 
     #[test]

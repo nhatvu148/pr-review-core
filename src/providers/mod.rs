@@ -9,6 +9,7 @@ use crate::config::Config;
 
 mod bitbucket;
 mod github;
+mod gitlab;
 mod types;
 
 pub use types::{InlineComment, PrMeta, ProviderName, ReviewPost};
@@ -29,6 +30,7 @@ pub fn is_bot_comment(cfg: &crate::config::Config, body: &str) -> bool {
 pub enum Provider {
     Github,
     Bitbucket,
+    Gitlab,
 }
 
 impl Provider {
@@ -37,7 +39,10 @@ impl Provider {
         match name {
             "github" => Ok(Provider::Github),
             "bitbucket" => Ok(Provider::Bitbucket),
-            other => anyhow::bail!("Unknown provider \"{other}\" (expected: github | bitbucket)"),
+            "gitlab" => Ok(Provider::Gitlab),
+            other => anyhow::bail!(
+                "Unknown provider \"{other}\" (expected: github | bitbucket | gitlab)"
+            ),
         }
     }
 
@@ -45,6 +50,7 @@ impl Provider {
         match self {
             Provider::Github => "github",
             Provider::Bitbucket => "bitbucket",
+            Provider::Gitlab => "gitlab",
         }
     }
 
@@ -59,6 +65,7 @@ impl Provider {
         match self {
             Provider::Github => github::get_diff(client, cfg, repo, pr).await,
             Provider::Bitbucket => bitbucket::get_diff(client, cfg, repo, pr).await,
+            Provider::Gitlab => gitlab::get_diff(client, cfg, repo, pr).await,
         }
     }
 
@@ -73,6 +80,7 @@ impl Provider {
         match self {
             Provider::Github => github::get_meta(client, cfg, repo, pr).await,
             Provider::Bitbucket => bitbucket::get_meta(client, cfg, repo, pr).await,
+            Provider::Gitlab => gitlab::get_meta(client, cfg, repo, pr).await,
         }
     }
 
@@ -91,6 +99,7 @@ impl Provider {
             Provider::Bitbucket => {
                 bitbucket::get_file_contents(client, cfg, repo, r#ref, path).await
             }
+            Provider::Gitlab => gitlab::get_file_contents(client, cfg, repo, r#ref, path).await,
         }
     }
 
@@ -99,6 +108,7 @@ impl Provider {
         match self {
             Provider::Github => github::clone_url(cfg, repo),
             Provider::Bitbucket => bitbucket::clone_url(cfg, repo),
+            Provider::Gitlab => gitlab::clone_url(cfg, repo),
         }
     }
 
@@ -115,6 +125,7 @@ impl Provider {
         match self {
             Provider::Github => github::post_review(client, cfg, meta, review).await,
             Provider::Bitbucket => bitbucket::post_review(client, cfg, meta, review).await,
+            Provider::Gitlab => gitlab::post_review(client, cfg, meta, review).await,
         }
     }
 }
