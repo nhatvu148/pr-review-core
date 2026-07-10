@@ -76,6 +76,24 @@ impl Provider {
         }
     }
 
+    /// Fetch a repo file's text at a git ref. `Ok(None)` if the file doesn't
+    /// exist (404). Used to load an optional per-repo `.prbot.toml`.
+    pub async fn get_file_contents(
+        &self,
+        client: &Client,
+        cfg: &Config,
+        repo: &str,
+        r#ref: &str,
+        path: &str,
+    ) -> Result<Option<String>> {
+        match self {
+            Provider::Github => github::get_file_contents(client, cfg, repo, r#ref, path).await,
+            Provider::Bitbucket => {
+                bitbucket::get_file_contents(client, cfg, repo, r#ref, path).await
+            }
+        }
+    }
+
     /// Build an authenticated HTTPS clone URL for the agentic reviewer.
     pub fn clone_url(&self, cfg: &Config, repo: &str) -> Result<String> {
         match self {

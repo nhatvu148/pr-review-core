@@ -10,6 +10,7 @@ use crate::diff::parse_valid_lines;
 use crate::llm::{review_diff, Finding, Review, ReviewResult, Usage};
 use crate::providers::{InlineComment, PrMeta, Provider, ReviewPost};
 use crate::repo::Workspace;
+use crate::repo_config;
 
 pub struct RunReviewInput {
     pub provider: String,
@@ -127,6 +128,50 @@ async fn run_agentic(
     agentic_review(client, cfg, meta, diff, &ws).await
 }
 
+/// Load an optional per-repo `.prbot.toml` and merge it over `base`, returning the
+/// effective config for this one review.
+///
+/// Fully fail-open: a missing file, a fetch error, or a parse error all log and
+/// return `base.clone()` so a repo config problem can never break the review.
+async fn load_repo_config(
+    provider: &Provider,
+    client: &reqwest::Client,
+    base: &Config,
+    repo: &str,
+    meta: &PrMeta,
+) -> Config {
+    // Prefer the exact head commit; fall back to the base branch when the provider
+    // didn't give us a head SHA (e.g. Bitbucket meta). If neither is available,
+    // there's nothing to fetch against — use the base config as-is.
+    let git_ref = match (meta.head_sha.as_deref(), meta.base_branch.as_deref()) {
+        (Some(sha), _) if !sha.is_empty() => sha,
+        (_, Some(branch)) if !branch.is_empty() => branch,
+        _ => return base.clone(),
+    };
+
+    match provider
+        .get_file_contents(client, base, repo, git_ref, ".prbot.toml")
+        .await
+    {
+        Ok(Some(text)) => match repo_config::parse(&text) {
+            Ok(rc) => {
+                tracing::info!("applied .prbot.toml overrides for {repo}");
+                base.with_repo_overrides(&rc)
+            }
+            Err(e) => {
+                tracing::warn!("ignoring invalid .prbot.toml for {repo}: {e:#}");
+                base.clone()
+            }
+        },
+        // No file, or any fetch error — proceed with the base config (fail-open).
+        Ok(None) => base.clone(),
+        Err(e) => {
+            tracing::warn!("could not fetch .prbot.toml for {repo}: {e:#}");
+            base.clone()
+        }
+    }
+}
+
 /// Review one pull request end-to-end.
 ///
 /// # Errors
@@ -138,6 +183,12 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
     let meta = provider
         .get_meta(&client, cfg, &input.repo, input.pr)
         .await?;
+
+    // Merge an optional per-repo `.prbot.toml` (fetched from the PR head) over the
+    // env config; shadow `cfg` so every step below — glob filter, model choice,
+    // agentic decision, self-critique, caps, and prompt — honors the overrides.
+    let effective = load_repo_config(&provider, &client, cfg, &input.repo, &meta).await;
+    let cfg = &effective;
 
     // Instant feedback: drop a "Reviewing…" summary comment before the slow LLM
     // call. It's upserted, so the real review updates this same comment.

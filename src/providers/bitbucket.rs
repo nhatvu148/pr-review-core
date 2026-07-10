@@ -88,6 +88,42 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
     })
 }
 
+/// Fetch a repo file's text at a git ref via the `src` endpoint.
+///
+/// Returns `Ok(None)` when the file doesn't exist (404) so the caller can treat
+/// a missing `.prbot.toml` as "no overrides" rather than an error.
+///
+/// # Errors
+/// If credentials are missing or the request fails with a non-404 error status.
+pub async fn get_file_contents(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    r#ref: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    let git_ref = r#ref;
+    let res = client
+        .get(format!(
+            "{}/repositories/{repo}/src/{git_ref}/{path}",
+            cfg.bitbucket_api_base
+        ))
+        .header(reqwest::header::AUTHORIZATION, auth_header(cfg)?)
+        .send()
+        .await?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "Bitbucket getFileContents {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    Ok(Some(res.text().await?))
+}
+
 /// Authenticated HTTPS clone URL.
 ///
 /// Git-over-HTTPS on Bitbucket Cloud authenticates an Atlassian API token with

@@ -175,6 +175,62 @@ impl Config {
             extra_system_prompt: resolve_extra_system_prompt(),
         }
     }
+
+    /// Return a clone of this config with any fields set in `rc` overridden.
+    ///
+    /// Only `Some(..)` fields of the per-repo [`RepoConfig`] take effect; the rest
+    /// keep the env-derived value. `rc.instructions` is *appended* to
+    /// [`Config::extra_system_prompt`] (newline-separated) rather than replacing it,
+    /// so a consumer's baked-in conventions block and the repo's own instructions
+    /// both reach the model.
+    ///
+    /// # Examples
+    /// ```
+    /// # use pr_review_core::config::Config;
+    /// # use pr_review_core::repo_config::RepoConfig;
+    /// let base = Config::from_env();
+    /// let rc = RepoConfig { min_confidence: Some(80), ..Default::default() };
+    /// let effective = base.with_repo_overrides(&rc);
+    /// assert_eq!(effective.min_confidence, 80);
+    /// ```
+    pub fn with_repo_overrides(&self, rc: &crate::repo_config::RepoConfig) -> Config {
+        let mut cfg = self.clone();
+        if let Some(v) = &rc.model {
+            cfg.openrouter_model = v.clone();
+        }
+        if let Some(v) = &rc.model_explore {
+            cfg.openrouter_model_explore = v.clone();
+        }
+        if let Some(v) = &rc.include_globs {
+            cfg.include_globs = v.clone();
+        }
+        if let Some(v) = &rc.exclude_globs {
+            cfg.exclude_globs = v.clone();
+        }
+        if let Some(v) = rc.min_confidence {
+            cfg.min_confidence = v;
+        }
+        if let Some(v) = rc.max_findings {
+            cfg.max_findings = v;
+        }
+        if let Some(v) = rc.self_critique {
+            cfg.self_critique = v;
+        }
+        if let Some(v) = rc.agentic {
+            cfg.agentic = v;
+        }
+        if let Some(v) = &rc.instructions {
+            let extra = v.trim();
+            if !extra.is_empty() {
+                if cfg.extra_system_prompt.is_empty() {
+                    cfg.extra_system_prompt = extra.to_string();
+                } else {
+                    cfg.extra_system_prompt = format!("{}\n{extra}", cfg.extra_system_prompt);
+                }
+            }
+        }
+        cfg
+    }
 }
 
 /// Resolve the extra system prompt: prefer the inline `EXTRA_SYSTEM_PROMPT` env
@@ -221,4 +277,71 @@ pub fn require(value: &str, name: &str) -> anyhow::Result<()> {
         anyhow::bail!("Missing required env var: {name}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::repo_config::RepoConfig;
+
+    #[test]
+    fn overrides_only_set_fields_and_appends_instructions() {
+        let mut base = Config::from_env();
+        base.openrouter_model = "base/model".to_string();
+        base.min_confidence = 10;
+        base.max_findings = 5;
+        base.self_critique = true;
+        base.agentic = false;
+        base.extra_system_prompt = "BASE CONVENTIONS".to_string();
+
+        let rc = RepoConfig {
+            model: Some("repo/model".to_string()),
+            min_confidence: Some(75),
+            self_critique: Some(false),
+            agentic: Some(true),
+            include_globs: Some(vec!["src/**".to_string()]),
+            instructions: Some("Never nit about formatting.".to_string()),
+            ..Default::default()
+        };
+
+        let eff = base.with_repo_overrides(&rc);
+
+        // Overridden fields take the repo value.
+        assert_eq!(eff.openrouter_model, "repo/model");
+        assert_eq!(eff.min_confidence, 75);
+        assert!(!eff.self_critique);
+        assert!(eff.agentic);
+        assert_eq!(eff.include_globs, vec!["src/**".to_string()]);
+        // Untouched field keeps the base value.
+        assert_eq!(eff.max_findings, 5);
+        // Instructions are appended, not replaced.
+        assert_eq!(
+            eff.extra_system_prompt,
+            "BASE CONVENTIONS\nNever nit about formatting."
+        );
+    }
+
+    #[test]
+    fn empty_repo_config_is_a_noop() {
+        let mut base = Config::from_env();
+        base.openrouter_model = "keep/me".to_string();
+        base.extra_system_prompt = "keep".to_string();
+
+        let eff = base.with_repo_overrides(&RepoConfig::default());
+
+        assert_eq!(eff.openrouter_model, "keep/me");
+        assert_eq!(eff.extra_system_prompt, "keep");
+    }
+
+    #[test]
+    fn instructions_set_when_base_prompt_empty() {
+        let mut base = Config::from_env();
+        base.extra_system_prompt = String::new();
+        let rc = RepoConfig {
+            instructions: Some("Focus on security.".to_string()),
+            ..Default::default()
+        };
+        let eff = base.with_repo_overrides(&rc);
+        assert_eq!(eff.extra_system_prompt, "Focus on security.");
+    }
 }

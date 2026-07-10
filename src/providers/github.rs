@@ -3,6 +3,7 @@
 //! comments (the bot's prior inline comments are deleted and reposted each run).
 
 use anyhow::Result;
+use base64::Engine;
 use reqwest::Client;
 use serde::Deserialize;
 
@@ -76,6 +77,62 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         base_branch: pr_data.base.and_then(|b| b.ref_),
         head_sha: pr_data.head.and_then(|h| h.sha),
     })
+}
+
+/// Fetch a repo file's text at a git ref via the Contents API.
+///
+/// Returns `Ok(None)` when the file doesn't exist (404) so the caller can treat
+/// a missing `.prbot.toml` as "no overrides" rather than an error.
+///
+/// # Errors
+/// If `GH_TOKEN` is missing, the request fails, or the response can't be decoded.
+pub async fn get_file_contents(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    r#ref: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    require(&cfg.github_token, "GH_TOKEN")?;
+
+    #[derive(Deserialize)]
+    struct Contents {
+        content: Option<String>,
+        encoding: Option<String>,
+    }
+
+    let git_ref = r#ref;
+    let url = format!(
+        "{}/repos/{repo}/contents/{path}?ref={git_ref}",
+        cfg.github_api_base
+    );
+    let res = gh(client.get(url), cfg).send().await?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "GitHub getFileContents {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    let data: Contents = res.json().await?;
+    match data.encoding.as_deref() {
+        Some("base64") => {
+            let content = data.content.unwrap_or_default();
+            // GitHub wraps the base64 payload at 60 cols; strip whitespace first.
+            let cleaned: String = content.split_whitespace().collect();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(cleaned.as_bytes())
+                .map_err(|e| anyhow::anyhow!("GitHub getFileContents: bad base64 ({e})"))?;
+            Ok(Some(String::from_utf8(bytes).map_err(|e| {
+                anyhow::anyhow!("GitHub getFileContents: non-UTF8 content ({e})")
+            })?))
+        }
+        // Small files can occasionally come back already decoded / other encodings.
+        _ => Ok(data.content),
+    }
 }
 
 /// Authenticated HTTPS clone URL (token as `x-access-token`).
