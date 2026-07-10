@@ -99,6 +99,15 @@ pub struct Config {
     pub structural_context: bool,
     /// Max number of files to fetch + parse for structural context (cost guard).
     pub structural_max_files: usize,
+
+    /// Scan changed lockfiles for known-vulnerable dependencies via OSV.dev and
+    /// append advisories to the review summary. Fully fail-open — never blocks a
+    /// review.
+    pub cve_scan: bool,
+    /// Max distinct packages queried against OSV per review (cost/fan-out guard).
+    pub cve_max_packages: usize,
+    /// Base URL of the OSV.dev API (override for a mirror or a test double).
+    pub osv_api_base: String,
 }
 
 impl Config {
@@ -193,6 +202,10 @@ impl Config {
 
             structural_context: env_or("STRUCTURAL_CONTEXT", "true").parse().unwrap_or(true),
             structural_max_files: env_or("STRUCTURAL_MAX_FILES", "15").parse().unwrap_or(15),
+
+            cve_scan: env_or("CVE_SCAN", "true").parse().unwrap_or(true),
+            cve_max_packages: env_or("CVE_MAX_PACKAGES", "100").parse().unwrap_or(100),
+            osv_api_base: env_or("OSV_API_BASE", "https://api.osv.dev"),
         }
     }
 

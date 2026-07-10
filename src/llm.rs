@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::clip;
 use crate::config::{require, Config};
-use crate::prompt::{build_user_prompt, CRITIQUE_SYSTEM_PROMPT, SYSTEM_PROMPT};
+use crate::prompt::{
+    build_user_prompt, ASK_SYSTEM_PROMPT, CRITIQUE_SYSTEM_PROMPT, DESCRIBE_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+};
 use crate::providers::PrMeta;
 
 #[derive(Serialize)]
@@ -290,10 +293,116 @@ pub async fn critique_findings(
         .ok_or_else(|| anyhow::anyhow!("OpenRouter returned an empty critique response."))?;
 
     let json = extract_json_array(&content).ok_or_else(|| {
-        anyhow::anyhow!("Critique did not return a JSON array: {}", clip(&content, 300))
+        anyhow::anyhow!(
+            "Critique did not return a JSON array: {}",
+            clip(&content, 300)
+        )
     })?;
     let kept: Vec<Finding> = serde_json::from_str(json)
         .map_err(|e| anyhow::anyhow!("Could not parse critique JSON ({e}): {}", clip(json, 300)))?;
 
     Ok(kept)
+}
+
+/// One-shot chat completion returning the raw assistant text. Shares the same
+/// OpenRouter call pattern (headers, base URL, synthesis model) as [`review_diff`].
+///
+/// # Errors
+/// If `OPENROUTER_API_KEY` is missing, OpenRouter returns an error status, or the
+/// response has no content.
+async fn chat_text(client: &Client, cfg: &Config, system: &str, user: &str) -> Result<String> {
+    require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
+
+    let req = ChatReq {
+        model: cfg.openrouter_model.clone(),
+        max_tokens: cfg.openrouter_max_tokens,
+        temperature: cfg.openrouter_temperature,
+        messages: vec![
+            Msg {
+                role: "system".into(),
+                content: system.to_string(),
+            },
+            Msg {
+                role: "user".into(),
+                content: user.to_string(),
+            },
+        ],
+    };
+
+    let res = client
+        .post(format!("{}/chat/completions", cfg.openrouter_base_url))
+        .bearer_auth(&cfg.openrouter_api_key)
+        .header("HTTP-Referer", &cfg.http_referer)
+        .header("X-Title", &cfg.x_title)
+        .json(&req)
+        .send()
+        .await?;
+
+    let status = res.status();
+    let text = res.text().await?;
+    let data: ChatRes = serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "OpenRouter {status}: non-JSON response ({e}): {}",
+            clip(&text, 300)
+        )
+    })?;
+
+    if !status.is_success() || data.error.is_some() {
+        let msg = data
+            .error
+            .and_then(|e| e.message)
+            .unwrap_or_else(|| clip(&text, 500));
+        anyhow::bail!("OpenRouter {status}: {msg}");
+    }
+
+    data.choices
+        .and_then(|c| c.into_iter().next())
+        .and_then(|c| c.message)
+        .and_then(|m| m.content)
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("OpenRouter returned an empty response."))
+}
+
+/// Answer a free-form question about a PR (the `/ask` command), grounded in its
+/// diff. Returns the answer as markdown.
+///
+/// # Errors
+/// If `OPENROUTER_API_KEY` is missing or the OpenRouter call fails.
+pub async fn answer_question(
+    client: &Client,
+    cfg: &Config,
+    meta: &PrMeta,
+    diff: &str,
+    question: &str,
+    structural_context: Option<&str>,
+) -> Result<String> {
+    let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
+    let truncated = diff.chars().count() > cfg.max_diff_chars;
+    let context = build_user_prompt(meta, &clipped, truncated, None, structural_context);
+    let user = format!("{context}\n\n--- QUESTION ---\n{}", question.trim());
+    let system = if cfg.extra_system_prompt.is_empty() {
+        ASK_SYSTEM_PROMPT.to_string()
+    } else {
+        format!("{ASK_SYSTEM_PROMPT}\n{}", cfg.extra_system_prompt)
+    };
+    chat_text(client, cfg, &system, &user).await
+}
+
+/// Generate a PR description from its diff (the `/describe` command). Returns
+/// markdown (no title header — the PR already has a title).
+///
+/// # Errors
+/// If `OPENROUTER_API_KEY` is missing or the OpenRouter call fails.
+pub async fn describe_pr(
+    client: &Client,
+    cfg: &Config,
+    meta: &PrMeta,
+    diff: &str,
+    structural_context: Option<&str>,
+) -> Result<String> {
+    let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
+    let truncated = diff.chars().count() > cfg.max_diff_chars;
+    let user = build_user_prompt(meta, &clipped, truncated, None, structural_context);
+    chat_text(client, cfg, DESCRIBE_SYSTEM_PROMPT, &user).await
 }

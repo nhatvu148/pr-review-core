@@ -128,7 +128,16 @@ async fn run_agentic(
     let sha = meta.head_sha.clone();
     // git clone is blocking — keep it off the async worker threads.
     let ws = tokio::task::spawn_blocking(move || Workspace::clone(&url, sha.as_deref())).await??;
-    agentic_review(client, cfg, meta, diff, omitted_note, structural_context, &ws).await
+    agentic_review(
+        client,
+        cfg,
+        meta,
+        diff,
+        omitted_note,
+        structural_context,
+        &ws,
+    )
+    .await
 }
 
 /// Load an optional per-repo `.prbot.toml` and merge it over `base`, returning the
@@ -136,7 +145,7 @@ async fn run_agentic(
 ///
 /// Fully fail-open: a missing file, a fetch error, or a parse error all log and
 /// return `base.clone()` so a repo config problem can never break the review.
-async fn load_repo_config(
+pub(crate) async fn load_repo_config(
     provider: &Provider,
     client: &reqwest::Client,
     base: &Config,
@@ -175,6 +184,47 @@ async fn load_repo_config(
     }
 }
 
+/// Post an advisory-only summary when the reviewable diff is empty but a
+/// dependency scan found something (e.g. a lockfile-only PR). Skipped on dry-run.
+async fn post_advisory_only(
+    provider: &Provider,
+    client: &reqwest::Client,
+    cfg: &Config,
+    meta: &PrMeta,
+    input: &RunReviewInput,
+    advisories: Vec<crate::deps::DepAdvisory>,
+) -> Result<RunReviewOutput> {
+    let mut summary = String::from(
+        "🤖 **Automated review**\n\nNo reviewable source changes (dependency/lockfile-only PR).",
+    );
+    summary.push_str("\n\n");
+    summary.push_str(&crate::deps::render_advisories(&advisories));
+    summary.push_str("\n\n_Automated advisory review — a human still owns the merge decision._");
+
+    let post = ReviewPost {
+        summary: summary.clone(),
+        inline: Vec::new(),
+    };
+    let mut out = RunReviewOutput {
+        provider: provider.name().to_string(),
+        repo: input.repo.clone(),
+        pr: input.pr,
+        model: cfg.openrouter_model.clone(),
+        recommendation: "APPROVE WITH CHANGES".to_string(),
+        findings: 0,
+        inline_posted: 0,
+        posted: false,
+        comment_url: None,
+        summary_markdown: summary,
+        usage: None,
+    };
+    if !input.dry_run {
+        out.comment_url = provider.post_review(client, cfg, meta, &post).await?;
+        out.posted = true;
+    }
+    Ok(out)
+}
+
 /// Review one pull request end-to-end.
 ///
 /// # Errors
@@ -209,20 +259,41 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
         }
     }
 
-    let diff = provider
+    let raw_diff = provider
         .get_diff(&client, cfg, &input.repo, input.pr)
         .await?;
+
+    // Dependency vulnerability scan runs on the RAW diff: lockfiles are dropped
+    // by the glob filter below (and never reach the LLM), so we must read added
+    // dependency lines before that. Fully fail-open — returns [] on any error.
+    let advisories = crate::deps::scan(&client, cfg, &raw_diff).await;
+    if !advisories.is_empty() {
+        tracing::info!(
+            "OSV: {} dependency advisor(y/ies) for {}#{}",
+            advisories.len(),
+            input.repo,
+            input.pr
+        );
+    }
 
     // Drop noisy files (lockfiles, generated, vendored, minified) before the LLM
     // sees the diff — saves tokens and noise. Fail-open: never loses the review.
     let (diff, dropped) =
-        crate::diff::filter_diff_by_globs(&diff, &cfg.include_globs, &cfg.exclude_globs);
+        crate::diff::filter_diff_by_globs(&raw_diff, &cfg.include_globs, &cfg.exclude_globs);
     if !dropped.is_empty() {
         tracing::info!("skipped {} file(s) by glob: {:?}", dropped.len(), dropped);
     }
 
+    // If every changed file was filtered out (e.g. a lockfile-only PR) there's
+    // nothing for the LLM to review — but a dependency advisory found on those
+    // lockfiles still deserves a comment. Post an advisory-only summary and return.
     if diff.trim().is_empty() {
-        anyhow::bail!("PR diff is empty (all files excluded by globs, or no changes) — nothing to review.");
+        if !advisories.is_empty() {
+            return post_advisory_only(&provider, &client, cfg, &meta, &input, advisories).await;
+        }
+        anyhow::bail!(
+            "PR diff is empty (all files excluded by globs, or no changes) — nothing to review."
+        );
     }
 
     // Smart size handling: keep whole files, dropping the lowest-priority ones
@@ -287,17 +358,34 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
                     input.repo,
                     input.pr
                 );
-                review_diff(&client, cfg, &meta, &diff, omitted_note.clone(), structural_opt).await?
+                review_diff(
+                    &client,
+                    cfg,
+                    &meta,
+                    &diff,
+                    omitted_note.clone(),
+                    structural_opt,
+                )
+                .await?
             }
         }
     } else {
-        review_diff(&client, cfg, &meta, &diff, omitted_note.clone(), structural_opt).await?
+        review_diff(
+            &client,
+            cfg,
+            &meta,
+            &diff,
+            omitted_note.clone(),
+            structural_opt,
+        )
+        .await?
     };
     // Post-process findings before anchoring: optional self-critique pass, then a
     // confidence floor, severity sort, and a hard cap — cuts noise before posting.
     let mut findings = result.review.findings.clone();
     if cfg.self_critique && !findings.is_empty() {
-        findings = match crate::llm::critique_findings(&client, cfg, &meta, &diff, &findings).await {
+        findings = match crate::llm::critique_findings(&client, cfg, &meta, &diff, &findings).await
+        {
             Ok(f) => f,
             Err(e) => {
                 tracing::warn!("self-critique failed ({e:#}); keeping original findings");
@@ -333,7 +421,11 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
         }
     }
 
-    let summary = render_summary(&result.review, &unanchored, inline.len());
+    let mut summary = render_summary(&result.review, &unanchored, inline.len());
+    if !advisories.is_empty() {
+        summary.push_str("\n\n");
+        summary.push_str(&crate::deps::render_advisories(&advisories));
+    }
     let inline_count = inline.len();
     let post = ReviewPost {
         summary: summary.clone(),

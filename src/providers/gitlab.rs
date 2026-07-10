@@ -58,6 +58,7 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
     #[derive(Deserialize)]
     struct Mr {
         title: Option<String>,
+        description: Option<String>,
         target_branch: Option<String>,
         sha: Option<String>,
     }
@@ -77,7 +78,71 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         title: mr.title,
         base_branch: mr.target_branch,
         head_sha: mr.sha,
+        body: mr.description,
     })
+}
+
+/// Post a standalone MR note (NOT deduped) — used for `/ask` answers and
+/// `/describe` confirmations. Returns the new note's URL.
+///
+/// # Errors
+/// If `GITLAB_TOKEN` is missing or the request fails.
+pub async fn post_comment(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    body: &str,
+) -> Result<Option<String>> {
+    require(&cfg.gitlab_token, "GITLAB_TOKEN")?;
+    #[derive(Deserialize)]
+    struct Created {
+        #[serde(default)]
+        web_url: Option<String>,
+    }
+    let marked = format!("{body}\n\n_{}_", cfg.comment_marker);
+    let res = gl(
+        client.post(format!("{}/notes", mr_base(cfg, repo, pr))),
+        cfg,
+    )
+    .json(&serde_json::json!({ "body": marked }))
+    .send()
+    .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "GitLab postComment {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    let c: Created = res.json().await?;
+    Ok(c.web_url)
+}
+
+/// Replace the MR description (the `/describe` command).
+///
+/// # Errors
+/// If `GITLAB_TOKEN` is missing or the request fails.
+pub async fn update_pr_description(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    description: &str,
+) -> Result<()> {
+    require(&cfg.gitlab_token, "GITLAB_TOKEN")?;
+    let res = gl(client.put(mr_base(cfg, repo, pr)), cfg)
+        .json(&serde_json::json!({ "description": description }))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "GitLab updatePrDescription {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    Ok(())
 }
 
 pub async fn get_diff(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<String> {
@@ -240,9 +305,7 @@ async fn find_summary_note(
     Ok(notes
         .into_iter()
         // A summary note is a plain (non-inline) note authored by the bot.
-        .find(|n| {
-            n.position.is_none() && n.body.as_deref().is_some_and(|b| is_bot_comment(cfg, b))
-        })
+        .find(|n| n.position.is_none() && n.body.as_deref().is_some_and(|b| is_bot_comment(cfg, b)))
         .map(|n| n.id))
 }
 
@@ -425,9 +488,7 @@ pub async fn post_review(
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    "no diff_refs for {repo}!{pr} ({e:#}); skipping inline comments"
-                );
+                tracing::warn!("no diff_refs for {repo}!{pr} ({e:#}); skipping inline comments");
             }
         }
     }

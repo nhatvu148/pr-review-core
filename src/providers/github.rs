@@ -55,13 +55,12 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
     #[derive(Deserialize)]
     struct Pr {
         title: Option<String>,
+        body: Option<String>,
         base: Option<Ref>,
         head: Option<Ref>,
     }
 
-    let res = gh(client.get(pr_url(cfg, repo, pr)), cfg)
-        .send()
-        .await?;
+    let res = gh(client.get(pr_url(cfg, repo, pr)), cfg).send().await?;
     if !res.status().is_success() {
         let status = res.status();
         anyhow::bail!(
@@ -76,7 +75,68 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         title: pr_data.title,
         base_branch: pr_data.base.and_then(|b| b.ref_),
         head_sha: pr_data.head.and_then(|h| h.sha),
+        body: pr_data.body,
     })
+}
+
+/// Post a standalone issue comment (NOT deduped) — used for `/ask` answers and
+/// `/describe` confirmations. Returns the new comment's URL.
+///
+/// # Errors
+/// If `GH_TOKEN` is missing or the request fails.
+pub async fn post_comment(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    body: &str,
+) -> Result<Option<String>> {
+    require(&cfg.github_token, "GH_TOKEN")?;
+    #[derive(Deserialize)]
+    struct Created {
+        html_url: Option<String>,
+    }
+    let marked = format!("{body}\n\n_{}_", cfg.comment_marker);
+    let url = format!("{}/repos/{repo}/issues/{pr}/comments", cfg.github_api_base);
+    let res = gh(client.post(url), cfg)
+        .json(&serde_json::json!({ "body": marked }))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "GitHub postComment {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    let c: Created = res.json().await?;
+    Ok(c.html_url)
+}
+
+/// Replace the PR description body (the `/describe` command).
+///
+/// # Errors
+/// If `GH_TOKEN` is missing or the request fails.
+pub async fn update_pr_description(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    description: &str,
+) -> Result<()> {
+    require(&cfg.github_token, "GH_TOKEN")?;
+    let res = gh(client.patch(pr_url(cfg, repo, pr)), cfg)
+        .json(&serde_json::json!({ "body": description }))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "GitHub updatePrDescription {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    Ok(())
 }
 
 /// Fetch a repo file's text at a git ref via the Contents API.

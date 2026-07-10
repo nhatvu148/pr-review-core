@@ -327,7 +327,10 @@ mod tests {
     #[test]
     fn gitlab_update_is_gated_by_flag() {
         for action in ["open", "reopen"] {
-            assert!(should_review_gitlab(action, false), "{action} should review");
+            assert!(
+                should_review_gitlab(action, false),
+                "{action} should review"
+            );
             assert!(should_review_gitlab(action, true), "{action} should review");
         }
         assert!(!should_review_gitlab("update", false));

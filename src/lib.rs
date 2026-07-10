@@ -7,7 +7,9 @@
 //! supply their own branding.
 
 pub mod agent;
+pub mod command;
 pub mod config;
+pub mod deps;
 pub mod diff;
 pub mod llm;
 pub mod prompt;
