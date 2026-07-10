@@ -166,6 +166,7 @@ pub async fn agentic_review(
     meta: &PrMeta,
     diff: &str,
     omitted_note: Option<&str>,
+    structural_context: Option<&str>,
     ws: &Workspace,
 ) -> Result<ReviewResult> {
     require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
@@ -177,9 +178,13 @@ pub async fn agentic_review(
     let omitted = omitted_note
         .map(|n| format!("\n[NOTE: {n}]"))
         .unwrap_or_default();
+    let structural = structural_context
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| format!("\n\n## Structural context\n{c}"))
+        .unwrap_or_default();
     let user =
         format!(
-        "Repository: {}\nPull request: #{}{}{omitted}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
+        "Repository: {}\nPull request: #{}{}{omitted}{structural}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
         meta.repo,
         meta.pr,
         meta.title.as_deref().map(|t| format!(" — {t}")).unwrap_or_default(),

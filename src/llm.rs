@@ -122,6 +122,7 @@ pub async fn review_diff(
     meta: &PrMeta,
     diff: &str,
     omitted_note: Option<String>,
+    structural_context: Option<&str>,
 ) -> Result<ReviewResult> {
     require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
 
@@ -151,7 +152,13 @@ pub async fn review_diff(
             },
             Msg {
                 role: "user".into(),
-                content: build_user_prompt(meta, &clipped, truncated, omitted_note.as_deref()),
+                content: build_user_prompt(
+                    meta,
+                    &clipped,
+                    truncated,
+                    omitted_note.as_deref(),
+                    structural_context,
+                ),
             },
         ],
     };

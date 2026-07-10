@@ -29,3 +29,14 @@ globset = "0.4"
 regex = "1"
 tempfile = "3"
 toml = "0.8"
+
+# Structural context (Tier B): name the enclosing definition of changed lines.
+# tree-sitter 0.24 with grammar crates pinned to their 0.23 line (mutually
+# ABI-compatible). Any grammar that won't build against this tree-sitter should
+# be dropped rather than left broken.
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-go = "0.23"

@@ -49,11 +49,17 @@ pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer 
 /// size budget (packed out before this call) and is surfaced to the model so it
 /// knows those files were NOT reviewed. This is distinct from `truncated`, which
 /// flags a hard character clamp of a single oversized file.
+///
+/// `structural_context`, when `Some` and non-empty, names the enclosing
+/// function/symbol of each changed line (see [`crate::structure`]); it's inserted
+/// as a `## Structural context` block BEFORE the diff so the model knows each
+/// change's scope.
 pub fn build_user_prompt(
     meta: &PrMeta,
     diff: &str,
     truncated: bool,
     omitted_note: Option<&str>,
+    structural_context: Option<&str>,
 ) -> String {
     let mut header = format!("Repository: {}\nPull request: #{}", meta.repo, meta.pr);
     if let Some(title) = &meta.title {
@@ -69,6 +75,11 @@ pub fn build_user_prompt(
         header.push_str(
             "\n\n[NOTE: diff was truncated to fit the size limit — review what is shown.]",
         );
+    }
+    if let Some(ctx) = structural_context {
+        if !ctx.trim().is_empty() {
+            header.push_str(&format!("\n\n## Structural context\n{ctx}\n"));
+        }
     }
     format!("{header}\n\n--- BEGIN DIFF ---\n{diff}\n--- END DIFF ---")
 }

@@ -15,6 +15,7 @@ pub mod providers;
 pub mod repo;
 pub mod repo_config;
 pub mod review;
+pub mod structure;
 pub mod webhook;
 
 /// Clip a string to at most `n` characters (char-safe — never splits a UTF-8

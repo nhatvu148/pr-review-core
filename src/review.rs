@@ -113,6 +113,7 @@ fn render_pending() -> String {
 }
 
 /// Clone the repo (off the async runtime) and run the agentic reviewer.
+#[allow(clippy::too_many_arguments)]
 async fn run_agentic(
     provider: &Provider,
     client: &reqwest::Client,
@@ -120,13 +121,14 @@ async fn run_agentic(
     meta: &PrMeta,
     diff: &str,
     omitted_note: Option<&str>,
+    structural_context: Option<&str>,
     repo: &str,
 ) -> Result<ReviewResult> {
     let url = provider.clone_url(cfg, repo)?;
     let sha = meta.head_sha.clone();
     // git clone is blocking — keep it off the async worker threads.
     let ws = tokio::task::spawn_blocking(move || Workspace::clone(&url, sha.as_deref())).await??;
-    agentic_review(client, cfg, meta, diff, omitted_note, &ws).await
+    agentic_review(client, cfg, meta, diff, omitted_note, structural_context, &ws).await
 }
 
 /// Load an optional per-repo `.prbot.toml` and merge it over `base`, returning the
@@ -243,6 +245,26 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
         )
     });
 
+    // Structural context: name the enclosing function/symbol of each changed line
+    // so the model knows every change's scope. Tier B (tree-sitter over fetched
+    // files) with a Tier A (hunk-header) fallback — fully fail-open, so a hiccup
+    // just yields an empty string and the review proceeds without it.
+    let structural = if cfg.structural_context {
+        crate::structure::structural_context(&provider, &client, cfg, &input.repo, &meta, &diff)
+            .await
+    } else {
+        String::new()
+    };
+    if !structural.is_empty() {
+        tracing::info!(
+            "structural context for {}#{}: {} line(s)",
+            input.repo,
+            input.pr,
+            structural.lines().count()
+        );
+    }
+    let structural_opt = (!structural.is_empty()).then_some(structural.as_str());
+
     // Agentic path (clone + tools) when enabled; falls back to diff-only on any
     // failure so a clone/agent hiccup never drops the review entirely.
     let result = if cfg.agentic {
@@ -253,6 +275,7 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
             &meta,
             &diff,
             omitted_note.as_deref(),
+            structural_opt,
             &input.repo,
         )
         .await
@@ -264,11 +287,11 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
                     input.repo,
                     input.pr
                 );
-                review_diff(&client, cfg, &meta, &diff, omitted_note.clone()).await?
+                review_diff(&client, cfg, &meta, &diff, omitted_note.clone(), structural_opt).await?
             }
         }
     } else {
-        review_diff(&client, cfg, &meta, &diff, omitted_note.clone()).await?
+        review_diff(&client, cfg, &meta, &diff, omitted_note.clone(), structural_opt).await?
     };
     // Post-process findings before anchoring: optional self-critique pass, then a
     // confidence floor, severity sort, and a hard cap — cuts noise before posting.

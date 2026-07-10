@@ -86,6 +86,13 @@ pub struct Config {
     /// inject a large conventions block (e.g. via a file baked into its image)
     /// without changing the library.
     pub extra_system_prompt: String,
+
+    /// Compute "structural context" (the enclosing function/symbol of each changed
+    /// line) and inject it into the review prompt so the model knows each change's
+    /// scope. Fully fail-open — never blocks a review.
+    pub structural_context: bool,
+    /// Max number of files to fetch + parse for structural context (cost guard).
+    pub structural_max_files: usize,
 }
 
 impl Config {
@@ -173,6 +180,9 @@ impl Config {
             ),
             x_title: env_or("OPENROUTER_X_TITLE", "pr-review"),
             extra_system_prompt: resolve_extra_system_prompt(),
+
+            structural_context: env_or("STRUCTURAL_CONTEXT", "true").parse().unwrap_or(true),
+            structural_max_files: env_or("STRUCTURAL_MAX_FILES", "15").parse().unwrap_or(15),
         }
     }
 
