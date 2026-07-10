@@ -4,10 +4,10 @@ Core engine behind self-hosted, advisory AI pull-request reviewers.
 
 `pr-review-core` fetches a pull request's unified diff, reviews it with a Claude
 model via [OpenRouter](https://openrouter.ai), and posts line-anchored inline
-comments plus a summary comment. It works with both **GitHub** and **Bitbucket**,
-and optionally runs an *agentic* pass that clones the repo and lets the model
-investigate cross-file context (grep / read_file / list_dir) before writing its
-findings.
+comments plus a summary comment. It works with **GitHub**, **GitLab**, and
+**Bitbucket**, and optionally runs an *agentic* pass that clones the repo and lets
+the model investigate cross-file context (grep / read_file / list_dir) before
+writing its findings.
 
 This crate is a **library** — it carries no bot identity of its own. Consumers
 (the actual bot binaries) depend on it and inject their branding and any extra
@@ -15,11 +15,20 @@ prompt through [`Config`].
 
 ## What's in the box
 
-- Provider-agnostic review flow (`review::run_review`) across GitHub + Bitbucket.
+- Provider-agnostic review flow (`review::run_review`) across GitHub, GitLab, and
+  Bitbucket.
 - Structured JSON review from the model, anchored to diff lines that the provider
   will accept (out-of-diff findings fold into the summary).
 - Optional agentic reviewer with a two-tier model split (cheap explore model +
   stronger synthesis model).
+- **Structural context**: tree-sitter identifies which functions/symbols each
+  change belongs to (Rust/TS/TSX/JS/Python/Go), computed locally without a clone,
+  with a git hunk-header fallback.
+- **Smart diff packing**: on large PRs, whole files are ranked (source > tests >
+  docs) and packed to the budget instead of blunt truncation; omitted files are
+  named to the model.
+- **Per-repo config**: a `.prbot.toml` at the repo root overrides model, globs,
+  confidence/caps, and adds free-text review `instructions`.
 - **Noise control**: an optional self-critique pass drops false positives / nits,
   a per-finding confidence score drives ranking, and a per-PR cap keeps reviews
   focused.

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.0
+
+Tier 2 — differentiate.
+
+- **GitLab provider**: merge-request review (diff, inline discussions + summary,
+  file fetch, clone, webhook helpers) alongside GitHub + Bitbucket.
+- **Structural context**: tree-sitter resolves which functions/symbols each change
+  touches (Rust/TS/TSX/JS/Python/Go), no clone needed, with a git hunk-header
+  fallback. `STRUCTURAL_CONTEXT`, `STRUCTURAL_MAX_FILES`.
+- **Smart large-diff packing**: rank files (source > tests > docs) and pack whole
+  sections to the budget instead of truncating; omitted files named to the model.
+- **Per-repo `.prbot.toml`**: override model, globs, confidence/caps, agentic, and
+  add free-text review `instructions` — fetched from the PR head, merged over env.
+
 ## 0.2.0
 
 Tier 1 — trust & signal.
