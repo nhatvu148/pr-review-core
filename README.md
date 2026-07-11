@@ -1,5 +1,9 @@
 # pr-review-core
 
+[![crates.io](https://img.shields.io/crates/v/pr-review-core.svg)](https://crates.io/crates/pr-review-core)
+[![docs.rs](https://img.shields.io/docsrs/pr-review-core)](https://docs.rs/pr-review-core)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/pr-review-core.svg)](#license)
+
 Core engine behind self-hosted, advisory AI pull-request reviewers.
 
 `pr-review-core` fetches a pull request's unified diff, reviews it with a Claude
