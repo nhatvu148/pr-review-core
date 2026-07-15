@@ -5,14 +5,20 @@
 Review lifecycle — reconcile instead of delete-and-repost (GitHub).
 
 - **Fingerprinted findings**: each inline comment carries a hidden fingerprint
-  (from file + normalized body). On re-review, GitHub now **reconciles** rather
-  than deleting all prior comments and reposting: a finding still present is
-  **left in place** (no notification churn, thread history preserved), a new
-  finding is **posted**, and a finding that's gone has its **review thread
-  resolved** (via GraphQL `resolveReviewThread`) with a "✅ Resolved" reply.
-- **"Resolved since last review"** section appended to the summary listing the
-  findings that were fixed; the reconcile runs even when a re-review finds
-  nothing, so previously-flagged issues get resolved and the summary reflects it.
+  (file + normalized body). On re-review, GitHub now **reconciles** rather than
+  deleting all prior comments and reposting: a finding still present is **left in
+  place** (no notification churn, thread history preserved), a new finding is
+  **posted**, and a finding that's gone is **cleaned up**.
+- **Robust finding matching**: a finding matches an existing comment by
+  fingerprint **or** by `(file, line)` — the line key keeps a *reworded* but
+  still-present finding matched, since LLM output isn't stable across runs.
+- **Resolve, with a delete fallback**: a gone finding's **review thread is
+  resolved** (GraphQL `resolveReviewThread`) with a "✅ Resolved" reply. If the
+  token can't resolve threads (a common PAT limitation — "Resource not accessible
+  by personal access token"), the comment is **deleted** instead, so gone
+  findings never pile up as stale open threads.
+- **"Resolved since last review"** summary section; the reconcile runs even when
+  a re-review finds nothing, so prior findings are cleaned up and reported.
 - Fully fail-soft: a GraphQL hiccup logs and degrades to posting the summary.
 - GitLab and Bitbucket keep the prior delete-and-repost behavior for now
   (GitLab port to follow; Bitbucket renders HTML markers literally).
