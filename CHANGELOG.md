@@ -9,9 +9,14 @@ Review lifecycle — reconcile instead of delete-and-repost (GitHub).
   deleting all prior comments and reposting: a finding still present is **left in
   place** (no notification churn, thread history preserved), a new finding is
   **posted**, and a finding that's gone is **cleaned up**.
-- **Robust finding matching**: a finding matches an existing comment by
-  fingerprint **or** by `(file, line)` — the line key keeps a *reworded* but
-  still-present finding matched, since LLM output isn't stable across runs.
+- **Robust finding matching**: findings are paired to existing comments **1:1**
+  (each thread claimed once) by fingerprint **or** `(file, line)` — the line key
+  keeps a *reworded* but still-present finding matched (LLM output isn't stable),
+  and the 1:1 pairing prevents two findings sharing a line from both matching one
+  thread (which could drop a genuinely-new finding or pin a stale thread open).
+- **Upgrade migration**: legacy comments from 0.5.0 (bot marker, no fingerprint)
+  are recognized and cleaned up (resolved/deleted) on the first 0.6 review rather
+  than left as orphaned, undedupable threads.
 - **Resolve, with a delete fallback**: a gone finding's **review thread is
   resolved** (GraphQL `resolveReviewThread`) with a "✅ Resolved" reply. If the
   token can't resolve threads (a common PAT limitation — "Resource not accessible

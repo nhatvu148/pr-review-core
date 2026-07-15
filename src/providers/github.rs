@@ -2,8 +2,6 @@
 //! Posts a summary issue comment (deduped/updated by marker) plus inline review
 //! comments (the bot's prior inline comments are deleted and reposted each run).
 
-use std::collections::HashSet;
-
 use anyhow::{Context, Result};
 use base64::Engine;
 use reqwest::Client;
@@ -371,7 +369,9 @@ struct BotThread {
     /// REST id of the thread's first (top) comment — for the delete fallback.
     comment_id: u64,
     is_resolved: bool,
-    fp: String,
+    /// `None` for a legacy (pre-0.6) comment: it carries the bot marker but no
+    /// fingerprint, so it never matches a finding and is cleaned up on first sight.
+    fp: Option<String>,
     path: String,
     /// Current line of the thread (tracked by GitHub across commits), used as a
     /// secondary match key so a reworded finding on the same line still matches.
@@ -405,16 +405,17 @@ async fn bot_threads(
                 if !is_bot_comment(cfg, body) {
                     continue;
                 }
-                if let Some(fp) = extract_fp(body) {
-                    out.push(BotThread {
-                        id: node["id"].as_str().unwrap_or_default().to_string(),
-                        comment_id: first["databaseId"].as_u64().unwrap_or(0),
-                        is_resolved: node["isResolved"].as_bool().unwrap_or(false),
-                        fp,
-                        path: node["path"].as_str().unwrap_or_default().to_string(),
-                        line: node["line"].as_u64(),
-                    });
-                }
+                // Include ALL bot threads. One with the marker but no fingerprint
+                // is a legacy (pre-0.6) comment — it never matches a finding, so
+                // reconcile cleans it up (resolve/delete) on first sight.
+                out.push(BotThread {
+                    id: node["id"].as_str().unwrap_or_default().to_string(),
+                    comment_id: first["databaseId"].as_u64().unwrap_or(0),
+                    is_resolved: node["isResolved"].as_bool().unwrap_or(false),
+                    fp: extract_fp(body),
+                    path: node["path"].as_str().unwrap_or_default().to_string(),
+                    line: node["line"].as_u64(),
+                });
             }
         }
         if rt["pageInfo"]["hasNextPage"].as_bool().unwrap_or(false) {
@@ -447,46 +448,52 @@ async fn reconcile_inline(
         .context("GitHub repo must be owner/name")?;
 
     let threads = bot_threads(client, cfg, owner, name, meta.pr).await?;
-    // A finding matches an existing thread if the fingerprints match OR they're on
-    // the same (file, line) — the latter keeps a reworded still-present finding
-    // matched (fingerprints are LLM-text-sensitive; the line is stable).
-    let existing_fps: HashSet<&str> = threads.iter().map(|t| t.fp.as_str()).collect();
-    let existing_lines: HashSet<(&str, u64)> = threads
-        .iter()
-        .filter_map(|t| t.line.map(|l| (t.path.as_str(), l)))
-        .collect();
-    let new_fps: HashSet<String> = inline
-        .iter()
-        .map(|c| finding_fingerprint(&c.path, &c.body))
-        .collect();
-    let new_lines: HashSet<(&str, u64)> =
-        inline.iter().map(|c| (c.path.as_str(), c.line)).collect();
 
-    // Post findings not already on the PR (leave still-present ones untouched).
+    // Pair each new finding to AT MOST ONE existing thread, claiming it so two
+    // findings can't both match the same thread (and a stale thread isn't kept
+    // alive by an unrelated finding on its line). Match by fingerprint first, then
+    // by (file, line) — the line key keeps a *reworded* still-present finding
+    // matched, since LLM text isn't stable across runs. Legacy threads (no
+    // fingerprint) never match and are cleaned up below.
+    let mut claimed = vec![false; threads.len()];
     for c in inline {
         let fp = finding_fingerprint(&c.path, &c.body);
-        let present =
-            existing_fps.contains(fp.as_str()) || existing_lines.contains(&(c.path.as_str(), c.line));
-        if !present {
-            post_inline(client, cfg, &meta.repo, meta.pr, commit_id, c, &fp).await?;
+        let mut hit = None;
+        for (i, t) in threads.iter().enumerate() {
+            if !claimed[i] && t.fp.as_deref() == Some(fp.as_str()) {
+                hit = Some(i);
+                break;
+            }
+        }
+        if hit.is_none() {
+            for (i, t) in threads.iter().enumerate() {
+                if !claimed[i] && t.fp.is_some() && t.path == c.path && t.line == Some(c.line) {
+                    hit = Some(i);
+                    break;
+                }
+            }
+        }
+        match hit {
+            Some(i) => claimed[i] = true, // already present → leave the thread as-is
+            None => post_inline(client, cfg, &meta.repo, meta.pr, commit_id, c, &fp).await?,
         }
     }
 
-    // Handle findings that are gone (not in the new set and not already resolved).
-    // Prefer resolving the thread (keeps history + leaves a ✅ note); if the token
-    // can't resolve threads (a common PAT limitation — "Resource not accessible by
-    // personal access token"), fall back to DELETING the comment so gone findings
-    // never accumulate as stale open threads. Reported in the summary either way.
+    // Any unclaimed thread is a finding that's gone (or a legacy comment): clean it
+    // up. Prefer resolving the thread (keeps history + leaves a ✅ note); if the
+    // token can't resolve threads (a common PAT limitation — "Resource not
+    // accessible by personal access token"), fall back to DELETING the comment so
+    // nothing accumulates. Report real (fingerprinted) findings in the summary;
+    // legacy comments are silent migration cleanup.
     let short = &commit_id[..commit_id.len().min(7)];
     let mut resolved = Vec::new();
-    for t in &threads {
-        let still_present = new_fps.contains(&t.fp)
-            || t.line
-                .is_some_and(|l| new_lines.contains(&(t.path.as_str(), l)));
-        if t.is_resolved || still_present {
+    for (i, t) in threads.iter().enumerate() {
+        if claimed[i] || t.is_resolved {
             continue;
         }
-        resolved.push(format!("`{}`", t.path));
+        if t.fp.is_some() {
+            resolved.push(format!("`{}`", t.path));
+        }
         match graphql(client, cfg, RESOLVE_MUTATION, serde_json::json!({ "tid": t.id })).await {
             Ok(_) => {
                 let reply = format!(
