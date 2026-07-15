@@ -2,7 +2,19 @@
 
 ## 0.6.0
 
-Review lifecycle — reconcile instead of delete-and-repost (GitHub).
+Review lifecycle + a backend seam for `/ask` and `/describe`.
+
+**Command backend seam**
+
+- **`ReviewBackend::complete`**: a free-form text-completion method (default: the
+  OpenRouter chat path) that powers `/ask` and `/describe`, so those commands run
+  on the **same backend as reviews** instead of always OpenRouter. A consumer
+  using an agent-CLI backend gets `/ask` and `/describe` on that backend too.
+- **`command::run_command_with(..., &dyn ReviewBackend)`**: like `run_command`
+  but with a caller-supplied backend; `run_command` is that with the default
+  OpenRouter backend, and `/review` now honors the supplied backend as well.
+
+**Review lifecycle — reconcile instead of delete-and-repost (GitHub)**
 
 - **Fingerprinted findings**: each inline comment carries a hidden fingerprint
   (file + normalized body). On re-review, GitHub now **reconciles** rather than

@@ -8,9 +8,10 @@
 
 use anyhow::Result;
 
+use crate::backend::{OpenRouterBackend, ReviewBackend};
 use crate::config::Config;
 use crate::providers::{PrMeta, Provider};
-use crate::review::{load_repo_config, run_review, RunReviewInput};
+use crate::review::{load_repo_config, run_review_with, RunReviewInput};
 
 /// HTML-comment delimiters wrapping the AI-generated section of a PR description
 /// so `/describe` can regenerate idempotently while preserving human-written
@@ -103,9 +104,26 @@ pub async fn run_command(
     pr: u64,
     cmd: Command,
 ) -> Result<CommandOutcome> {
+    run_command_with(cfg, provider_name, repo, pr, cmd, &OpenRouterBackend).await
+}
+
+/// Like [`run_command`] but with a caller-supplied [`ReviewBackend`], so `/review`,
+/// `/ask`, and `/describe` all run on the same backend (e.g. an agent CLI) instead
+/// of always OpenRouter.
+///
+/// # Errors
+/// On unknown provider, or any provider/backend failure.
+pub async fn run_command_with(
+    cfg: &Config,
+    provider_name: &str,
+    repo: &str,
+    pr: u64,
+    cmd: Command,
+    backend: &dyn ReviewBackend,
+) -> Result<CommandOutcome> {
     match cmd {
         Command::Review => {
-            let out = run_review(
+            let out = run_review_with(
                 cfg,
                 RunReviewInput {
                     provider: provider_name.to_string(),
@@ -114,6 +132,7 @@ pub async fn run_command(
                     dry_run: false,
                     placeholder: true,
                 },
+                backend,
             )
             .await?;
             Ok(CommandOutcome {
@@ -121,8 +140,8 @@ pub async fn run_command(
                 comment_url: out.comment_url,
             })
         }
-        Command::Ask(question) => run_ask(cfg, provider_name, repo, pr, &question).await,
-        Command::Describe => run_describe(cfg, provider_name, repo, pr).await,
+        Command::Ask(question) => run_ask(cfg, backend, provider_name, repo, pr, &question).await,
+        Command::Describe => run_describe(cfg, backend, provider_name, repo, pr).await,
     }
 }
 
@@ -151,6 +170,7 @@ async fn prepared_diff(
 /// `/ask`: answer a question about the PR and post it as a reply comment.
 async fn run_ask(
     cfg: &Config,
+    backend: &dyn ReviewBackend,
     provider_name: &str,
     repo: &str,
     pr: u64,
@@ -176,7 +196,7 @@ async fn run_ask(
 
     let structural_opt = (!structural.is_empty()).then_some(structural.as_str());
     let answer =
-        crate::llm::answer_question(&client, cfg, &meta, &diff, question, structural_opt).await?;
+        crate::llm::answer_question(cfg, backend, &meta, &diff, question, structural_opt).await?;
     // Echo the question so the thread reads as a Q&A exchange.
     let body = format!("> **/ask** {question}\n\n{answer}");
     let url = provider.post_comment(&client, cfg, repo, pr, &body).await?;
@@ -190,6 +210,7 @@ async fn run_ask(
 /// (preserving human-written content), update the PR, and confirm in a comment.
 async fn run_describe(
     cfg: &Config,
+    backend: &dyn ReviewBackend,
     provider_name: &str,
     repo: &str,
     pr: u64,
@@ -218,7 +239,7 @@ async fn run_describe(
     }
 
     let structural_opt = (!structural.is_empty()).then_some(structural.as_str());
-    let generated = crate::llm::describe_pr(&client, cfg, &meta, &diff, structural_opt).await?;
+    let generated = crate::llm::describe_pr(cfg, backend, &meta, &diff, structural_opt).await?;
     let merged = merge_description(meta.body.as_deref().unwrap_or(""), &generated);
     provider
         .update_pr_description(&client, cfg, &meta, &merged)

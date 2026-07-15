@@ -51,6 +51,15 @@ pub struct ReviewContext<'a> {
 #[async_trait]
 pub trait ReviewBackend: Send + Sync {
     async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult>;
+
+    /// Free-form text completion, given a system prompt and a user prompt (which
+    /// already contains the diff/context). Powers the `/ask` and `/describe`
+    /// commands, so they run on the same backend as reviews instead of always
+    /// OpenRouter. Default: the OpenRouter chat path.
+    async fn complete(&self, cfg: &Config, system: &str, user: &str) -> Result<String> {
+        let client = reqwest::Client::new();
+        crate::llm::chat_text(&client, cfg, system, user).await
+    }
 }
 
 /// Default backend: reviews with a Claude model via OpenRouter.
