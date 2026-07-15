@@ -5,9 +5,10 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::agent::agentic_review;
+use crate::backend::{OpenRouterBackend, ReviewBackend, ReviewContext};
 use crate::config::Config;
 use crate::diff::parse_valid_lines;
-use crate::llm::{review_diff, Finding, Review, ReviewResult, Usage};
+use crate::llm::{Finding, Review, ReviewResult, Usage};
 use crate::providers::{InlineComment, PrMeta, Provider, ReviewPost};
 use crate::repo::Workspace;
 use crate::repo_config;
@@ -114,7 +115,7 @@ fn render_pending() -> String {
 
 /// Clone the repo (off the async runtime) and run the agentic reviewer.
 #[allow(clippy::too_many_arguments)]
-async fn run_agentic(
+pub(crate) async fn run_agentic(
     provider: &Provider,
     client: &reqwest::Client,
     cfg: &Config,
@@ -225,11 +226,29 @@ async fn post_advisory_only(
     Ok(out)
 }
 
-/// Review one pull request end-to-end.
+/// Review one pull request end-to-end, using the default [`OpenRouterBackend`]
+/// (a Claude model via OpenRouter).
 ///
 /// # Errors
 /// On unknown provider, empty diff, or any provider/LLM API failure.
 pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReviewOutput> {
+    run_review_with(cfg, input, &OpenRouterBackend).await
+}
+
+/// Review one pull request end-to-end with a caller-supplied [`ReviewBackend`].
+///
+/// Identical to [`run_review`] except the model step is delegated to `backend`,
+/// letting a consumer plug in a different reviewer (e.g. an AI agent CLI) while
+/// reusing all of the diff preparation, finding post-processing, anchoring, and
+/// posting logic. [`run_review`] is just this with [`OpenRouterBackend`].
+///
+/// # Errors
+/// On unknown provider, empty diff, or any provider/backend failure.
+pub async fn run_review_with(
+    cfg: &Config,
+    input: RunReviewInput,
+    backend: &dyn ReviewBackend,
+) -> Result<RunReviewOutput> {
     let provider = Provider::from_name(&input.provider)?;
     let client = reqwest::Client::new();
 
@@ -336,50 +355,20 @@ pub async fn run_review(cfg: &Config, input: RunReviewInput) -> Result<RunReview
     }
     let structural_opt = (!structural.is_empty()).then_some(structural.as_str());
 
-    // Agentic path (clone + tools) when enabled; falls back to diff-only on any
-    // failure so a clone/agent hiccup never drops the review entirely.
-    let result = if cfg.agentic {
-        match run_agentic(
-            &provider,
-            &client,
-            cfg,
-            &meta,
-            &diff,
-            omitted_note.as_deref(),
-            structural_opt,
-            &input.repo,
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(
-                    "agentic review failed for {}#{} ({e:#}); falling back to diff-only",
-                    input.repo,
-                    input.pr
-                );
-                review_diff(
-                    &client,
-                    cfg,
-                    &meta,
-                    &diff,
-                    omitted_note.clone(),
-                    structural_opt,
-                )
-                .await?
-            }
-        }
-    } else {
-        review_diff(
-            &client,
-            cfg,
-            &meta,
-            &diff,
-            omitted_note.clone(),
-            structural_opt,
-        )
-        .await?
+    // Delegate the model step to the backend. The default OpenRouterBackend runs
+    // the agentic path (clone + tools) when enabled and falls back to diff-only
+    // on failure; a custom backend (e.g. an agent CLI) decides its own strategy.
+    let ctx = ReviewContext {
+        client: &client,
+        cfg,
+        provider: &provider,
+        repo: &input.repo,
+        meta: &meta,
+        diff: &diff,
+        omitted_note: omitted_note.as_deref(),
+        structural_context: structural_opt,
     };
+    let result = backend.review(&ctx).await?;
     // Post-process findings before anchoring: optional self-critique pass, then a
     // confidence floor, severity sort, and a hard cap — cuts noise before posting.
     let mut findings = result.review.findings.clone();
