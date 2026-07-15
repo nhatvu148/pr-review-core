@@ -25,6 +25,64 @@ pub fn is_bot_comment(cfg: &crate::config::Config, body: &str) -> bool {
     body.contains(&cfg.comment_marker)
 }
 
+// ── review-lifecycle reconciliation (fingerprints) ──────────────────────────
+
+/// A stable-ish fingerprint of a finding, from its file path + body text
+/// (normalized to alphanumerics + lowercase to absorb minor rephrasing and the
+/// severity decoration). Embedded as a hidden marker on each inline comment so a
+/// later review can tell which findings are the **same** (leave in place), which
+/// are **new** (post), and which are **gone** (resolve the thread).
+///
+/// Best-effort: an LLM that heavily rewords the same finding may read as a new
+/// one (old resolved + new posted). Genuinely-fixed findings resolve cleanly.
+pub(crate) fn finding_fingerprint(path: &str, body: &str) -> String {
+    use sha2::{Digest, Sha256};
+    fn norm(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    }
+    let mut h = Sha256::new();
+    h.update(norm(path).as_bytes());
+    h.update(b"|");
+    h.update(norm(body).as_bytes());
+    hex::encode(&h.finalize()[..6]) // 12 hex chars — plenty for per-PR uniqueness
+}
+
+/// The hidden marker embedded in a posted comment to carry its fingerprint.
+/// GitHub/GitLab hide HTML comments; Bitbucket renders them literally, so the
+/// reconcile flow is GitHub/GitLab-only for now.
+pub(crate) fn fp_marker(fp: &str) -> String {
+    format!("<!-- prbot-fp:{fp} -->")
+}
+
+/// Extract the fingerprint from a comment body previously posted by the bot.
+pub(crate) fn extract_fp(body: &str) -> Option<String> {
+    const PREFIX: &str = "<!-- prbot-fp:";
+    let start = body.find(PREFIX)? + PREFIX.len();
+    let rest = &body[start..];
+    let end = rest.find("-->")?;
+    let fp = rest[..end].trim();
+    (!fp.is_empty()).then(|| fp.to_string())
+}
+
+/// Render a "Resolved since last review" summary section for findings that were
+/// flagged in a prior review and are no longer present. Empty string if none.
+pub(crate) fn render_resolved(resolved: &[String]) -> String {
+    if resolved.is_empty() {
+        return String::new();
+    }
+    let mut s = format!(
+        "\n\n## ✅ Resolved since last review\n\n_{} previously-flagged finding(s) no longer present:_\n",
+        resolved.len()
+    );
+    for r in resolved {
+        s.push_str(&format!("- {r}\n"));
+    }
+    s
+}
+
 /// Which host the PR lives on.
 #[derive(Clone, Copy)]
 pub enum Provider {
@@ -166,5 +224,43 @@ impl Provider {
             Provider::Bitbucket => bitbucket::post_review(client, cfg, meta, review).await,
             Provider::Gitlab => gitlab::post_review(client, cfg, meta, review).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_fp, finding_fingerprint, fp_marker, render_resolved};
+
+    #[test]
+    fn fingerprint_is_stable_and_normalizes() {
+        // Same finding, minor formatting differences → same fingerprint.
+        let a = finding_fingerprint("src/lib.rs", "Missing null check. Fix: guard it.");
+        let b = finding_fingerprint("src/lib.rs", "missing null   check.  fix: guard it.");
+        assert_eq!(a, b);
+        // Different file or body → different fingerprint.
+        assert_ne!(a, finding_fingerprint("src/other.rs", "Missing null check. Fix: guard it."));
+        assert_ne!(a, finding_fingerprint("src/lib.rs", "A totally different problem."));
+        assert_eq!(a.len(), 12); // 6 bytes hex-encoded
+    }
+
+    #[test]
+    fn fp_marker_round_trips() {
+        let fp = finding_fingerprint("a.rs", "some finding");
+        let body = format!("⚠️ **HIGH** — some finding\n\n_bot_\n{}", fp_marker(&fp));
+        assert_eq!(extract_fp(&body).as_deref(), Some(fp.as_str()));
+    }
+
+    #[test]
+    fn extract_fp_absent() {
+        assert_eq!(extract_fp("a plain comment with no marker"), None);
+    }
+
+    #[test]
+    fn render_resolved_empty_and_nonempty() {
+        assert_eq!(render_resolved(&[]), "");
+        let s = render_resolved(&["`src/a.rs`".to_string(), "`src/b.rs`".to_string()]);
+        assert!(s.contains("Resolved since last review"));
+        assert!(s.contains("`src/a.rs`") && s.contains("`src/b.rs`"));
+        assert!(s.contains("2 previously-flagged"));
     }
 }

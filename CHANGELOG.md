@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0
+
+Review lifecycle — reconcile instead of delete-and-repost (GitHub).
+
+- **Fingerprinted findings**: each inline comment carries a hidden fingerprint
+  (from file + normalized body). On re-review, GitHub now **reconciles** rather
+  than deleting all prior comments and reposting: a finding still present is
+  **left in place** (no notification churn, thread history preserved), a new
+  finding is **posted**, and a finding that's gone has its **review thread
+  resolved** (via GraphQL `resolveReviewThread`) with a "✅ Resolved" reply.
+- **"Resolved since last review"** section appended to the summary listing the
+  findings that were fixed; the reconcile runs even when a re-review finds
+  nothing, so previously-flagged issues get resolved and the summary reflects it.
+- Fully fail-soft: a GraphQL hiccup logs and degrades to posting the summary.
+- GitLab and Bitbucket keep the prior delete-and-repost behavior for now
+  (GitLab port to follow; Bitbucket renders HTML markers literally).
+
 ## 0.5.0
 
 Pluggable review backend.
