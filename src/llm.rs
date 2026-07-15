@@ -85,8 +85,9 @@ pub struct ReviewResult {
 }
 
 /// Pull the JSON object out of a model response that may be wrapped in prose or
-/// ```json fences — take the first `{` through the last `}`.
-pub(crate) fn extract_json(text: &str) -> Option<&str> {
+/// ```json fences — take the first `{` through the last `}`. Exposed so custom
+/// [`crate::backend::ReviewBackend`]s can parse a model's text into a [`Review`].
+pub fn extract_json(text: &str) -> Option<&str> {
     let start = text.find('{')?;
     let end = text.rfind('}')?;
     if end > start {

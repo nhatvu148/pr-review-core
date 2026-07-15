@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0
+
+Pluggable review backend.
+
+- **`ReviewBackend` seam**: the model step of a review is now a trait
+  (`backend::ReviewBackend`) fed a `backend::ReviewContext` (client, config,
+  provider, repo, PR meta, prepared diff, omitted-files note, structural
+  context). `review::run_review_with(cfg, input, &dyn ReviewBackend)` runs the
+  full pipeline — diff fetch, glob filter, packing, structural context,
+  dependency scan, finding post-processing, anchoring, posting — and delegates
+  only the model call. Lets a consumer plug in a different reviewer (e.g. an AI
+  agent CLI driven over a repo clone) while reusing everything around it.
+- **`OpenRouterBackend`**: the default backend (Claude via OpenRouter, agentic
+  loop + diff-only fallback). `run_review` is now `run_review_with` with this
+  backend, so existing behavior and API are unchanged.
+
 ## 0.4.0
 
 Tier 3 — bigger bets.
