@@ -311,7 +311,12 @@ pub async fn critique_findings(
 /// # Errors
 /// If `OPENROUTER_API_KEY` is missing, OpenRouter returns an error status, or the
 /// response has no content.
-async fn chat_text(client: &Client, cfg: &Config, system: &str, user: &str) -> Result<String> {
+pub(crate) async fn chat_text(
+    client: &Client,
+    cfg: &Config,
+    system: &str,
+    user: &str,
+) -> Result<String> {
     require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
 
     let req = ChatReq {
@@ -371,8 +376,8 @@ async fn chat_text(client: &Client, cfg: &Config, system: &str, user: &str) -> R
 /// # Errors
 /// If `OPENROUTER_API_KEY` is missing or the OpenRouter call fails.
 pub async fn answer_question(
-    client: &Client,
     cfg: &Config,
+    backend: &dyn crate::backend::ReviewBackend,
     meta: &PrMeta,
     diff: &str,
     question: &str,
@@ -387,7 +392,7 @@ pub async fn answer_question(
     } else {
         format!("{ASK_SYSTEM_PROMPT}\n{}", cfg.extra_system_prompt)
     };
-    chat_text(client, cfg, &system, &user).await
+    backend.complete(cfg, &system, &user).await
 }
 
 /// Generate a PR description from its diff (the `/describe` command). Returns
@@ -396,8 +401,8 @@ pub async fn answer_question(
 /// # Errors
 /// If `OPENROUTER_API_KEY` is missing or the OpenRouter call fails.
 pub async fn describe_pr(
-    client: &Client,
     cfg: &Config,
+    backend: &dyn crate::backend::ReviewBackend,
     meta: &PrMeta,
     diff: &str,
     structural_context: Option<&str>,
@@ -405,5 +410,5 @@ pub async fn describe_pr(
     let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
     let truncated = diff.chars().count() > cfg.max_diff_chars;
     let user = build_user_prompt(meta, &clipped, truncated, None, structural_context);
-    chat_text(client, cfg, DESCRIBE_SYSTEM_PROMPT, &user).await
+    backend.complete(cfg, DESCRIBE_SYSTEM_PROMPT, &user).await
 }
