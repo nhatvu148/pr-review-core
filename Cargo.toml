@@ -41,3 +41,9 @@ tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-python = "0.23"
 tree-sitter-go = "0.23"
+
+[dev-dependencies]
+# Mock OpenRouter endpoint. `Config::openrouter_base_url` is already injectable,
+# so the agent loop can be characterised end-to-end over real HTTP without
+# changing production code.
+wiremock = "0.6"

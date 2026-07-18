@@ -78,6 +78,7 @@ struct ChatRes {
 }
 
 /// The outcome of one review call.
+#[derive(Debug)]
 pub struct ReviewResult {
     pub review: Review,
     pub model: String,
