@@ -17,6 +17,12 @@ This crate is a **library** — it carries no bot identity of its own. Consumers
 (the actual bot binaries) depend on it and inject their branding and any extra
 prompt through [`Config`].
 
+## Used by
+
+- **🦀 Kaniscope** — built entirely on this crate:
+  - a hosted **[playground](https://kaniscope.nvnv.app)** (paste a diff or a GitHub PR URL → get a review), and
+  - a **[GitHub Action](https://github.com/marketplace/actions/kaniscope-ai-code-review)** on the Marketplace (`uses: nhatvu148/kaniscope-action@v1`).
+
 ## What's in the box
 
 - Provider-agnostic review flow (`review::run_review`) across GitHub, GitLab, and
