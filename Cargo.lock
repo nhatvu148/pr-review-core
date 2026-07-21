@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "pr-review-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "agent-loop-core",
  "anyhow",
