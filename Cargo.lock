@@ -5,7 +5,8 @@ version = 4
 [[package]]
 name = "agent-loop-core"
 version = "0.1.0"
-source = "git+https://github.com/nhatvu148/agent-loop-core?tag=v0.1.0#7b88cb0f1402538a41609ab737e82f245050a65d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fccd1e583ddf040d5d235fb04593f744f3a22ca48f52dc1fb5dcae93ce4dea9"
 dependencies = [
  "async-trait",
  "reqwest",
