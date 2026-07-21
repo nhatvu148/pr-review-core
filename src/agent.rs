@@ -1,11 +1,27 @@
-//! Agentic reviewer: an OpenRouter tool-calling loop. The model is given the PR
-//! diff plus read-only tools (`read_file`, `list_dir`, `grep`) over a clone of
-//! the repo, investigates cross-file context on its own, then returns the same
-//! structured review the diff-only path produces.
+//! Agentic reviewer: the model is given the PR diff plus read-only tools
+//! (`read_file`, `list_dir`, `grep`) over a clone of the repo, investigates
+//! cross-file context on its own, then returns the same structured review the
+//! diff-only path produces.
+//!
+//! The tool-calling loop itself lives in the shared `agent-core` crate (a cheap
+//! model explores with tools, a strong model synthesizes the review). This
+//! module supplies the three repo tools, frames the diff, and parses the result
+//! back into a [`Review`]. The migration also fixed a live bug: the old
+//! hand-rolled `reqwest::Client` had no timeout, so a stalled provider hung the
+//! whole review — `agent-core`'s transport carries a timeout and 429 retry.
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_loop_core::{
+    Backend, ChatBackend, ChatClient, EventSink, ModelPolicy, ProviderConfig, RetryPolicy,
+    RunRequest, Tool, ToolError, ToolOutput, ToolRegistry,
+};
 use anyhow::Result;
+use async_trait::async_trait;
 use reqwest::Client;
-use serde_json::{json, Value};
+use schemars::JsonSchema;
+use serde::Deserialize;
 
 use crate::clip;
 use crate::config::{require, Config};
@@ -34,120 +50,123 @@ When done, respond with ONLY a JSON object (no tools, no prose) of this shape:
 }
 Rules: only raise findings on lines shown in the diff (set line=null if you can't pin one — it folds into the summary). Use the repo context to catch cross-file issues (a change that breaks a caller, a wrong type, a missing update elsewhere). Don't invent problems."#;
 
-/// Tool schemas advertised to the model (OpenAI function-calling format).
-fn tool_defs() -> Value {
-    json!([
-        {"type":"function","function":{
-            "name":"grep","description":"Regex search across the repository.",
-            "parameters":{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"]}}},
-        {"type":"function","function":{
-            "name":"read_file","description":"Read a file, optionally a 1-indexed inclusive line range.",
-            "parameters":{"type":"object","properties":{
-                "path":{"type":"string"},"start":{"type":"integer"},"end":{"type":"integer"}},"required":["path"]}}},
-        {"type":"function","function":{
-            "name":"list_dir","description":"List entries directly under a directory.",
-            "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}
-    ])
-}
+// ---- repo tools -----------------------------------------------------------
+//
+// The three read-only tools, as typed `agent-core` tools. Each carries a
+// lightweight `Workspace` handle sharing the clone's root (the caller's
+// `Workspace` owns the TempDir and outlives the run). Output is clipped to the
+// same 6 KB the hand-rolled loop used, and a workspace error is returned as
+// `Error: ...` text — identical to what the model saw before — so it keeps
+// exploring rather than aborting.
 
-/// Run a single tool call against the workspace, returning a text result the
-/// model can read (errors are returned as text so the loop continues).
-fn run_tool(ws: &Workspace, name: &str, args: &str) -> String {
-    let args: Value = serde_json::from_str(args).unwrap_or_else(|_| json!({}));
-    let result: Result<String> = match name {
-        "grep" => {
-            let pat = args["pattern"].as_str().unwrap_or("");
-            ws.grep(pat, 50).map(|hits| {
-                if hits.is_empty() {
-                    "(no matches)".to_string()
-                } else {
-                    hits.join("\n")
-                }
-            })
-        }
-        "read_file" => {
-            let path = args["path"].as_str().unwrap_or("");
-            let start = args["start"].as_u64().map(|v| v as usize);
-            let end = args["end"].as_u64().map(|v| v as usize);
-            ws.read_file(path, start, end)
-        }
-        "list_dir" => {
-            let path = args["path"].as_str().unwrap_or("");
-            ws.list_dir(path).map(|e| e.join("\n"))
-        }
-        other => Ok(format!("unknown tool: {other}")),
-    };
-    match result {
-        Ok(s) => clip(&s, 6_000),
-        Err(e) => format!("Error: {e}"),
+const TOOL_CLIP: usize = 6_000;
+
+fn ws_result(r: Result<String>) -> ToolOutput {
+    match r {
+        Ok(s) => ToolOutput::ok(clip(&s, TOOL_CLIP)),
+        Err(e) => ToolOutput::ok(format!("Error: {e}")),
     }
 }
 
-/// Cap the total size of tool-result content carried in the conversation: keep
-/// the newest results in full up to `budget_chars`, elide older ones. Bounds the
-/// per-request token count so context can't snowball or overflow the model window.
-fn trim_history(messages: &mut [Value], budget_chars: usize) {
-    let mut used = 0usize;
-    for m in messages.iter_mut().rev() {
-        if m["role"].as_str() != Some("tool") {
-            continue; // only the file dumps in tool results are worth eliding
-        }
-        let len = m["content"]
-            .as_str()
-            .map(|c| c.chars().count())
-            .unwrap_or(0);
-        if used + len > budget_chars {
-            m["content"] = json!("[earlier tool result elided to save context]");
-        } else {
-            used += len;
-        }
+struct GrepTool {
+    ws: Arc<Workspace>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct GrepArgs {
+    /// Regex to search for across the repository.
+    pattern: String,
+}
+
+#[async_trait]
+impl Tool for GrepTool {
+    type Args = GrepArgs;
+    fn name(&self) -> &'static str {
+        "grep"
+    }
+    fn description(&self) -> &'static str {
+        "Regex search across the repository."
+    }
+    async fn call(&self, args: Self::Args) -> std::result::Result<ToolOutput, ToolError> {
+        Ok(ws_result(self.ws.grep(&args.pattern, 50).map(|hits| {
+            if hits.is_empty() {
+                "(no matches)".to_string()
+            } else {
+                hits.join("\n")
+            }
+        })))
     }
 }
 
-/// One OpenRouter chat-completions call. Returns the assistant message and the
-/// call's `total_tokens` (0 if the field is absent).
-async fn chat(
-    client: &Client,
-    cfg: &Config,
-    model: &str,
-    messages: &[Value],
-    tools: &Value,
-    tool_choice: &str,
-) -> Result<(Value, u32)> {
-    let req = json!({
-        "model": model,
-        "max_tokens": cfg.openrouter_max_tokens,
-        "temperature": cfg.openrouter_temperature,
-        "messages": messages,
-        "tools": tools,
-        "tool_choice": tool_choice,
-    });
+struct ReadFileTool {
+    ws: Arc<Workspace>,
+}
 
-    let res = client
-        .post(format!("{}/chat/completions", cfg.openrouter_base_url))
-        .bearer_auth(&cfg.openrouter_api_key)
-        .header("HTTP-Referer", &cfg.http_referer)
-        .header("X-Title", &cfg.x_title)
-        .json(&req)
-        .send()
-        .await?;
+#[derive(Deserialize, JsonSchema)]
+struct ReadFileArgs {
+    /// Path relative to the repository root.
+    path: String,
+    /// 1-indexed inclusive start line.
+    start: Option<usize>,
+    /// 1-indexed inclusive end line.
+    end: Option<usize>,
+}
 
-    let status = res.status();
-    let text = res.text().await?;
-    let data: Value = serde_json::from_str(&text).map_err(|e| {
-        anyhow::anyhow!("OpenRouter {status}: non-JSON ({e}): {}", clip(&text, 300))
-    })?;
-    if !status.is_success() || data.get("error").is_some() {
-        let msg = data["error"]["message"]
-            .as_str()
-            .unwrap_or(&clip(&text, 400))
-            .to_string();
-        anyhow::bail!("OpenRouter {status}: {msg}");
+#[async_trait]
+impl Tool for ReadFileTool {
+    type Args = ReadFileArgs;
+    fn name(&self) -> &'static str {
+        "read_file"
     }
+    fn description(&self) -> &'static str {
+        "Read a file, optionally a 1-indexed inclusive line range."
+    }
+    async fn call(&self, args: Self::Args) -> std::result::Result<ToolOutput, ToolError> {
+        Ok(ws_result(
+            self.ws.read_file(&args.path, args.start, args.end),
+        ))
+    }
+}
 
-    let tokens = data["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
-    let message = data["choices"][0]["message"].clone();
-    Ok((message, tokens))
+struct ListDirTool {
+    ws: Arc<Workspace>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ListDirArgs {
+    /// Directory path relative to the repository root.
+    path: String,
+}
+
+#[async_trait]
+impl Tool for ListDirTool {
+    type Args = ListDirArgs;
+    fn name(&self) -> &'static str {
+        "list_dir"
+    }
+    fn description(&self) -> &'static str {
+        "List entries directly under a directory."
+    }
+    async fn call(&self, args: Self::Args) -> std::result::Result<ToolOutput, ToolError> {
+        Ok(ws_result(
+            self.ws.list_dir(&args.path).map(|e| e.join("\n")),
+        ))
+    }
+}
+
+/// Build the tool registry over a shallow workspace handle. `Workspace::from_dir`
+/// shares the clone's root without owning the TempDir, so the caller's borrowed
+/// `Workspace` keeps the directory alive for the run's duration.
+fn build_registry(ws: &Workspace) -> ToolRegistry {
+    let handle = Arc::new(Workspace::from_dir(ws.root()));
+    ToolRegistry::new()
+        .with(GrepTool {
+            ws: Arc::clone(&handle),
+        })
+        .with(ReadFileTool {
+            ws: Arc::clone(&handle),
+        })
+        .with(ListDirTool { ws: handle })
 }
 
 /// Review a PR agentically with a two-tier model split: a cheap `explore` model
@@ -157,11 +176,15 @@ async fn chat(
 /// — where judgment matters — come from the stronger model. Usage is summed
 /// across every call.
 ///
+/// The loop, transport (with the timeout + 429 retry the old code lacked), and
+/// history compaction all live in `agent-core`; this function frames the diff,
+/// supplies the tools, and parses the synthesized JSON back into a [`Review`].
+///
 /// # Errors
 /// On missing API key, OpenRouter failure, or if the synthesis model doesn't
 /// return a parseable review.
 pub async fn agentic_review(
-    client: &Client,
+    _client: &Client,
     cfg: &Config,
     meta: &PrMeta,
     diff: &str,
@@ -182,8 +205,7 @@ pub async fn agentic_review(
         .filter(|c| !c.trim().is_empty())
         .map(|c| format!("\n\n## Structural context\n{c}"))
         .unwrap_or_default();
-    let user =
-        format!(
+    let user = format!(
         "Repository: {}\nPull request: #{}{}{omitted}{structural}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
         meta.repo,
         meta.pr,
@@ -197,97 +219,74 @@ pub async fn agentic_review(
         format!("{AGENT_SYSTEM_PROMPT}\n{}", cfg.extra_system_prompt)
     };
 
-    let mut messages: Vec<Value> = vec![
-        json!({"role":"system","content": system_prompt}),
-        json!({"role":"user","content": user}),
-    ];
-    let tools = tool_defs();
-    let mut total_tokens = 0u32;
+    let chat = ChatClient::new(ProviderConfig {
+        base_url: cfg.openrouter_base_url.clone(),
+        api_key: cfg.openrouter_api_key.clone(),
+        timeout: Duration::from_secs(cfg.openrouter_timeout_secs),
+        retry: RetryPolicy {
+            max_retries: cfg.openrouter_max_retries,
+            ..RetryPolicy::default()
+        },
+        extra_headers: vec![
+            ("HTTP-Referer".to_string(), cfg.http_referer.clone()),
+            ("X-Title".to_string(), cfg.x_title.clone()),
+        ],
+        ..ProviderConfig::default()
+    })
+    .map_err(|e| anyhow::anyhow!(e))?;
 
-    // Phase 1 — exploration on the cheap model. Loop until it stops asking for
-    // tools (it's gathered enough) or we hit the turn cap.
-    for turn in 0..cfg.max_turns {
-        trim_history(&mut messages, cfg.max_history_chars);
+    let policy = ModelPolicy {
+        explore: cfg.openrouter_model_explore.clone(),
+        synthesize: cfg.openrouter_model.clone(),
+        max_turns: cfg.max_turns as u32,
+        // pr-review-core bounded the run by turns, not tokens.
+        stop_after_tokens: None,
+        // The transport carries the per-request timeout; there was no
+        // whole-run wall-clock cap in the hand-rolled loop.
+        timeout_secs: None,
+        max_tokens: cfg.openrouter_max_tokens,
+        temperature: cfg.openrouter_temperature,
+        max_history_chars: cfg.max_history_chars,
+        initial_tool_choice: "auto".to_string(),
+        continue_on_tool_error: true,
+        // pr-review-core always runs the final tools-forbidden synthesis turn —
+        // even single-model — because that turn is where the clean review JSON
+        // is demanded.
+        final_synthesis: true,
+    };
 
-        let (message, tokens) = chat(
-            client,
-            cfg,
-            &cfg.openrouter_model_explore,
-            &messages,
-            &tools,
-            "auto",
+    let backend = ChatBackend::new(chat, Arc::new(build_registry(ws)), policy);
+    let outcome = backend
+        .run(
+            RunRequest {
+                system_prompt,
+                user_prompt: user,
+                messages: Vec::new(),
+                tool_scope: Vec::new(),
+            },
+            EventSink::none(),
         )
-        .await?;
-        total_tokens += tokens;
-        messages.push(message.clone());
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
 
-        let tool_calls = message["tool_calls"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        if tool_calls.is_empty() {
-            break; // explorer is done gathering — synthesize below
-        }
-        for tc in &tool_calls {
-            let id = tc["id"].as_str().unwrap_or("");
-            let name = tc["function"]["name"].as_str().unwrap_or("");
-            let args = tc["function"]["arguments"].as_str().unwrap_or("{}");
-            tracing::info!(
-                "agent[{}#{}] turn {turn} explore: {name} {}",
-                meta.repo,
-                meta.pr,
-                clip(args, 160)
-            );
-            let result = run_tool(ws, name, args);
-            messages.push(json!({"role":"tool","tool_call_id": id, "content": result}));
-        }
-    }
-
-    // Phase 2 — synthesis on the main (quality) model. Forbid tools and demand
-    // the review JSON, using only the context the explorer already gathered.
-    messages.push(json!({
-        "role": "user",
-        "content": "Stop investigating now. Using only what you've already gathered, output ONLY the final review JSON object — no prose, no tool calls."
-    }));
-    trim_history(&mut messages, cfg.max_history_chars);
-
-    let (message, tokens) = chat(
-        client,
-        cfg,
-        &cfg.openrouter_model,
-        &messages,
-        &tools,
-        "none",
-    )
-    .await?;
-    total_tokens += tokens;
-
-    let content = message["content"].as_str().unwrap_or_default();
+    // Parse with this crate's own extractor so the error text stays stable.
+    let content = outcome.content.as_deref().unwrap_or_default();
     let parsed = extract_json(content)
         .ok_or_else(|| anyhow::anyhow!("agent returned no JSON: {}", clip(content, 300)))?;
     let review: Review = serde_json::from_str(parsed).map_err(|e| {
         anyhow::anyhow!("could not parse agent review ({e}): {}", clip(parsed, 300))
     })?;
 
-    let usage = (total_tokens > 0).then_some(Usage {
+    let usage = (outcome.total_tokens > 0).then_some(Usage {
         prompt_tokens: None,
         completion_tokens: None,
-        total_tokens: Some(total_tokens),
+        total_tokens: Some(outcome.total_tokens),
     });
-    // Report both tiers so token cost attribution is honest — the summed usage
-    // spans the explore and synthesis models. Collapse to one name when tiering
-    // is disabled (explore == synthesis).
-    let model = if cfg.openrouter_model_explore == cfg.openrouter_model {
-        cfg.openrouter_model.clone()
-    } else {
-        format!(
-            "{} (explore: {})",
-            cfg.openrouter_model, cfg.openrouter_model_explore
-        )
-    };
+    // `outcome.model` is agent-core's honest attribution — "main (explore:
+    // cheap)" when tiered, collapsing to one name when explore == synthesize.
     Ok(ReviewResult {
         review,
-        model,
+        model: outcome.model,
         usage,
     })
 }
@@ -305,6 +304,9 @@ mod tests {
     //! `RecordingBackend` formalises.
 
     use super::*;
+    // json!/Value moved out of the production imports when the loop was swapped;
+    // the mock harness still needs them.
+    use serde_json::{json, Value};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
@@ -391,6 +393,9 @@ mod tests {
         c.max_turns = 6;
         c.max_history_chars = 45_000;
         c.max_diff_chars = 200_000;
+        // No retries in tests: keeps the transient-failure test to one attempt
+        // (fast + deterministic) rather than the production default of 3.
+        c.openrouter_max_retries = 0;
         c
     }
 
@@ -567,13 +572,16 @@ mod tests {
         assert_eq!(tool_msgs[1]["tool_call_id"], "c2");
     }
 
-    // ---- known defects, pinned deliberately --------------------------------
+    // ---- tool-error handling: one defect fixed, one behaviour preserved ----
 
     #[tokio::test]
-    async fn unknown_tool_is_reported_as_text_not_an_error() {
-        // DEFECT (pinned): an unroutable tool name yields a normal-looking tool
-        // result. The loop cannot distinguish "tool doesn't exist" from a real
-        // answer, and burns a turn either way.
+    async fn an_unknown_tool_name_surfaces_to_the_model_as_text() {
+        // Behaviour PRESERVED, not a fix: both the old loop and agent-loop-core
+        // hand the model a "unknown tool `X`" tool result rather than aborting,
+        // so it keeps going. (Internally the new registry produces a typed
+        // `NotFound` error, which is cleaner for the loop's own handling, but the
+        // model sees the same kind of text — this test just pins that the run
+        // doesn't crash and the miss is reported.)
         let (srv, seq) = server(vec![
             tool_turn(&[("c1", "delete_everything", "{}")], 1),
             text_turn("ok", 1),
@@ -588,20 +596,23 @@ mod tests {
             .expect("unknown tool does not fail the review");
 
         let reqs = seq.requests();
-        let tool_msg = messages(&reqs, 1)
+        let content = messages(&reqs, 1)
             .iter()
             .find(|m| m["role"] == "tool")
-            .unwrap();
-        assert_eq!(tool_msg["content"], "unknown tool: delete_everything");
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(content.contains("unknown tool"), "got: {content}");
+        assert!(content.contains("delete_everything"), "names it: {content}");
     }
 
     #[tokio::test]
-    async fn malformed_tool_args_silently_become_an_empty_object() {
-        // DEFECT (pinned): `serde_json::from_str(args).unwrap_or(json!({}))` plus
-        // `args["pattern"].as_str().unwrap_or("")` turns unparseable arguments
-        // into a repo-wide empty-regex grep instead of an error. The typed-args
-        // work in step 3 should change this — and this test should then be
-        // updated deliberately, not silently.
+    async fn malformed_tool_args_are_rejected_not_silently_defaulted() {
+        // WAS a pinned defect: `unwrap_or(json!({}))` plus
+        // `args["pattern"].as_str().unwrap_or("")` turned unparseable arguments
+        // into a repo-wide empty-regex grep. agent-core parses once, strictly,
+        // and tells the model the arguments were invalid.
         let (srv, seq) = server(vec![
             tool_turn(&[("c1", "grep", "{not valid json")], 1),
             text_turn("ok", 1),
@@ -624,9 +635,10 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(
-            !content.starts_with("Error:"),
-            "today this degrades silently rather than erroring; got: {content}"
+            content.contains("invalid arguments"),
+            "should reject, not run an empty-regex grep; got: {content}"
         );
+        assert!(content.contains("grep"), "names the tool: {content}");
     }
 
     // ---- usage & model reporting -------------------------------------------
@@ -722,87 +734,73 @@ mod tests {
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
 
-        // Pinned: there is no retry today — a single 429 discards the whole run.
-        // Step 2 (provider.rs) changes this; update this test when it does.
+        // Retries are now real and configurable (agent-core's transport); the
+        // old code had none. `cfg_for` sets max_retries = 0, so this asserts the
+        // single-attempt behaviour: a 429 with retries off aborts, surfacing as
+        // a rate-limit error rather than the old raw passthrough.
         let err = agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("rate limited"), "got: {err}");
     }
 
-    // ---- private helpers ----------------------------------------------------
+    // ---- the repo tools -----------------------------------------------------
+    //
+    // `trim_history`, the tool dispatch table, and the schema/dispatch
+    // drift-guard moved into agent-core with the loop and are tested there. What
+    // remains this crate's own is the three repo tools; these cover their output
+    // contract (clip size, error-as-text) directly.
 
-    #[test]
-    fn trim_history_elides_only_older_tool_results() {
-        let mut msgs = vec![
-            json!({"role":"system","content":"S"}),
-            json!({"role":"user","content":"U"}),
-            json!({"role":"tool","tool_call_id":"1","content":"old-and-long"}),
-            json!({"role":"tool","tool_call_id":"2","content":"newest"}),
-        ];
-        trim_history(&mut msgs, 8); // fits "newest" (6) but not the older one
-
-        assert_eq!(msgs[0]["content"], "S", "system is never touched");
-        assert_eq!(msgs[1]["content"], "U", "user is never touched");
-        assert_eq!(
-            msgs[2]["content"],
-            "[earlier tool result elided to save context]"
-        );
-        assert_eq!(msgs[3]["content"], "newest", "newest result kept in full");
-    }
-
-    #[test]
-    fn trim_history_keeps_everything_under_budget() {
-        let mut msgs = vec![
-            json!({"role":"tool","tool_call_id":"1","content":"a"}),
-            json!({"role":"tool","tool_call_id":"2","content":"b"}),
-        ];
-        trim_history(&mut msgs, 10_000);
-        assert_eq!(msgs[0]["content"], "a");
-        assert_eq!(msgs[1]["content"], "b");
-    }
-
-    #[test]
-    fn run_tool_clips_oversized_results() {
+    #[tokio::test]
+    async fn read_file_tool_clips_oversized_output() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("big.txt"), "x".repeat(20_000)).unwrap();
-        let ws = Workspace::from_dir(d.path());
-
-        let out = run_tool(&ws, "read_file", r#"{"path":"big.txt"}"#);
+        let tool = ReadFileTool {
+            ws: Arc::new(Workspace::from_dir(d.path())),
+        };
+        let out = tool
+            .call(ReadFileArgs {
+                path: "big.txt".to_string(),
+                start: None,
+                end: None,
+            })
+            .await
+            .unwrap();
         assert!(
-            out.chars().count() <= 6_100,
+            out.content.chars().count() <= 6_100,
             "clipped to ~6k, got {}",
-            out.len()
+            out.content.len()
         );
     }
 
-    #[test]
-    fn run_tool_surfaces_sandbox_escape_as_error_text() {
+    #[tokio::test]
+    async fn read_file_tool_returns_a_sandbox_escape_as_error_text() {
+        // The clone is a sandbox; a path escaping it must not read the host FS.
+        // Preserved verbatim from the old loop: the error is returned as
+        // "Error: ..." text the model can read, not a hard failure.
         let (_d, ws) = workspace();
-        let out = run_tool(&ws, "read_file", r#"{"path":"../../../etc/passwd"}"#);
-        assert!(out.starts_with("Error:"), "got: {out}");
+        let tool = ReadFileTool {
+            ws: Arc::new(Workspace::from_dir(ws.root())),
+        };
+        let out = tool
+            .call(ReadFileArgs {
+                path: "../../../etc/passwd".to_string(),
+                start: None,
+                end: None,
+            })
+            .await
+            .unwrap();
+        assert!(out.content.starts_with("Error:"), "got: {}", out.content);
     }
 
     #[test]
-    fn tool_defs_match_the_names_run_tool_dispatches() {
-        // Guards the schema/dispatch drift called out in the review: today these
-        // are two independent sources of truth.
-        let defs = tool_defs();
-        let names: Vec<&str> = defs
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|d| d["function"]["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(names, vec!["grep", "read_file", "list_dir"]);
-
+    fn the_registry_exposes_exactly_the_three_repo_tools() {
         let (_d, ws) = workspace();
-        for n in names {
-            let out = run_tool(&ws, n, r#"{"path":".","pattern":"alpha"}"#);
-            assert!(
-                !out.starts_with("unknown tool:"),
-                "{n} is advertised but not dispatched"
-            );
-        }
+        // Sorted by agent-core; drift between schema and dispatch is now
+        // structurally impossible (same map), so this just pins the surface.
+        assert_eq!(
+            build_registry(&ws).names(),
+            vec!["grep", "list_dir", "read_file"]
+        );
     }
 }
