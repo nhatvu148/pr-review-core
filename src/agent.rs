@@ -572,14 +572,16 @@ mod tests {
         assert_eq!(tool_msgs[1]["tool_call_id"], "c2");
     }
 
-    // ---- defects that the agent-core migration fixed -----------------------
+    // ---- tool-error handling: one defect fixed, one behaviour preserved ----
 
     #[tokio::test]
-    async fn an_unknown_tool_name_is_named_to_the_model() {
-        // WAS a pinned defect: an unroutable name yielded a normal-looking tool
-        // result ("unknown tool: X"), so the loop could not distinguish "no such
-        // tool" from a real answer. agent-core's registry is the single source
-        // for both the advertised schema and dispatch, and reports the miss.
+    async fn an_unknown_tool_name_surfaces_to_the_model_as_text() {
+        // Behaviour PRESERVED, not a fix: both the old loop and agent-loop-core
+        // hand the model a "unknown tool `X`" tool result rather than aborting,
+        // so it keeps going. (Internally the new registry produces a typed
+        // `NotFound` error, which is cleaner for the loop's own handling, but the
+        // model sees the same kind of text — this test just pins that the run
+        // doesn't crash and the miss is reported.)
         let (srv, seq) = server(vec![
             tool_turn(&[("c1", "delete_everything", "{}")], 1),
             text_turn("ok", 1),
