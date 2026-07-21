@@ -34,6 +34,12 @@ pub struct Config {
     pub openrouter_base_url: String,
     pub openrouter_max_tokens: u32,
     pub openrouter_temperature: f32,
+    /// Whole-request timeout for a single model call. The hand-rolled loop had
+    /// none, so a stalled provider hung the entire review.
+    pub openrouter_timeout_secs: u64,
+    /// Retries for a transient failure (429 / 5xx) on one call. The hand-rolled
+    /// loop had none, so a single 429 discarded the whole review.
+    pub openrouter_max_retries: u32,
 
     pub max_diff_chars: usize,
 
@@ -136,6 +142,10 @@ impl Config {
             openrouter_temperature: env_or("OPENROUTER_TEMPERATURE", "0.2")
                 .parse()
                 .unwrap_or(0.2),
+            openrouter_timeout_secs: env_or("OPENROUTER_TIMEOUT_SECS", "120")
+                .parse()
+                .unwrap_or(120),
+            openrouter_max_retries: env_or("OPENROUTER_MAX_RETRIES", "3").parse().unwrap_or(3),
 
             max_diff_chars: env_or("MAX_DIFF_CHARS", "200000")
                 .parse()
