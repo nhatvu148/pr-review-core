@@ -13,7 +13,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_core::{
+use agent_loop_core::{
     Backend, ChatBackend, ChatClient, EventSink, ModelPolicy, ProviderConfig, RetryPolicy,
     RunRequest, Tool, ToolError, ToolOutput, ToolRegistry,
 };
