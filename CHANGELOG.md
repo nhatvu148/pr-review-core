@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.7.0
+
+Migrated the agentic reviewer onto the shared [`agent-loop-core`](https://crates.io/crates/agent-loop-core) crate, and **fixed a live bug**: the agentic path built its HTTP client with no timeout, so a stalled provider hung the entire review and a single 429 discarded it.
+
+**Resilient transport (the fix)**
+
+- The agentic review loop now runs on `agent-loop-core`, whose chat transport
+  carries a per-request **timeout** and **429/5xx retry** with backoff — both
+  configurable via `OPENROUTER_TIMEOUT_SECS` (default 120) and
+  `OPENROUTER_MAX_RETRIES` (default 3). Previously a hung OpenRouter connection
+  had no upper bound.
+
+**Loop internals moved to `agent-loop-core`**
+
+- The tool-calling loop, history compaction, and the two-model explore/synthesize
+  split now live in the shared crate (also consumed by other reviewers). The three
+  repo tools (`grep` / `read_file` / `list_dir`) became typed tools — the schema
+  is derived from the argument type, so the advertised schema and the arguments a
+  tool actually reads can no longer drift.
+- Malformed tool arguments are now **rejected** (reported to the model) instead of
+  silently running the tool with defaults — previously a malformed `grep` became a
+  repo-wide empty-regex match.
+
+**Dependency note**
+
+- Adds `agent-loop-core = "0.1"`. Its transport uses `rustls` with bundled
+  `webpki-roots` (via reqwest 0.12), so it needs **no cmake to build and no
+  `ca-certificates` at runtime** — consumers on minimal images are unaffected.
+
+The public API (`run_review`, `ReviewBackend`, `Review`, the command/webhook
+surface) is unchanged; this is an internals + resilience release.
+
 ## 0.6.0
 
 Review lifecycle + a backend seam for `/ask` and `/describe`.

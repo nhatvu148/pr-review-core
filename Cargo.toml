@@ -1,6 +1,6 @@
 [package]
 name = "pr-review-core"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "Core engine for a self-hosted advisory AI PR reviewer: fetches a pull request diff, reviews it with a Claude model via OpenRouter, and posts line-anchored inline comments plus a summary. Works with GitHub and Bitbucket."
 license = "MIT OR Apache-2.0"
