@@ -125,6 +125,15 @@ enum Lang {
     Go,
 }
 
+/// Whether a path is JS/TS-family (`.ts/.tsx/.js/.jsx` and their variants) — the
+/// files [`references_in_source`] can AST-classify for JSX + type references.
+pub(crate) fn is_js_family(path: &str) -> bool {
+    matches!(
+        language_for_path(path),
+        Some(Lang::TypeScript | Lang::Tsx | Lang::JavaScript)
+    )
+}
+
 /// Classify a path to a supported [`Lang`] by extension, or `None` if unsupported.
 fn language_for_path(path: &str) -> Option<Lang> {
     let ext = path.rsplit('.').next()?.to_ascii_lowercase();
@@ -320,6 +329,117 @@ pub(crate) fn changed_symbols(
             end: s.end,
         })
         .collect()
+}
+
+/// How a symbol is referenced, so [`crate::blast`] can bucket JSX renders and
+/// type usages that a `\bNAME\s*\(` call grep never matches.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum RefKind {
+    /// `f(...)`, `obj.f(...)`, or `new F(...)`.
+    Call,
+    /// A JSX element: `<Comp/>` or `<Ns.Comp/>`.
+    Jsx,
+    /// A type position: `: T`, `extends T`, `Foo<T>`.
+    Type,
+}
+
+/// One classified reference to a symbol in a source file (1-indexed line).
+pub(crate) struct SymbolRef {
+    pub line: u64,
+    pub kind: RefKind,
+}
+
+/// Text of a callee/tag/constructor node that names the referenced symbol:
+/// a bare `identifier` yields its text; a `member_expression`
+/// (`foo.bar` / `Ns.Comp`) yields the `property` (last segment). `None` otherwise.
+fn ref_name<'a>(node: Node, src: &'a [u8]) -> Option<&'a str> {
+    match node.kind() {
+        "identifier" | "type_identifier" | "property_identifier" => node.utf8_text(src).ok(),
+        "member_expression" | "nested_identifier" => node
+            .child_by_field_name("property")
+            .and_then(|p| p.utf8_text(src).ok())
+            .or_else(|| node.utf8_text(src).ok().and_then(|t| t.rsplit('.').next())),
+        _ => None,
+    }
+}
+
+/// Find references to `name` in a JS/TS-family `source` (parsed as `path`'s
+/// language), classified as [`RefKind::Call`], [`RefKind::Jsx`], or
+/// [`RefKind::Type`]. This catches the references a call-only grep misses: JSX
+/// component usage (`<Name/>`) and type positions (`: Name`, `extends Name`,
+/// `Foo<Name>`).
+///
+/// Returns 1-indexed lines. Fully fail-open: a non-JS-family path, a parse error,
+/// or no matches all yield an empty vec. Deduplicated by `(line, kind)`.
+pub(crate) fn references_in_source(path: &str, source: &str, name: &str) -> Vec<SymbolRef> {
+    let lang = match language_for_path(path) {
+        Some(l @ (Lang::TypeScript | Lang::Tsx | Lang::JavaScript)) => l,
+        _ => return Vec::new(),
+    };
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let mut parser = Parser::new();
+    if parser.set_language(&lang.ts_language()).is_err() {
+        return Vec::new();
+    }
+    let tree = match parser.parse(source, None) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let src = source.as_bytes();
+
+    let mut seen: HashSet<(u64, RefKind)> = HashSet::new();
+    let mut out: Vec<SymbolRef> = Vec::new();
+    let mut push = |node: Node, kind: RefKind, out: &mut Vec<SymbolRef>| {
+        let line = node.start_position().row as u64 + 1;
+        if seen.insert((line, kind)) {
+            out.push(SymbolRef { line, kind });
+        }
+    };
+
+    // Manual pre-order walk (no tree-sitter query, to keep the grammar coupling
+    // in one place and stay fail-open on grammar drift).
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "call_expression" => {
+                if node
+                    .child_by_field_name("function")
+                    .and_then(|f| ref_name(f, src))
+                    == Some(name)
+                {
+                    push(node, RefKind::Call, &mut out);
+                }
+            }
+            "new_expression" => {
+                if node
+                    .child_by_field_name("constructor")
+                    .and_then(|c| ref_name(c, src))
+                    == Some(name)
+                {
+                    push(node, RefKind::Call, &mut out);
+                }
+            }
+            // Match the opening/self-closing tag only (not the closing tag) so a
+            // paired element `<Comp>…</Comp>` counts once.
+            "jsx_opening_element" | "jsx_self_closing_element" => {
+                if node.child_by_field_name("name").and_then(|n| ref_name(n, src)) == Some(name) {
+                    push(node, RefKind::Jsx, &mut out);
+                }
+            }
+            "type_identifier" if node.utf8_text(src) == Ok(name) => {
+                push(node, RefKind::Type, &mut out);
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    out.sort_by_key(|r| r.line);
+    out
 }
 
 /// Render one file's resolved symbols as a `Changed symbols:` block entry.
@@ -585,5 +705,84 @@ func processOrder(o Order) int {
         }];
         let s = format_symbols("src/util.rs", &syms);
         assert_eq!(s, "- src/util.rs: fn clamp (lines 5\u{2013}9)");
+    }
+
+    // ----- references_in_source (JSX + type + call classification) -----
+
+    fn kinds_on(refs: &[SymbolRef]) -> Vec<(u64, RefKind)> {
+        refs.iter().map(|r| (r.line, r.kind)).collect()
+    }
+
+    #[test]
+    fn refs_classify_jsx_component_usage() {
+        let src = "\
+function App() {
+  return <FindingCard title=\"x\" />;
+}
+function Other() {
+  return <FindingCard>{y}</FindingCard>;
+}
+";
+        let refs = references_in_source("app.tsx", src, "FindingCard");
+        // Both the self-closing (line 2) and the paired opening tag (line 5) count
+        // once each; the closing tag on line 5 must not double-count.
+        assert_eq!(kinds_on(&refs), vec![(2, RefKind::Jsx), (5, RefKind::Jsx)]);
+    }
+
+    #[test]
+    fn refs_classify_namespaced_jsx() {
+        let src = "const x = <Ns.Panel/>;\n";
+        let refs = references_in_source("a.tsx", src, "Panel");
+        assert_eq!(kinds_on(&refs), vec![(1, RefKind::Jsx)]);
+    }
+
+    #[test]
+    fn refs_classify_type_positions() {
+        let src = "\
+function f(x: Finding): Finding { return x; }
+const a: Array<Finding> = [];
+";
+        // Param + return type collapse to one entry on line 1 (dedup by line+kind);
+        // the generic arg on line 2 is a second type reference.
+        let finding = references_in_source("a.ts", src, "Finding");
+        assert_eq!(
+            kinds_on(&finding),
+            vec![(1, RefKind::Type), (2, RefKind::Type)]
+        );
+    }
+
+    #[test]
+    fn refs_ignore_class_extends_value_identifier() {
+        // `class B extends Base` makes `Base` a value identifier, not a
+        // type_identifier — we deliberately don't over-match bare identifiers.
+        let refs = references_in_source("a.ts", "class B extends Base {}\n", "Base");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn refs_classify_calls_and_new() {
+        let src = "\
+scoreColor(1);
+foo.analyzeGlstat(y);
+const w = new Widget();
+";
+        assert_eq!(
+            kinds_on(&references_in_source("a.ts", src, "scoreColor")),
+            vec![(1, RefKind::Call)]
+        );
+        assert_eq!(
+            kinds_on(&references_in_source("a.ts", src, "analyzeGlstat")),
+            vec![(2, RefKind::Call)]
+        );
+        assert_eq!(
+            kinds_on(&references_in_source("a.ts", src, "Widget")),
+            vec![(3, RefKind::Call)]
+        );
+    }
+
+    #[test]
+    fn refs_empty_for_non_js_family_and_no_match() {
+        assert!(references_in_source("a.rs", "fn f() { g(); }", "g").is_empty());
+        assert!(references_in_source("a.tsx", "const x = 1;\n", "Missing").is_empty());
     }
 }
