@@ -106,6 +106,15 @@ pub struct Config {
     /// Max number of files to fetch + parse for structural context (cost guard).
     pub structural_max_files: usize,
 
+    /// Compute a "blast radius" for the agentic reviewer: from the clone, find the
+    /// callers and tests of each changed symbol and seed the prompt with them (also
+    /// exposes a `references` tool). Agentic path only — needs the clone. Fail-open.
+    pub blast_radius: bool,
+    /// Max number of changed symbols to expand into a blast radius (cost guard).
+    pub blast_max_symbols: usize,
+    /// Max call sites listed per symbol per bucket (callers / tests) (cost guard).
+    pub blast_max_refs: usize,
+
     /// Scan changed lockfiles for known-vulnerable dependencies via OSV.dev and
     /// append advisories to the review summary. Fully fail-open — never blocks a
     /// review.
@@ -212,6 +221,10 @@ impl Config {
 
             structural_context: env_or("STRUCTURAL_CONTEXT", "true").parse().unwrap_or(true),
             structural_max_files: env_or("STRUCTURAL_MAX_FILES", "15").parse().unwrap_or(15),
+
+            blast_radius: env_or("BLAST_RADIUS", "true").parse().unwrap_or(true),
+            blast_max_symbols: env_or("BLAST_MAX_SYMBOLS", "12").parse().unwrap_or(12),
+            blast_max_refs: env_or("BLAST_MAX_REFS", "8").parse().unwrap_or(8),
 
             cve_scan: env_or("CVE_SCAN", "true").parse().unwrap_or(true),
             cve_max_packages: env_or("CVE_MAX_PACKAGES", "100").parse().unwrap_or(100),

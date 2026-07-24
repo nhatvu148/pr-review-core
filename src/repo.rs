@@ -95,6 +95,14 @@ impl Workspace {
         Ok(out)
     }
 
+    /// Read a file's raw content (no line numbers), sandboxed to the clone. Used
+    /// by [`crate::blast`] to tree-sit changed files; the LLM-facing reader is
+    /// [`Workspace::read_file`], which numbers lines.
+    pub fn read_raw(&self, rel: &str) -> Result<String> {
+        let path = self.resolve(rel)?;
+        std::fs::read_to_string(&path).with_context(|| format!("read {rel}"))
+    }
+
     /// List entries (dirs end with `/`) directly under a repo-relative directory.
     pub fn list_dir(&self, rel: &str) -> Result<Vec<String>> {
         let path = self.resolve(rel)?;

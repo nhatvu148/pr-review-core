@@ -33,8 +33,9 @@ const AGENT_SYSTEM_PROMPT: &str = r#"You are an expert software engineer reviewi
 - grep(pattern): regex search across the repo
 - read_file(path, start?, end?): read a file (optionally a 1-indexed line range)
 - list_dir(path): list a directory
+- references(symbol): call sites of a symbol across the repo, split into callers and tests (a precise shortcut for "who calls this?")
 
-Investigate the change in context: look up the definitions and CALLERS of changed functions, the types they use, related tests, and config. Be economical: grep to find the relevant line, then read_file with a NARROW line range (start/end) rather than whole files. Aim to finish in a few focused lookups, not exhaustive crawling.
+Investigate the change in context: look up the definitions and CALLERS of changed functions, the types they use, related tests, and config. When a `## Blast radius` block is provided, its callers/tests are already computed — start from those files instead of re-searching, and use `references(symbol)` rather than crafting your own grep for call sites. Be economical: read_file with a NARROW line range (start/end) rather than whole files. Aim to finish in a few focused lookups, not exhaustive crawling.
 
 When done, respond with ONLY a JSON object (no tools, no prose) of this shape:
 {
@@ -154,10 +155,42 @@ impl Tool for ListDirTool {
     }
 }
 
+/// Precise "who calls this?" over the clone: [`crate::blast::references`] returns
+/// call sites split into callers and tests. Carries the ref cap it needs so the
+/// tool stays a plain workspace handle; unlike the others it can't fail (an empty
+/// or capped result is reported as text).
+struct ReferencesTool {
+    ws: Arc<Workspace>,
+    max_refs: usize,
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ReferencesArgs {
+    /// Symbol (function / method / class) name to find call sites for.
+    symbol: String,
+}
+
+#[async_trait]
+impl Tool for ReferencesTool {
+    type Args = ReferencesArgs;
+    fn name(&self) -> &'static str {
+        "references"
+    }
+    fn description(&self) -> &'static str {
+        "Call sites of a symbol (function/method/class) across the repo, split into callers and tests. Prefer this over grep for finding who calls something."
+    }
+    async fn call(&self, args: Self::Args) -> std::result::Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::ok(clip(
+            &crate::blast::references(&self.ws, &args.symbol, self.max_refs),
+            TOOL_CLIP,
+        )))
+    }
+}
+
 /// Build the tool registry over a shallow workspace handle. `Workspace::from_dir`
 /// shares the clone's root without owning the TempDir, so the caller's borrowed
 /// `Workspace` keeps the directory alive for the run's duration.
-fn build_registry(ws: &Workspace) -> ToolRegistry {
+fn build_registry(ws: &Workspace, cfg: &Config) -> ToolRegistry {
     let handle = Arc::new(Workspace::from_dir(ws.root()));
     ToolRegistry::new()
         .with(GrepTool {
@@ -166,7 +199,13 @@ fn build_registry(ws: &Workspace) -> ToolRegistry {
         .with(ReadFileTool {
             ws: Arc::clone(&handle),
         })
-        .with(ListDirTool { ws: handle })
+        .with(ListDirTool {
+            ws: Arc::clone(&handle),
+        })
+        .with(ReferencesTool {
+            ws: handle,
+            max_refs: cfg.blast_max_refs,
+        })
 }
 
 /// Review a PR agentically with a two-tier model split: a cheap `explore` model
@@ -205,8 +244,19 @@ pub async fn agentic_review(
         .filter(|c| !c.trim().is_empty())
         .map(|c| format!("\n\n## Structural context\n{c}"))
         .unwrap_or_default();
+    // Blast radius: precomputed callers + tests for each changed symbol, read from
+    // the clone. Fail-open — an empty string just omits the block. Built from the
+    // FULL `diff`, not `clipped`: blast_seed only enumerates the changed
+    // symbols/lines (it doesn't render the diff), so the safety clamp must not drop
+    // the blast radius for symbols in the truncated tail.
+    let blast = crate::blast::blast_seed(ws, diff, cfg);
+    let blast = if blast.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{blast}")
+    };
     let user = format!(
-        "Repository: {}\nPull request: #{}{}{omitted}{structural}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
+        "Repository: {}\nPull request: #{}{}{omitted}{structural}{blast}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
         meta.repo,
         meta.pr,
         meta.title.as_deref().map(|t| format!(" — {t}")).unwrap_or_default(),
@@ -255,7 +305,7 @@ pub async fn agentic_review(
         final_synthesis: true,
     };
 
-    let backend = ChatBackend::new(chat, Arc::new(build_registry(ws)), policy);
+    let backend = ChatBackend::new(chat, Arc::new(build_registry(ws, cfg)), policy);
     let outcome = backend
         .run(
             RunRequest {
@@ -453,7 +503,7 @@ mod tests {
         // Phase 1: cheap model, tools offered.
         assert_eq!(reqs[0]["model"], "explore/model");
         assert_eq!(reqs[0]["tool_choice"], "auto");
-        assert!(reqs[0]["tools"].as_array().unwrap().len() == 3);
+        assert!(reqs[0]["tools"].as_array().unwrap().len() == 4);
         assert_eq!(reqs[1]["model"], "explore/model");
 
         // Phase 2: strong model, tools forbidden.
@@ -794,13 +844,13 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_exposes_exactly_the_three_repo_tools() {
+    fn the_registry_exposes_exactly_the_repo_tools() {
         let (_d, ws) = workspace();
         // Sorted by agent-core; drift between schema and dispatch is now
         // structurally impossible (same map), so this just pins the surface.
         assert_eq!(
-            build_registry(&ws).names(),
-            vec!["grep", "list_dir", "read_file"]
+            build_registry(&ws, &Config::from_env()).names(),
+            vec!["grep", "list_dir", "read_file", "references"]
         );
     }
 }
