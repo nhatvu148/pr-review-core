@@ -39,11 +39,9 @@ pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
             }
         } else if let Some(path) = &cur_path {
             match line.chars().next() {
-                Some('+') => {
-                    map.entry(path.clone()).or_default().insert(new_line);
-                    new_line += 1;
-                }
-                Some(' ') => {
+                // Added ('+') and context (' ') lines both exist on the new side,
+                // so both are valid anchors and both advance the new-side counter.
+                Some('+') | Some(' ') => {
                     map.entry(path.clone()).or_default().insert(new_line);
                     new_line += 1;
                 }
