@@ -16,7 +16,9 @@ use std::collections::HashSet;
 use crate::config::Config;
 use crate::diff::parse_valid_lines;
 use crate::repo::Workspace;
-use crate::structure::{changed_symbols, diff_file_order};
+use crate::structure::{
+    changed_symbols, diff_file_order, is_js_family, references_in_source, RefKind,
+};
 
 /// A single call/reference site found for a symbol.
 struct Ref {
@@ -24,25 +26,29 @@ struct Ref {
     line: u64,
 }
 
-/// One changed symbol together with its discovered callers and tests.
+/// One changed symbol together with its discovered callers, tests, and type uses.
 struct SymbolBlast {
     label: &'static str,
     name: String,
     def_file: String,
     callers: Vec<Ref>,
     tests: Vec<Ref>,
+    /// Type-position references (`: T`, `Foo<T>`) — TS/TSX only.
+    types: Vec<Ref>,
     /// The clone-wide search hit its ceiling, so a bucket may be incomplete — an
     /// empty one must not be read as a real "no callers/tests" signal.
     capped: bool,
 }
 
-/// Result of a clone-wide call-site search, already split by bucket. Fetched with
-/// a generous ceiling ([`RAW_FETCH_CAP`]) so a heavily-called symbol's source
-/// callers can't crowd its tests out of the result window; buckets are truncated
-/// to `blast_max_refs` only at render time.
+/// Result of a clone-wide reference search, split by bucket. `callers` mixes plain
+/// calls and JSX renders (`<Comp/>`); `types` is type-position uses; `tests` is any
+/// reference living in a test file. Fetched with a generous ceiling
+/// ([`RAW_FETCH_CAP`]) so a heavily-used symbol's callers can't crowd its tests out
+/// of the result window; buckets are truncated to `blast_max_refs` at render time.
 struct CallSites {
     callers: Vec<Ref>,
     tests: Vec<Ref>,
+    types: Vec<Ref>,
     capped: bool,
 }
 
@@ -99,62 +105,115 @@ fn looks_like_definition(text: &str, name: &str) -> bool {
     false
 }
 
-/// Find call sites of `name` across the clone: grep `\bNAME\s*\(`, drop the
-/// symbol's own definition span (when `def` is given: `(file, start, end)`) and
-/// any line that is itself a definition of `name`. Deduplicated by `(path, line)`,
-/// split into caller/test buckets, and sorted for deterministic output.
+/// Find references to `name` across the clone, split into `callers` (calls + JSX
+/// renders), `tests` (any reference in a test file), and `types` (TS type
+/// positions). The symbol's own definition span (`def` = `(file, start, end)`) and
+/// self-definition lines are excluded. Deterministic (sorted + de-duplicated by
+/// `(path, line)` per bucket).
 ///
-/// The raw grep is fetched with a generous ceiling ([`RAW_FETCH_CAP`]) rather than
-/// a small combined cap, so a heavily-called symbol's source callers can't crowd
-/// its tests out of the result window (`ws.grep`'s walk order isn't sorted, so a
-/// small cap could return callers-only and read as "no tests → dead code"). If the
-/// fetch still hits the ceiling, [`CallSites::capped`] flags it. Fully fail-open —
-/// a bad regex or grep error yields empty buckets.
+/// Two engines, each with a grep sized to its own need so neither dilutes the
+/// other's [`RAW_FETCH_CAP`] window:
+/// - **Non-JS** (Rust/Go/Python/…): a narrow `\bNAME\s*\(` grep — every hit is
+///   already a call, so the cap is spent only on real calls (pre-JSX behaviour).
+/// - **JS/TS family** (`.ts/.tsx/.js/.jsx`): a broad `\bNAME\b` grep locates
+///   candidate *files*, each parsed once by [`references_in_source`] for precise
+///   JSX / type / call classification (JSX and type uses aren't call syntax, so
+///   the narrow grep can't see them).
+///
+/// Either grep hitting its ceiling sets [`CallSites::capped`] so an empty bucket
+/// isn't misread as absence. Fully fail-open — a bad regex or grep error yields
+/// empty buckets.
 fn call_sites(ws: &Workspace, name: &str, def: Option<(&str, u64, u64)>) -> CallSites {
     if name.is_empty() {
         return CallSites {
             callers: Vec::new(),
             tests: Vec::new(),
+            types: Vec::new(),
             capped: false,
         };
     }
-    let pattern = format!(r"\b{}\s*\(", regex::escape(name));
-    let raw = ws.grep(&pattern, RAW_FETCH_CAP).unwrap_or_default();
-    let capped = raw.len() >= RAW_FETCH_CAP;
+    let esc = regex::escape(name);
+    // Narrow call grep — the only source for non-JS files, so their candidate list
+    // keeps its full cap and pre-PR precision (no dilution by bare mentions).
+    let call_hits = ws
+        .grep(&format!(r"\b{esc}\s*\("), RAW_FETCH_CAP)
+        .unwrap_or_default();
+    // Broad mention grep — mined ONLY for JS-family file paths to AST-classify.
+    let mention_hits = ws
+        .grep(&format!(r"\b{esc}\b"), RAW_FETCH_CAP)
+        .unwrap_or_default();
+    let capped = call_hits.len() >= RAW_FETCH_CAP || mention_hits.len() >= RAW_FETCH_CAP;
 
-    let mut seen: HashSet<(String, u64)> = HashSet::new();
     let mut callers: Vec<Ref> = Vec::new();
     let mut tests: Vec<Ref> = Vec::new();
-    for hit in &raw {
+    let mut types: Vec<Ref> = Vec::new();
+    let in_def_span = |path: &str, line: u64| {
+        matches!(def, Some((df, s, e)) if path == df && line >= s && line <= e)
+    };
+
+    // JS-family: parse each distinct candidate file once, classify every reference.
+    let mut seen_js: HashSet<String> = HashSet::new();
+    for hit in &mention_hits {
+        let Some((path, _)) = parse_grep_hit(hit) else {
+            continue;
+        };
+        if !is_js_family(&path) || !seen_js.insert(path.clone()) {
+            continue;
+        }
+        let Ok(src) = ws.read_raw(&path) else { continue };
+        let is_test = is_test_path(&path);
+        for r in references_in_source(&path, &src, name) {
+            if in_def_span(&path, r.line) {
+                continue;
+            }
+            let bucket = if is_test {
+                &mut tests
+            } else if r.kind == RefKind::Type {
+                &mut types
+            } else {
+                &mut callers // Call | Jsx
+            };
+            bucket.push(Ref {
+                path: path.clone(),
+                line: r.line,
+            });
+        }
+    }
+
+    // Non-JS: every narrow-grep hit is already a `NAME(` call; drop only the
+    // definition span and lines that are themselves a definition of `name`.
+    for hit in &call_hits {
         let Some((path, line)) = parse_grep_hit(hit) else {
             continue;
         };
-        // Exclude the definition's own body span.
-        if let Some((df, s, e)) = def {
-            if path == df && line >= s && line <= e {
-                continue;
-            }
+        if is_js_family(&path) {
+            continue; // handled by the AST pass above
         }
-        // Exclude lines that are themselves a definition of the same name.
         let text = hit.splitn(3, ':').nth(2).unwrap_or("");
-        if looks_like_definition(text, name) {
+        if in_def_span(&path, line) || looks_like_definition(text, name) {
             continue;
         }
-        if seen.insert((path.clone(), line)) {
-            let bucket = if is_test_path(&path) {
-                &mut tests
-            } else {
-                &mut callers
-            };
-            bucket.push(Ref { path, line });
-        }
+        let bucket = if is_test_path(&path) {
+            &mut tests
+        } else {
+            &mut callers
+        };
+        bucket.push(Ref { path, line });
     }
-    let by_loc = |a: &Ref, b: &Ref| a.path.cmp(&b.path).then(a.line.cmp(&b.line));
-    callers.sort_by(&by_loc);
-    tests.sort_by(&by_loc);
+
+    // Sort + de-dup by (path, line): a line carrying two ref kinds (e.g. a Call and
+    // a Jsx to the same name) must list once, not twice.
+    let finish = |v: &mut Vec<Ref>| {
+        v.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+        v.dedup_by(|a, b| a.path == b.path && a.line == b.line);
+    };
+    finish(&mut callers);
+    finish(&mut tests);
+    finish(&mut types);
     CallSites {
         callers,
         tests,
+        types,
         capped,
     }
 }
@@ -191,6 +250,7 @@ fn compute(ws: &Workspace, diff: &str, cfg: &Config) -> Vec<SymbolBlast> {
                 def_file: path.clone(),
                 callers: cs.callers,
                 tests: cs.tests,
+                types: cs.types,
                 capped: cs.capped,
             });
         }
@@ -228,36 +288,36 @@ pub fn blast_seed(ws: &Workspace, diff: &str, cfg: &Config) -> String {
     }
 
     let mut s = String::from(
-        "## Blast radius\nPrecomputed call sites and tests for the definitions this PR changes \
-(candidate list from a clone-wide search — confirm with read_file). \
-\"no in-repo callers\" often means a new/public API, an entrypoint, or dead code.",
+        "## Blast radius\nPrecomputed references to the definitions this PR changes — callers \
+(calls + JSX `<Comp/>` renders), tests, and type uses (candidate list from a clone-wide \
+search; confirm with read_file). \"no in-repo callers\" often means a new/public API, an \
+entrypoint, or dead code.",
     );
     for b in &syms {
         s.push_str(&format!("\n- {} {} ({})", b.label, b.name, b.def_file));
-        if b.callers.is_empty() && b.tests.is_empty() {
+        if b.callers.is_empty() && b.tests.is_empty() && b.types.is_empty() {
             // Only claim "none found" when the search was exhaustive; a capped
             // search that returned nothing after filtering is inconclusive, not
             // evidence of dead code.
             s.push_str(if b.capped {
-                ": search capped — callers/tests could not be fully enumerated"
+                ": search capped — references could not be fully enumerated"
             } else {
-                ": no in-repo callers or tests found"
+                ": no in-repo callers, tests, or type uses found"
             });
             continue;
         }
-        if !b.callers.is_empty() {
-            s.push_str(&format!(
-                "\n    callers ({}): {}",
-                b.callers.len(),
-                render_refs(&b.callers, cfg.blast_max_refs)
-            ));
-        }
-        if !b.tests.is_empty() {
-            s.push_str(&format!(
-                "\n    tests ({}): {}",
-                b.tests.len(),
-                render_refs(&b.tests, cfg.blast_max_refs)
-            ));
+        for (label, refs) in [
+            ("callers", &b.callers),
+            ("tests", &b.tests),
+            ("type uses", &b.types),
+        ] {
+            if !refs.is_empty() {
+                s.push_str(&format!(
+                    "\n    {label} ({}): {}",
+                    refs.len(),
+                    render_refs(refs, cfg.blast_max_refs)
+                ));
+            }
         }
         // When the raw search was capped, an empty bucket may be truncation, not
         // absence — say so, so the model doesn't read "no tests" as a signal.
@@ -268,41 +328,37 @@ pub fn blast_seed(ws: &Workspace, diff: &str, cfg: &Config) -> String {
     s
 }
 
-/// Back the agent's `references` tool: call sites of `name` across the clone,
-/// split into callers and tests, as a compact text block the model can read.
-/// No definition span is known here (the model supplies a bare name), so only
-/// self-definition *lines* are filtered.
+/// Back the agent's `references` tool: references to `name` across the clone,
+/// split into callers (calls + JSX renders), tests, and type uses, as a compact
+/// text block the model can read. No definition span is known here (the model
+/// supplies a bare name), so only self-definition *lines* are filtered.
 pub fn references(ws: &Workspace, name: &str, max_refs: usize) -> String {
     let cs = call_sites(ws, name, None);
-    if cs.callers.is_empty() && cs.tests.is_empty() {
+    if cs.callers.is_empty() && cs.tests.is_empty() && cs.types.is_empty() {
         return if cs.capped {
-            format!("(search capped — could not enumerate call sites for `{name}`)")
+            format!("(search capped — could not enumerate references for `{name}`)")
         } else {
-            format!("(no call sites found for `{name}`)")
+            format!("(no references found for `{name}`)")
         };
     }
-    let mut s = String::new();
-    if !cs.callers.is_empty() {
-        s.push_str(&format!(
-            "callers ({}): {}",
-            cs.callers.len(),
-            render_refs(&cs.callers, max_refs)
-        ));
-    }
-    if !cs.tests.is_empty() {
-        if !s.is_empty() {
-            s.push('\n');
+    let mut lines: Vec<String> = Vec::new();
+    for (label, refs) in [
+        ("callers", &cs.callers),
+        ("tests", &cs.tests),
+        ("type uses", &cs.types),
+    ] {
+        if !refs.is_empty() {
+            lines.push(format!(
+                "{label} ({}): {}",
+                refs.len(),
+                render_refs(refs, max_refs)
+            ));
         }
-        s.push_str(&format!(
-            "tests ({}): {}",
-            cs.tests.len(),
-            render_refs(&cs.tests, max_refs)
-        ));
     }
     if cs.capped {
-        s.push_str("\n(search capped — list may be incomplete)");
+        lines.push("(search capped — list may be incomplete)".to_string());
     }
-    s
+    lines.join("\n")
 }
 
 #[cfg(test)]
@@ -441,6 +497,94 @@ diff --git a/src/orders.rs b/src/orders.rs
         let d = fixture();
         let ws = Workspace::from_dir(d.path());
         let out = references(&ws, "nonexistent_symbol_xyz", 8);
-        assert!(out.contains("no call sites"), "{out}");
+        assert!(out.contains("no references found"), "{out}");
+    }
+
+    // ----- TS/TSX: JSX renders + type uses (the #9 capability) -----
+
+    /// A tiny TSX repo: `Card` rendered as JSX, `Finding` used as a type, and
+    /// `analyze` called from a `.test.ts`.
+    fn ts_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        let w = |rel: &str, body: &str| fs::write(dir.path().join(rel), body).unwrap();
+        w("src/Card.tsx", "export function Card() {\n  return null;\n}\n");
+        w(
+            "src/App.tsx",
+            "import { Card } from './Card';\nexport function App() {\n  return <Card />;\n}\n",
+        );
+        w("src/types.ts", "export interface Finding {\n  id: string;\n}\n");
+        w(
+            "src/analyze.ts",
+            "import { Finding } from './types';\nexport function analyze(f: Finding): Finding {\n  return f;\n}\n",
+        );
+        w(
+            "src/analyze.test.ts",
+            "import { analyze } from './analyze';\ntest('runs', () => {\n  analyze({ id: '1' } as any);\n});\n",
+        );
+        dir
+    }
+
+    #[test]
+    fn references_finds_jsx_render_as_a_caller() {
+        let d = ts_fixture();
+        let ws = Workspace::from_dir(d.path());
+        // `<Card />` in App.tsx is a caller even though there's no `Card(` call.
+        let out = references(&ws, "Card", 8);
+        assert!(out.contains("callers"), "{out}");
+        assert!(out.contains("src/App.tsx"), "JSX render found: {out}");
+    }
+
+    #[test]
+    fn references_finds_type_uses_bucket() {
+        let d = ts_fixture();
+        let ws = Workspace::from_dir(d.path());
+        // `Finding` is used only in type positions — a call grep would miss it.
+        let out = references(&ws, "Finding", 8);
+        assert!(out.contains("type uses"), "type bucket present: {out}");
+        assert!(out.contains("src/analyze.ts"), "{out}");
+        assert!(!out.contains("callers ("), "no call sites for a pure type: {out}");
+    }
+
+    #[test]
+    fn call_sites_dedups_same_line_call_and_jsx() {
+        // A line that references `Card` as BOTH a JSX element and a call yields two
+        // SymbolRefs (different kinds); they must collapse to ONE caller entry.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/Card.tsx"),
+            "export function Card() { return null; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/use.tsx"),
+            "export const U = (c: boolean) => (c ? <Card /> : Card());\n",
+        )
+        .unwrap();
+        let ws = Workspace::from_dir(dir.path());
+        let out = references(&ws, "Card", 8);
+        assert_eq!(out.matches("src/use.tsx:1").count(), 1, "listed once: {out}");
+        assert!(out.contains("callers (1)"), "{out}");
+    }
+
+    #[test]
+    fn blast_seed_ts_splits_callers_and_tests() {
+        let d = ts_fixture();
+        let ws = Workspace::from_dir(d.path());
+        // A diff editing `analyze` (line 2 of analyze.ts, inside the function).
+        let diff = "\
+diff --git a/src/analyze.ts b/src/analyze.ts
+--- a/src/analyze.ts
++++ b/src/analyze.ts
+@@ -2,2 +2,2 @@ export function analyze(f: Finding): Finding {
+-  return f;
++  return f;
+";
+        let seed = blast_seed(&ws, diff, &cfg());
+        assert!(seed.contains("analyze"), "{seed}");
+        // The only in-repo call to analyze is in the test file → tests bucket.
+        assert!(seed.contains("tests ("), "{seed}");
+        assert!(seed.contains("src/analyze.test.ts"), "{seed}");
     }
 }
