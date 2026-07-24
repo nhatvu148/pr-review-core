@@ -13,8 +13,6 @@
 
 use std::collections::HashSet;
 
-use std::collections::HashMap;
-
 use crate::config::Config;
 use crate::diff::parse_valid_lines;
 use crate::repo::Workspace;
@@ -107,123 +105,111 @@ fn looks_like_definition(text: &str, name: &str) -> bool {
     false
 }
 
-/// Whether a grepped line contains an actual call `NAME(` (vs a bare mention like
-/// an import or comment). Used for the non-JS grep path.
-fn is_call_line(text: &str, name: &str) -> bool {
-    let mut rest = text;
-    while let Some(i) = rest.find(name) {
-        let after = &rest[i + name.len()..];
-        // A word boundary before, then optional whitespace, then `(`.
-        let before_ok = rest[..i]
-            .chars()
-            .next_back()
-            .map(|c| !c.is_alphanumeric() && c != '_')
-            .unwrap_or(true);
-        if before_ok && after.trim_start().starts_with('(') {
-            return true;
-        }
-        rest = after;
-    }
-    false
-}
-
 /// Find references to `name` across the clone, split into `callers` (calls + JSX
 /// renders), `tests` (any reference in a test file), and `types` (TS type
 /// positions). The symbol's own definition span (`def` = `(file, start, end)`) and
-/// self-definition lines are excluded. Deterministic (sorted by `(path, line)`).
+/// self-definition lines are excluded. Deterministic (sorted + de-duplicated by
+/// `(path, line)` per bucket).
 ///
-/// Two engines by file type:
-/// - **JS/TS family** (`.ts/.tsx/.js/.jsx`): tree-sitter classification via
-///   [`references_in_source`] — catches JSX `<Comp/>` and type uses that a call
-///   grep can't, and never mistakes a comment/string for a call.
-/// - **Everything else**: the grep line is kept only when it's an actual `NAME(`
-///   call (Rust/Go/Python behaviour, unchanged).
+/// Two engines, each with a grep sized to its own need so neither dilutes the
+/// other's [`RAW_FETCH_CAP`] window:
+/// - **Non-JS** (Rust/Go/Python/…): a narrow `\bNAME\s*\(` grep — every hit is
+///   already a call, so the cap is spent only on real calls (pre-JSX behaviour).
+/// - **JS/TS family** (`.ts/.tsx/.js/.jsx`): a broad `\bNAME\b` grep locates
+///   candidate *files*, each parsed once by [`references_in_source`] for precise
+///   JSX / type / call classification (JSX and type uses aren't call syntax, so
+///   the narrow grep can't see them).
 ///
-/// A broad `\bNAME\b` grep finds candidate lines/files under a generous ceiling
-/// ([`RAW_FETCH_CAP`]); overflow sets [`CallSites::capped`] so an empty bucket
+/// Either grep hitting its ceiling sets [`CallSites::capped`] so an empty bucket
 /// isn't misread as absence. Fully fail-open — a bad regex or grep error yields
 /// empty buckets.
 fn call_sites(ws: &Workspace, name: &str, def: Option<(&str, u64, u64)>) -> CallSites {
-    let empty = || CallSites {
-        callers: Vec::new(),
-        tests: Vec::new(),
-        types: Vec::new(),
-        capped: false,
-    };
     if name.is_empty() {
-        return empty();
-    }
-    let raw = ws
-        .grep(&format!(r"\b{}\b", regex::escape(name)), RAW_FETCH_CAP)
-        .unwrap_or_default();
-    let capped = raw.len() >= RAW_FETCH_CAP;
-
-    // Group grep hits by file, preserving first-seen order.
-    let mut files: Vec<String> = Vec::new();
-    let mut hits: HashMap<String, Vec<(u64, String)>> = HashMap::new();
-    for hit in &raw {
-        let Some((path, line)) = parse_grep_hit(hit) else {
-            continue;
+        return CallSites {
+            callers: Vec::new(),
+            tests: Vec::new(),
+            types: Vec::new(),
+            capped: false,
         };
-        let text = hit.splitn(3, ':').nth(2).unwrap_or("").to_string();
-        hits.entry(path.clone()).or_insert_with(|| {
-            files.push(path.clone());
-            Vec::new()
-        });
-        hits.get_mut(&path).unwrap().push((line, text));
     }
+    let esc = regex::escape(name);
+    // Narrow call grep — the only source for non-JS files, so their candidate list
+    // keeps its full cap and pre-PR precision (no dilution by bare mentions).
+    let call_hits = ws
+        .grep(&format!(r"\b{esc}\s*\("), RAW_FETCH_CAP)
+        .unwrap_or_default();
+    // Broad mention grep — mined ONLY for JS-family file paths to AST-classify.
+    let mention_hits = ws
+        .grep(&format!(r"\b{esc}\b"), RAW_FETCH_CAP)
+        .unwrap_or_default();
+    let capped = call_hits.len() >= RAW_FETCH_CAP || mention_hits.len() >= RAW_FETCH_CAP;
 
     let mut callers: Vec<Ref> = Vec::new();
     let mut tests: Vec<Ref> = Vec::new();
     let mut types: Vec<Ref> = Vec::new();
-    // Excludes the definition's own body span for a hit in the definition file.
     let in_def_span = |path: &str, line: u64| {
         matches!(def, Some((df, s, e)) if path == df && line >= s && line <= e)
     };
 
-    for path in &files {
-        let is_test = is_test_path(path);
-        if is_js_family(path) {
-            // Tree-sitter: one parse of the whole file, precise classification.
-            let Ok(src) = ws.read_raw(path) else { continue };
-            for r in references_in_source(path, &src, name) {
-                if in_def_span(path, r.line) {
-                    continue;
-                }
-                let bucket = if is_test {
-                    &mut tests
-                } else if r.kind == RefKind::Type {
-                    &mut types
-                } else {
-                    &mut callers // Call | Jsx
-                };
-                bucket.push(Ref {
-                    path: path.clone(),
-                    line: r.line,
-                });
+    // JS-family: parse each distinct candidate file once, classify every reference.
+    let mut seen_js: HashSet<String> = HashSet::new();
+    for hit in &mention_hits {
+        let Some((path, _)) = parse_grep_hit(hit) else {
+            continue;
+        };
+        if !is_js_family(&path) || !seen_js.insert(path.clone()) {
+            continue;
+        }
+        let Ok(src) = ws.read_raw(&path) else { continue };
+        let is_test = is_test_path(&path);
+        for r in references_in_source(&path, &src, name) {
+            if in_def_span(&path, r.line) {
+                continue;
             }
-        } else {
-            // Non-JS: keep only genuine `NAME(` calls, minus definitions.
-            for (line, text) in &hits[path] {
-                if in_def_span(path, *line)
-                    || looks_like_definition(text, name)
-                    || !is_call_line(text, name)
-                {
-                    continue;
-                }
-                let bucket = if is_test { &mut tests } else { &mut callers };
-                bucket.push(Ref {
-                    path: path.clone(),
-                    line: *line,
-                });
-            }
+            let bucket = if is_test {
+                &mut tests
+            } else if r.kind == RefKind::Type {
+                &mut types
+            } else {
+                &mut callers // Call | Jsx
+            };
+            bucket.push(Ref {
+                path: path.clone(),
+                line: r.line,
+            });
         }
     }
 
-    let by_loc = |a: &Ref, b: &Ref| a.path.cmp(&b.path).then(a.line.cmp(&b.line));
-    callers.sort_by(&by_loc);
-    tests.sort_by(&by_loc);
-    types.sort_by(&by_loc);
+    // Non-JS: every narrow-grep hit is already a `NAME(` call; drop only the
+    // definition span and lines that are themselves a definition of `name`.
+    for hit in &call_hits {
+        let Some((path, line)) = parse_grep_hit(hit) else {
+            continue;
+        };
+        if is_js_family(&path) {
+            continue; // handled by the AST pass above
+        }
+        let text = hit.splitn(3, ':').nth(2).unwrap_or("");
+        if in_def_span(&path, line) || looks_like_definition(text, name) {
+            continue;
+        }
+        let bucket = if is_test_path(&path) {
+            &mut tests
+        } else {
+            &mut callers
+        };
+        bucket.push(Ref { path, line });
+    }
+
+    // Sort + de-dup by (path, line): a line carrying two ref kinds (e.g. a Call and
+    // a Jsx to the same name) must list once, not twice.
+    let finish = |v: &mut Vec<Ref>| {
+        v.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
+        v.dedup_by(|a, b| a.path == b.path && a.line == b.line);
+    };
+    finish(&mut callers);
+    finish(&mut tests);
+    finish(&mut types);
     CallSites {
         callers,
         tests,
@@ -558,6 +544,28 @@ diff --git a/src/orders.rs b/src/orders.rs
         assert!(out.contains("type uses"), "type bucket present: {out}");
         assert!(out.contains("src/analyze.ts"), "{out}");
         assert!(!out.contains("callers ("), "no call sites for a pure type: {out}");
+    }
+
+    #[test]
+    fn call_sites_dedups_same_line_call_and_jsx() {
+        // A line that references `Card` as BOTH a JSX element and a call yields two
+        // SymbolRefs (different kinds); they must collapse to ONE caller entry.
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/Card.tsx"),
+            "export function Card() { return null; }\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("src/use.tsx"),
+            "export const U = (c: boolean) => (c ? <Card /> : Card());\n",
+        )
+        .unwrap();
+        let ws = Workspace::from_dir(dir.path());
+        let out = references(&ws, "Card", 8);
+        assert_eq!(out.matches("src/use.tsx:1").count(), 1, "listed once: {out}");
+        assert!(out.contains("callers (1)"), "{out}");
     }
 
     #[test]
