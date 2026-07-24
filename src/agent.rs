@@ -193,7 +193,10 @@ pub async fn agentic_review(
     // Blast radius: precomputed callers + tests for each changed symbol, read from
     // the clone. Fail-open — an empty string just omits the block. This is the
     // agentic-only enhancement; the diff-only path has no clone to search.
-    let blast = crate::blast::blast_seed(ws, &clipped, cfg);
+    // Built from the FULL `diff`, not `clipped`: blast_seed only enumerates the
+    // changed symbols/lines (it doesn't render the diff), so the safety-clamp
+    // truncation must not drop the blast radius for symbols in the tail.
+    let blast = crate::blast::blast_seed(ws, diff, cfg);
     let blast = if blast.is_empty() {
         String::new()
     } else {

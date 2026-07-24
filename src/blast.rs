@@ -22,8 +22,6 @@ use crate::structure::{changed_symbols, diff_file_order};
 struct Ref {
     path: String,
     line: u64,
-    /// True when `path` looks like a test file (see [`is_test_path`]).
-    is_test: bool,
 }
 
 /// One changed symbol together with its discovered callers and tests.
@@ -33,7 +31,25 @@ struct SymbolBlast {
     def_file: String,
     callers: Vec<Ref>,
     tests: Vec<Ref>,
+    /// The clone-wide search hit its ceiling, so a bucket may be incomplete — an
+    /// empty one must not be read as a real "no callers/tests" signal.
+    capped: bool,
 }
+
+/// Result of a clone-wide call-site search, already split by bucket. Fetched with
+/// a generous ceiling ([`RAW_FETCH_CAP`]) so a heavily-called symbol's source
+/// callers can't crowd its tests out of the result window; buckets are truncated
+/// to `blast_max_refs` only at render time.
+struct CallSites {
+    callers: Vec<Ref>,
+    tests: Vec<Ref>,
+    capped: bool,
+}
+
+/// Ceiling on raw grep hits fetched per symbol. Far above the per-bucket display
+/// cap (`blast_max_refs`, default 8) so both buckets are reached in practice; the
+/// pathological overflow past this is flagged via [`CallSites::capped`].
+const RAW_FETCH_CAP: usize = 600;
 
 /// Heuristic: does this path look like a test file? Covers the common conventions
 /// across Rust/TS/JS/Python/Go (dir-based and filename-based).
@@ -85,19 +101,30 @@ fn looks_like_definition(text: &str, name: &str) -> bool {
 
 /// Find call sites of `name` across the clone: grep `\bNAME\s*\(`, drop the
 /// symbol's own definition span (when `def` is given: `(file, start, end)`) and
-/// any line that is itself a definition of `name`. Deduplicated by `(path, line)`
-/// and sorted for deterministic output. Fully fail-open — a bad regex or grep
-/// error yields an empty vec.
-fn call_sites(ws: &Workspace, name: &str, def: Option<(&str, u64, u64)>, max: usize) -> Vec<Ref> {
+/// any line that is itself a definition of `name`. Deduplicated by `(path, line)`,
+/// split into caller/test buckets, and sorted for deterministic output.
+///
+/// The raw grep is fetched with a generous ceiling ([`RAW_FETCH_CAP`]) rather than
+/// a small combined cap, so a heavily-called symbol's source callers can't crowd
+/// its tests out of the result window (`ws.grep`'s walk order isn't sorted, so a
+/// small cap could return callers-only and read as "no tests → dead code"). If the
+/// fetch still hits the ceiling, [`CallSites::capped`] flags it. Fully fail-open —
+/// a bad regex or grep error yields empty buckets.
+fn call_sites(ws: &Workspace, name: &str, def: Option<(&str, u64, u64)>) -> CallSites {
     if name.is_empty() {
-        return Vec::new();
+        return CallSites {
+            callers: Vec::new(),
+            tests: Vec::new(),
+            capped: false,
+        };
     }
     let pattern = format!(r"\b{}\s*\(", regex::escape(name));
-    // Over-fetch so definition/self filtering still leaves room up to `max`.
-    let raw = ws.grep(&pattern, max.saturating_mul(6).clamp(30, 400)).unwrap_or_default();
+    let raw = ws.grep(&pattern, RAW_FETCH_CAP).unwrap_or_default();
+    let capped = raw.len() >= RAW_FETCH_CAP;
 
     let mut seen: HashSet<(String, u64)> = HashSet::new();
-    let mut out: Vec<Ref> = Vec::new();
+    let mut callers: Vec<Ref> = Vec::new();
+    let mut tests: Vec<Ref> = Vec::new();
     for hit in &raw {
         let Some((path, line)) = parse_grep_hit(hit) else {
             continue;
@@ -114,15 +141,22 @@ fn call_sites(ws: &Workspace, name: &str, def: Option<(&str, u64, u64)>, max: us
             continue;
         }
         if seen.insert((path.clone(), line)) {
-            out.push(Ref {
-                is_test: is_test_path(&path),
-                path,
-                line,
-            });
+            let bucket = if is_test_path(&path) {
+                &mut tests
+            } else {
+                &mut callers
+            };
+            bucket.push(Ref { path, line });
         }
     }
-    out.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-    out
+    let by_loc = |a: &Ref, b: &Ref| a.path.cmp(&b.path).then(a.line.cmp(&b.line));
+    callers.sort_by(&by_loc);
+    tests.sort_by(&by_loc);
+    CallSites {
+        callers,
+        tests,
+        capped,
+    }
 }
 
 /// Compute the blast radius for every changed symbol in the diff, using files
@@ -150,19 +184,14 @@ fn compute(ws: &Workspace, diff: &str, cfg: &Config) -> Vec<SymbolBlast> {
             if !seen.insert((path.clone(), sym.name.clone())) {
                 continue;
             }
-            let all = call_sites(
-                ws,
-                &sym.name,
-                Some((&path, sym.start, sym.end)),
-                cfg.blast_max_refs,
-            );
-            let (tests, callers): (Vec<Ref>, Vec<Ref>) = all.into_iter().partition(|r| r.is_test);
+            let cs = call_sites(ws, &sym.name, Some((&path, sym.start, sym.end)));
             out.push(SymbolBlast {
                 label: sym.label,
                 name: sym.name,
                 def_file: path.clone(),
-                callers,
-                tests,
+                callers: cs.callers,
+                tests: cs.tests,
+                capped: cs.capped,
             });
         }
     }
@@ -206,7 +235,14 @@ pub fn blast_seed(ws: &Workspace, diff: &str, cfg: &Config) -> String {
     for b in &syms {
         s.push_str(&format!("\n- {} {} ({})", b.label, b.name, b.def_file));
         if b.callers.is_empty() && b.tests.is_empty() {
-            s.push_str(": no in-repo callers or tests found");
+            // Only claim "none found" when the search was exhaustive; a capped
+            // search that returned nothing after filtering is inconclusive, not
+            // evidence of dead code.
+            s.push_str(if b.capped {
+                ": search capped — callers/tests could not be fully enumerated"
+            } else {
+                ": no in-repo callers or tests found"
+            });
             continue;
         }
         if !b.callers.is_empty() {
@@ -223,6 +259,11 @@ pub fn blast_seed(ws: &Workspace, diff: &str, cfg: &Config) -> String {
                 render_refs(&b.tests, cfg.blast_max_refs)
             ));
         }
+        // When the raw search was capped, an empty bucket may be truncation, not
+        // absence — say so, so the model doesn't read "no tests" as a signal.
+        if b.capped {
+            s.push_str("\n    (search capped — a missing bucket may be incomplete, not absent)");
+        }
     }
     s
 }
@@ -232,28 +273,34 @@ pub fn blast_seed(ws: &Workspace, diff: &str, cfg: &Config) -> String {
 /// No definition span is known here (the model supplies a bare name), so only
 /// self-definition *lines* are filtered.
 pub fn references(ws: &Workspace, name: &str, cfg: &Config) -> String {
-    let all = call_sites(ws, name, None, cfg.blast_max_refs);
-    if all.is_empty() {
-        return format!("(no call sites found for `{name}`)");
+    let cs = call_sites(ws, name, None);
+    if cs.callers.is_empty() && cs.tests.is_empty() {
+        return if cs.capped {
+            format!("(search capped — could not enumerate call sites for `{name}`)")
+        } else {
+            format!("(no call sites found for `{name}`)")
+        };
     }
-    let (tests, callers): (Vec<Ref>, Vec<Ref>) = all.into_iter().partition(|r| r.is_test);
     let mut s = String::new();
-    if !callers.is_empty() {
+    if !cs.callers.is_empty() {
         s.push_str(&format!(
             "callers ({}): {}",
-            callers.len(),
-            render_refs(&callers, cfg.blast_max_refs)
+            cs.callers.len(),
+            render_refs(&cs.callers, cfg.blast_max_refs)
         ));
     }
-    if !tests.is_empty() {
+    if !cs.tests.is_empty() {
         if !s.is_empty() {
             s.push('\n');
         }
         s.push_str(&format!(
             "tests ({}): {}",
-            tests.len(),
-            render_refs(&tests, cfg.blast_max_refs)
+            cs.tests.len(),
+            render_refs(&cs.tests, cfg.blast_max_refs)
         ));
+    }
+    if cs.capped {
+        s.push_str("\n(search capped — list may be incomplete)");
     }
     s
 }
@@ -335,17 +382,26 @@ diff --git a/src/orders.rs b/src/orders.rs
         let d = fixture();
         let ws = Workspace::from_dir(d.path());
         // Exclude the definition span in orders.rs (lines 1..=3).
-        let refs = call_sites(&ws, "process", Some(("src/orders.rs", 1, 3)), 8);
-        let paths: Vec<&str> = refs.iter().map(|r| r.path.as_str()).collect();
-        assert!(paths.contains(&"src/handler.rs"), "caller found: {paths:?}");
-        assert!(paths.contains(&"tests/orders_test.rs"), "test found: {paths:?}");
-        // The definition line itself must not appear as a caller.
+        let cs = call_sites(&ws, "process", Some(("src/orders.rs", 1, 3)));
+        // The caller lands in the callers bucket, the test in the tests bucket —
+        // buckets are populated independently so one can't crowd out the other.
         assert!(
-            !refs.iter().any(|r| r.path == "src/orders.rs"),
+            cs.callers.iter().any(|r| r.path == "src/handler.rs"),
+            "caller found: {:?}",
+            cs.callers.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+        assert!(
+            cs.tests.iter().any(|r| r.path == "tests/orders_test.rs"),
+            "test found: {:?}",
+            cs.tests.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+        // The definition line itself must not appear in either bucket.
+        assert!(
+            !cs.callers.iter().chain(cs.tests.iter()).any(|r| r.path == "src/orders.rs"),
             "definition excluded"
         );
-        // Test file is classified as a test.
-        assert!(refs.iter().find(|r| r.path.contains("orders_test")).unwrap().is_test);
+        // A small fixture never hits the fetch ceiling.
+        assert!(!cs.capped);
     }
 
     #[test]
