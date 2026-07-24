@@ -272,7 +272,7 @@ pub fn blast_seed(ws: &Workspace, diff: &str, cfg: &Config) -> String {
 /// split into callers and tests, as a compact text block the model can read.
 /// No definition span is known here (the model supplies a bare name), so only
 /// self-definition *lines* are filtered.
-pub fn references(ws: &Workspace, name: &str, cfg: &Config) -> String {
+pub fn references(ws: &Workspace, name: &str, max_refs: usize) -> String {
     let cs = call_sites(ws, name, None);
     if cs.callers.is_empty() && cs.tests.is_empty() {
         return if cs.capped {
@@ -286,7 +286,7 @@ pub fn references(ws: &Workspace, name: &str, cfg: &Config) -> String {
         s.push_str(&format!(
             "callers ({}): {}",
             cs.callers.len(),
-            render_refs(&cs.callers, cfg.blast_max_refs)
+            render_refs(&cs.callers, max_refs)
         ));
     }
     if !cs.tests.is_empty() {
@@ -296,7 +296,7 @@ pub fn references(ws: &Workspace, name: &str, cfg: &Config) -> String {
         s.push_str(&format!(
             "tests ({}): {}",
             cs.tests.len(),
-            render_refs(&cs.tests, cfg.blast_max_refs)
+            render_refs(&cs.tests, max_refs)
         ));
     }
     if cs.capped {
@@ -430,7 +430,7 @@ diff --git a/src/orders.rs b/src/orders.rs
     fn references_tool_reports_buckets() {
         let d = fixture();
         let ws = Workspace::from_dir(d.path());
-        let out = references(&ws, "process", &cfg());
+        let out = references(&ws, "process", 8);
         assert!(out.contains("callers"), "{out}");
         assert!(out.contains("tests"), "{out}");
         assert!(out.contains("src/handler.rs:2"), "{out}");
@@ -440,7 +440,7 @@ diff --git a/src/orders.rs b/src/orders.rs
     fn references_tool_reports_nothing_for_unknown() {
         let d = fixture();
         let ws = Workspace::from_dir(d.path());
-        let out = references(&ws, "nonexistent_symbol_xyz", &cfg());
+        let out = references(&ws, "nonexistent_symbol_xyz", 8);
         assert!(out.contains("no call sites"), "{out}");
     }
 }
