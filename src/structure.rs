@@ -290,6 +290,38 @@ fn symbols_for_file(lang: Lang, source: &str, changed: &HashSet<u64>) -> Vec<Sym
     out
 }
 
+/// A definition a PR changed, exposed for cross-file analysis (see
+/// [`crate::blast`]). The `&'static str` label mirrors [`Sym::label`].
+pub(crate) struct ChangedSymbol {
+    pub label: &'static str,
+    pub name: String,
+    pub start: u64,
+    pub end: u64,
+}
+
+/// The smallest enclosing named definitions of `changed` lines in `source`, keyed
+/// by `path`'s language. Returns an empty vec for an unsupported language or any
+/// parse failure — the tree-sitter wrapper [`crate::blast`] builds a blast radius
+/// on. Reuses the exact enclosing-definition logic Tier B renders for the prompt.
+pub(crate) fn changed_symbols(
+    path: &str,
+    source: &str,
+    changed: &HashSet<u64>,
+) -> Vec<ChangedSymbol> {
+    let Some(lang) = language_for_path(path) else {
+        return Vec::new();
+    };
+    symbols_for_file(lang, source, changed)
+        .into_iter()
+        .map(|s| ChangedSymbol {
+            label: s.label,
+            name: s.name,
+            start: s.start,
+            end: s.end,
+        })
+        .collect()
+}
+
 /// Render one file's resolved symbols as a `Changed symbols:` block entry.
 fn format_symbols(path: &str, syms: &[Sym]) -> String {
     let parts: Vec<String> = syms
@@ -306,7 +338,7 @@ fn format_symbols(path: &str, syms: &[Sym]) -> String {
 
 /// Ordered, de-duplicated list of new-side file paths in the diff (empty/preamble
 /// sections dropped), preserving first-appearance order.
-fn diff_file_order(diff: &str) -> Vec<String> {
+pub(crate) fn diff_file_order(diff: &str) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut order: Vec<String> = Vec::new();
     for (path, _) in split_diff_sections(diff) {

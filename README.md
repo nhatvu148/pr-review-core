@@ -34,6 +34,11 @@ prompt through [`Config`].
 - **Structural context**: tree-sitter identifies which functions/symbols each
   change belongs to (Rust/TS/TSX/JS/Python/Go), computed locally without a clone,
   with a git hunk-header fallback.
+- **Blast radius** (agentic path): from the clone, precomputes the callers and
+  tests of each changed symbol and seeds the reviewer with them (plus a
+  `references(symbol)` tool), so it catches cross-file breakage — a changed
+  function whose caller or test still expects the old shape — without hand-rolling
+  greps. Fail-open; tune with `BLAST_RADIUS` / `BLAST_MAX_SYMBOLS` / `BLAST_MAX_REFS`.
 - **Smart diff packing**: on large PRs, whole files are ranked (source > tests >
   docs) and packed to the budget instead of blunt truncation; omitted files are
   named to the model.
