@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.0
+
+**Blast radius** — the agentic reviewer is now seeded with each changed symbol's
+callers, tests, and type uses, computed locally from the clone, so it catches
+cross-file breakage without hand-rolling greps to rediscover them.
+
+- New `blast` module: for every changed symbol, a clone-wide search finds its
+  **callers**, **tests**, and (TS/TSX) **type uses**, rendered as a `## Blast
+  radius` block injected into the agentic prompt. Also exposes a
+  `references(symbol)` tool. Fully fail-open; tune with `BLAST_RADIUS`,
+  `BLAST_MAX_SYMBOLS`, and `BLAST_MAX_REFS`.
+- **TS/TSX precision**: references are classified with tree-sitter, so JSX renders
+  (`<Comp/>`, `<Ns.Comp/>`) count as callers and type positions (`: T`, `Foo<T>`,
+  return types) populate a dedicated "type uses" bucket — references a `name(`
+  call grep can't see. Rust/Go/Python keep the grep call path.
+- Non-JS caller discovery uses a narrow `NAME(` grep (undiluted fetch budget);
+  JS-family files are located by a broad grep and AST-classified. Buckets are
+  de-duplicated by `(path, line)`, and a capped clone-wide search is flagged so an
+  empty bucket is never misread as "no callers".
+
 ## 0.7.0
 
 Migrated the agentic reviewer onto the shared [`agent-loop-core`](https://crates.io/crates/agent-loop-core) crate, and **fixed a live bug**: the agentic path built its HTTP client with no timeout, so a stalled provider hung the entire review and a single 429 discarded it.
