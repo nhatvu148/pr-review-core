@@ -410,19 +410,6 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> (String, Vec<String>
 /// assert_eq!(dropped, vec!["Cargo.lock".to_string()]);
 /// assert!(kept.contains("src/a.rs") && !kept.contains("Cargo.lock"));
 /// ```
-/// Whether a single `path` passes the include/exclude glob filters — the per-path
-/// equivalent of [`filter_diff_by_globs`], for callers that hold one path rather
-/// than a diff (e.g. the `/review-file` command). Fails **open**: an invalid glob
-/// in either set means "allow" rather than silently blocking the review.
-#[must_use]
-pub fn path_matches_globs(path: &str, include: &[String], exclude: &[String]) -> bool {
-    let (include_set, exclude_set) = match (build_globset(include), build_globset(exclude)) {
-        (Some(i), Some(e)) => (i, e),
-        _ => return true,
-    };
-    (include.is_empty() || include_set.is_match(path)) && !exclude_set.is_match(path)
-}
-
 pub fn filter_diff_by_globs(
     diff: &str,
     include: &[String],
@@ -455,6 +442,19 @@ pub fn filter_diff_by_globs(
     }
 
     (out, dropped)
+}
+
+/// Whether a single `path` passes the include/exclude glob filters — the per-path
+/// equivalent of [`filter_diff_by_globs`], for callers that hold one path rather
+/// than a diff (e.g. the `/review-file` command). Fails **open**: an invalid glob
+/// in either set means "allow" rather than silently blocking the review.
+#[must_use]
+pub fn path_matches_globs(path: &str, include: &[String], exclude: &[String]) -> bool {
+    let (include_set, exclude_set) = match (build_globset(include), build_globset(exclude)) {
+        (Some(i), Some(e)) => (i, e),
+        _ => return true,
+    };
+    (include.is_empty() || include_set.is_match(path)) && !exclude_set.is_match(path)
 }
 
 #[cfg(test)]
