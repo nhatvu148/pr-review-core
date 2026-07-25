@@ -36,11 +36,14 @@ prompt through [`Config`].
   with a git hunk-header fallback.
 - **Blast radius** (agentic path): from the clone, precomputes the callers, tests,
   and type uses of each changed symbol and seeds the reviewer with them (plus a
-  `references(symbol)` tool), so it catches cross-file breakage — a changed
-  function whose caller or test still expects the old shape — without hand-rolling
-  greps. For TS/TSX it uses tree-sitter, so **JSX renders (`<Comp/>`) and type
-  positions (`: T`, `Foo<T>`)** count as references, not just `name(` calls.
-  Fail-open; tune with `BLAST_RADIUS` / `BLAST_MAX_SYMBOLS` / `BLAST_MAX_REFS`.
+  `references(symbol)` tool), so it doesn't have to rediscover them by hand. For
+  TS/TSX it uses tree-sitter, so **JSX renders (`<Comp/>`) and type positions
+  (`: T`, `Foo<T>`)** count as references, not just `name(` calls. Fail-open; tune
+  with `BLAST_RADIUS` / `BLAST_MAX_SYMBOLS` / `BLAST_MAX_REFS`.
+  _Measured note: on typical, well-named repos this showed **no recall improvement**
+  in benchmarking (a capable model already infers cross-file breakage from the diff
+  via names/types/docs); it may still help on large monorepos or poorly-named code.
+  On by default — measure on your repos before relying on it._
 - **Complexity metrics**: deterministic cyclomatic + cognitive complexity (with an
   A–F grade) for the functions a change touches, computed with tree-sitter from the
   files already fetched for structural context — no LLM, no extra fetch. Only
