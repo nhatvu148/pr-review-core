@@ -9,7 +9,7 @@ use crate::clip;
 use crate::config::{require, Config};
 use crate::prompt::{
     build_user_prompt, ASK_SYSTEM_PROMPT, CRITIQUE_SYSTEM_PROMPT, DESCRIBE_SYSTEM_PROMPT,
-    SYSTEM_PROMPT,
+    FILE_REVIEW_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
 use crate::providers::PrMeta;
 
@@ -412,4 +412,46 @@ pub async fn describe_pr(
     let truncated = diff.chars().count() > cfg.max_diff_chars;
     let user = build_user_prompt(meta, &clipped, truncated, None, structural_context);
     backend.complete(cfg, DESCRIBE_SYSTEM_PROMPT, &user).await
+}
+
+/// Deep-review an ENTIRE file (the `/review-file` command): number the file's
+/// lines, ask the model for the structured review JSON, and parse it. Findings may
+/// anchor to any line in the file (not just diff lines).
+///
+/// # Errors
+/// On a backend failure, or if the model doesn't return a parseable review.
+pub async fn review_file(
+    cfg: &Config,
+    backend: &dyn crate::backend::ReviewBackend,
+    path: &str,
+    content: &str,
+) -> Result<Review> {
+    // 1-index the lines so the model can anchor findings to real line numbers.
+    let numbered: String = content
+        .lines()
+        .enumerate()
+        .map(|(i, l)| format!("{}: {l}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let clipped: String = numbered.chars().take(cfg.max_diff_chars).collect();
+    let truncated = numbered.chars().count() > cfg.max_diff_chars;
+    let user = format!(
+        "File: {path}{}\n\n{clipped}",
+        if truncated {
+            "\n[NOTE: file truncated to the size limit — review what is shown]"
+        } else {
+            ""
+        }
+    );
+    let system = if cfg.extra_system_prompt.is_empty() {
+        FILE_REVIEW_SYSTEM_PROMPT.to_string()
+    } else {
+        format!("{FILE_REVIEW_SYSTEM_PROMPT}\n{}", cfg.extra_system_prompt)
+    };
+    let raw = backend.complete(cfg, &system, &user).await?;
+    let json = extract_json(&raw)
+        .ok_or_else(|| anyhow::anyhow!("file review returned no JSON: {}", clip(&raw, 300)))?;
+    let review: Review = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("could not parse file review ({e}): {}", clip(json, 300)))?;
+    Ok(review)
 }

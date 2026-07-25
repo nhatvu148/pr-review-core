@@ -174,11 +174,14 @@ pub async fn get_file_contents(
     r#ref: &str,
     path: &str,
 ) -> Result<Option<String>> {
-    let git_ref = r#ref;
+    // Encode ref + path (slashes preserved) so a caller-supplied path can't inject
+    // a query/fragment and change which ref/file is fetched.
     let res = client
         .get(format!(
-            "{}/repositories/{repo}/src/{git_ref}/{path}",
-            cfg.bitbucket_api_base
+            "{}/repositories/{repo}/src/{}/{}",
+            cfg.bitbucket_api_base,
+            super::github::enc_path(r#ref),
+            super::github::enc_path(path)
         ))
         .header(reqwest::header::AUTHORIZATION, auth_header(cfg)?)
         .send()

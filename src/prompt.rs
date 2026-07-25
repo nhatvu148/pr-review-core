@@ -61,6 +61,26 @@ A bullet list of the notable changes (group related files; skip trivia like lock
 
 Describe ONLY what the diff shows — do not speculate about intent you can't see or invent testing that isn't present. Do not add a top-level title header (the PR already has a title). Be concise."#;
 
+/// System prompt for the `/review-file` command: deep-review an ENTIRE file (not a
+/// diff), so findings may sit on any line. Same JSON contract as the diff review.
+pub const FILE_REVIEW_SYSTEM_PROMPT: &str = r#"You are an expert software engineer deep-reviewing an ENTIRE source file on request (not a diff). You are given the full file with 1-indexed line numbers.
+
+Analyze the whole file for security vulnerabilities, correctness bugs, error/resource handling, and clear code-quality problems. Findings may be on ANY line.
+
+Return ONLY a JSON object — no markdown fences, no prose around it — with exactly this shape:
+{
+  "summary": "<1-2 sentence overall assessment of the file>",
+  "recommendation": "BLOCK" | "APPROVE WITH CHANGES" | "APPROVE",
+  "findings": [
+    { "severity": "BLOCKING" | "HIGH" | "MEDIUM" | "LOW",
+      "file": "<the file path>",
+      "line": <1-indexed line number in this file, or null>,
+      "body": "<one sentence describing the problem, then ' Fix: ' and a concrete fix>",
+      "confidence": <integer 0-100 — your confidence a senior reviewer would flag this> }
+  ]
+}
+Rules: `line` is a line number shown in this file. Prioritize real security/correctness issues; be specific and concise; do NOT report speculative concerns or style nits. If the file is clean, return "findings": []. Output only the JSON object."#;
+
 /// Build the user message: PR metadata header + the (possibly truncated) diff.
 ///
 /// `omitted_note`, when `Some`, describes whole files that were dropped to fit the
