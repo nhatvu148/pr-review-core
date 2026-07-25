@@ -28,7 +28,10 @@ prompt through [`Config`].
 - Provider-agnostic review flow (`review::run_review`) across GitHub, GitLab, and
   Bitbucket.
 - Structured JSON review from the model, anchored to diff lines that the provider
-  will accept (out-of-diff findings fold into the summary).
+  will accept (out-of-diff findings fold into the summary). A finding that just
+  missed a diff line (model off-by-a-few / drift) is **re-anchored** to a nearby
+  diff line when that line's code matches what the finding references, so small
+  drift still posts inline instead of the summary (`REANCHOR_FINDINGS`).
 - Optional agentic reviewer with a two-tier model split (cheap explore model +
   stronger synthesis model).
 - **Structural context**: tree-sitter identifies which functions/symbols each

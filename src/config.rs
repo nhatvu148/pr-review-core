@@ -63,6 +63,12 @@ pub struct Config {
     /// Hard cap on the number of findings posted (after sorting by severity).
     pub max_findings: usize,
 
+    /// Re-anchor a finding whose `line` just missed a real diff line: snap it to
+    /// the nearest diff line within a small window when that line's code matches
+    /// what the finding references, so a small drift posts inline instead of
+    /// folding into the summary. Conservative + fail-open.
+    pub reanchor_findings: bool,
+
     /// Use the agentic reviewer: clone the repo and let the model investigate
     /// cross-file context with tools, instead of a single diff-only call.
     pub agentic: bool,
@@ -206,6 +212,7 @@ impl Config {
             self_critique: env_or("SELF_CRITIQUE", "true").parse().unwrap_or(true),
             min_confidence: env_or("MIN_CONFIDENCE", "0").parse().unwrap_or(0),
             max_findings: env_or("MAX_FINDINGS", "20").parse().unwrap_or(20),
+            reanchor_findings: env_or("REANCHOR_FINDINGS", "true").parse().unwrap_or(true),
 
             agentic: env_or("AGENTIC", "false").parse().unwrap_or(false),
             max_turns: env_or("MAX_TURNS", "6").parse().unwrap_or(6),

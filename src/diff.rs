@@ -55,6 +55,37 @@ pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
     map
 }
 
+/// Map each new-side file path to `{ line number -> line text }` (added or context
+/// lines, the leading `+`/space stripped), for the new version of the file. The
+/// content companion to [`parse_valid_lines`], used to confirm a re-anchor by
+/// matching a finding to what's actually on a nearby diff line.
+pub fn diff_line_texts(diff: &str) -> HashMap<String, HashMap<u64, String>> {
+    let mut map: HashMap<String, HashMap<u64, String>> = HashMap::new();
+    let mut cur_path: Option<String> = None;
+    let mut new_line: u64 = 0;
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let p = rest.trim();
+            let p = p.strip_prefix("b/").unwrap_or(p);
+            cur_path = (p != "/dev/null").then(|| p.to_string());
+        } else if line.starts_with("@@") {
+            if let Some(plus) = line.split('+').nth(1) {
+                let num: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
+                new_line = num.parse().unwrap_or(0);
+            }
+        } else if let Some(path) = &cur_path {
+            if let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix(' ')) {
+                map.entry(path.clone())
+                    .or_default()
+                    .insert(new_line, text.to_string());
+                new_line += 1;
+            }
+        }
+    }
+    map
+}
+
 /// Build a [`GlobSet`] from patterns, returning `None` if any pattern is invalid
 /// (so callers can fail-open and skip filtering rather than lose the review).
 fn build_globset(patterns: &[String]) -> Option<GlobSet> {
@@ -447,8 +478,8 @@ pub fn filter_diff_by_globs(
 #[cfg(test)]
 mod tests {
     use super::{
-        bundle_key, filter_diff_by_globs, pack_diff, pack_diff_bundled, parse_valid_lines,
-        split_diff_sections,
+        bundle_key, diff_line_texts, filter_diff_by_globs, pack_diff, pack_diff_bundled,
+        parse_valid_lines, split_diff_sections,
     };
 
     /// A minimal one-hunk section for `path`, adding `body` lines (to control size).
@@ -504,6 +535,15 @@ mod tests {
         let (packed, dropped) = pack_diff(&diff, a.chars().count() + 5);
         assert!(packed.contains("src/a.ts"));
         assert_eq!(dropped, vec!["src/big.ts".to_string()]);
+    }
+
+    #[test]
+    fn diff_line_texts_captures_new_side_content() {
+        let d = "+++ b/a.ts\n@@ -1,2 +1,3 @@\n ctx\n+added line\n ctx2\n";
+        let m = &diff_line_texts(d)["a.ts"];
+        assert_eq!(m[&1], "ctx");
+        assert_eq!(m[&2], "added line");
+        assert_eq!(m[&3], "ctx2");
     }
 
     #[test]
