@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.9.0
+
+Five additions this cycle — deterministic **complexity metrics**, **smart diff
+bundling**, a **benchmark harness**, **finding re-anchoring**, and a full-file
+**`/review-file`** command.
+
+**Complexity metrics**
+
+- Deterministic **cyclomatic (McCabe) + cognitive** complexity with an A–F grade
+  for the functions a change touches, computed with tree-sitter from the files
+  already fetched for structural context — no LLM, no extra fetch. Named arrow
+  functions are measured (name recovered from the binding), and the parse is
+  shared with structural context so each file is parsed once. Only functions
+  at/above `COMPLEXITY_MIN_CYCLOMATIC` are surfaced. Toggle with
+  `COMPLEXITY_METRICS`. Fully fail-open.
+
+**Smart diff bundling**
+
+- On large PRs, related changed files — a source and its test, i18n siblings —
+  now pack as one unit and stay adjacent so the model reviews them together
+  instead of having them scattered by priority. Toggle with `FILE_BUNDLING`;
+  per-repo overridable via `.prbot.toml`.
+
+**Re-anchor drifted findings**
+
+- A finding whose line drifted just off a real diff line is snapped to the
+  nearest diff line (within a ±3 window) whose code shares a significant symbol
+  with the finding body — otherwise it folds to the summary as before. The match
+  requires a distinctive shared symbol (filtered both sides, length ≥4) and
+  breaks ties deterministically, so a wrong inline anchor is never posted. Toggle
+  with `REANCHOR_FINDINGS`; per-repo overridable.
+
+**`/review-file <path>` command**
+
+- Deep-review an entire file at the PR head, beyond just the diff — findings may
+  sit on any line and post as a summary comment. Honors the repo's include/exclude
+  globs (an excluded path is politely refused). User-supplied paths are
+  percent-encoded before reaching the provider APIs so they can't override the
+  fetched ref.
+
+**Benchmark harness** (`examples/bench.rs`)
+
+- Scores the reviewer against a corpus of PRs with known issues, reporting
+  labeled **precision / recall / F1** and token cost, with a replicates mode
+  (mean ± spread) to average out agentic non-determinism — so a feature's effect
+  can be A/B'd by toggling its flag. `RunReviewOutput.findings_detail` exposes the
+  structured findings for tooling. _Note: blast radius (0.8.0) was measured with
+  this harness and showed no recall improvement on typical well-named repos; it's
+  kept on but the docs no longer claim it "catches more bugs."_
+
 ## 0.8.0
 
 **Blast radius** — the agentic reviewer is now seeded with each changed symbol's
