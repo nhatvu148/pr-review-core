@@ -63,6 +63,12 @@ pub struct Config {
     /// Hard cap on the number of findings posted (after sorting by severity).
     pub max_findings: usize,
 
+    /// Re-anchor a finding whose `line` just missed a real diff line: snap it to
+    /// the nearest diff line within a small window when that line's code matches
+    /// what the finding references, so a small drift posts inline instead of
+    /// folding into the summary. Conservative + fail-open.
+    pub reanchor_findings: bool,
+
     /// Use the agentic reviewer: clone the repo and let the model investigate
     /// cross-file context with tools, instead of a single diff-only call.
     pub agentic: bool,
@@ -206,6 +212,7 @@ impl Config {
             self_critique: env_or("SELF_CRITIQUE", "true").parse().unwrap_or(true),
             min_confidence: env_or("MIN_CONFIDENCE", "0").parse().unwrap_or(0),
             max_findings: env_or("MAX_FINDINGS", "20").parse().unwrap_or(20),
+            reanchor_findings: env_or("REANCHOR_FINDINGS", "true").parse().unwrap_or(true),
 
             agentic: env_or("AGENTIC", "false").parse().unwrap_or(false),
             max_turns: env_or("MAX_TURNS", "6").parse().unwrap_or(6),
@@ -298,6 +305,9 @@ impl Config {
         if let Some(v) = rc.file_bundling {
             cfg.file_bundling = v;
         }
+        if let Some(v) = rc.reanchor_findings {
+            cfg.reanchor_findings = v;
+        }
         if let Some(v) = &rc.instructions {
             let extra = v.trim();
             if !extra.is_empty() {
@@ -372,6 +382,7 @@ mod tests {
         base.self_critique = true;
         base.agentic = false;
         base.file_bundling = true;
+        base.reanchor_findings = true;
         base.extra_system_prompt = "BASE CONVENTIONS".to_string();
 
         let rc = RepoConfig {
@@ -380,6 +391,7 @@ mod tests {
             self_critique: Some(false),
             agentic: Some(true),
             file_bundling: Some(false),
+            reanchor_findings: Some(false),
             include_globs: Some(vec!["src/**".to_string()]),
             instructions: Some("Never nit about formatting.".to_string()),
             ..Default::default()
@@ -393,6 +405,7 @@ mod tests {
         assert!(!eff.self_critique);
         assert!(eff.agentic);
         assert!(!eff.file_bundling);
+        assert!(!eff.reanchor_findings);
         assert_eq!(eff.include_globs, vec!["src/**".to_string()]);
         // Untouched field keeps the base value.
         assert_eq!(eff.max_findings, 5);

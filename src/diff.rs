@@ -19,6 +19,18 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 /// ```
 pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
     let mut map: HashMap<String, HashSet<u64>> = HashMap::new();
+    for_each_new_side_line(diff, |path, new_line, _text| {
+        map.entry(path.to_string()).or_default().insert(new_line);
+    });
+    map
+}
+
+/// Walk a unified diff's new side, invoking `f(path, line_number, text)` for each
+/// added or context line (the leading `+`/space stripped), in order. This is the
+/// single place the `+++`/`@@`/line-marker state machine lives, so
+/// [`parse_valid_lines`] and [`diff_line_texts`] can't drift apart. Removed (`-`)
+/// lines don't advance the new-side counter; `/dev/null` targets are skipped.
+fn for_each_new_side_line(diff: &str, mut f: impl FnMut(&str, u64, &str)) {
     let mut cur_path: Option<String> = None;
     let mut new_line: u64 = 0;
 
@@ -26,11 +38,7 @@ pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
         if let Some(rest) = line.strip_prefix("+++ ") {
             let p = rest.trim();
             let p = p.strip_prefix("b/").unwrap_or(p);
-            cur_path = if p == "/dev/null" {
-                None
-            } else {
-                Some(p.to_string())
-            };
+            cur_path = (p != "/dev/null").then(|| p.to_string());
         } else if line.starts_with("@@") {
             // @@ -old,n +new,m @@  — grab the start of the new-side range.
             if let Some(plus) = line.split('+').nth(1) {
@@ -38,20 +46,26 @@ pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
                 new_line = num.parse().unwrap_or(0);
             }
         } else if let Some(path) = &cur_path {
-            match line.chars().next() {
-                Some('+') => {
-                    map.entry(path.clone()).or_default().insert(new_line);
-                    new_line += 1;
-                }
-                Some(' ') => {
-                    map.entry(path.clone()).or_default().insert(new_line);
-                    new_line += 1;
-                }
-                // '-' removed line: new side doesn't advance. Other markers ignored.
-                _ => {}
+            if let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix(' ')) {
+                f(path, new_line, text);
+                new_line += 1;
             }
+            // '-' removed line: new side doesn't advance. Other markers ignored.
         }
     }
+}
+
+/// Map each new-side file path to `{ line number -> line text }` (added or context
+/// lines, the leading `+`/space stripped), for the new version of the file. The
+/// content companion to [`parse_valid_lines`], used to confirm a re-anchor by
+/// matching a finding to what's actually on a nearby diff line.
+pub fn diff_line_texts(diff: &str) -> HashMap<String, HashMap<u64, String>> {
+    let mut map: HashMap<String, HashMap<u64, String>> = HashMap::new();
+    for_each_new_side_line(diff, |path, new_line, text| {
+        map.entry(path.to_string())
+            .or_default()
+            .insert(new_line, text.to_string());
+    });
     map
 }
 
@@ -460,8 +474,8 @@ pub fn path_matches_globs(path: &str, include: &[String], exclude: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        bundle_key, filter_diff_by_globs, pack_diff, pack_diff_bundled, parse_valid_lines,
-        path_matches_globs, split_diff_sections,
+        bundle_key, diff_line_texts, filter_diff_by_globs, pack_diff, pack_diff_bundled,
+        parse_valid_lines, path_matches_globs, split_diff_sections,
     };
 
     #[test]
@@ -540,6 +554,15 @@ mod tests {
         let (packed, dropped) = pack_diff(&diff, a.chars().count() + 5);
         assert!(packed.contains("src/a.ts"));
         assert_eq!(dropped, vec!["src/big.ts".to_string()]);
+    }
+
+    #[test]
+    fn diff_line_texts_captures_new_side_content() {
+        let d = "+++ b/a.ts\n@@ -1,2 +1,3 @@\n ctx\n+added line\n ctx2\n";
+        let m = &diff_line_texts(d)["a.ts"];
+        assert_eq!(m[&1], "ctx");
+        assert_eq!(m[&2], "added line");
+        assert_eq!(m[&3], "ctx2");
     }
 
     #[test]
