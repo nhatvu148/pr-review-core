@@ -410,6 +410,19 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> (String, Vec<String>
 /// assert_eq!(dropped, vec!["Cargo.lock".to_string()]);
 /// assert!(kept.contains("src/a.rs") && !kept.contains("Cargo.lock"));
 /// ```
+/// Whether a single `path` passes the include/exclude glob filters — the per-path
+/// equivalent of [`filter_diff_by_globs`], for callers that hold one path rather
+/// than a diff (e.g. the `/review-file` command). Fails **open**: an invalid glob
+/// in either set means "allow" rather than silently blocking the review.
+#[must_use]
+pub fn path_matches_globs(path: &str, include: &[String], exclude: &[String]) -> bool {
+    let (include_set, exclude_set) = match (build_globset(include), build_globset(exclude)) {
+        (Some(i), Some(e)) => (i, e),
+        _ => return true,
+    };
+    (include.is_empty() || include_set.is_match(path)) && !exclude_set.is_match(path)
+}
+
 pub fn filter_diff_by_globs(
     diff: &str,
     include: &[String],
@@ -448,8 +461,31 @@ pub fn filter_diff_by_globs(
 mod tests {
     use super::{
         bundle_key, filter_diff_by_globs, pack_diff, pack_diff_bundled, parse_valid_lines,
-        split_diff_sections,
+        path_matches_globs, split_diff_sections,
     };
+
+    #[test]
+    fn path_matches_globs_respects_include_and_exclude() {
+        // Empty include = everything allowed, subject to exclude.
+        assert!(path_matches_globs("src/lib.rs", &[], &[]));
+        // Excluded path is rejected.
+        assert!(!path_matches_globs(
+            "secrets/prod.env",
+            &[],
+            &["secrets/**".to_string()]
+        ));
+        // With an include set, only matching paths pass.
+        assert!(path_matches_globs("src/a.rs", &["src/**".to_string()], &[]));
+        assert!(!path_matches_globs("docs/x.md", &["src/**".to_string()], &[]));
+        // Exclude wins over include.
+        assert!(!path_matches_globs(
+            "src/gen.rs",
+            &["src/**".to_string()],
+            &["**/gen.rs".to_string()]
+        ));
+        // Invalid glob -> fail open (allow).
+        assert!(path_matches_globs("anything", &["[".to_string()], &[]));
+    }
 
     /// A minimal one-hunk section for `path`, adding `body` lines (to control size).
     fn section(path: &str, body: &str) -> String {

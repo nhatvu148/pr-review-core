@@ -36,7 +36,7 @@ pub enum Command {
 /// What a command run did, for the caller to log.
 #[derive(Debug, Clone)]
 pub struct CommandOutcome {
-    /// `"review"`, `"ask"`, or `"describe"`.
+    /// `"review"`, `"ask"`, `"describe"`, or `"review-file"`.
     pub command: &'static str,
     /// URL of the comment posted (or the review summary), when available.
     pub comment_url: Option<String>,
@@ -170,6 +170,27 @@ async fn run_review_file(
     let meta = provider.get_meta(&client, cfg, repo, pr).await?;
     let effective = load_repo_config(&provider, &client, cfg, repo, &meta).await;
     let cfg = &effective;
+
+    // Honour the repo's include/exclude globs so `/review-file` can't be used to
+    // pull in a file the diff-based review would have filtered out (e.g. secrets
+    // or vendored paths excluded via `.prbot.toml`).
+    if !crate::diff::path_matches_globs(path, &cfg.include_globs, &cfg.exclude_globs) {
+        let url = provider
+            .post_comment(
+                &client,
+                cfg,
+                repo,
+                pr,
+                &format!(
+                    "> **/review-file** `{path}`\n\nThat path is excluded by this repo's review file filters, so I won't review it."
+                ),
+            )
+            .await?;
+        return Ok(CommandOutcome {
+            command: "review-file",
+            comment_url: url,
+        });
+    }
 
     // Fetch the file at the PR head (fall back to the base branch if no head SHA).
     let git_ref = match (meta.head_sha.as_deref(), meta.base_branch.as_deref()) {
