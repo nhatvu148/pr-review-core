@@ -225,7 +225,10 @@ async fn run_review_file(
     let mut findings = review.findings.clone();
     findings.retain(|f| f.confidence.unwrap_or(100) >= cfg.min_confidence);
     findings.sort_by(|a, b| {
-        crate::review::severity_rank(&b.severity).cmp(&crate::review::severity_rank(&a.severity))
+        crate::review::severity_rank(&b.severity)
+            .cmp(&crate::review::severity_rank(&a.severity))
+            // Secondary key: higher confidence first — matches the `/review` path.
+            .then(b.confidence.unwrap_or(0).cmp(&a.confidence.unwrap_or(0)))
     });
     findings.truncate(cfg.max_findings);
 
@@ -413,7 +416,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_the_three_commands() {
+    fn parses_the_core_commands() {
         assert_eq!(parse_command("/review"), Some(Command::Review));
         assert_eq!(parse_command("/describe"), Some(Command::Describe));
         assert_eq!(

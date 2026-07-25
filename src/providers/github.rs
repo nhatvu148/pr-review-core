@@ -18,6 +18,22 @@ fn pr_url(cfg: &Config, repo: &str, pr: u64) -> String {
     format!("{}/repos/{repo}/pulls/{pr}", cfg.github_api_base)
 }
 
+/// Percent-encode a URL path, preserving `/` segment separators. Keeps nested
+/// paths resolvable while stopping a caller-supplied path from injecting a query
+/// or fragment (`?`, `#`, `&`, whitespace, …) into the request URL.
+pub(super) fn enc_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// Apply the common GitHub JSON headers + auth to a request builder.
 fn gh(rb: reqwest::RequestBuilder, cfg: &Config) -> reqwest::RequestBuilder {
     rb.bearer_auth(&cfg.github_token)
@@ -164,12 +180,17 @@ pub async fn get_file_contents(
         encoding: Option<String>,
     }
 
-    let git_ref = r#ref;
+    // Encode the (possibly caller-supplied) path so it can't inject a query/
+    // fragment and override `ref`; pass `ref` as a real query param. Slashes are
+    // preserved so nested paths still resolve.
     let url = format!(
-        "{}/repos/{repo}/contents/{path}?ref={git_ref}",
-        cfg.github_api_base
+        "{}/repos/{repo}/contents/{}",
+        cfg.github_api_base,
+        enc_path(path)
     );
-    let res = gh(client.get(url), cfg).send().await?;
+    let res = gh(client.get(url).query(&[("ref", r#ref)]), cfg)
+        .send()
+        .await?;
     if res.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(None);
     }
@@ -566,4 +587,19 @@ pub async fn post_review(
     let mut summary = review.summary.clone();
     summary.push_str(&render_resolved(&resolved));
     upsert_summary(client, cfg, &meta.repo, meta.pr, &summary).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::enc_path;
+
+    #[test]
+    fn enc_path_preserves_slashes_but_escapes_query_injection() {
+        // Normal nested paths pass through untouched.
+        assert_eq!(enc_path("src/providers/github.rs"), "src/providers/github.rs");
+        // A path trying to smuggle a query param gets its `?`/`=` escaped.
+        assert_eq!(enc_path("foo.rs?ref=evil"), "foo.rs%3Fref%3Devil");
+        // Spaces and other unsafe bytes are escaped too.
+        assert_eq!(enc_path("a b#c"), "a%20b%23c");
+    }
 }
