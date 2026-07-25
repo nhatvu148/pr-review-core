@@ -48,7 +48,9 @@ prompt through [`Config`].
   Toggle with `COMPLEXITY_METRICS`.
 - **Smart diff packing**: on large PRs, whole files are ranked (source > tests >
   docs) and packed to the budget instead of blunt truncation; omitted files are
-  named to the model.
+  named to the model. With **file bundling** (`FILE_BUNDLING`), related files — a
+  source and its test, i18n siblings — pack as one unit and stay adjacent so the
+  model reviews them together, rather than being scattered by priority.
 - **Dependency vulnerability scan**: added lockfile entries (Cargo/npm/yarn/pnpm/
   Go/PyPI/RubyGems/Composer) are checked against [OSV.dev](https://osv.dev) and
   known CVEs are surfaced in the summary with severity + fix version — no local

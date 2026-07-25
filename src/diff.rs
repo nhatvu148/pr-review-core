@@ -223,55 +223,166 @@ fn file_priority(path: &str) -> u8 {
 /// assert!(dropped.is_empty());
 /// ```
 pub fn pack_diff(diff: &str, max_chars: usize) -> (String, Vec<String>) {
+    pack_impl(diff, max_chars, false)
+}
+
+/// [`pack_diff`] that keeps **related files together**: a source and its test, or
+/// i18n siblings, pack as one unit and stay adjacent, instead of being scattered
+/// by priority. Falls back to keeping a unit's highest-priority members when the
+/// whole unit can't fit, so a big source is never dropped just because its test
+/// pushed the bundle over budget.
+pub fn pack_diff_bundled(diff: &str, max_chars: usize) -> (String, Vec<String>) {
+    pack_impl(diff, max_chars, true)
+}
+
+/// Known i18n locale codes — the allowlist that gates locale stripping in
+/// [`bundle_key`], so a real name segment like `util.io` isn't mistaken for one.
+fn is_locale(s: &str) -> bool {
+    matches!(
+        s,
+        "en" | "zh" | "ja" | "ko" | "fr" | "de" | "es" | "it" | "pt" | "ru" | "vi" | "th" | "ar"
+            | "hi" | "id" | "nl" | "pl" | "tr" | "uk" | "cs" | "sv" | "da" | "fi" | "no" | "ro"
+            | "hu" | "el"
+    )
+}
+
+/// Group key for bundling: a file's directory plus its normalized base name
+/// (final extension, a `test`/`spec` marker, and an i18n locale stripped). So
+/// `src/foo.ts`, `src/foo.test.ts`, and `src/foo.spec.ts` all share `src/foo`, and
+/// `i18n/msg.en.json` / `i18n/msg.zh.json` share `i18n/msg`. Unrelated files fall
+/// on distinct keys and bundle alone.
+fn bundle_key(path: &str) -> String {
+    let (dir, file) = match path.rfind('/') {
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("", path),
+    };
+    let mut f = file.to_ascii_lowercase();
+    // Drop the final extension.
+    if let Some(i) = f.rfind('.') {
+        if i > 0 {
+            f.truncate(i);
+        }
+    }
+    // Drop a co-located test/spec marker (`foo.test`, `foo_spec`, …).
+    for suf in ["-test", "-spec", "_test", "_spec", ".test", ".spec"] {
+        if let Some(s) = f.strip_suffix(suf) {
+            let n = s.len();
+            f.truncate(n);
+            break;
+        }
+    }
+    // Python `test_foo.py` pairs with `foo.py`.
+    if let Some(s) = f.strip_prefix("test_") {
+        f = s.to_string();
+    }
+    // Drop a trailing i18n locale (`msg.en`, `msg_zh`) — allowlisted.
+    if let Some(i) = f.rfind(['.', '_']) {
+        if is_locale(&f[i + 1..]) {
+            f.truncate(i);
+        }
+    }
+    format!("{dir}/{f}")
+}
+
+/// Pack a too-large diff to `max_chars`, keeping whole files (see [`pack_diff`]).
+/// When `bundle`, related files are grouped into units that pack together and stay
+/// adjacent (see [`pack_diff_bundled`]); otherwise each file is its own unit and
+/// the behaviour is the historical per-file packing.
+fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> (String, Vec<String>) {
     if diff.chars().count() <= max_chars {
         return (diff.to_string(), Vec::new());
     }
 
     let sections = split_diff_sections(diff);
 
-    // Rank order: priority DESC, then section length ASC (prefer more, smaller
-    // high-value files). Original indices are preserved for output ordering.
-    let mut order: Vec<usize> = (0..sections.len()).collect();
+    // Units = section-index groups. Without bundling each section is its own unit.
+    let units: Vec<Vec<usize>> = if bundle {
+        let mut keys: Vec<String> = Vec::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (i, (path, _)) in sections.iter().enumerate() {
+            // Preamble / empty-path sections never bundle.
+            let key = if path.is_empty() {
+                format!("\0{i}")
+            } else {
+                bundle_key(path)
+            };
+            match keys.iter().position(|k| k == &key) {
+                Some(p) => groups[p].push(i),
+                None => {
+                    keys.push(key);
+                    groups.push(vec![i]);
+                }
+            }
+        }
+        groups
+    } else {
+        (0..sections.len()).map(|i| vec![i]).collect()
+    };
+
+    let len_of = |i: usize| sections[i].1.chars().count();
+    let unit_len = |u: &[usize]| -> usize { u.iter().map(|&i| len_of(i)).sum() };
+    let unit_priority =
+        |u: &[usize]| -> u8 { u.iter().map(|&i| file_priority(&sections[i].0)).max().unwrap_or(0) };
+
+    // Rank units: priority DESC, then total length ASC (more, smaller, high-value).
+    let mut order: Vec<usize> = (0..units.len()).collect();
     order.sort_by(|&a, &b| {
-        let (pa, pb) = (file_priority(&sections[a].0), file_priority(&sections[b].0));
-        pb.cmp(&pa).then_with(|| {
-            sections[a]
-                .1
-                .chars()
-                .count()
-                .cmp(&sections[b].1.chars().count())
-        })
+        unit_priority(&units[b])
+            .cmp(&unit_priority(&units[a]))
+            .then_with(|| unit_len(&units[a]).cmp(&unit_len(&units[b])))
     });
 
-    // Greedily keep sections whose cumulative length stays within budget; skip
-    // (drop) any that would overflow, still trying smaller later ones.
+    // Greedily keep whole units within budget; if a whole unit can't fit, keep its
+    // highest-priority members that still do (don't drop a big source over its test).
     let mut keep = vec![false; sections.len()];
     let mut used = 0usize;
-    for &i in &order {
-        let len = sections[i].1.chars().count();
-        if used + len <= max_chars {
-            keep[i] = true;
-            used += len;
+    for &ui in &order {
+        let u = &units[ui];
+        let ul = unit_len(u);
+        if used + ul <= max_chars {
+            for &i in u {
+                keep[i] = true;
+            }
+            used += ul;
+        } else if u.len() > 1 {
+            let mut members = u.clone();
+            members.sort_by(|&a, &b| {
+                file_priority(&sections[b].0)
+                    .cmp(&file_priority(&sections[a].0))
+                    .then_with(|| len_of(a).cmp(&len_of(b)))
+            });
+            for &i in &members {
+                if used + len_of(i) <= max_chars {
+                    keep[i] = true;
+                    used += len_of(i);
+                }
+            }
         }
     }
 
-    // Fail-safe: if nothing fit (a single file larger than the whole budget),
-    // keep the best-ranked section so we never return empty — the caller's
-    // safety clamp trims it to the hard cap.
+    // Fail-safe: never return empty — keep the best-ranked unit's first section.
     if !keep.iter().any(|&k| k) {
-        if let Some(&best) = order.first() {
-            keep[best] = true;
+        if let Some(&i) = order.first().and_then(|&ui| units[ui].first()) {
+            keep[i] = true;
         }
     }
 
-    // Re-emit kept sections in original order; report dropped (named) paths.
+    // Emit unit-by-unit in first-appearance order so bundle members stay adjacent;
+    // within a unit, sections in diff order. (Non-bundle units are singletons in
+    // index order → the original ordering, unchanged.)
+    let mut unit_order: Vec<usize> = (0..units.len()).collect();
+    unit_order.sort_by_key(|&ui| *units[ui].iter().min().unwrap());
+
     let mut out = String::new();
     let mut dropped: Vec<String> = Vec::new();
-    for (i, (path, text)) in sections.iter().enumerate() {
-        if keep[i] {
-            out.push_str(text);
-        } else if !path.is_empty() {
-            dropped.push(path.clone());
+    for &ui in &unit_order {
+        for &i in &units[ui] {
+            let (path, text) = &sections[i];
+            if keep[i] {
+                out.push_str(text);
+            } else if !path.is_empty() {
+                dropped.push(path.clone());
+            }
         }
     }
 
@@ -335,7 +446,65 @@ pub fn filter_diff_by_globs(
 
 #[cfg(test)]
 mod tests {
-    use super::{filter_diff_by_globs, pack_diff, parse_valid_lines, split_diff_sections};
+    use super::{
+        bundle_key, filter_diff_by_globs, pack_diff, pack_diff_bundled, parse_valid_lines,
+        split_diff_sections,
+    };
+
+    /// A minimal one-hunk section for `path`, adding `body` lines (to control size).
+    fn section(path: &str, body: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n+{body}\n"
+        )
+    }
+
+    #[test]
+    fn bundle_key_groups_source_test_spec_and_i18n() {
+        // Co-located source + test + spec share one key.
+        let k = bundle_key("src/foo.ts");
+        assert_eq!(bundle_key("src/foo.test.ts"), k);
+        assert_eq!(bundle_key("src/foo.spec.tsx"), k);
+        // Go and Python test conventions.
+        assert_eq!(bundle_key("pkg/user_test.go"), bundle_key("pkg/user.go"));
+        assert_eq!(bundle_key("app/test_users.py"), bundle_key("app/users.py"));
+        // i18n siblings (allowlisted locales).
+        let m = bundle_key("i18n/msg.en.json");
+        assert_eq!(bundle_key("i18n/msg.zh.json"), m);
+        // Unrelated files, and a non-locale 2-letter segment, stay distinct.
+        assert_ne!(bundle_key("src/foo.ts"), bundle_key("src/bar.ts"));
+        assert_ne!(bundle_key("src/util.io.ts"), bundle_key("src/util.ts"));
+    }
+
+    #[test]
+    fn bundled_pack_keeps_source_and_test_adjacent() {
+        // Diff order interleaves the pair with an unrelated file: foo, other, foo.test.
+        let foo = section("src/foo.ts", "aa");
+        let other = section("src/other.ts", &"x".repeat(400));
+        let foot = section("src/foo.test.ts", "bb");
+        let diff = format!("{foo}{other}{foot}");
+
+        // Budget fits the small foo+foo.test bundle but not the large `other`.
+        let budget = foo.chars().count() + foot.chars().count() + 5;
+        let (packed, dropped) = pack_diff_bundled(&diff, budget);
+
+        assert_eq!(dropped, vec!["src/other.ts".to_string()], "big unrelated file dropped");
+        // The test section sits immediately after the source — bundled, adjacent.
+        let s = packed.find("src/foo.ts").unwrap();
+        let t = packed.find("src/foo.test.ts").unwrap();
+        assert!(s < t, "source before its test");
+        assert!(!packed.contains("src/other.ts"), "other not emitted");
+    }
+
+    #[test]
+    fn unbundled_pack_matches_historical_order() {
+        // Without bundling, the same over-budget diff keeps original section order.
+        let a = section("src/a.ts", "aa");
+        let big = section("src/big.ts", &"y".repeat(400));
+        let diff = format!("{a}{big}");
+        let (packed, dropped) = pack_diff(&diff, a.chars().count() + 5);
+        assert!(packed.contains("src/a.ts"));
+        assert_eq!(dropped, vec!["src/big.ts".to_string()]);
+    }
 
     #[test]
     fn anchors_added_and_context_lines() {

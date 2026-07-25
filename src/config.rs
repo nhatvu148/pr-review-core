@@ -50,6 +50,11 @@ pub struct Config {
     /// vendored, minified) — drops noise and saves tokens before the LLM call.
     pub exclude_globs: Vec<String>,
 
+    /// When packing a large diff to the size budget, group related changed files
+    /// (a source + its test, i18n siblings) into one unit so they stay adjacent
+    /// and pack together instead of being scattered by priority. Fail-open.
+    pub file_bundling: bool,
+
     /// Run a second, skeptical "self-critique" pass that removes false positives
     /// and out-of-scope nits from the findings before posting.
     pub self_critique: bool,
@@ -195,6 +200,8 @@ impl Config {
                     "**/*.generated.*",
                 ],
             ),
+
+            file_bundling: env_or("FILE_BUNDLING", "true").parse().unwrap_or(true),
 
             self_critique: env_or("SELF_CRITIQUE", "true").parse().unwrap_or(true),
             min_confidence: env_or("MIN_CONFIDENCE", "0").parse().unwrap_or(0),
