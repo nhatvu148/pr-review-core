@@ -35,6 +35,11 @@ pub struct RunReviewOutput {
     pub model: String,
     pub recommendation: String,
     pub findings: usize,
+    /// The post-processed findings that were posted (after self-critique,
+    /// confidence floor, sort, and cap). Exposed for tooling/benchmarks that need
+    /// the structured findings, not just the count. Empty on an advisory-only run.
+    #[serde(default)]
+    pub findings_detail: Vec<Finding>,
     pub inline_posted: usize,
     pub posted: bool,
     pub comment_url: Option<String>,
@@ -213,6 +218,7 @@ async fn post_advisory_only(
         model: cfg.openrouter_model.clone(),
         recommendation: "APPROVE WITH CHANGES".to_string(),
         findings: 0,
+        findings_detail: Vec::new(),
         inline_posted: 0,
         posted: false,
         comment_url: None,
@@ -428,6 +434,7 @@ pub async fn run_review_with(
         model: result.model,
         recommendation: result.review.recommendation.clone(),
         findings: findings.len(),
+        findings_detail: findings.clone(),
         inline_posted: inline_count,
         posted: false,
         comment_url: None,

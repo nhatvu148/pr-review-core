@@ -57,6 +57,12 @@ prompt through [`Config`].
   `/describe` (re)generates the PR description idempotently, preserving human edits.
 - **Per-repo config**: a `.prbot.toml` at the repo root overrides model, globs,
   confidence/caps, and adds free-text review `instructions`.
+- **Benchmark harness**: `examples/bench.rs` scores the reviewer against a corpus
+  of PRs with known issues (`examples/bench-corpus.example.json`) — reporting
+  precision / recall / F1 and token cost, so a feature's effect (blast radius,
+  complexity, backend) can be A/B'd by re-running with the flag toggled. Dry-run;
+  needs an OpenRouter key. `RunReviewOutput.findings_detail` exposes the structured
+  findings for tooling.
 - **Noise control**: an optional self-critique pass drops false positives / nits,
   a per-finding confidence score drives ranking, and a per-PR cap keeps reviews
   focused.

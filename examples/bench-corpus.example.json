@@ -1,0 +1,17 @@
+[
+  {
+    "provider": "github",
+    "repo": "owner/app",
+    "pr": 42,
+    "issues": [
+      { "file": "backend/src/kpis.service.ts", "line": 2488, "type": "bug", "note": "N+1 query inside the tenant loop" },
+      { "file": "backend/src/auth.guard.ts", "line": 71, "type": "bug", "note": "user can be undefined when the token is expired" }
+    ]
+  },
+  {
+    "provider": "github",
+    "repo": "owner/app",
+    "pr": 55,
+    "issues": []
+  }
+]
