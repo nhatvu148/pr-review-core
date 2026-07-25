@@ -110,6 +110,7 @@ size caps) are also read from the environment — see `src/config.rs`.
 | `SELF_CRITIQUE` | `true` | Second skeptical pass that removes false positives / low-value nits. |
 | `MIN_CONFIDENCE` | `0` | Drop findings below this confidence (0–100). |
 | `MAX_FINDINGS` | `20` | Cap findings per PR (ranked by severity then confidence). |
+| `REANCHOR_FINDINGS` | `true` | Snap a finding that drifted just off a diff line to the nearest diff line sharing a code symbol (else it folds to the summary). |
 | `EXCLUDE_GLOBS` | lockfiles, generated, vendored, minified | Comma-separated globs skipped before the LLM call. |
 | `INCLUDE_GLOBS` | *(empty = all)* | If set, only files matching these globs are reviewed. |
 | `LLM_BASE_URL` | `OPENROUTER_BASE_URL` → openrouter | OpenAI-compatible endpoint (e.g. `http://localhost:11434/v1` for Ollama). |
