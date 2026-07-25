@@ -69,11 +69,33 @@ impl Lang {
         }
     }
 
-    /// The function's declared name, if any (`None` for anonymous closures).
+    /// The function's declared name. Most functions carry a `name` field; a JS/TS
+    /// **arrow / function-expression never does** — its name lives on the binding
+    /// (`const handleSubmit = () => {}`, `obj.fn = () => {}`, `{ key: () => {} }`,
+    /// a class field), which is the dominant style in modern TS/React. We recover
+    /// that so those functions get a complexity signal. `None` only for truly
+    /// anonymous inline callbacks (`arr.map(x => x + 1)`).
     fn fn_name(self, node: Node, src: &[u8]) -> Option<String> {
-        node.child_by_field_name("name")
+        if let Some(n) = node
+            .child_by_field_name("name")
             .and_then(|n| n.utf8_text(src).ok())
-            .map(str::to_string)
+        {
+            return Some(n.to_string());
+        }
+        if matches!(node.kind(), "arrow_function" | "function_expression") {
+            let parent = node.parent()?;
+            let name_node = match parent.kind() {
+                "variable_declarator" => parent.child_by_field_name("name"),
+                "assignment_expression" => parent.child_by_field_name("left"),
+                "pair" => parent.child_by_field_name("key"),
+                "public_field_definition" | "field_definition" => {
+                    parent.child_by_field_name("name")
+                }
+                _ => None,
+            }?;
+            return name_node.utf8_text(src).ok().map(str::to_string);
+        }
+        None
     }
 
     /// Cyclomatic decision points contributed by `node` (1 per branch; `&&`/`||`
@@ -159,7 +181,7 @@ fn bool_ops(node: Node, src: &[u8]) -> u32 {
 }
 
 /// Complexity metrics for one changed function.
-pub(crate) struct FnComplexity {
+pub struct FnComplexity {
     pub label: &'static str,
     pub name: String,
     pub cyclomatic: u32,
@@ -256,7 +278,11 @@ fn label_for(lang: Lang, kind: &str) -> &'static str {
 /// Cyclomatic + cognitive complexity for every function a change touches in
 /// `source` (parsed as `path`'s language). Deduplicated by definition span, sorted
 /// by start line. Fully fail-open: unsupported language / parse error → empty vec.
-pub(crate) fn changed_fn_complexity(
+///
+/// Parses `source` itself; when the caller already has a tree-sitter tree for this
+/// file (as [`crate::structure`] does), prefer [`changed_fn_complexity_in`] to
+/// avoid a second parse.
+pub fn changed_fn_complexity(
     path: &str,
     source: &str,
     changed: &HashSet<u64>,
@@ -271,8 +297,22 @@ pub(crate) fn changed_fn_complexity(
     let Some(tree) = parser.parse(source, None) else {
         return Vec::new();
     };
+    changed_fn_complexity_in(path, tree.root_node(), source, changed)
+}
+
+/// [`changed_fn_complexity`] over an already-parsed `root` — lets a caller share
+/// one parse across structural symbols and complexity (same grammar per
+/// extension). Fail-open: an unsupported `path` extension yields an empty vec.
+pub(crate) fn changed_fn_complexity_in(
+    path: &str,
+    root: Node,
+    source: &str,
+    changed: &HashSet<u64>,
+) -> Vec<FnComplexity> {
+    let Some(lang) = lang_for(path) else {
+        return Vec::new();
+    };
     let src = source.as_bytes();
-    let root = tree.root_node();
 
     let mut lines: Vec<u64> = changed.iter().copied().filter(|l| *l > 0).collect();
     lines.sort_unstable();
@@ -382,6 +422,33 @@ def pick(items):
         assert_eq!(f.name, "pick");
         // 1 + for + if + (and) + elif = 5
         assert_eq!(f.cyclomatic, 5);
+    }
+
+    #[test]
+    fn named_arrow_function_is_measured() {
+        // Arrow functions have no `name` field — recover it from the binding.
+        // This is the dominant TS/React style, so it must produce a signal.
+        let src = "\
+const handleSubmit = (x: number) => {
+  if (x > 0) { return 1; }
+  return 0;
+};
+";
+        let f = only("a.tsx", src, 2);
+        assert_eq!(f.name, "handleSubmit");
+        assert_eq!(f.cyclomatic, 2); // 1 + if
+    }
+
+    #[test]
+    fn anonymous_inline_arrow_is_skipped() {
+        // A bare callback has no binding name — no signal, no noise.
+        let items = changed_fn_complexity(
+            "a.ts",
+            "function f(xs: number[]) { return xs.map((x) => x + 1); }\n",
+            &changed(&[1]),
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].name, "f");
     }
 
     #[test]

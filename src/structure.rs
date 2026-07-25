@@ -241,17 +241,23 @@ fn node_name(lang: Lang, node: Node, src: &[u8]) -> Option<String> {
 /// Parse `source` with tree-sitter and, for each changed line, collect the
 /// smallest enclosing named definition. Returns unique symbols. Fully fail-open:
 /// a language/parse error yields an empty vec.
+///
+/// Parses `source` itself; a caller that already holds a tree for this file should
+/// prefer [`symbols_in_tree`] so the parse is shared (e.g. with complexity metrics).
 fn symbols_for_file(lang: Lang, source: &str, changed: &HashSet<u64>) -> Vec<Sym> {
     let mut parser = Parser::new();
     if parser.set_language(&lang.ts_language()).is_err() {
         return Vec::new();
     }
-    let tree = match parser.parse(source, None) {
-        Some(t) => t,
-        None => return Vec::new(),
+    let Some(tree) = parser.parse(source, None) else {
+        return Vec::new();
     };
+    symbols_in_tree(lang, tree.root_node(), source, changed)
+}
+
+/// [`symbols_for_file`] over an already-parsed `root`, so the parse can be shared.
+fn symbols_in_tree(lang: Lang, root: Node, source: &str, changed: &HashSet<u64>) -> Vec<Sym> {
     let src = source.as_bytes();
-    let root = tree.root_node();
 
     // Deterministic output: visit changed lines in ascending order.
     let mut lines: Vec<u64> = changed.iter().copied().collect();
@@ -520,16 +526,29 @@ pub async fn structural_context(
             _ => continue,
         };
 
-        let syms = symbols_for_file(lang, &content, lines);
+        // Parse the fetched content ONCE; structural symbols and complexity metrics
+        // share the tree (same grammar per extension) — no double parse, no refetch.
+        let mut parser = Parser::new();
+        let tree = if parser.set_language(&lang.ts_language()).is_ok() {
+            parser.parse(&content, None)
+        } else {
+            None
+        };
+        let Some(tree) = tree else {
+            continue; // unparsable — falls through to the Tier A hunk-header regions
+        };
+        let root = tree.root_node();
+
+        let syms = symbols_in_tree(lang, root, &content, lines);
         if !syms.is_empty() {
             covered.insert(path.clone());
             ts_blocks.push(format_symbols(&path, &syms));
         }
 
-        // Reuse the fetched content for complexity metrics (no extra fetch). Only
-        // surface functions at/above the threshold so this stays a risk flag.
+        // Complexity of the changed functions, from the same tree. Only surface
+        // functions at/above the threshold so this stays a risk flag, not noise.
         if cfg.complexity_metrics {
-            for f in crate::complexity::changed_fn_complexity(&path, &content, lines) {
+            for f in crate::complexity::changed_fn_complexity_in(&path, root, &content, lines) {
                 if f.cyclomatic >= cfg.complexity_min_cyclomatic {
                     complexity_lines.push(format!(
                         "- {} {} ({}): cyclomatic {}, cognitive {} — grade {}",
