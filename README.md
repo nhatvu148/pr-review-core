@@ -59,7 +59,8 @@ prompt through [`Config`].
   known CVEs are surfaced in the summary with severity + fix version — no local
   resolver, HTTP-only.
 - **PR commands**: `/ask <question>` answers questions about the PR from its diff;
-  `/describe` (re)generates the PR description idempotently, preserving human edits.
+  `/describe` (re)generates the PR description idempotently, preserving human edits;
+  `/review-file <path>` deep-reviews an entire file at the PR head, beyond just the diff.
 - **Per-repo config**: a `.prbot.toml` at the repo root overrides model, globs,
   confidence/caps, and adds free-text review `instructions`.
 - **Benchmark harness**: `examples/bench.rs` scores the reviewer against a corpus
@@ -125,6 +126,7 @@ commands posted as PR comments:
 | `/review` | (Re)run the full review. |
 | `/ask <question>` | Answer a question about the PR, grounded in its diff. |
 | `/describe` | (Re)generate the PR description, merged idempotently into the body. |
+| `/review-file <path>` | Deep-review an entire file at the PR head (not just the diff); findings post as a summary comment. |
 
 Route them from a bot binary with [`command::parse_command`] + [`command::run_command`].
 

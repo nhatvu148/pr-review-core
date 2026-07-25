@@ -48,7 +48,7 @@ pub struct RunReviewOutput {
 }
 
 /// Rank a severity for sorting (higher = more urgent). Unknown severities rank 0.
-fn severity_rank(sev: &str) -> u8 {
+pub(crate) fn severity_rank(sev: &str) -> u8 {
     match sev.to_uppercase().as_str() {
         "BLOCKING" => 3,
         "HIGH" => 2,
@@ -58,7 +58,7 @@ fn severity_rank(sev: &str) -> u8 {
     }
 }
 
-fn severity_emoji(sev: &str) -> &'static str {
+pub(crate) fn severity_emoji(sev: &str) -> &'static str {
     match sev.to_uppercase().as_str() {
         "BLOCKING" => "🚨",
         "HIGH" => "⚠️",
