@@ -295,6 +295,9 @@ impl Config {
         if let Some(v) = rc.agentic {
             cfg.agentic = v;
         }
+        if let Some(v) = rc.file_bundling {
+            cfg.file_bundling = v;
+        }
         if let Some(v) = &rc.instructions {
             let extra = v.trim();
             if !extra.is_empty() {
@@ -368,6 +371,7 @@ mod tests {
         base.max_findings = 5;
         base.self_critique = true;
         base.agentic = false;
+        base.file_bundling = true;
         base.extra_system_prompt = "BASE CONVENTIONS".to_string();
 
         let rc = RepoConfig {
@@ -375,6 +379,7 @@ mod tests {
             min_confidence: Some(75),
             self_critique: Some(false),
             agentic: Some(true),
+            file_bundling: Some(false),
             include_globs: Some(vec!["src/**".to_string()]),
             instructions: Some("Never nit about formatting.".to_string()),
             ..Default::default()
@@ -387,6 +392,7 @@ mod tests {
         assert_eq!(eff.min_confidence, 75);
         assert!(!eff.self_critique);
         assert!(eff.agentic);
+        assert!(!eff.file_bundling);
         assert_eq!(eff.include_globs, vec!["src/**".to_string()]);
         // Untouched field keeps the base value.
         assert_eq!(eff.max_findings, 5);
