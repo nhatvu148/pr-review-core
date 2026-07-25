@@ -324,7 +324,11 @@ pub async fn run_review_with(
     // Smart size handling: keep whole files, dropping the lowest-priority ones
     // first, until the diff fits `max_diff_chars` — instead of a blunt mid-file
     // char cut. Applied ONCE here so both review paths get the same packed diff.
-    let (diff, packed_dropped) = crate::diff::pack_diff(&diff, cfg.max_diff_chars);
+    let (diff, packed_dropped) = if cfg.file_bundling {
+        crate::diff::pack_diff_bundled(&diff, cfg.max_diff_chars)
+    } else {
+        crate::diff::pack_diff(&diff, cfg.max_diff_chars)
+    };
     if !packed_dropped.is_empty() {
         tracing::info!(
             "packed diff: omitted {} lower-priority file(s) to fit budget: {:?}",

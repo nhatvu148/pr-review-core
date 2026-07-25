@@ -50,6 +50,11 @@ pub struct Config {
     /// vendored, minified) — drops noise and saves tokens before the LLM call.
     pub exclude_globs: Vec<String>,
 
+    /// When packing a large diff to the size budget, group related changed files
+    /// (a source + its test, i18n siblings) into one unit so they stay adjacent
+    /// and pack together instead of being scattered by priority. Fail-open.
+    pub file_bundling: bool,
+
     /// Run a second, skeptical "self-critique" pass that removes false positives
     /// and out-of-scope nits from the findings before posting.
     pub self_critique: bool,
@@ -196,6 +201,8 @@ impl Config {
                 ],
             ),
 
+            file_bundling: env_or("FILE_BUNDLING", "true").parse().unwrap_or(true),
+
             self_critique: env_or("SELF_CRITIQUE", "true").parse().unwrap_or(true),
             min_confidence: env_or("MIN_CONFIDENCE", "0").parse().unwrap_or(0),
             max_findings: env_or("MAX_FINDINGS", "20").parse().unwrap_or(20),
@@ -288,6 +295,9 @@ impl Config {
         if let Some(v) = rc.agentic {
             cfg.agentic = v;
         }
+        if let Some(v) = rc.file_bundling {
+            cfg.file_bundling = v;
+        }
         if let Some(v) = &rc.instructions {
             let extra = v.trim();
             if !extra.is_empty() {
@@ -361,6 +371,7 @@ mod tests {
         base.max_findings = 5;
         base.self_critique = true;
         base.agentic = false;
+        base.file_bundling = true;
         base.extra_system_prompt = "BASE CONVENTIONS".to_string();
 
         let rc = RepoConfig {
@@ -368,6 +379,7 @@ mod tests {
             min_confidence: Some(75),
             self_critique: Some(false),
             agentic: Some(true),
+            file_bundling: Some(false),
             include_globs: Some(vec!["src/**".to_string()]),
             instructions: Some("Never nit about formatting.".to_string()),
             ..Default::default()
@@ -380,6 +392,7 @@ mod tests {
         assert_eq!(eff.min_confidence, 75);
         assert!(!eff.self_critique);
         assert!(eff.agentic);
+        assert!(!eff.file_bundling);
         assert_eq!(eff.include_globs, vec!["src/**".to_string()]);
         // Untouched field keeps the base value.
         assert_eq!(eff.max_findings, 5);

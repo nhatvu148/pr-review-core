@@ -24,6 +24,9 @@ pub struct RepoConfig {
     pub max_findings: Option<usize>,
     pub self_critique: Option<bool>,
     pub agentic: Option<bool>,
+    /// Toggle grouping related changed files (source + test, i18n siblings) when
+    /// packing a large diff, for this repo.
+    pub file_bundling: Option<bool>,
     /// Toggle the OSV.dev dependency vulnerability scan for this repo.
     pub cve_scan: Option<bool>,
     /// Extra review instructions in plain language, appended to the system prompt.
