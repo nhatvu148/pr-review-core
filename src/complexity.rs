@@ -225,6 +225,13 @@ fn cyclomatic(func: Node, lang: Lang, src: &[u8]) -> u32 {
 /// Approximate cognitive complexity: each control-flow structure adds `1 + its
 /// nesting depth`, and nesting increases inside it. Boolean operators are left to
 /// cyclomatic. Doesn't descend into nested functions.
+///
+/// Known divergence from SonarSource: an `else if` chain counts as increasing
+/// nesting (its `else` branch is itself a nested `if`), so a flat N-way else-if
+/// scores `1+2+…+N` rather than a flat `N`. This can overstate a common,
+/// unremarkable pattern — fine for a risk *signal*, but don't read the cognitive
+/// number as an exact SonarSource score. (Cyclomatic, the primary grade driver,
+/// is unaffected: it counts each branch once regardless of nesting.)
 fn cognitive(func: Node, lang: Lang) -> u32 {
     fn walk(n: Node, lang: Lang, nesting: u32) -> u32 {
         let mut total = 0;
@@ -449,6 +456,32 @@ const handleSubmit = (x: number) => {
         );
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "f");
+    }
+
+    #[test]
+    fn go_counts_if_switch_cases_and_bool() {
+        // Locks in the Go grammar node names (if_statement, expression_case, …).
+        let src = "\
+package main
+
+func classify(x int) string {
+	if x > 0 && x < 10 {
+		return \"small\"
+	}
+	switch x {
+	case 0:
+		return \"zero\"
+	case 1:
+		return \"one\"
+	default:
+		return \"many\"
+	}
+}
+";
+        let f = only("a.go", src, 4);
+        assert_eq!(f.name, "classify");
+        // 1 + if + (&&) + 2 expression_case (default not counted) = 5
+        assert_eq!(f.cyclomatic, 5);
     }
 
     #[test]
