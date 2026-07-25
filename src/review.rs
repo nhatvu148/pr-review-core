@@ -78,6 +78,89 @@ fn inline_body(f: &Finding) -> String {
     )
 }
 
+/// A finding may miss a real diff line by this many rows and still be re-anchored.
+const REANCHOR_WINDOW: i64 = 3;
+
+/// The shared symbol tying a finding to a diff line must be at least this long.
+/// Short tokens (`sum`, `map`, `key`, `ctx`) collide too easily to be evidence of
+/// the *same* code, so a match on them folds the finding to the summary instead of
+/// risking a wrong inline anchor.
+const MIN_ANCHOR_SYMBOL_LEN: usize = 4;
+
+/// Extract identifier tokens (`[A-Za-z_][A-Za-z0-9_]*`) from `s`.
+fn idents(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in s.chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Significant symbols on a code line: identifiers ≥3 chars minus common keywords
+/// — the tokens whose presence in a finding body ties the finding to this line.
+fn line_symbols(text: &str) -> Vec<String> {
+    const KW: &[&str] = &[
+        "const", "let", "var", "function", "return", "import", "export", "from", "class",
+        "interface", "type", "public", "private", "protected", "static", "async", "await", "for",
+        "while", "new", "void", "null", "true", "false", "this", "self", "def", "func", "pub",
+        "use", "mod", "struct", "enum", "impl", "package",
+    ];
+    idents(text)
+        .into_iter()
+        .filter(|w| w.len() >= 3 && !KW.contains(&w.as_str()))
+        .collect()
+}
+
+/// Re-anchor a finding at `line` (which isn't itself a diff line) to the nearest
+/// diff line within [`REANCHOR_WINDOW`] whose code shares a *significant* symbol
+/// with the finding body. Conservative — no shared significant symbol means `None`
+/// (the finding folds to the summary). Both sides are filtered through
+/// [`line_symbols`] (identifiers ≥3 chars, common keywords dropped) and the shared
+/// symbol must be ≥[`MIN_ANCHOR_SYMBOL_LEN`], so a collision on a short/incidental
+/// token can't snap a finding to an unrelated line. Matching *code-line* symbols
+/// (not raw prose) sidesteps prose/code ambiguity. Candidates are ordered by
+/// (distance, line number) so ties resolve deterministically.
+fn reanchor(
+    line: u64,
+    valid: &std::collections::HashSet<u64>,
+    texts: &std::collections::HashMap<u64, String>,
+    body: &str,
+) -> Option<u64> {
+    // Filter the body the same way as the code line, so only significant shared
+    // symbols count — asymmetric filtering would let generic words match.
+    let body_words: std::collections::HashSet<String> = line_symbols(body).into_iter().collect();
+    if body_words.is_empty() {
+        return None;
+    }
+    let mut cands: Vec<u64> = valid
+        .iter()
+        .copied()
+        .filter(|&c| c != line && (c as i64 - line as i64).abs() <= REANCHOR_WINDOW)
+        .collect();
+    // (distance, line) — deterministic tie-break: equidistant candidates prefer the
+    // lower line number rather than HashSet iteration order.
+    cands.sort_by_key(|&c| ((c as i64 - line as i64).abs(), c));
+    for c in cands {
+        if let Some(text) = texts.get(&c) {
+            if line_symbols(text)
+                .iter()
+                .any(|s| s.len() >= MIN_ANCHOR_SYMBOL_LEN && body_words.contains(s))
+            {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
 /// The summary comment: overall + recommendation + any findings that couldn't be
 /// anchored to a diff line (line-anchored ones go inline).
 fn render_summary(review: &Review, unanchored: &[&Finding], inline_count: usize) -> String {
@@ -401,22 +484,37 @@ pub async fn run_review_with(
     findings.truncate(cfg.max_findings);
 
     let valid = parse_valid_lines(&diff);
+    // Line texts are only needed to confirm a re-anchor (content match).
+    let line_texts = if cfg.reanchor_findings {
+        crate::diff::diff_line_texts(&diff)
+    } else {
+        std::collections::HashMap::new()
+    };
 
-    // Anchor findings whose (file, line) is actually in the diff; the rest fold
-    // into the summary so the provider never rejects an out-of-diff anchor.
+    // Anchor findings whose (file, line) is actually in the diff. A finding that
+    // just missed (model off-by-a-few / drift) is re-anchored to a nearby diff line
+    // when its code matches; the rest fold into the summary so the provider never
+    // rejects an out-of-diff anchor.
     let mut inline: Vec<InlineComment> = Vec::new();
     let mut unanchored: Vec<&Finding> = Vec::new();
     for f in &findings {
-        let anchored = f
+        let mut anchor = f
             .line
-            .is_some_and(|l| valid.get(&f.file).is_some_and(|s| s.contains(&l)));
-        match (anchored, f.line) {
-            (true, Some(line)) => inline.push(InlineComment {
+            .filter(|l| valid.get(&f.file).is_some_and(|s| s.contains(l)));
+        if anchor.is_none() && cfg.reanchor_findings {
+            if let (Some(l), Some(v), Some(t)) =
+                (f.line, valid.get(&f.file), line_texts.get(&f.file))
+            {
+                anchor = reanchor(l, v, t, &f.body);
+            }
+        }
+        match anchor {
+            Some(line) => inline.push(InlineComment {
                 path: f.file.clone(),
                 line,
                 body: inline_body(f),
             }),
-            _ => unanchored.push(f),
+            None => unanchored.push(f),
         }
     }
 
@@ -452,4 +550,74 @@ pub async fn run_review_with(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{idents, line_symbols, reanchor};
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn idents_extracts_tokens() {
+        assert_eq!(idents("foo.bar(baz_qux)"), vec!["foo", "bar", "baz_qux"]);
+    }
+
+    #[test]
+    fn line_symbols_drops_keywords_and_short_tokens() {
+        let s = line_symbols("export function calcTotal(o) {");
+        assert!(s.contains(&"calcTotal".to_string()));
+        assert!(!s.iter().any(|w| w == "export" || w == "function" || w == "o"));
+    }
+
+    #[test]
+    fn reanchor_snaps_to_the_matching_diff_line() {
+        let valid: HashSet<u64> = [8, 10, 12].into_iter().collect();
+        let mut texts = HashMap::new();
+        texts.insert(8, "  const subtotal = sum(items);".to_string());
+        texts.insert(10, "  return calcTotal(order, tax);".to_string());
+        texts.insert(12, "}".to_string());
+        // Finding drifted to line 9; its body names calcTotal, which is on line 10.
+        let got = reanchor(9, &valid, &texts, "`calcTotal` now needs a tax arg. Fix: pass it.");
+        assert_eq!(got, Some(10));
+    }
+
+    #[test]
+    fn reanchor_declines_without_a_content_match() {
+        let valid: HashSet<u64> = [8, 10].into_iter().collect();
+        let mut texts = HashMap::new();
+        texts.insert(8, "  const x = 1;".to_string());
+        texts.insert(10, "  const y = 2;".to_string());
+        assert_eq!(reanchor(9, &valid, &texts, "Missing null check on user.roles"), None);
+    }
+
+    #[test]
+    fn reanchor_declines_on_a_short_shared_token() {
+        // The only token shared with a nearby line is 3 chars ("sum") — below the
+        // distinctiveness floor, so no snap (avoids anchoring on generic collisions).
+        let valid: HashSet<u64> = [10].into_iter().collect();
+        let mut texts = HashMap::new();
+        texts.insert(10, "  const total = sum(items);".to_string());
+        assert_eq!(reanchor(9, &valid, &texts, "sum is off by one"), None);
+    }
+
+    #[test]
+    fn reanchor_ties_break_on_lower_line_number() {
+        // Lines 8 and 10 are both distance 2 from 9 and both content-match. The pick
+        // must be deterministic (lower line), independent of HashSet order.
+        let valid: HashSet<u64> = [8, 10].into_iter().collect();
+        let mut texts = HashMap::new();
+        texts.insert(8, "  calcTotal(order);".to_string());
+        texts.insert(10, "  calcTotal(basket);".to_string());
+        assert_eq!(reanchor(9, &valid, &texts, "calcTotal needs a tax arg"), Some(8));
+    }
+
+    #[test]
+    fn reanchor_ignores_lines_outside_the_window() {
+        let valid: HashSet<u64> = [20].into_iter().collect();
+        let mut texts = HashMap::new();
+        texts.insert(20, "  calcTotal();".to_string());
+        // 20 is 11 rows from 9 — outside REANCHOR_WINDOW, so no snap even though the
+        // symbol matches.
+        assert_eq!(reanchor(9, &valid, &texts, "calcTotal issue"), None);
+    }
 }
