@@ -81,6 +81,12 @@ fn inline_body(f: &Finding) -> String {
 /// A finding may miss a real diff line by this many rows and still be re-anchored.
 const REANCHOR_WINDOW: i64 = 3;
 
+/// The shared symbol tying a finding to a diff line must be at least this long.
+/// Short tokens (`sum`, `map`, `key`, `ctx`) collide too easily to be evidence of
+/// the *same* code, so a match on them folds the finding to the summary instead of
+/// risking a wrong inline anchor.
+const MIN_ANCHOR_SYMBOL_LEN: usize = 4;
+
 /// Extract identifier tokens (`[A-Za-z_][A-Za-z0-9_]*`) from `s`.
 fn idents(s: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -114,26 +120,40 @@ fn line_symbols(text: &str) -> Vec<String> {
 }
 
 /// Re-anchor a finding at `line` (which isn't itself a diff line) to the nearest
-/// diff line within [`REANCHOR_WINDOW`] whose code shares a symbol with the finding
-/// body. Conservative — no shared symbol means `None` (the finding folds to the
-/// summary), so a wrong anchor is never posted. Matching *code-line* symbols (not
-/// the prose body) sidesteps prose/code ambiguity.
+/// diff line within [`REANCHOR_WINDOW`] whose code shares a *significant* symbol
+/// with the finding body. Conservative — no shared significant symbol means `None`
+/// (the finding folds to the summary). Both sides are filtered through
+/// [`line_symbols`] (identifiers ≥3 chars, common keywords dropped) and the shared
+/// symbol must be ≥[`MIN_ANCHOR_SYMBOL_LEN`], so a collision on a short/incidental
+/// token can't snap a finding to an unrelated line. Matching *code-line* symbols
+/// (not raw prose) sidesteps prose/code ambiguity. Candidates are ordered by
+/// (distance, line number) so ties resolve deterministically.
 fn reanchor(
     line: u64,
     valid: &std::collections::HashSet<u64>,
     texts: &std::collections::HashMap<u64, String>,
     body: &str,
 ) -> Option<u64> {
-    let body_words: std::collections::HashSet<String> = idents(body).into_iter().collect();
+    // Filter the body the same way as the code line, so only significant shared
+    // symbols count — asymmetric filtering would let generic words match.
+    let body_words: std::collections::HashSet<String> = line_symbols(body).into_iter().collect();
+    if body_words.is_empty() {
+        return None;
+    }
     let mut cands: Vec<u64> = valid
         .iter()
         .copied()
         .filter(|&c| c != line && (c as i64 - line as i64).abs() <= REANCHOR_WINDOW)
         .collect();
-    cands.sort_by_key(|&c| (c as i64 - line as i64).abs());
+    // (distance, line) — deterministic tie-break: equidistant candidates prefer the
+    // lower line number rather than HashSet iteration order.
+    cands.sort_by_key(|&c| ((c as i64 - line as i64).abs(), c));
     for c in cands {
         if let Some(text) = texts.get(&c) {
-            if line_symbols(text).iter().any(|s| body_words.contains(s)) {
+            if line_symbols(text)
+                .iter()
+                .any(|s| s.len() >= MIN_ANCHOR_SYMBOL_LEN && body_words.contains(s))
+            {
                 return Some(c);
             }
         }
@@ -568,6 +588,27 @@ mod tests {
         texts.insert(8, "  const x = 1;".to_string());
         texts.insert(10, "  const y = 2;".to_string());
         assert_eq!(reanchor(9, &valid, &texts, "Missing null check on user.roles"), None);
+    }
+
+    #[test]
+    fn reanchor_declines_on_a_short_shared_token() {
+        // The only token shared with a nearby line is 3 chars ("sum") — below the
+        // distinctiveness floor, so no snap (avoids anchoring on generic collisions).
+        let valid: HashSet<u64> = [10].into_iter().collect();
+        let mut texts = HashMap::new();
+        texts.insert(10, "  const total = sum(items);".to_string());
+        assert_eq!(reanchor(9, &valid, &texts, "sum is off by one"), None);
+    }
+
+    #[test]
+    fn reanchor_ties_break_on_lower_line_number() {
+        // Lines 8 and 10 are both distance 2 from 9 and both content-match. The pick
+        // must be deterministic (lower line), independent of HashSet order.
+        let valid: HashSet<u64> = [8, 10].into_iter().collect();
+        let mut texts = HashMap::new();
+        texts.insert(8, "  calcTotal(order);".to_string());
+        texts.insert(10, "  calcTotal(basket);".to_string());
+        assert_eq!(reanchor(9, &valid, &texts, "calcTotal needs a tax arg"), Some(8));
     }
 
     #[test]
