@@ -106,6 +106,14 @@ pub struct Config {
     /// Max number of files to fetch + parse for structural context (cost guard).
     pub structural_max_files: usize,
 
+    /// Surface deterministic complexity metrics (cyclomatic + cognitive, A–F grade)
+    /// for the functions a change touches, computed with tree-sitter alongside the
+    /// structural context. A cheap, LLM-free risk signal. Fully fail-open.
+    pub complexity_metrics: bool,
+    /// Only report a changed function when its cyclomatic complexity is at least
+    /// this — keeps the block a high-signal risk flag, not noise for trivial code.
+    pub complexity_min_cyclomatic: u32,
+
     /// Compute a "blast radius" for the agentic reviewer: from the clone, find the
     /// callers and tests of each changed symbol and seed the prompt with them (also
     /// exposes a `references` tool). Agentic path only — needs the clone. Fail-open.
@@ -221,6 +229,11 @@ impl Config {
 
             structural_context: env_or("STRUCTURAL_CONTEXT", "true").parse().unwrap_or(true),
             structural_max_files: env_or("STRUCTURAL_MAX_FILES", "15").parse().unwrap_or(15),
+
+            complexity_metrics: env_or("COMPLEXITY_METRICS", "true").parse().unwrap_or(true),
+            complexity_min_cyclomatic: env_or("COMPLEXITY_MIN_CYCLOMATIC", "8")
+                .parse()
+                .unwrap_or(8),
 
             blast_radius: env_or("BLAST_RADIUS", "true").parse().unwrap_or(true),
             blast_max_symbols: env_or("BLAST_MAX_SYMBOLS", "12").parse().unwrap_or(12),

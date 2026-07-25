@@ -496,6 +496,7 @@ pub async fn structural_context(
     let valid = parse_valid_lines(diff);
     let mut covered: HashSet<String> = HashSet::new();
     let mut ts_blocks: Vec<String> = Vec::new();
+    let mut complexity_lines: Vec<String> = Vec::new();
     let mut attempted = 0usize;
 
     for path in diff_file_order(diff) {
@@ -524,6 +525,24 @@ pub async fn structural_context(
             covered.insert(path.clone());
             ts_blocks.push(format_symbols(&path, &syms));
         }
+
+        // Reuse the fetched content for complexity metrics (no extra fetch). Only
+        // surface functions at/above the threshold so this stays a risk flag.
+        if cfg.complexity_metrics {
+            for f in crate::complexity::changed_fn_complexity(&path, &content, lines) {
+                if f.cyclomatic >= cfg.complexity_min_cyclomatic {
+                    complexity_lines.push(format!(
+                        "- {} {} ({}): cyclomatic {}, cognitive {} — grade {}",
+                        f.label,
+                        f.name,
+                        path,
+                        f.cyclomatic,
+                        f.cognitive,
+                        f.grade()
+                    ));
+                }
+            }
+        }
     }
 
     let mut out = String::new();
@@ -543,6 +562,16 @@ pub async fn structural_context(
             out.push_str("\n\n");
         }
         out.push_str(&format_regions(&regions));
+    }
+
+    // Deterministic complexity of the changed functions (a risk signal, not a
+    // verdict — higher grades warrant a closer look at testability/edge cases).
+    if !complexity_lines.is_empty() {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str("Complexity of changed functions (cyclomatic / cognitive; grade A best, F worst):\n");
+        out.push_str(&complexity_lines.join("\n"));
     }
 
     out
