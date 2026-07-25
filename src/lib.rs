@@ -10,6 +10,7 @@ pub mod agent;
 pub mod backend;
 pub mod blast;
 pub mod command;
+pub mod complexity;
 pub mod config;
 pub mod deps;
 pub mod diff;

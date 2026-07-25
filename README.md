@@ -41,6 +41,11 @@ prompt through [`Config`].
   greps. For TS/TSX it uses tree-sitter, so **JSX renders (`<Comp/>`) and type
   positions (`: T`, `Foo<T>`)** count as references, not just `name(` calls.
   Fail-open; tune with `BLAST_RADIUS` / `BLAST_MAX_SYMBOLS` / `BLAST_MAX_REFS`.
+- **Complexity metrics**: deterministic cyclomatic + cognitive complexity (with an
+  A–F grade) for the functions a change touches, computed with tree-sitter from the
+  files already fetched for structural context — no LLM, no extra fetch. Only
+  functions at/above `COMPLEXITY_MIN_CYCLOMATIC` are surfaced, as a risk signal.
+  Toggle with `COMPLEXITY_METRICS`.
 - **Smart diff packing**: on large PRs, whole files are ranked (source > tests >
   docs) and packed to the budget instead of blunt truncation; omitted files are
   named to the model.
