@@ -29,6 +29,9 @@ pub struct RepoConfig {
     pub file_bundling: Option<bool>,
     /// Toggle the OSV.dev dependency vulnerability scan for this repo.
     pub cve_scan: Option<bool>,
+    /// Toggle re-anchoring a finding that drifted just off a diff line to the
+    /// nearest matching diff line (else it folds to the summary), for this repo.
+    pub reanchor_findings: Option<bool>,
     /// Extra review instructions in plain language, appended to the system prompt.
     pub instructions: Option<String>,
 }

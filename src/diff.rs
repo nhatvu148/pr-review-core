@@ -19,48 +19,18 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 /// ```
 pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
     let mut map: HashMap<String, HashSet<u64>> = HashMap::new();
-    let mut cur_path: Option<String> = None;
-    let mut new_line: u64 = 0;
-
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            let p = rest.trim();
-            let p = p.strip_prefix("b/").unwrap_or(p);
-            cur_path = if p == "/dev/null" {
-                None
-            } else {
-                Some(p.to_string())
-            };
-        } else if line.starts_with("@@") {
-            // @@ -old,n +new,m @@  — grab the start of the new-side range.
-            if let Some(plus) = line.split('+').nth(1) {
-                let num: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
-                new_line = num.parse().unwrap_or(0);
-            }
-        } else if let Some(path) = &cur_path {
-            match line.chars().next() {
-                Some('+') => {
-                    map.entry(path.clone()).or_default().insert(new_line);
-                    new_line += 1;
-                }
-                Some(' ') => {
-                    map.entry(path.clone()).or_default().insert(new_line);
-                    new_line += 1;
-                }
-                // '-' removed line: new side doesn't advance. Other markers ignored.
-                _ => {}
-            }
-        }
-    }
+    for_each_new_side_line(diff, |path, new_line, _text| {
+        map.entry(path.to_string()).or_default().insert(new_line);
+    });
     map
 }
 
-/// Map each new-side file path to `{ line number -> line text }` (added or context
-/// lines, the leading `+`/space stripped), for the new version of the file. The
-/// content companion to [`parse_valid_lines`], used to confirm a re-anchor by
-/// matching a finding to what's actually on a nearby diff line.
-pub fn diff_line_texts(diff: &str) -> HashMap<String, HashMap<u64, String>> {
-    let mut map: HashMap<String, HashMap<u64, String>> = HashMap::new();
+/// Walk a unified diff's new side, invoking `f(path, line_number, text)` for each
+/// added or context line (the leading `+`/space stripped), in order. This is the
+/// single place the `+++`/`@@`/line-marker state machine lives, so
+/// [`parse_valid_lines`] and [`diff_line_texts`] can't drift apart. Removed (`-`)
+/// lines don't advance the new-side counter; `/dev/null` targets are skipped.
+fn for_each_new_side_line(diff: &str, mut f: impl FnMut(&str, u64, &str)) {
     let mut cur_path: Option<String> = None;
     let mut new_line: u64 = 0;
 
@@ -70,19 +40,32 @@ pub fn diff_line_texts(diff: &str) -> HashMap<String, HashMap<u64, String>> {
             let p = p.strip_prefix("b/").unwrap_or(p);
             cur_path = (p != "/dev/null").then(|| p.to_string());
         } else if line.starts_with("@@") {
+            // @@ -old,n +new,m @@  — grab the start of the new-side range.
             if let Some(plus) = line.split('+').nth(1) {
                 let num: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
                 new_line = num.parse().unwrap_or(0);
             }
         } else if let Some(path) = &cur_path {
             if let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix(' ')) {
-                map.entry(path.clone())
-                    .or_default()
-                    .insert(new_line, text.to_string());
+                f(path, new_line, text);
                 new_line += 1;
             }
+            // '-' removed line: new side doesn't advance. Other markers ignored.
         }
     }
+}
+
+/// Map each new-side file path to `{ line number -> line text }` (added or context
+/// lines, the leading `+`/space stripped), for the new version of the file. The
+/// content companion to [`parse_valid_lines`], used to confirm a re-anchor by
+/// matching a finding to what's actually on a nearby diff line.
+pub fn diff_line_texts(diff: &str) -> HashMap<String, HashMap<u64, String>> {
+    let mut map: HashMap<String, HashMap<u64, String>> = HashMap::new();
+    for_each_new_side_line(diff, |path, new_line, text| {
+        map.entry(path.to_string())
+            .or_default()
+            .insert(new_line, text.to_string());
+    });
     map
 }
 

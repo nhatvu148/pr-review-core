@@ -305,6 +305,9 @@ impl Config {
         if let Some(v) = rc.file_bundling {
             cfg.file_bundling = v;
         }
+        if let Some(v) = rc.reanchor_findings {
+            cfg.reanchor_findings = v;
+        }
         if let Some(v) = &rc.instructions {
             let extra = v.trim();
             if !extra.is_empty() {
@@ -379,6 +382,7 @@ mod tests {
         base.self_critique = true;
         base.agentic = false;
         base.file_bundling = true;
+        base.reanchor_findings = true;
         base.extra_system_prompt = "BASE CONVENTIONS".to_string();
 
         let rc = RepoConfig {
@@ -387,6 +391,7 @@ mod tests {
             self_critique: Some(false),
             agentic: Some(true),
             file_bundling: Some(false),
+            reanchor_findings: Some(false),
             include_globs: Some(vec!["src/**".to_string()]),
             instructions: Some("Never nit about formatting.".to_string()),
             ..Default::default()
@@ -400,6 +405,7 @@ mod tests {
         assert!(!eff.self_critique);
         assert!(eff.agentic);
         assert!(!eff.file_bundling);
+        assert!(!eff.reanchor_findings);
         assert_eq!(eff.include_globs, vec!["src/**".to_string()]);
         // Untouched field keeps the base value.
         assert_eq!(eff.max_findings, 5);
