@@ -476,6 +476,19 @@ pub async fn run_review_with(
         };
     }
     findings.retain(|f| f.confidence.unwrap_or(100) >= cfg.min_confidence);
+    // Deterministic diff-hygiene findings (class D): change-set hazards — a binary
+    // swept in, an oversized generated file — that need no model call to catch.
+    // Added after self-critique/confidence-floor (they're facts, not guesses) but
+    // before the severity sort + cap, so they compete on severity like any finding.
+    for h in crate::diff::diff_hygiene(&raw_diff) {
+        findings.push(Finding {
+            severity: h.severity.to_string(),
+            file: h.file,
+            line: None,
+            body: h.body,
+            confidence: Some(100),
+        });
+    }
     findings.sort_by(|a, b| {
         severity_rank(&b.severity)
             .cmp(&severity_rank(&a.severity))

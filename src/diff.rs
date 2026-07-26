@@ -471,12 +471,116 @@ pub fn path_matches_globs(path: &str, include: &[String], exclude: &[String]) ->
     (include.is_empty() || include_set.is_match(path)) && !exclude_set.is_match(path)
 }
 
+/// A deterministic "diff-hygiene" issue: a property of the *change set* (not the
+/// code) worth flagging without an LLM — a binary swept into a commit, an oversized
+/// generated file. Reviewer-coverage class D: cheaper, zero-variance, and it cannot
+/// hallucinate, so it's strictly better than asking the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HygieneIssue {
+    /// New-side path of the offending file.
+    pub file: String,
+    /// `"MEDIUM"` or `"LOW"` — mapped straight onto a finding's severity.
+    pub severity: &'static str,
+    /// Human-facing explanation, already in the `<problem>. Fix: <fix>` shape.
+    pub body: String,
+}
+
+/// A newly-added text file with at least this many added lines is worth a nudge
+/// (likely generated/vendored output that shouldn't be committed).
+const LARGE_ADDED_LINES: usize = 1000;
+
+/// Scan a raw unified diff for deterministic diff-hygiene issues (class D). Targets
+/// *added* files only — the change-set hazards a normal diff view hides. No model,
+/// no clone; runs on the raw diff so a file filtered out of the review is still seen.
+#[must_use]
+pub fn diff_hygiene(diff: &str) -> Vec<HygieneIssue> {
+    let mut issues = Vec::new();
+    for (path, section) in split_diff_sections(diff) {
+        if path.is_empty() {
+            continue; // preamble or a /dev/null deletion — no added file to judge
+        }
+        // Only *added* files: a `new file mode` header is git's unambiguous marker.
+        if !section.lines().any(|l| l.starts_with("new file mode")) {
+            continue;
+        }
+        if section.lines().any(|l| l.starts_with("Binary files ")) {
+            issues.push(HygieneIssue {
+                file: path.clone(),
+                severity: "MEDIUM",
+                body: format!(
+                    "A binary file `{path}` was added in this change — binaries bloat the repo permanently and are invisible in a normal diff view. Fix: drop it from the commit (`.gitignore`, Git LFS, or a release asset) unless it is intentional."
+                ),
+            });
+            continue;
+        }
+        let added = section
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .count();
+        if added >= LARGE_ADDED_LINES {
+            issues.push(HygieneIssue {
+                file: path.clone(),
+                severity: "LOW",
+                body: format!(
+                    "`{path}` adds {added} lines in a single new file. If this is generated or vendored output it shouldn't be committed. Fix: confirm it's hand-written; otherwise `.gitignore` or exclude it."
+                ),
+            });
+        }
+    }
+    issues
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        bundle_key, diff_line_texts, filter_diff_by_globs, pack_diff, pack_diff_bundled,
-        parse_valid_lines, path_matches_globs, split_diff_sections,
+        bundle_key, diff_hygiene, diff_line_texts, filter_diff_by_globs, pack_diff,
+        pack_diff_bundled, parse_valid_lines, path_matches_globs, split_diff_sections,
     };
+
+    #[test]
+    fn hygiene_flags_an_added_binary_file() {
+        let diff = "diff --git a/assets/ime.zip b/assets/ime.zip\n\
+                    new file mode 100644\n\
+                    index 0000000..abc1234\n\
+                    Binary files /dev/null and b/assets/ime.zip differ\n";
+        let issues = diff_hygiene(diff);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].file, "assets/ime.zip");
+        assert_eq!(issues[0].severity, "MEDIUM");
+        assert!(issues[0].body.contains("binary"));
+    }
+
+    #[test]
+    fn hygiene_ignores_a_normal_added_source_file() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n\
+                    new file mode 100644\n\
+                    --- /dev/null\n+++ b/src/a.rs\n@@ -0,0 +1,2 @@\n+fn a() {}\n+// ok\n";
+        assert!(diff_hygiene(diff).is_empty());
+    }
+
+    #[test]
+    fn hygiene_ignores_a_modified_binary() {
+        // No `new file mode` → a modification, not an add; class D targets adds.
+        let diff = "diff --git a/logo.png b/logo.png\n\
+                    index 111..222 100644\n\
+                    Binary files a/logo.png and b/logo.png differ\n";
+        assert!(diff_hygiene(diff).is_empty());
+    }
+
+    #[test]
+    fn hygiene_flags_a_large_added_file() {
+        let mut section = String::from(
+            "diff --git a/gen/bundle.js b/gen/bundle.js\n\
+             new file mode 100644\n--- /dev/null\n+++ b/gen/bundle.js\n@@ -0,0 +1,1500 @@\n",
+        );
+        for i in 0..1500 {
+            section.push_str(&format!("+line{i}\n"));
+        }
+        let issues = diff_hygiene(&section);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].severity, "LOW");
+        assert!(issues[0].body.contains("1500 lines"));
+    }
 
     #[test]
     fn path_matches_globs_respects_include_and_exclude() {
@@ -490,7 +594,11 @@ mod tests {
         ));
         // With an include set, only matching paths pass.
         assert!(path_matches_globs("src/a.rs", &["src/**".to_string()], &[]));
-        assert!(!path_matches_globs("docs/x.md", &["src/**".to_string()], &[]));
+        assert!(!path_matches_globs(
+            "docs/x.md",
+            &["src/**".to_string()],
+            &[]
+        ));
         // Exclude wins over include.
         assert!(!path_matches_globs(
             "src/gen.rs",
@@ -503,9 +611,7 @@ mod tests {
 
     /// A minimal one-hunk section for `path`, adding `body` lines (to control size).
     fn section(path: &str, body: &str) -> String {
-        format!(
-            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n+{body}\n"
-        )
+        format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n+{body}\n")
     }
 
     #[test]
@@ -537,7 +643,11 @@ mod tests {
         let budget = foo.chars().count() + foot.chars().count() + 5;
         let (packed, dropped) = pack_diff_bundled(&diff, budget);
 
-        assert_eq!(dropped, vec!["src/other.ts".to_string()], "big unrelated file dropped");
+        assert_eq!(
+            dropped,
+            vec!["src/other.ts".to_string()],
+            "big unrelated file dropped"
+        );
         // The test section sits immediately after the source — bundled, adjacent.
         let s = packed.find("src/foo.ts").unwrap();
         let t = packed.find("src/foo.test.ts").unwrap();
