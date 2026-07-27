@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.10.0
+
+Two review-facing additions — deterministic **diff-hygiene** findings and a
+**recommendation floor** — plus benchmark-harness improvements.
+
+**Diff hygiene (coverage class D)**
+
+- `diff::diff_hygiene()` flags change-set hazards a normal diff view hides, with no
+  LLM call (zero tokens, zero variance, can't hallucinate): an **added binary file**
+  (MEDIUM) and an **oversized added file** (LOW, ≥1000 added lines). Runs on the raw
+  diff — *before* the empty-diff short-circuit — so a swept-in binary or vendored
+  tree is caught even when every file was filtered out of the LLM review. Merged into
+  both the normal and advisory-only paths and ranked by severity like any finding.
+
+**Recommendation floor**
+
+- The posted recommendation is now the **stronger** of the model's own verdict and
+  the floor implied by the merged findings' max severity — only ever upgrading, never
+  softening. A deterministic MEDIUM hygiene finding (a swept-in binary) can no longer
+  sit under an "APPROVE". Computed from the pre-truncation finding set so a capped
+  finding can't leave the recommendation understating a real problem.
+
+**Benchmark harness**
+
+- New `examples/bench_local.rs` + `scripts/swe_to_corpus.py`: score the reviewer
+  against raw-diff corpora built from public bug-fix datasets (SWE-bench, reverse-
+  patched so a fix commit is a free ground-truth annotation), with per-language F1.
+- `hits()` now scores **file-level** issues and **summary findings** (`line: null`),
+  matching like-with-like — so unanchored-but-correct findings are measurable instead
+  of always reading as a miss.
+
 ## 0.9.0
 
 Five additions this cycle — deterministic **complexity metrics**, **smart diff
