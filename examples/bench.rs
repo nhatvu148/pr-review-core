@@ -41,7 +41,12 @@ struct Case {
 #[derive(Deserialize)]
 struct Issue {
     file: String,
-    line: u64,
+    /// Anchor line, or `null`/omitted for a **file-level** issue (a defect with no
+    /// single line, e.g. "this page is unreachable") — which matches any finding in
+    /// the same file, including the summary findings the reviewer emits for exactly
+    /// these cases.
+    #[serde(default)]
+    line: Option<u64>,
     #[serde(default)]
     #[allow(dead_code)]
     r#type: String,
@@ -53,8 +58,13 @@ struct Issue {
 /// A finding hits an issue: same file, within TOLERANCE lines.
 fn hits(f: &Finding, i: &Issue) -> bool {
     f.file == i.file
-        && f.line
-            .is_some_and(|l| (l as i64 - i.line as i64).abs() <= TOLERANCE)
+        && match (f.line, i.line) {
+            // Both anchored: within tolerance.
+            (Some(fl), Some(il)) => (fl as i64 - il as i64).abs() <= TOLERANCE,
+            // Either side is file-level (a summary finding, or a file-level issue):
+            // same file is enough. Coarser, so keep line numbers where a defect has one.
+            _ => true,
+        }
 }
 
 /// Aggregate scores for one full pass over the corpus.

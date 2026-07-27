@@ -54,14 +54,21 @@ struct Case {
 #[derive(Deserialize)]
 struct Issue {
     file: String,
-    line: u64,
+    /// Anchor line, or `null`/omitted for a **file-level** issue (a defect with no
+    /// single line) — matches any finding in the same file, incl. summary findings.
+    #[serde(default)]
+    line: Option<u64>,
 }
 
 /// A finding hits an issue: same file, within TOLERANCE lines.
 fn hits(f: &Finding, i: &Issue) -> bool {
     f.file == i.file
-        && f.line
-            .is_some_and(|l| (l as i64 - i.line as i64).abs() <= TOLERANCE)
+        && match (f.line, i.line) {
+            (Some(fl), Some(il)) => (fl as i64 - il as i64).abs() <= TOLERANCE,
+            // Either side file-level (a summary finding, or a file-level issue): same
+            // file is enough. Before this, a summary finding could never be scored.
+            _ => true,
+        }
 }
 
 /// Running tallies for a precision/recall computation (one bucket).
