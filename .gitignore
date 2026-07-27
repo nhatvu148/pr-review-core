@@ -1,1 +1,6 @@
 /target
+
+# Local reviewer-tuning notes and benchmark data — kept out of the public crate
+docs/REVIEWER_COVERAGE.md
+docs/bench-corpus.json
+docs/feedback/
