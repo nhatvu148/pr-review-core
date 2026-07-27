@@ -68,6 +68,40 @@ pub(crate) fn severity_emoji(sev: &str) -> &'static str {
     }
 }
 
+/// Rank a recommendation so two can be compared (higher = blocks more).
+fn recommendation_rank(rec: &str) -> u8 {
+    let r = rec.to_uppercase();
+    if r.contains("BLOCK") {
+        2
+    } else if r.contains("CHANGES") {
+        1
+    } else {
+        0
+    }
+}
+
+/// The recommendation actually posted: the **stronger** of the model's own verdict
+/// and the floor implied by the merged findings' max severity. Deterministic hygiene
+/// findings are added after the model decides, so without this a MEDIUM "swept-in
+/// binary" could sit under an "APPROVE". Only ever upgrades — never softens the model.
+fn effective_recommendation(model_rec: &str, findings: &[Finding]) -> String {
+    let max_sev = findings
+        .iter()
+        .map(|f| severity_rank(&f.severity))
+        .max()
+        .unwrap_or(0);
+    let floor = match max_sev {
+        3 => "BLOCK",                     // a BLOCKING finding
+        2 | 1 => "APPROVE WITH CHANGES",  // HIGH or MEDIUM
+        _ => "APPROVE",                   // LOW-only or none — don't force changes
+    };
+    if recommendation_rank(model_rec) >= recommendation_rank(floor) {
+        model_rec.trim().to_string()
+    } else {
+        floor.to_string()
+    }
+}
+
 /// Body for an inline comment: `<emoji> **SEVERITY** — <problem>. Fix: …`
 fn inline_body(f: &Finding) -> String {
     format!(
@@ -163,11 +197,16 @@ fn reanchor(
 
 /// The summary comment: overall + recommendation + any findings that couldn't be
 /// anchored to a diff line (line-anchored ones go inline).
-fn render_summary(review: &Review, unanchored: &[&Finding], inline_count: usize) -> String {
+fn render_summary(
+    review: &Review,
+    recommendation: &str,
+    unanchored: &[&Finding],
+    inline_count: usize,
+) -> String {
     let mut s = format!(
         "🤖 **Automated review**\n\n{}\n\n**Recommendation:** {}",
         review.summary.trim(),
-        review.recommendation.trim()
+        recommendation.trim()
     );
     if inline_count > 0 {
         s.push_str(&format!("\n\n_{inline_count} inline comment(s) below._"));
@@ -273,6 +312,33 @@ pub(crate) async fn load_repo_config(
     }
 }
 
+/// Build the summary comment for a PR with nothing for the LLM to review, from any
+/// dependency advisories and/or deterministic hygiene findings. Pure — no I/O — so
+/// the "a swept-in binary must still produce a comment" path is directly testable.
+fn render_no_review_summary(advisories: &[crate::deps::DepAdvisory], hygiene: &[Finding]) -> String {
+    let mut s = String::from(
+        "🤖 **Automated review**\n\nNo reviewable source changes (all files excluded by filters).",
+    );
+    if !advisories.is_empty() {
+        s.push_str("\n\n");
+        s.push_str(&crate::deps::render_advisories(advisories));
+    }
+    if !hygiene.is_empty() {
+        s.push_str("\n\n## Findings");
+        for f in hygiene {
+            s.push_str(&format!(
+                "\n- {} **{}** — `{}` — {}",
+                severity_emoji(&f.severity),
+                f.severity.to_uppercase(),
+                f.file,
+                f.body.trim()
+            ));
+        }
+    }
+    s.push_str("\n\n_Automated advisory review — a human still owns the merge decision._");
+    s
+}
+
 /// Post a summary when there's nothing for the LLM to review (every file was
 /// filtered out) but a dependency advisory and/or a deterministic diff-hygiene
 /// finding still deserves a comment. Skipped on dry-run.
@@ -285,26 +351,14 @@ async fn post_advisory_only(
     advisories: Vec<crate::deps::DepAdvisory>,
     hygiene: Vec<Finding>,
 ) -> Result<RunReviewOutput> {
-    let mut summary = String::from(
-        "🤖 **Automated review**\n\nNo reviewable source changes (all files excluded by filters).",
-    );
-    if !advisories.is_empty() {
-        summary.push_str("\n\n");
-        summary.push_str(&crate::deps::render_advisories(&advisories));
-    }
-    if !hygiene.is_empty() {
-        summary.push_str("\n\n## Findings");
-        for f in &hygiene {
-            summary.push_str(&format!(
-                "\n- {} **{}** — `{}` — {}",
-                severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
-                f.file,
-                f.body.trim()
-            ));
-        }
-    }
-    summary.push_str("\n\n_Automated advisory review — a human still owns the merge decision._");
+    let summary = render_no_review_summary(&advisories, &hygiene);
+    // A CVE advisory always warrants changes; hygiene findings upgrade from there.
+    let baseline = if advisories.is_empty() {
+        "APPROVE"
+    } else {
+        "APPROVE WITH CHANGES"
+    };
+    let recommendation = effective_recommendation(baseline, &hygiene);
 
     let post = ReviewPost {
         summary: summary.clone(),
@@ -315,7 +369,7 @@ async fn post_advisory_only(
         repo: input.repo.clone(),
         pr: input.pr,
         model: cfg.openrouter_model.clone(),
-        recommendation: "APPROVE WITH CHANGES".to_string(),
+        recommendation,
         findings: hygiene.len(),
         findings_detail: hygiene,
         inline_posted: 0,
@@ -553,7 +607,10 @@ pub async fn run_review_with(
         }
     }
 
-    let mut summary = render_summary(&result.review, &unanchored, inline.len());
+    // Recommendation reflects the *merged* findings (incl. deterministic hygiene the
+    // model never saw), upgraded from — never softening — the model's own verdict.
+    let recommendation = effective_recommendation(&result.review.recommendation, &findings);
+    let mut summary = render_summary(&result.review, &recommendation, &unanchored, inline.len());
     if !advisories.is_empty() {
         summary.push_str("\n\n");
         summary.push_str(&crate::deps::render_advisories(&advisories));
@@ -569,7 +626,7 @@ pub async fn run_review_with(
         repo: input.repo.clone(),
         pr: input.pr,
         model: result.model,
-        recommendation: result.review.recommendation.clone(),
+        recommendation: recommendation.clone(),
         findings: findings.len(),
         findings_detail: findings.clone(),
         inline_posted: inline_count,
@@ -589,7 +646,47 @@ pub async fn run_review_with(
 
 #[cfg(test)]
 mod tests {
-    use super::{idents, line_symbols, reanchor};
+    use super::{
+        effective_recommendation, idents, line_symbols, reanchor, render_no_review_summary,
+    };
+    use crate::llm::Finding;
+
+    fn finding(severity: &str) -> Finding {
+        Finding {
+            severity: severity.to_string(),
+            file: "assets/ime.zip".to_string(),
+            line: None,
+            body: "A binary file `assets/ime.zip` was added. Fix: drop it.".to_string(),
+            confidence: Some(100),
+        }
+    }
+
+    #[test]
+    fn recommendation_upgrades_but_never_downgrades() {
+        // A MEDIUM hygiene finding lifts an APPROVE to "approve with changes".
+        assert_eq!(
+            effective_recommendation("APPROVE", &[finding("MEDIUM")]),
+            "APPROVE WITH CHANGES"
+        );
+        // A BLOCKING finding forces a block.
+        assert_eq!(effective_recommendation("APPROVE", &[finding("BLOCKING")]), "BLOCK");
+        // A LOW-only finding does NOT force changes.
+        assert_eq!(effective_recommendation("APPROVE", &[finding("LOW")]), "APPROVE");
+        // The model's stronger verdict is never softened by weaker findings.
+        assert_eq!(effective_recommendation("BLOCK", &[finding("LOW")]), "BLOCK");
+        // No findings → the model's verdict is kept verbatim.
+        assert_eq!(effective_recommendation("APPROVE", &[]), "APPROVE");
+    }
+
+    #[test]
+    fn no_review_summary_still_names_a_swept_in_binary() {
+        // The regression the wiring guards against: an all-excluded PR whose only
+        // change is a binary must still produce a comment that names the file.
+        let s = render_no_review_summary(&[], &[finding("MEDIUM")]);
+        assert!(s.contains("assets/ime.zip"));
+        assert!(s.contains("MEDIUM"));
+        assert!(s.contains("## Findings"));
+    }
     use std::collections::{HashMap, HashSet};
 
     #[test]
