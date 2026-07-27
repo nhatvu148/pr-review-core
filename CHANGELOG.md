@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.1
+
+Patch: **calibrate the diff-hygiene binary check.** As first shipped it flagged
+*any* added binary and produced a false positive on a routine image asset (a 7 KB
+`.webp` avatar in `public/`). `diff::diff_hygiene()` now suppresses common
+image/font extensions (`.png/.jpg/.webp/.ico/.woff…`) — archives, executables,
+databases, and unknown binaries still fire, so the swept-in-`.zip` signal is intact.
+Precision fix; no API change.
+
 ## 0.10.0
 
 Two review-facing additions — deterministic **diff-hygiene** findings and a
