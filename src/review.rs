@@ -273,8 +273,9 @@ pub(crate) async fn load_repo_config(
     }
 }
 
-/// Post an advisory-only summary when the reviewable diff is empty but a
-/// dependency scan found something (e.g. a lockfile-only PR). Skipped on dry-run.
+/// Post a summary when there's nothing for the LLM to review (every file was
+/// filtered out) but a dependency advisory and/or a deterministic diff-hygiene
+/// finding still deserves a comment. Skipped on dry-run.
 async fn post_advisory_only(
     provider: &Provider,
     client: &reqwest::Client,
@@ -282,12 +283,27 @@ async fn post_advisory_only(
     meta: &PrMeta,
     input: &RunReviewInput,
     advisories: Vec<crate::deps::DepAdvisory>,
+    hygiene: Vec<Finding>,
 ) -> Result<RunReviewOutput> {
     let mut summary = String::from(
-        "🤖 **Automated review**\n\nNo reviewable source changes (dependency/lockfile-only PR).",
+        "🤖 **Automated review**\n\nNo reviewable source changes (all files excluded by filters).",
     );
-    summary.push_str("\n\n");
-    summary.push_str(&crate::deps::render_advisories(&advisories));
+    if !advisories.is_empty() {
+        summary.push_str("\n\n");
+        summary.push_str(&crate::deps::render_advisories(&advisories));
+    }
+    if !hygiene.is_empty() {
+        summary.push_str("\n\n## Findings");
+        for f in &hygiene {
+            summary.push_str(&format!(
+                "\n- {} **{}** — `{}` — {}",
+                severity_emoji(&f.severity),
+                f.severity.to_uppercase(),
+                f.file,
+                f.body.trim()
+            ));
+        }
+    }
     summary.push_str("\n\n_Automated advisory review — a human still owns the merge decision._");
 
     let post = ReviewPost {
@@ -300,8 +316,8 @@ async fn post_advisory_only(
         pr: input.pr,
         model: cfg.openrouter_model.clone(),
         recommendation: "APPROVE WITH CHANGES".to_string(),
-        findings: 0,
-        findings_detail: Vec::new(),
+        findings: hygiene.len(),
+        findings_detail: hygiene,
         inline_posted: 0,
         posted: false,
         comment_url: None,
@@ -392,12 +408,27 @@ pub async fn run_review_with(
         tracing::info!("skipped {} file(s) by glob: {:?}", dropped.len(), dropped);
     }
 
+    // Deterministic diff-hygiene findings (class D). Computed from the RAW diff so a
+    // glob-excluded file (a vendored tree, a swept-in binary) is still seen — which
+    // is the whole point, so it must run *before* the empty-diff short-circuit below.
+    let hygiene: Vec<Finding> = crate::diff::diff_hygiene(&raw_diff)
+        .into_iter()
+        .map(|h| Finding {
+            severity: h.severity.to_string(),
+            file: h.file,
+            line: None,
+            body: h.body,
+            confidence: Some(100),
+        })
+        .collect();
+
     // If every changed file was filtered out (e.g. a lockfile-only PR) there's
-    // nothing for the LLM to review — but a dependency advisory found on those
-    // lockfiles still deserves a comment. Post an advisory-only summary and return.
+    // nothing for the LLM to review — but a dependency advisory or a hygiene finding
+    // on those files still deserves a comment. Post the no-review summary and return.
     if diff.trim().is_empty() {
-        if !advisories.is_empty() {
-            return post_advisory_only(&provider, &client, cfg, &meta, &input, advisories).await;
+        if !advisories.is_empty() || !hygiene.is_empty() {
+            return post_advisory_only(&provider, &client, cfg, &meta, &input, advisories, hygiene)
+                .await;
         }
         anyhow::bail!(
             "PR diff is empty (all files excluded by globs, or no changes) — nothing to review."
@@ -476,19 +507,10 @@ pub async fn run_review_with(
         };
     }
     findings.retain(|f| f.confidence.unwrap_or(100) >= cfg.min_confidence);
-    // Deterministic diff-hygiene findings (class D): change-set hazards — a binary
-    // swept in, an oversized generated file — that need no model call to catch.
-    // Added after self-critique/confidence-floor (they're facts, not guesses) but
-    // before the severity sort + cap, so they compete on severity like any finding.
-    for h in crate::diff::diff_hygiene(&raw_diff) {
-        findings.push(Finding {
-            severity: h.severity.to_string(),
-            file: h.file,
-            line: None,
-            body: h.body,
-            confidence: Some(100),
-        });
-    }
+    // Merge the diff-hygiene findings (computed earlier, before the empty-diff
+    // short-circuit). Added after self-critique/confidence-floor — they're facts,
+    // not guesses — but before the severity sort + cap, so they compete like any.
+    findings.extend(hygiene);
     findings.sort_by(|a, b| {
         severity_rank(&b.severity)
             .cmp(&severity_rank(&a.severity))

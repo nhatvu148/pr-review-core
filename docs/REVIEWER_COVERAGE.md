@@ -166,13 +166,19 @@ over-broad `git add`. Trivially detectable; nothing was looking.
 **Required capability.** None from the model. Implement in Rust in `src/diff.rs`
 as deterministic pre-checks emitted as findings:
 
-| check | suggested threshold |
-|---|---|
-| added binary file | any file with NUL bytes, or > 1 MB |
-| added file > N lines with no extension in `include_globs` | 5 000 |
-| lockfile changed with no manifest change | exact |
-| added path matching a `.gitignore` pattern | exact |
-| high-entropy string in an added line | tuned; expect false positives, gate behind config |
+| check | threshold | status |
+|---|---|---|
+| added binary file | git's `Binary files … differ` marker on a `new file mode` | **done** (MEDIUM) |
+| oversized added file | ≥ `LARGE_ADDED_LINES` (1000) added lines | **done** (LOW) |
+| lockfile changed with no manifest change | exact | deferred |
+| added path matching a `.gitignore` pattern | exact | deferred |
+| high-entropy string in an added line | tuned; expect false positives, gate behind config | deferred |
+
+The two `done` checks run on the **raw** diff (before glob filtering and before the
+empty-diff short-circuit), so an added binary or oversized file is flagged even when
+it is the PR's *only* change and every file was filtered out of the LLM review. The
+`deferred` rows carry more false-positive risk and should land only with a matching
+regression case, per §4.1.
 
 Deterministic checks are strictly better than model-derived ones here: zero
 token cost, zero variance, and they cannot hallucinate.
