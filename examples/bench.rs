@@ -16,10 +16,16 @@
 //! ## Corpus format (JSON array)
 //! ```json
 //! [ { "provider": "github", "repo": "owner/app", "pr": 42,
-//!     "issues": [ { "file": "src/a.ts", "line": 88, "type": "bug", "note": "N+1" } ] } ]
+//!     "issues": [
+//!       { "file": "src/a.ts", "line": 88, "type": "bug", "note": "N+1" },
+//!       { "file": "src/nav.ts", "type": "bug", "note": "page unreachable — no single line" }
+//!     ] } ]
 //! ```
-//! A finding matches an issue when it's in the same file within ±`TOLERANCE` lines.
-//! Proximity scoring is a signal, not a proof — keep the corpus honest.
+//! A line-anchored issue matches a finding in the same file within ±`TOLERANCE`
+//! lines. **Omit `line`** (or set it null) for a *file-level* issue — a defect with
+//! no single anchor line; it matches a same-file **summary** finding (also lineless).
+//! Anchored and file-level never cross-match. Proximity is a signal, not a proof —
+//! keep the corpus honest.
 
 use pr_review_core::config::Config;
 use pr_review_core::llm::Finding;
@@ -61,9 +67,12 @@ fn hits(f: &Finding, i: &Issue) -> bool {
         && match (f.line, i.line) {
             // Both anchored: within tolerance.
             (Some(fl), Some(il)) => (fl as i64 - il as i64).abs() <= TOLERANCE,
-            // Either side is file-level (a summary finding, or a file-level issue):
-            // same file is enough. Coarser, so keep line numbers where a defect has one.
-            _ => true,
+            // Both file-level: a summary finding ↔ a file-level issue, same file.
+            (None, None) => true,
+            // Never cross-match an anchored finding/issue with an unanchored one — that
+            // would let one vague summary finding credit every line-anchored issue in
+            // the file (and a file-level issue be "hit" by every finding), inflating both.
+            _ => false,
         }
 }
 
