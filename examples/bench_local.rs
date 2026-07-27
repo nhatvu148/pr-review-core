@@ -21,7 +21,9 @@
 //!     "diff": "<unified diff — the change under review>",
 //!     "issues": [ { "file": "astropy/modeling/separable.py", "line": 245 } ] } ]
 //! ```
-//! A finding matches an issue when it's in the same file within ±`TOLERANCE` lines.
+//! A line-anchored issue matches a finding in the same file within ±`TOLERANCE`
+//! lines. **Omit `line`** for a *file-level* issue — one with no single anchor line;
+//! it matches a same-file summary finding. Anchored and file-level never cross-match.
 //! Ground truth from fix commits is noisier than hand-annotation (a fixed line isn't
 //! always the *only* place a reviewer should flag) — trust the aggregate, not one case.
 
@@ -54,14 +56,23 @@ struct Case {
 #[derive(Deserialize)]
 struct Issue {
     file: String,
-    line: u64,
+    /// Anchor line, or `null`/omitted for a **file-level** issue (a defect with no
+    /// single line) — matches any finding in the same file, incl. summary findings.
+    #[serde(default)]
+    line: Option<u64>,
 }
 
 /// A finding hits an issue: same file, within TOLERANCE lines.
 fn hits(f: &Finding, i: &Issue) -> bool {
     f.file == i.file
-        && f.line
-            .is_some_and(|l| (l as i64 - i.line as i64).abs() <= TOLERANCE)
+        && match (f.line, i.line) {
+            (Some(fl), Some(il)) => (fl as i64 - il as i64).abs() <= TOLERANCE,
+            // Both file-level: a summary finding ↔ a file-level issue, same file.
+            (None, None) => true,
+            // Never cross-match an anchored finding/issue with an unanchored one — one
+            // vague finding would otherwise credit every line-anchored issue in the file.
+            _ => false,
+        }
 }
 
 /// Running tallies for a precision/recall computation (one bucket).
