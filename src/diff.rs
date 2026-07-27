@@ -489,6 +489,21 @@ pub struct HygieneIssue {
 /// (likely generated/vendored output that shouldn't be committed).
 const LARGE_ADDED_LINES: usize = 1000;
 
+/// Whether an added binary is a routine image/font asset — the kind teams commit
+/// deliberately (a logo, an avatar, a webfont). Suppressed from the diff-hygiene
+/// check so it doesn't flag routine product work; archives, executables, databases,
+/// and unknown binaries (the actual repo-bloat hazards, e.g. a swept-in `.zip`) still
+/// fire. Size and PR-body gates would sharpen this further but need the clone / PR
+/// metadata; extension is the signal available from the diff alone.
+fn is_routine_asset(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    const ASSET_EXT: &[&str] = &[
+        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".avif", ".bmp", ".tiff", ".woff",
+        ".woff2", ".ttf", ".otf", ".eot",
+    ];
+    ASSET_EXT.iter().any(|e| p.ends_with(e))
+}
+
 /// Scan a raw unified diff for deterministic diff-hygiene issues (class D). Targets
 /// *added* files only — the change-set hazards a normal diff view hides. No model,
 /// no clone; runs on the raw diff so a file filtered out of the review is still seen.
@@ -504,13 +519,18 @@ pub fn diff_hygiene(diff: &str) -> Vec<HygieneIssue> {
             continue;
         }
         if section.lines().any(|l| l.starts_with("Binary files ")) {
-            issues.push(HygieneIssue {
-                file: path.clone(),
-                severity: "MEDIUM",
-                body: format!(
-                    "A binary file `{path}` was added in this change — binaries bloat the repo permanently and are invisible in a normal diff view. Fix: drop it from the commit (`.gitignore`, Git LFS, or a release asset) unless it is intentional."
-                ),
-            });
+            // A routine image/font asset (logo, avatar, webfont) is deliberate product
+            // work, not repo bloat — don't flag it. Archives/executables/DBs/unknown
+            // binaries still fire (that's the swept-in-`.zip` signal from #97).
+            if !is_routine_asset(&path) {
+                issues.push(HygieneIssue {
+                    file: path.clone(),
+                    severity: "MEDIUM",
+                    body: format!(
+                        "A binary file `{path}` was added in this change — binaries bloat the repo permanently and are invisible in a normal diff view. Fix: drop it from the commit (`.gitignore`, Git LFS, or a release asset) unless it is intentional."
+                    ),
+                });
+            }
             continue;
         }
         let added = section
@@ -548,6 +568,21 @@ mod tests {
         assert_eq!(issues[0].file, "assets/ime.zip");
         assert_eq!(issues[0].severity, "MEDIUM");
         assert!(issues[0].body.contains("binary"));
+    }
+
+    #[test]
+    fn hygiene_ignores_a_routine_image_asset() {
+        // A committed product asset (avatar/logo/webfont) is deliberate, not bloat —
+        // it must not flag (regression: nomnaviet#106, a 7 KB .webp in public/).
+        let diff = "diff --git a/apps/web/public/assistant/be-na.webp b/apps/web/public/assistant/be-na.webp\n\
+                    new file mode 100644\n\
+                    index 0000000..abc1234\n\
+                    Binary files /dev/null and b/apps/web/public/assistant/be-na.webp differ\n";
+        assert!(diff_hygiene(diff).is_empty());
+        // ...but a non-asset binary (archive/executable) in the same spot still fires.
+        let zip = "diff --git a/apps/web/public/data.zip b/apps/web/public/data.zip\n\
+                   new file mode 100644\nBinary files /dev/null and b/apps/web/public/data.zip differ\n";
+        assert_eq!(diff_hygiene(zip).len(), 1);
     }
 
     #[test]
