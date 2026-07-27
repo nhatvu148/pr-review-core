@@ -570,6 +570,11 @@ pub async fn run_review_with(
             .cmp(&severity_rank(&a.severity))
             .then(b.confidence.unwrap_or(0).cmp(&a.confidence.unwrap_or(0)))
     });
+    // Recommendation reflects the *merged* findings (incl. deterministic hygiene the
+    // model never saw), upgraded from — never softening — the model's own verdict.
+    // Computed BEFORE the cap so a hygiene finding truncated out of the posted list
+    // still can't leave the recommendation understating a real problem.
+    let recommendation = effective_recommendation(&result.review.recommendation, &findings);
     findings.truncate(cfg.max_findings);
 
     let valid = parse_valid_lines(&diff);
@@ -607,9 +612,7 @@ pub async fn run_review_with(
         }
     }
 
-    // Recommendation reflects the *merged* findings (incl. deterministic hygiene the
-    // model never saw), upgraded from — never softening — the model's own verdict.
-    let recommendation = effective_recommendation(&result.review.recommendation, &findings);
+    // `recommendation` was computed from the pre-truncation findings above.
     let mut summary = render_summary(&result.review, &recommendation, &unanchored, inline.len());
     if !advisories.is_empty() {
         summary.push_str("\n\n");
@@ -650,6 +653,7 @@ mod tests {
         effective_recommendation, idents, line_symbols, reanchor, render_no_review_summary,
     };
     use crate::llm::Finding;
+    use std::collections::{HashMap, HashSet};
 
     fn finding(severity: &str) -> Finding {
         Finding {
@@ -687,7 +691,6 @@ mod tests {
         assert!(s.contains("MEDIUM"));
         assert!(s.contains("## Findings"));
     }
-    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn idents_extracts_tokens() {
