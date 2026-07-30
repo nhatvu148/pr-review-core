@@ -32,6 +32,8 @@ pub struct RepoConfig {
     /// Toggle grouping related changed files (source + test, i18n siblings) when
     /// packing a large diff, for this repo.
     pub file_bundling: Option<bool>,
+    /// Toggle fetching the head commit's CI results into the prompt for this repo.
+    pub ci_status: Option<bool>,
     /// Toggle the OSV.dev dependency vulnerability scan for this repo.
     pub cve_scan: Option<bool>,
     /// Toggle re-anchoring a finding that drifted just off a diff line to the

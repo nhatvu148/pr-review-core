@@ -93,7 +93,7 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         .and_then(|s| s.commit)
         .and_then(|c| c.hash)
         .filter(|h| !h.is_empty());
-    let ci_status = match &source_sha {
+    let ci_status = match source_sha.as_ref().filter(|_| cfg.ci_status) {
         // Fail-open: build status is context, never a precondition for reviewing.
         Some(sha) => get_build_status(client, cfg, repo, sha)
             .await

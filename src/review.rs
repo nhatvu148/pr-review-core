@@ -150,7 +150,10 @@ fn burst_key(f: &Finding) -> String {
 fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
     let mut groups: Vec<(String, Vec<Finding>)> = Vec::new();
     for f in findings {
-        let key = burst_key(&f);
+        // Severity is part of the key, so a group is uniform by construction: two
+        // findings that share a phrase but not a severity are, by the model's own
+        // judgement, not the same claim — and merging them would hide that.
+        let key = format!("{}|{}", f.severity.to_uppercase(), burst_key(&f));
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, g)) => g.push(f),
             None => groups.push((key, vec![f])),
@@ -831,19 +834,34 @@ mod tests {
         assert_eq!(collapse_bursts(mixed).len(), 3);
     }
 
-    /// Collapsing must never soften the verdict: the survivor carries the group's
-    /// highest severity, so `effective_recommendation` still sees it.
+    /// Collapsing must never soften the verdict: a group is uniform in severity, so
+    /// whatever `effective_recommendation` would have seen, it still sees.
     #[test]
-    fn the_collapsed_finding_keeps_the_highest_severity() {
+    fn a_uniform_group_collapses_at_its_own_severity() {
+        let findings = vec![
+            f("MEDIUM", "a.zip", "A binary file `a.zip` was added."),
+            f("MEDIUM", "b.zip", "A binary file `b.zip` was added."),
+            f("MEDIUM", "c.zip", "A binary file `c.zip` was added."),
+        ];
+        let out = collapse_bursts(findings);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, "MEDIUM");
+        assert_eq!(out[0].file, "a.zip");
+    }
+
+    /// Severity is part of the group key, so a shared phrase at two severities is
+    /// two claims, not one. Splitting means neither collapses (each is below the
+    /// threshold) — the safe direction: nothing is merged that shouldn't be.
+    #[test]
+    fn a_mixed_severity_group_is_not_collapsed() {
         let findings = vec![
             f("LOW", "a.zip", "A binary file `a.zip` was added."),
             f("MEDIUM", "b.zip", "A binary file `b.zip` was added."),
             f("LOW", "c.zip", "A binary file `c.zip` was added."),
         ];
         let out = collapse_bursts(findings);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].severity, "MEDIUM");
-        assert_eq!(out[0].file, "b.zip");
+        assert_eq!(out.len(), 3, "2 LOW + 1 MEDIUM: neither reaches 3");
+        assert!(out.iter().all(|f| !f.body.contains("other file(s)")));
     }
 
     #[test]

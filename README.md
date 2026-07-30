@@ -119,6 +119,7 @@ size caps) are also read from the environment — see `src/config.rs`.
 | `VENDORED_GLOBS` | `thirdparty/`, `third_party/`, `vendor/`, `vendored/`, `external/`, `node_modules/` | Globs marking vendored third-party source. Diff-hygiene findings are suppressed inside them and the reviewer is told not to propose edits there — committing vendored code in bulk is the intent, not a defect. Setting this REPLACES the defaults. |
 | `LLM_BASE_URL` | `OPENROUTER_BASE_URL` → openrouter | OpenAI-compatible endpoint (e.g. `http://localhost:11434/v1` for Ollama). |
 | `LLM_API_KEY` | `OPENROUTER_API_KEY` | API key for the endpoint above. |
+| `CI_STATUS` | `true` | Fetch the head commit's CI results (GitHub check runs / Bitbucket build statuses) and show them in the prompt, so the reviewer can't assert a broken build that CI already decided. One extra API call per review; set `false` for tokens near their rate limit. |
 | `CVE_SCAN` | `true` | Scan changed lockfiles for known-vulnerable deps via OSV.dev. |
 | `CVE_MAX_PACKAGES` | `100` | Max distinct packages queried against OSV per review. |
 | `OSV_API_BASE` | `https://api.osv.dev` | OSV API base (override for a mirror/test double). |

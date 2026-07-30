@@ -278,7 +278,7 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
     let pr_data: Pr = res.json().await?;
     let head_sha = pr_data.head.and_then(|h| h.sha);
     // Fail-open: CI status is context, never a precondition for reviewing.
-    let ci_status = match &head_sha {
+    let ci_status = match head_sha.as_ref().filter(|_| cfg.ci_status) {
         Some(sha) => get_check_status(client, cfg, repo, sha)
             .await
             .unwrap_or_else(|e| {
