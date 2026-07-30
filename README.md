@@ -64,8 +64,10 @@ prompt through [`Config`].
 - **PR commands**: `/ask <question>` answers questions about the PR from its diff;
   `/describe` (re)generates the PR description idempotently, preserving human edits;
   `/review-file <path>` deep-reviews an entire file at the PR head, beyond just the diff.
-- **Per-repo config**: a `.prbot.toml` at the repo root overrides model, globs,
-  confidence/caps, and adds free-text review `instructions`.
+- **Per-repo config**: a `.prbot.toml` at the repo root overrides model, globs
+  (including `vendored`, which marks third-party source the reviewer must not file
+  hygiene findings on or propose edits inside), confidence/caps, and adds free-text
+  review `instructions`.
 - **Benchmark harness**: `examples/bench.rs` scores the reviewer against a corpus
   of PRs with known issues (`examples/bench-corpus.example.json`) — reporting
   precision / recall / F1 and token cost, so a feature's effect (blast radius,
@@ -114,6 +116,7 @@ size caps) are also read from the environment — see `src/config.rs`.
 | `REANCHOR_FINDINGS` | `true` | Snap a finding that drifted just off a diff line to the nearest diff line sharing a code symbol (else it folds to the summary). |
 | `EXCLUDE_GLOBS` | lockfiles, generated, vendored, minified | Comma-separated globs skipped before the LLM call. |
 | `INCLUDE_GLOBS` | *(empty = all)* | If set, only files matching these globs are reviewed. |
+| `VENDORED_GLOBS` | `thirdparty/`, `third_party/`, `vendor/`, `vendored/`, `external/`, `node_modules/` | Globs marking vendored third-party source. Diff-hygiene findings are suppressed inside them and the reviewer is told not to propose edits there — committing vendored code in bulk is the intent, not a defect. Setting this REPLACES the defaults. |
 | `LLM_BASE_URL` | `OPENROUTER_BASE_URL` → openrouter | OpenAI-compatible endpoint (e.g. `http://localhost:11434/v1` for Ollama). |
 | `LLM_API_KEY` | `OPENROUTER_API_KEY` | API key for the endpoint above. |
 | `CVE_SCAN` | `true` | Scan changed lockfiles for known-vulnerable deps via OSV.dev. |

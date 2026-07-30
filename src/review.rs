@@ -139,6 +139,14 @@ fn burst_key(f: &Finding) -> String {
 ///
 /// Order is preserved (each group lands where its first member was), and a group
 /// keeps its highest-severity member as the representative so nothing is softened.
+///
+/// **A group containing a HIGH or BLOCKING finding is never collapsed.** Collapsing
+/// is lossy — only the representative keeps its inline anchor and its `Fix:` text —
+/// and three genuinely distinct serious bugs can share an opening phrase (the same
+/// vulnerable pattern repeated across files is *also* what a real burst looks like).
+/// At LOW/MEDIUM that trade is worth it; at HIGH it is not, because the cost of
+/// dropping a real fix instruction exceeds the cost of a repetitive review. Both
+/// recorded bursts were MEDIUM and LOW, so the canary is unaffected.
 fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
     let mut groups: Vec<(String, Vec<Finding>)> = Vec::new();
     for f in findings {
@@ -155,6 +163,21 @@ fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
             out.append(&mut group);
             continue;
         }
+        // Never merge serious findings — each one's anchor and fix must survive.
+        let max_rank = group
+            .iter()
+            .map(|f| severity_rank(&f.severity))
+            .max()
+            .unwrap_or(0);
+        if max_rank >= severity_rank("HIGH") {
+            tracing::info!(
+                "not collapsing {} findings at HIGH+ despite a shared claim: \"{key}\"",
+                group.len()
+            );
+            out.append(&mut group);
+            continue;
+        }
+
         let n = group.len();
         tracing::warn!("collapsed {n} findings that make the same claim: \"{key}\"");
 
@@ -166,13 +189,16 @@ fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
             .map_or(0, |(i, _)| i);
         let mut rep = group.remove(best);
 
+        // Name enough files that the reader can check the pattern themselves; the
+        // cap only exists to keep one comment from becoming a file listing.
+        const MAX_NAMED: usize = 10;
         let mut named: Vec<String> = group
             .iter()
-            .take(3)
+            .take(MAX_NAMED)
             .map(|f| format!("`{}`", f.file))
             .collect();
-        if group.len() > 3 {
-            named.push(format!("and {} more", group.len() - 3));
+        if group.len() > MAX_NAMED {
+            named.push(format!("and {} more", group.len() - MAX_NAMED));
         }
         rep.body = format!(
             "{} \n\nThe same applies to {} other file(s) in this change ({}) — reported once \
@@ -779,6 +805,30 @@ mod tests {
             f("LOW", "b.cxx", "`b.cxx` adds 1868 lines in one new file."),
         ];
         assert_eq!(collapse_bursts(findings).len(), 2);
+    }
+
+    /// Raised on PR #27: collapsing is lossy — only the representative keeps its
+    /// inline anchor and its `Fix:` text — so three distinct serious bugs that share
+    /// an opening phrase must NOT be merged. Both recorded bursts were MEDIUM/LOW.
+    #[test]
+    fn serious_findings_are_never_collapsed() {
+        let same_claim = "SQL built by string concatenation reaches the driver.";
+        let findings = vec![
+            f("HIGH", "a.rs", same_claim),
+            f("HIGH", "b.rs", same_claim),
+            f("HIGH", "c.rs", same_claim),
+        ];
+        let out = collapse_bursts(findings);
+        assert_eq!(out.len(), 3, "each HIGH keeps its own anchor and fix");
+        assert!(out.iter().all(|f| !f.body.contains("other file(s)")));
+
+        // One HIGH in the group protects the whole group.
+        let mixed = vec![
+            f("LOW", "a.rs", same_claim),
+            f("LOW", "b.rs", same_claim),
+            f("BLOCKING", "c.rs", same_claim),
+        ];
+        assert_eq!(collapse_bursts(mixed).len(), 3);
     }
 
     /// Collapsing must never soften the verdict: the survivor carries the group's
