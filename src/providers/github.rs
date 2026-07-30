@@ -103,21 +103,17 @@ const FILES_MAX_PAGES: u64 = 30;
 /// allowlist of formats no one edits as text: a false claim here costs a MEDIUM
 /// finding (and, via the recommendation floor, an "approve with changes"), whereas
 /// missing one only loses a hygiene bonus on an already-oversized PR.
+/// Grouped by kind, in order: archives; executables/objects/libraries; images,
+/// fonts and media; documents, databases, model weights and installers.
 fn is_binary_ext(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     const BINARY_EXT: &[&str] = &[
-        // archives
-        ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war",
-        // executables, objects, libraries
-        ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".lib", ".class", ".wasm",
-        ".pdb", ".obj",
-        // images, fonts, media
+        ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war", ".exe",
+        ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".lib", ".class", ".wasm", ".pdb", ".obj",
         ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".avif", ".bmp", ".tiff", ".psd",
         ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov", ".avi", ".wav",
-        ".webm", ".ogg",
-        // documents, databases, models, installers
-        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".db", ".sqlite",
-        ".sqlite3", ".mdb", ".onnx", ".pt", ".pth", ".h5", ".pkl", ".npy", ".npz",
+        ".webm", ".ogg", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".db",
+        ".sqlite", ".sqlite3", ".mdb", ".onnx", ".pt", ".pth", ".h5", ".pkl", ".npy", ".npz",
         ".safetensors", ".dmg", ".iso", ".deb", ".rpm", ".msi", ".apk", ".ipa", ".keystore",
         ".jks", ".p12", ".pfx",
     ];
@@ -280,14 +276,94 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         );
     }
     let pr_data: Pr = res.json().await?;
+    let head_sha = pr_data.head.and_then(|h| h.sha);
+    // Fail-open: CI status is context, never a precondition for reviewing.
+    let ci_status = match &head_sha {
+        Some(sha) => get_check_status(client, cfg, repo, sha)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("could not fetch check runs for {repo}@{sha}: {e:#}");
+                None
+            }),
+        None => None,
+    };
     Ok(PrMeta {
         repo: repo.to_string(),
         pr,
         title: pr_data.title,
         base_branch: pr_data.base.and_then(|b| b.ref_),
-        head_sha: pr_data.head.and_then(|h| h.sha),
+        head_sha,
         body: pr_data.body,
+        ci_status,
     })
+}
+
+/// Fetch the check runs for a commit and render them one per line.
+///
+/// Returns `None` when no checks have reported — which must read as "unknown", not
+/// "nothing ran": a repo with no CI and a repo whose CI has not started yet are
+/// indistinguishable here, and neither licenses a claim about the build.
+///
+/// # Errors
+/// If the request fails or the response can't be parsed.
+pub async fn get_check_status(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    sha: &str,
+) -> Result<Option<String>> {
+    #[derive(Deserialize)]
+    struct Run {
+        name: Option<String>,
+        /// `queued` | `in_progress` | `completed`.
+        status: Option<String>,
+        /// `success` | `failure` | `neutral` | `cancelled` | `timed_out` | …
+        conclusion: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Runs {
+        check_runs: Option<Vec<Run>>,
+    }
+
+    let url = format!(
+        "{}/repos/{repo}/commits/{}/check-runs?per_page=50",
+        cfg.github_api_base,
+        enc_path(sha)
+    );
+    let res = gh(client.get(url), cfg).send().await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "GitHub getCheckRuns {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 200)
+        );
+    }
+    let runs = res
+        .json::<Runs>()
+        .await
+        .context("GitHub getCheckRuns: unexpected response shape")?
+        .check_runs
+        .unwrap_or_default();
+    if runs.is_empty() {
+        return Ok(None);
+    }
+
+    let rendered = runs
+        .iter()
+        .map(|r| {
+            let name = r.name.as_deref().unwrap_or("(unnamed check)");
+            // A completed run reports its conclusion; a running one has none yet,
+            // and saying "in_progress" is more honest than reporting no result.
+            let state = r
+                .conclusion
+                .as_deref()
+                .or(r.status.as_deref())
+                .unwrap_or("unknown");
+            format!("- {name}: {state}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Some(rendered))
 }
 
 /// Post a standalone issue comment (NOT deduped) — used for `/ask` answers and

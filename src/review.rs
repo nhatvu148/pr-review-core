@@ -102,6 +102,91 @@ fn effective_recommendation(model_rec: &str, findings: &[Finding]) -> String {
     }
 }
 
+/// This many findings making the same claim about different files are collapsed
+/// into one. Three is the point where a list stops reading as several observations
+/// and starts reading as one pattern.
+const BURST_THRESHOLD: usize = 3;
+
+/// The *shape* of a finding's claim, with the per-file parts removed: backticked
+/// spans (paths, symbols) and digits (line counts, sizes) are dropped, and what
+/// remains is truncated to its first dozen words.
+///
+/// Two findings sharing a key are making the same argument about different files.
+fn burst_key(f: &Finding) -> String {
+    let mut out = String::new();
+    let mut in_tick = false;
+    for c in f.body.chars() {
+        match c {
+            '`' => in_tick = !in_tick,
+            _ if in_tick || c.is_ascii_digit() => {}
+            _ => out.extend(c.to_lowercase()),
+        }
+    }
+    out.split_whitespace()
+        .take(12)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Collapse `BURST_THRESHOLD`+ findings that make the same claim about different
+/// files into one finding that names the count and the files.
+///
+/// Two production failures had this signature — 111 vendored source files reported
+/// as added binaries, then seven vendored files reported as oversized — and in both
+/// the review read as "here are N separate problems" when the honest reading was
+/// "here is one claim about N files". Collapsing is better output *and* a canary: a
+/// systematic false positive is exactly a claim that repeats.
+///
+/// Order is preserved (each group lands where its first member was), and a group
+/// keeps its highest-severity member as the representative so nothing is softened.
+fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
+    let mut groups: Vec<(String, Vec<Finding>)> = Vec::new();
+    for f in findings {
+        let key = burst_key(&f);
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, g)) => g.push(f),
+            None => groups.push((key, vec![f])),
+        }
+    }
+
+    let mut out = Vec::new();
+    for (key, mut group) in groups {
+        if group.len() < BURST_THRESHOLD {
+            out.append(&mut group);
+            continue;
+        }
+        let n = group.len();
+        tracing::warn!("collapsed {n} findings that make the same claim: \"{key}\"");
+
+        // Keep the most severe member; ties keep the first (input order).
+        let best = group
+            .iter()
+            .enumerate()
+            .max_by_key(|(i, f)| (severity_rank(&f.severity), std::cmp::Reverse(*i)))
+            .map_or(0, |(i, _)| i);
+        let mut rep = group.remove(best);
+
+        let mut named: Vec<String> = group
+            .iter()
+            .take(3)
+            .map(|f| format!("`{}`", f.file))
+            .collect();
+        if group.len() > 3 {
+            named.push(format!("and {} more", group.len() - 3));
+        }
+        rep.body = format!(
+            "{} \n\nThe same applies to {} other file(s) in this change ({}) — reported once \
+             rather than {n} times. If that pattern is expected here (vendored or generated \
+             code, a mechanical refactor), treat this as one decision, not {n}.",
+            rep.body.trim_end(),
+            group.len(),
+            named.join(", ")
+        );
+        out.push(rep);
+    }
+    out
+}
+
 /// Body for an inline comment: `<emoji> **SEVERITY** — <problem>. Fix: …`
 fn inline_body(f: &Finding) -> String {
     format!(
@@ -465,7 +550,7 @@ pub async fn run_review_with(
     // Deterministic diff-hygiene findings (class D). Computed from the RAW diff so a
     // glob-excluded file (a vendored tree, a swept-in binary) is still seen — which
     // is the whole point, so it must run *before* the empty-diff short-circuit below.
-    let hygiene: Vec<Finding> = crate::diff::diff_hygiene(&raw_diff)
+    let hygiene: Vec<Finding> = crate::diff::diff_hygiene_with(&raw_diff, &cfg.vendored_globs)
         .into_iter()
         .map(|h| Finding {
             severity: h.severity.to_string(),
@@ -565,6 +650,9 @@ pub async fn run_review_with(
     // short-circuit). Added after self-critique/confidence-floor — they're facts,
     // not guesses — but before the severity sort + cap, so they compete like any.
     findings.extend(hygiene);
+    // Collapse a burst of one claim repeated across many files into a single finding
+    // that states the count — before the sort, so the survivor competes on merit.
+    findings = collapse_bursts(findings);
     findings.sort_by(|a, b| {
         severity_rank(&b.severity)
             .cmp(&severity_rank(&a.severity))
@@ -650,10 +738,72 @@ pub async fn run_review_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_recommendation, idents, line_symbols, reanchor, render_no_review_summary,
+        burst_key, collapse_bursts, effective_recommendation, idents, line_symbols, reanchor,
+        render_no_review_summary,
     };
     use crate::llm::Finding;
     use std::collections::{HashMap, HashSet};
+
+    fn f(severity: &str, file: &str, body: &str) -> Finding {
+        Finding {
+            severity: severity.to_string(),
+            file: file.to_string(),
+            line: None,
+            body: body.to_string(),
+            confidence: Some(100),
+        }
+    }
+
+    /// The VinaText#20 round-2 shape: one claim, seven files.
+    #[test]
+    fn a_repeated_claim_collapses_into_one_finding() {
+        let findings = vec![
+            f("LOW", "a.cxx", "`a.cxx` adds 2192 lines in one new file."),
+            f("LOW", "b.cxx", "`b.cxx` adds 1868 lines in one new file."),
+            f("LOW", "c.cxx", "`c.cxx` adds 1268 lines in one new file."),
+            f("HIGH", "d.rs", "Unvalidated input reaches the query."),
+        ];
+        let out = collapse_bursts(findings);
+        assert_eq!(out.len(), 2, "three same-shape findings become one");
+        assert!(out[0].body.contains("2 other file(s)"));
+        assert!(out[0].body.contains("`b.cxx`"));
+        // The unrelated finding is untouched.
+        assert_eq!(out[1].file, "d.rs");
+        assert!(!out[1].body.contains("other file(s)"));
+    }
+
+    #[test]
+    fn two_of_a_kind_are_left_alone() {
+        let findings = vec![
+            f("LOW", "a.cxx", "`a.cxx` adds 2192 lines in one new file."),
+            f("LOW", "b.cxx", "`b.cxx` adds 1868 lines in one new file."),
+        ];
+        assert_eq!(collapse_bursts(findings).len(), 2);
+    }
+
+    /// Collapsing must never soften the verdict: the survivor carries the group's
+    /// highest severity, so `effective_recommendation` still sees it.
+    #[test]
+    fn the_collapsed_finding_keeps_the_highest_severity() {
+        let findings = vec![
+            f("LOW", "a.zip", "A binary file `a.zip` was added."),
+            f("MEDIUM", "b.zip", "A binary file `b.zip` was added."),
+            f("LOW", "c.zip", "A binary file `c.zip` was added."),
+        ];
+        let out = collapse_bursts(findings);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].severity, "MEDIUM");
+        assert_eq!(out[0].file, "b.zip");
+    }
+
+    #[test]
+    fn burst_key_ignores_paths_and_numbers_but_not_the_claim() {
+        let a = f("LOW", "a.rs", "`a.rs` adds 2192 lines in one new file.");
+        let b = f("LOW", "b.rs", "`b.rs` adds 17 lines in one new file.");
+        let c = f("LOW", "c.rs", "`c.rs` leaks a handle on the error path.");
+        assert_eq!(burst_key(&a), burst_key(&b));
+        assert_ne!(burst_key(&a), burst_key(&c));
+    }
 
     fn finding(severity: &str) -> Finding {
         Finding {

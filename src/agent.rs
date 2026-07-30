@@ -263,10 +263,13 @@ pub async fn agentic_review(
         if truncated { "\n[diff truncated]" } else { "" },
     );
 
-    let system_prompt = if cfg.extra_system_prompt.is_empty() {
-        AGENT_SYSTEM_PROMPT.to_string()
-    } else {
-        format!("{AGENT_SYSTEM_PROMPT}\n{}", cfg.extra_system_prompt)
+    let system_prompt = {
+        let base = format!("{AGENT_SYSTEM_PROMPT}\n{}", crate::prompt::REVIEW_RULES);
+        if cfg.extra_system_prompt.is_empty() {
+            base
+        } else {
+            format!("{base}\n{}", cfg.extra_system_prompt)
+        }
     };
 
     let chat = ChatClient::new(ProviderConfig {
@@ -470,6 +473,7 @@ mod tests {
             base_branch: None,
             head_sha: None,
             body: None,
+            ci_status: None,
         }
     }
 

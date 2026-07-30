@@ -20,6 +20,11 @@ pub struct RepoConfig {
     pub model_explore: Option<String>,
     pub include_globs: Option<Vec<String>>,
     pub exclude_globs: Option<Vec<String>>,
+    /// Globs marking vendored third-party source (`thirdparty/**`, `vendor/**`, …).
+    /// Diff-hygiene findings are suppressed inside them and the reviewer is told not
+    /// to propose edits there — the remedy for vendored code is an upstream patch or
+    /// a version bump. Setting this REPLACES the conventional defaults.
+    pub vendored: Option<Vec<String>>,
     pub min_confidence: Option<u8>,
     pub max_findings: Option<usize>,
     pub self_critique: Option<bool>,

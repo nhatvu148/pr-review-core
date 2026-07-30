@@ -157,6 +157,7 @@ fn synthetic_meta(case: &Case) -> PrMeta {
         base_branch: None,
         head_sha: None,
         body: None,
+        ci_status: None,
     }
 }
 

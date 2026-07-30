@@ -504,15 +504,71 @@ fn is_routine_asset(path: &str) -> bool {
     ASSET_EXT.iter().any(|e| p.ends_with(e))
 }
 
+/// Path segments that conventionally hold third-party source. Committing code in
+/// bulk under one of these is the *intended act* of vendoring, not a hygiene defect,
+/// so class-D checks are suppressed inside them.
+///
+/// Matched as whole path segments at any depth, so `frontend/node_modules/x` and
+/// `node_modules/x` both count. `external` is included because the convention is
+/// common enough to be worth the trade, even though some repos use it for
+/// first-party code — the cost of a wrong suppression is one lost hygiene bonus,
+/// while the cost of a wrong finding is a false positive that moves the
+/// recommendation. Override with `vendored` in `.prbot.toml` when it misfires.
+pub const DEFAULT_VENDORED_DIRS: &[&str] = &[
+    "thirdparty",
+    "third_party",
+    "vendor",
+    "vendored",
+    "external",
+    "node_modules",
+];
+
+/// Whether `path` lies inside vendored third-party code.
+///
+/// With no configured globs this is a whole-segment match against
+/// [`DEFAULT_VENDORED_DIRS`]; with globs it defers to them entirely, so a repo can
+/// both widen and narrow the default. Fails **closed** on an invalid glob (treats
+/// the path as NOT vendored), because suppressing findings is the riskier direction.
+#[must_use]
+pub fn is_vendored(path: &str, vendored_globs: &[String]) -> bool {
+    if vendored_globs.is_empty() {
+        return path
+            .split('/')
+            .any(|seg| DEFAULT_VENDORED_DIRS.contains(&seg));
+    }
+    build_globset(vendored_globs).is_some_and(|set| set.is_match(path))
+}
+
 /// Scan a raw unified diff for deterministic diff-hygiene issues (class D). Targets
 /// *added* files only — the change-set hazards a normal diff view hides. No model,
 /// no clone; runs on the raw diff so a file filtered out of the review is still seen.
+///
+/// Vendored paths are skipped — see [`diff_hygiene_with`], which this delegates to
+/// with the default vendored directories.
 #[must_use]
 pub fn diff_hygiene(diff: &str) -> Vec<HygieneIssue> {
+    diff_hygiene_with(diff, &[])
+}
+
+/// [`diff_hygiene`] with explicit vendored globs (from `.prbot.toml`); an empty
+/// slice means [`DEFAULT_VENDORED_DIRS`].
+///
+/// Vendoring is why this split exists. A PR that adds 265 files of upstream source
+/// under `thirdparty/` is doing the thing it says on the tin: every class-D signal
+/// fires (bulk added files, files over the line threshold, sometimes binaries), and
+/// every one of those findings is wrong — the suggested remedy, "`.gitignore` or
+/// exclude it", is impossible for source you must compile. Suppressing the class
+/// inside vendored paths is the whole fix; the reviewer's judgment about vendored
+/// code belongs in the prompt, not here.
+#[must_use]
+pub fn diff_hygiene_with(diff: &str, vendored_globs: &[String]) -> Vec<HygieneIssue> {
     let mut issues = Vec::new();
     for (path, section) in split_diff_sections(diff) {
         if path.is_empty() {
             continue; // preamble or a /dev/null deletion — no added file to judge
+        }
+        if is_vendored(&path, vendored_globs) {
+            continue; // committing third-party source is the intent, not a defect
         }
         // Only *added* files: a `new file mode` header is git's unambiguous marker.
         if !section.lines().any(|l| l.starts_with("new file mode")) {
@@ -553,7 +609,7 @@ pub fn diff_hygiene(diff: &str) -> Vec<HygieneIssue> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bundle_key, diff_hygiene, diff_line_texts, filter_diff_by_globs, pack_diff,
+        bundle_key, diff_hygiene, diff_line_texts, filter_diff_by_globs, is_vendored, pack_diff,
         pack_diff_bundled, parse_valid_lines, path_matches_globs, split_diff_sections,
     };
 
@@ -615,6 +671,54 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].severity, "LOW");
         assert!(issues[0].body.contains("1500 lines"));
+    }
+
+    /// VinaText#20: a PR vendoring Scintilla/Lexilla under `thirdparty/` drew seven
+    /// LOW "adds N lines in a single new file … `.gitignore` or exclude it" findings.
+    /// Every line count was exact and every conclusion was wrong — you cannot
+    /// gitignore source you must compile. Bulk-committing upstream code is the
+    /// intended act of a vendoring PR.
+    #[test]
+    fn hygiene_skips_vendored_paths() {
+        let mut section = String::from(
+            "diff --git a/thirdparty/lexilla/lexers/LexRuby.cxx b/thirdparty/lexilla/lexers/LexRuby.cxx\n\
+             new file mode 100644\n--- /dev/null\n+++ b/thirdparty/lexilla/lexers/LexRuby.cxx\n@@ -0,0 +1,2192 @@\n",
+        );
+        for i in 0..2192 {
+            section.push_str(&format!("+line{i}\n"));
+        }
+        assert!(diff_hygiene(&section).is_empty());
+
+        // A binary swept into a vendored tree is equally the vendoring act.
+        let bin = "diff --git a/vendor/libs/x.zip b/vendor/libs/x.zip\n\
+                   new file mode 100644\nBinary files /dev/null and b/vendor/libs/x.zip differ\n";
+        assert!(diff_hygiene(bin).is_empty());
+
+        // ...but the same file OUTSIDE a vendored path still fires.
+        let bin_outside = "diff --git a/assets/x.zip b/assets/x.zip\n\
+                           new file mode 100644\nBinary files /dev/null and b/assets/x.zip differ\n";
+        assert_eq!(diff_hygiene(bin_outside).len(), 1);
+    }
+
+    #[test]
+    fn vendored_dirs_match_at_any_depth_and_only_whole_segments() {
+        assert!(is_vendored("thirdparty/lexilla/LexD.cxx", &[]));
+        assert!(is_vendored("frontend/node_modules/react/index.js", &[]));
+        assert!(is_vendored("vendor/x.go", &[]));
+        // Whole segments only — a file merely *named* like one is first-party code.
+        assert!(!is_vendored("src/vendor_client.rs", &[]));
+        assert!(!is_vendored("src/thirdparty.rs", &[]));
+        assert!(!is_vendored("src/lib.rs", &[]));
+    }
+
+    #[test]
+    fn configured_vendored_globs_replace_the_defaults() {
+        let globs = vec!["libs/upstream/**".to_string()];
+        assert!(is_vendored("libs/upstream/a.c", &globs));
+        // Configuring the list turns the conventional names OFF — the repo decides.
+        assert!(!is_vendored("thirdparty/a.c", &globs));
+        // Invalid glob → fails CLOSED (not vendored), since suppressing is riskier.
+        assert!(!is_vendored("thirdparty/a.c", &["[".to_string()]));
     }
 
     #[test]

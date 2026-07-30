@@ -18,6 +18,17 @@ pub struct PrMeta {
     /// The PR/MR description body, when fetched. Used by the `/describe` command
     /// to preserve any human-written content around the generated section.
     pub body: Option<String>,
+    /// Rendered CI check results for `head_sha`, when the provider exposes them.
+    ///
+    /// Fetched with the metadata so every backend gets it without a signature
+    /// change, and surfaced in the prompt: "this change breaks the build" is the
+    /// cheapest-to-falsify claim a reviewer can make, and the most expensive to get
+    /// wrong (it arrives at BLOCKING). A green check on the reviewed commit settles
+    /// it without the reviewer reasoning about the build at all.
+    ///
+    /// `None` means "not known" — never "nothing ran". Fail-open: a failed status
+    /// fetch must not cost the review.
+    pub ci_status: Option<String>,
 }
 
 /// One inline comment anchored to a file + line on the new side of the diff.
