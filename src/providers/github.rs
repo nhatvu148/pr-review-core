@@ -95,6 +95,35 @@ pub(super) struct FileEntry {
 const FILES_PER_PAGE: u64 = 100;
 const FILES_MAX_PAGES: u64 = 30;
 
+/// Is this path *unambiguously* binary from its extension alone?
+///
+/// Used only on the Files-API path, where a missing `patch` is ambiguous between "a
+/// binary" and "GitHub truncated a large PR". Claiming binary is what feeds
+/// [`crate::diff::diff_hygiene`]'s swept-in-binary finding, so the list is an
+/// allowlist of formats no one edits as text: a false claim here costs a MEDIUM
+/// finding (and, via the recommendation floor, an "approve with changes"), whereas
+/// missing one only loses a hygiene bonus on an already-oversized PR.
+fn is_binary_ext(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    const BINARY_EXT: &[&str] = &[
+        // archives
+        ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war",
+        // executables, objects, libraries
+        ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".lib", ".class", ".wasm",
+        ".pdb", ".obj",
+        // images, fonts, media
+        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".avif", ".bmp", ".tiff", ".psd",
+        ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov", ".avi", ".wav",
+        ".webm", ".ogg",
+        // documents, databases, models, installers
+        ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".db", ".sqlite",
+        ".sqlite3", ".mdb", ".onnx", ".pt", ".pth", ".h5", ".pkl", ".npy", ".npz",
+        ".safetensors", ".dmg", ".iso", ".deb", ".rpm", ".msi", ".apk", ".ipa", ".keystore",
+        ".jks", ".p12", ".pfx",
+    ];
+    BINARY_EXT.iter().any(|e| p.ends_with(e))
+}
+
 /// Render Files-API entries as a unified diff equivalent to what the `.diff` media
 /// type would have returned.
 ///
@@ -115,6 +144,19 @@ pub(super) fn render_files_diff(files: &[FileEntry], truncated: bool) -> String 
             "[note: this PR exceeds GitHub's 3000-file API ceiling — the files below \
              are the first 3000; later files are NOT shown]\n",
         );
+    }
+    // A patch-less file is the *norm* on this path, not an anomaly: GitHub withholds
+    // patches wholesale once a PR's diff passes its size limits. Lead with the count
+    // so a reader sees "N files I could not inspect" rather than inferring something
+    // about the handful that later survive the findings cap.
+    let no_patch = files.iter().filter(|f| f.patch.is_none()).count();
+    if no_patch > 0 {
+        out.push_str(&format!(
+            "[note: GitHub returned no patch for {no_patch} of {} files (its per-PR diff \
+             size limits) — those files are listed below but their contents are NOT shown \
+             and could not be reviewed]\n",
+            files.len()
+        ));
     }
     for f in files {
         let status = f.status.as_deref().unwrap_or("modified");
@@ -146,15 +188,21 @@ pub(super) fn render_files_diff(files: &[FileEntry], truncated: bool) -> String 
                     out.push('\n');
                 }
             }
-            // No `patch`. Zero additions and deletions is GitHub's signature for a
-            // binary file; anything else is a text file whose patch was withheld for
-            // size. Deliberately no `+++` line here — there are no hunks to anchor.
-            None if f.additions + f.deletions == 0 => {
+            // No `patch`. A missing patch is *unknown*, not *binary*: GitHub omits
+            // `patch` AND reports `additions: 0` for ordinary text files whenever the
+            // PR-level diff exceeds its limits — which is exactly the situation that
+            // put us on this path. Counts therefore cannot distinguish the two, so
+            // only the path itself may claim binary, and only for extensions that are
+            // unambiguously binary. Everything else says it does not know.
+            //
+            // Deliberately no `+++` line in either arm — there are no hunks to anchor.
+            None if is_binary_ext(new) => {
                 out.push_str(&format!("Binary files {a} and {b} differ\n"));
             }
             None => {
                 out.push_str(&format!(
-                    "[diff omitted by GitHub — file too large to patch: +{} -{}]\n",
+                    "[no diff available from GitHub for this file (+{} -{}) — contents not \
+                     reviewable; do NOT infer that it is binary or unchanged]\n",
                     f.additions, f.deletions
                 ));
             }
@@ -813,8 +861,53 @@ mod tests {
         let mut f = entry("huge.sql", "modified", None);
         f.additions = 40_000;
         let diff = render_files_diff(&[f], false);
-        assert!(diff.contains("[diff omitted by GitHub — file too large to patch: +40000 -0]"));
+        assert!(diff.contains("[no diff available from GitHub for this file (+40000 -0)"));
         assert!(!diff.contains("Binary files"));
+    }
+
+    /// Acceptance test for VinaText#20. GitHub omits `patch` **and reports
+    /// `additions: 0`** for ordinary text files once a PR's diff passes its size
+    /// limits — 111 of 267 files on that PR. Treating zero counts as "binary" turned
+    /// vendored `.cxx` sources into five MEDIUM "you committed a binary" findings.
+    /// Counts cannot distinguish the cases; only the extension may.
+    #[test]
+    fn truncated_text_files_are_never_called_binary() {
+        let files: Vec<FileEntry> = ["lexers/LexD.cxx", "src/app.ts", "tools/gen.py", "Makefile"]
+            .iter()
+            .map(|p| entry(p, "added", None)) // patch: None, additions 0, deletions 0
+            .collect();
+        let diff = render_files_diff(&files, false);
+
+        assert!(!diff.contains("Binary files"), "no binary claim: {diff}");
+        assert!(
+            crate::diff::diff_hygiene(&diff).is_empty(),
+            "and therefore no hygiene finding"
+        );
+        assert!(diff.contains("[no diff available from GitHub for this file"));
+    }
+
+    /// The counterpart: the swept-in-archive signal must survive on this path, since
+    /// suppressing it everywhere would trade one false-positive class for a real miss.
+    #[test]
+    fn a_patchless_archive_is_still_called_binary() {
+        let diff = render_files_diff(&[entry("assets/ime.zip", "added", None)], false);
+        assert!(diff.contains("Binary files /dev/null and b/assets/ime.zip differ"));
+        assert_eq!(crate::diff::diff_hygiene(&diff).len(), 1);
+    }
+
+    /// §4.6, no silent caps: the count of un-inspectable files leads the diff, so the
+    /// review reads as "111 files I could not see", not "5 binaries you committed".
+    #[test]
+    fn the_count_of_patchless_files_is_stated_up_front() {
+        let files = vec![
+            entry("a.cxx", "added", None),
+            entry("b.cxx", "added", None),
+            entry("c.rs", "modified", Some("@@ -1 +1 @@\n+x\n")),
+        ];
+        let diff = render_files_diff(&files, false);
+        assert!(diff.starts_with("[note: GitHub returned no patch for 2 of 3 files"));
+        // The note must not break parsing of the file that does have a patch.
+        assert!(crate::diff::parse_valid_lines(&diff).contains_key("c.rs"));
     }
 
     #[test]
