@@ -1,5 +1,76 @@
 # Changelog
 
+## 0.11.0
+
+Minor: four reviewer-quality changes, each written from a recorded production
+failure in the feedback corpus rather than from theory, plus the tooling to tell
+whether any of it worked.
+
+**⚠️ Breaking (source-level).** `PrMeta` gained `ci_status`, and `Config` gained
+`vendored_globs` and `ci_status`. Code constructing either with a struct literal
+must add the fields; code using `Config::from_env()` and provider `get_meta()` is
+unaffected. This is why it's 0.11.0 and not 0.10.5.
+
+**Vendored paths (class D)**
+
+- `diff::is_vendored` + `diff::diff_hygiene_with` skip third-party trees, defaulting
+  to `thirdparty/`, `third_party/`, `vendor/`, `vendored/`, `external/` and
+  `node_modules/`, matched as **whole path segments at any depth** (so
+  `frontend/node_modules/x` counts and `src/vendor_client.rs` does not). Override
+  with `VENDORED_GLOBS` or `vendored` in `.prbot.toml`; setting either replaces the
+  defaults. `diff_hygiene` keeps its signature and delegates.
+- On `VinaText#20`, a PR vendoring 265 files of Scintilla/Lexilla drew binary
+  findings on its `.cxx` sources and then seven "adds N lines — `.gitignore` or
+  exclude it" findings on the same tree. Every line count was exact and every
+  conclusion was wrong: you cannot gitignore source you must compile.
+
+**Burst collapse**
+
+- Findings making the same claim about different files collapse into one that states
+  the count (`review::collapse_bursts`). Two failures had this signature — 111 files
+  reported as added binaries, then seven reported as oversized — where the review
+  read as "N separate problems" instead of "one claim about N files".
+- Bounded deliberately: a group containing a **HIGH or BLOCKING** finding is never
+  collapsed (collapsing is lossy — only the representative keeps its anchor and its
+  `Fix:` text), and severity is part of the group key, so a shared phrase at two
+  severities is two claims. Both recorded bursts were uniform MEDIUM / uniform LOW.
+
+**CI status**
+
+- `PrMeta::ci_status` carries the head commit's GitHub check runs or Bitbucket build
+  statuses, fetched with the metadata so every backend gets it without a signature
+  change, and rendered by `build_user_prompt` **before** the diff with the
+  consequence spelled out: a passing check falsifies a build-break claim.
+- Paged (3 × 100) with `total_count` honoured; when a commit has more runs than were
+  fetched, the block says the list is incomplete and cannot show that every check
+  passed — an incomplete list must never read as a complete one.
+- Gated by `CI_STATUS` (default on) and `ci_status` in `.prbot.toml`. Fail-open
+  throughout: a failed status fetch costs a log line, never the review. GitLab
+  pipelines are not wired up; `None` reads as "unknown", so there is simply no block.
+- From `VinaText#10`, where two **BLOCKING** findings asserted a broken MFC build on
+  a commit whose CI was green — the cheapest-to-falsify claim a reviewer can make,
+  arriving at the one severity that stops a merge.
+
+**Shared review rules**
+
+- `prompt::REVIEW_RULES`, appended to `SYSTEM_PROMPT` and the agent system prompt and
+  public so agent-CLI backends outside this crate can append it too, keeping all
+  three from drifting. It encodes: the severity rubric (a bug that **throws** is
+  never LOW; a wrong BLOCKING is the most expensive error available), verify a cited
+  rule against the config that *enforces* it rather than a prose doc, don't assert
+  build outcomes, don't propose edits inside vendored code, and raise a repeated
+  claim once.
+
+**Measurement**
+
+- `scripts/feedback_scoreboard.py` turns the hand-written feedback entries into a
+  precision scoreboard — per PR-round, plus the worst severity any false positive was
+  filed at. Entries it cannot parse are reported, never silently dropped.
+- `scripts/swe_to_corpus.py` gains `--max-issues` / `--max-diff-chars`. A
+  reverse-patched refactor turns every changed line into a "known issue" — measured
+  on SWE-bench_Multilingual: median 2 per case but mean 25.8, max 1617, and one
+  205 KB diff — and those outliers dominate both recall and the token bill.
+
 ## 0.10.4
 
 Patch: **a missing patch is *unknown*, not *binary*** — fixes a false-positive class
