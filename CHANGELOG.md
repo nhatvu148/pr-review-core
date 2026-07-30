@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.10.4
+
+Patch: **a missing patch is *unknown*, not *binary*** — fixes a false-positive class
+0.10.3 introduced. On `nhatvu148/VinaText#20` (265 vendored files) the Files-API
+fallback rendered **111 text files** as `Binary files … differ`, which fed
+`diff_hygiene` 111 fake candidates and posted 5 MEDIUM "you committed a binary"
+findings — enough, via the recommendation floor, to turn an `APPROVE` into
+`APPROVE WITH CHANGES`.
+
+0.10.3 assumed `additions + deletions == 0` identifies a binary. GitHub reports
+exactly that, and omits `patch`, for **ordinary text files** whenever the PR-level
+diff exceeds its size limits — i.e. precisely the condition that puts us on this path.
+Counts cannot distinguish the two cases.
+
+- Only an unambiguously binary **extension** may now synthesize the `Binary files …
+  differ` marker (74-entry allowlist: archives, executables, media, fonts, documents,
+  databases, model weights, installers). Verified against the real PR: 0 of its 111
+  patch-less files match. A swept-in `.zip` still fires, so the class-D signal holds.
+- Every other patch-less file renders as `[no diff available from GitHub for this file
+  (+N -M) — contents not reviewable; do NOT infer that it is binary or unchanged]`.
+- The rebuilt diff now **leads with the count** of un-inspectable files, so a review
+  reads as "111 files I could not inspect" rather than "5 binaries you committed"
+  (`REVIEWER_COVERAGE.md` §4.6, no silent caps).
+
+The 0.10.3 test could not catch this: it set `additions = 40_000`, while real PR-level
+truncation zeroes the counts. Replaced with the zero-count case.
+
 ## 0.10.3
 
 Patch: **a PR too big for GitHub's `.diff` media type is now reviewable.** Seen in
