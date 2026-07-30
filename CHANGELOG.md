@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.10.3
+
+Patch: **a PR too big for GitHub's `.diff` media type is now reviewable.** Seen in
+production on `nhatvu148/VinaText#20` — the review died with
+`GitHub getDiff 406 Not Acceptable: "the diff exceeded the maximum number of lines
+(20000)"`. The PR was fine; only that *representation* of it was unavailable.
+
+- `providers::github::get_diff` now falls back to `GET /pulls/{n}/files` on 406 and
+  rebuilds an equivalent unified diff from the per-file patches. The Files API has no
+  20000-line limit.
+- The synthesized `diff --git` / `new file mode` / `---`/`+++` headers are the ones
+  `split_diff_sections`, `parse_valid_lines`, and `diff_hygiene` key on, so a rebuilt
+  diff anchors inline comments and trips hygiene findings exactly like a native one
+  (pinned by tests).
+- What the Files API can't provide is stated in the diff instead of silently dropped:
+  a withheld `patch` renders as `[diff omitted by GitHub — file too large to patch]`,
+  a binary as the standard `Binary files … differ` marker, and a file list past the
+  3000-file API ceiling as a leading truncation note. A partial diff never reads as a
+  small change.
+
+Only affects PRs that already failed outright. No API change.
+
 ## 0.10.2
 
 Patch: **a model dropping one field no longer costs the whole review.** Seen in
