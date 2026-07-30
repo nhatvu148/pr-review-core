@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.10.2
+
+Patch: **a model dropping one field no longer costs the whole review.** Seen in
+production on a large PR — after a ~5-minute agent run the review died with
+`could not parse review JSON: missing field \`severity\``, because `Finding`
+demanded every field.
+
+- `Finding::severity` now defaults to `MEDIUM` when absent (not `LOW`: LOW and
+  unknown both rank 0, so an unlabelled finding would sort last and be first out
+  under `max_findings`). `Finding::file` defaults to empty — it then simply fails to
+  anchor and folds into the summary. Only `body` is still required.
+- `Review::findings` deserializes **element-by-element**: an element that still can't
+  be parsed is dropped with a `warn!` instead of failing the review.
+- `critique_findings` parses leniently too, but errors if the array was non-empty and
+  *nothing* survived — a wrong-shaped critique must fail open (keep the original
+  findings) rather than silently return zero.
+
+Applies to every backend that returns `Review`, including agent-CLI backends that
+deserialize these types out-of-crate. No API change.
+
 ## 0.10.1
 
 Patch: **calibrate the diff-hygiene binary check.** As first shipped it flagged
