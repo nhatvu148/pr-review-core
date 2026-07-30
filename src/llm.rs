@@ -35,10 +35,25 @@ pub struct Usage {
     pub total_tokens: Option<u32>,
 }
 
+/// Severity assumed when the model omits the field. Deliberately not `LOW`:
+/// `severity_rank` ranks LOW and unknown equally at 0, so an unlabelled finding
+/// would sort last and be first out under `max_findings`. MEDIUM keeps a real
+/// finding visible without inventing urgency.
+fn default_severity() -> String {
+    "MEDIUM".to_string()
+}
+
 /// One review finding from the model.
+///
+/// Only `body` is required. `severity` and `file` are defaulted rather than
+/// demanded because a model that drops one field must not cost the whole review:
+/// an unlabelled severity becomes MEDIUM, and an empty `file` simply fails to
+/// anchor and folds into the summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
+    #[serde(default = "default_severity")]
     pub severity: String,
+    #[serde(default)]
     pub file: String,
     #[serde(default)]
     pub line: Option<u64>,
@@ -49,12 +64,40 @@ pub struct Finding {
     pub confidence: Option<u8>,
 }
 
+/// Parse a findings array element-by-element, dropping (with a warning) any element
+/// that still can't be understood. One malformed finding must never invalidate the
+/// review it sits in — that trades a whole expensive review for a formatting slip.
+///
+/// Returns `(kept, dropped)`.
+pub(crate) fn findings_from_values(raw: Vec<serde_json::Value>) -> (Vec<Finding>, usize) {
+    let mut kept = Vec::with_capacity(raw.len());
+    let mut dropped = 0usize;
+    for v in raw {
+        match serde_json::from_value::<Finding>(v) {
+            Ok(f) => kept.push(f),
+            Err(e) => {
+                dropped += 1;
+                tracing::warn!("dropping malformed finding ({e})");
+            }
+        }
+    }
+    (kept, dropped)
+}
+
+fn lenient_findings<'de, D>(d: D) -> std::result::Result<Vec<Finding>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<serde_json::Value>::deserialize(d)?;
+    Ok(findings_from_values(raw).0)
+}
+
 /// The structured review the model returns.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Review {
     pub summary: String,
     pub recommendation: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_findings")]
     pub findings: Vec<Finding>,
 }
 
@@ -300,8 +343,18 @@ pub async fn critique_findings(
             clip(&content, 300)
         )
     })?;
-    let kept: Vec<Finding> = serde_json::from_str(json)
+    let raw: Vec<serde_json::Value> = serde_json::from_str(json)
         .map_err(|e| anyhow::anyhow!("Could not parse critique JSON ({e}): {}", clip(json, 300)))?;
+    let (kept, dropped) = findings_from_values(raw);
+    // If the critique returned elements but none survived, its shape is wrong — error
+    // so the caller fails open and keeps the original findings. Silently returning an
+    // empty list here would delete every finding in the review.
+    if kept.is_empty() && dropped > 0 {
+        anyhow::bail!(
+            "Critique returned {dropped} unparseable finding(s): {}",
+            clip(json, 300)
+        );
+    }
 
     Ok(kept)
 }
@@ -454,4 +507,69 @@ pub async fn review_file(
     let review: Review = serde_json::from_str(json)
         .map_err(|e| anyhow::anyhow!("could not parse file review ({e}): {}", clip(json, 300)))?;
     Ok(review)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Deserialization tolerance. A model that drops a field on one finding used to
+    //! cost the entire review (seen in production: `missing field \`severity\``
+    //! after a ~5-minute agent run). These pin the salvage behaviour.
+
+    use super::{findings_from_values, Review};
+
+    #[test]
+    fn finding_missing_severity_defaults_to_medium() {
+        let review: Review = serde_json::from_str(
+            r#"{"summary":"s","recommendation":"APPROVE WITH CHANGES",
+                "findings":[{"file":"a.rs","line":11,"body":"b"}]}"#,
+        )
+        .expect("a missing severity must not fail the whole review");
+        assert_eq!(review.findings.len(), 1);
+        assert_eq!(review.findings[0].severity, "MEDIUM");
+    }
+
+    #[test]
+    fn finding_missing_file_still_parses_and_folds_to_summary() {
+        let review: Review = serde_json::from_str(
+            r#"{"summary":"s","recommendation":"APPROVE",
+                "findings":[{"severity":"HIGH","body":"b"}]}"#,
+        )
+        .expect("a missing file must not fail the whole review");
+        assert_eq!(review.findings[0].file, "");
+        assert_eq!(review.findings[0].line, None);
+    }
+
+    #[test]
+    fn one_malformed_finding_is_dropped_not_fatal() {
+        // Element 2 has no `body` — nothing to post — so it goes, and the two real
+        // findings survive.
+        let review: Review = serde_json::from_str(
+            r#"{"summary":"s","recommendation":"BLOCK","findings":[
+                {"severity":"HIGH","file":"a.rs","line":3,"body":"real"},
+                {"severity":"LOW","file":"b.rs"},
+                {"file":"c.rs","body":"also real"}]}"#,
+        )
+        .expect("one bad element must not fail the whole review");
+        assert_eq!(review.findings.len(), 2);
+        assert_eq!(review.findings[1].severity, "MEDIUM");
+    }
+
+    #[test]
+    fn required_fields_of_the_review_itself_still_hard_fail() {
+        // `summary`/`recommendation` stay mandatory: without them there is no review
+        // to post, so failing loudly is right.
+        assert!(serde_json::from_str::<Review>(r#"{"summary":"s","findings":[]}"#).is_err());
+    }
+
+    #[test]
+    fn findings_from_values_reports_what_it_dropped() {
+        let raw = vec![
+            serde_json::json!({"file": "a.rs", "body": "real"}),
+            serde_json::json!({"file": "b.rs"}),
+            serde_json::json!("not even an object"),
+        ];
+        let (kept, dropped) = findings_from_values(raw);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(dropped, 2);
+    }
 }
