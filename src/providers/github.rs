@@ -323,32 +323,52 @@ pub async fn get_check_status(
     #[derive(Deserialize)]
     struct Runs {
         check_runs: Option<Vec<Run>>,
+        /// How many runs the commit actually has — the only way to know the page
+        /// we got is partial.
+        #[serde(default)]
+        total_count: Option<u64>,
     }
 
-    let url = format!(
-        "{}/repos/{repo}/commits/{}/check-runs?per_page=50",
-        cfg.github_api_base,
-        enc_path(sha)
-    );
-    let res = gh(client.get(url), cfg).send().await?;
-    if !res.status().is_success() {
-        let status = res.status();
-        anyhow::bail!(
-            "GitHub getCheckRuns {status}: {}",
-            clip(&res.text().await.unwrap_or_default(), 200)
+    // A CI matrix routinely produces dozens of runs. Paging matters here more than
+    // it looks: the prompt tells the model a passing check falsifies a build-break
+    // claim, so a *failing* run that fell off the end would license exactly the
+    // wrong conclusion. Page to a bound, then say plainly what was not fetched.
+    const PER_PAGE: u64 = 100;
+    const MAX_PAGES: u64 = 3;
+
+    let mut runs: Vec<Run> = Vec::new();
+    let mut total: Option<u64> = None;
+    for page in 1..=MAX_PAGES {
+        let url = format!(
+            "{}/repos/{repo}/commits/{}/check-runs?per_page={PER_PAGE}&page={page}",
+            cfg.github_api_base,
+            enc_path(sha)
         );
+        let res = gh(client.get(url), cfg).send().await?;
+        if !res.status().is_success() {
+            let status = res.status();
+            anyhow::bail!(
+                "GitHub getCheckRuns {status}: {}",
+                clip(&res.text().await.unwrap_or_default(), 200)
+            );
+        }
+        let body: Runs = res
+            .json()
+            .await
+            .context("GitHub getCheckRuns: unexpected response shape")?;
+        total = body.total_count.or(total);
+        let batch = body.check_runs.unwrap_or_default();
+        let full_page = batch.len() as u64 == PER_PAGE;
+        runs.extend(batch);
+        if !full_page || total.is_some_and(|t| runs.len() as u64 >= t) {
+            break;
+        }
     }
-    let runs = res
-        .json::<Runs>()
-        .await
-        .context("GitHub getCheckRuns: unexpected response shape")?
-        .check_runs
-        .unwrap_or_default();
     if runs.is_empty() {
         return Ok(None);
     }
 
-    let rendered = runs
+    let mut rendered: Vec<String> = runs
         .iter()
         .map(|r| {
             let name = r.name.as_deref().unwrap_or("(unnamed check)");
@@ -361,9 +381,21 @@ pub async fn get_check_status(
                 .unwrap_or("unknown");
             format!("- {name}: {state}")
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(Some(rendered))
+        .collect();
+    // An incomplete list must never read as a complete one — a hidden failure is
+    // the case this whole block exists to prevent the reviewer getting wrong.
+    if let Some(t) = total.filter(|t| *t > runs.len() as u64) {
+        let missing = t - runs.len() as u64;
+        tracing::warn!(
+            "check runs for {repo}@{sha} truncated: showed {} of {t}",
+            runs.len()
+        );
+        rendered.push(format!(
+            "- [{missing} further check(s) NOT shown — this commit has {t}. \
+             The list above is incomplete: it cannot show that every check passed.]"
+        ));
+    }
+    Ok(Some(rendered.join("\n")))
 }
 
 /// Post a standalone issue comment (NOT deduped) — used for `/ask` answers and

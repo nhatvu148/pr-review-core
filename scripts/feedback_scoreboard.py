@@ -138,8 +138,20 @@ def parse_entry(path: Path) -> tuple[list[Row], str | None]:
     return rows, None
 
 
+def sort_key(r: Row):
+    """Order rows without assuming the PR number parsed.
+
+    `r.pr` is `"?"` when the entry's heading didn't match `TITLE` — a hand-written
+    file is one typo away from that, and `int("?")` used to take the whole script
+    down with it. Unparsed PRs sort last within their repo, and are called out in
+    the output rather than passing as ordinary rows.
+    """
+    numeric = int(r.pr) if r.pr.isdigit() else 0
+    return (r.date, r.repo, 0 if r.pr.isdigit() else 1, numeric, r.round)
+
+
 def render(parsed: Parsed) -> str:
-    rows = sorted(parsed.rows, key=lambda r: (r.date, r.repo, int(r.pr), r.round))
+    rows = sorted(parsed.rows, key=sort_key)
 
     out = [
         "# Reviewer scoreboard",
@@ -186,6 +198,21 @@ def render(parsed: Parsed) -> str:
         out.append(f"- unlabelled: {unlabelled}")
     if not any(by_sev.values()) and not unlabelled:
         out.append("- none recorded")
+
+    # Scored, but the heading didn't parse — say so rather than let a row with a
+    # bare "?" for its PR pass as ordinary.
+    headless = sorted({r.source for r in rows if not r.pr.isdigit()})
+    if headless:
+        out += [
+            "",
+            "## Entries with an unreadable heading",
+            "",
+            "Their verdicts ARE counted above, but the `# owner/repo#N — title` heading",
+            "could not be parsed, so the PR column shows `?`. Fix the heading to get a",
+            "real row.",
+            "",
+        ]
+        out += [f"- `{name}`" for name in headless]
 
     if parsed.unparsed:
         out += [
