@@ -57,10 +57,19 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         branch: Option<Branch>,
     }
     #[derive(Deserialize)]
+    struct Commit {
+        hash: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct Source {
+        commit: Option<Commit>,
+    }
+    #[derive(Deserialize)]
     struct Pr {
         title: Option<String>,
         description: Option<String>,
         destination: Option<Destination>,
+        source: Option<Source>,
     }
 
     let res = client
@@ -77,6 +86,23 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         );
     }
     let pr_data: Pr = res.json().await?;
+    // The source commit is fetched only to look up build statuses; `head_sha` stays
+    // None because Bitbucket inline comments don't need a commit id.
+    let source_sha = pr_data
+        .source
+        .and_then(|s| s.commit)
+        .and_then(|c| c.hash)
+        .filter(|h| !h.is_empty());
+    let ci_status = match source_sha.as_ref().filter(|_| cfg.ci_status) {
+        // Fail-open: build status is context, never a precondition for reviewing.
+        Some(sha) => get_build_status(client, cfg, repo, sha)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("could not fetch build statuses for {repo}@{sha}: {e:#}");
+                None
+            }),
+        None => None,
+    };
     Ok(PrMeta {
         repo: repo.to_string(),
         pr,
@@ -87,7 +113,70 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
             .and_then(|b| b.name),
         head_sha: None, // Bitbucket inline comments don't need a commit id
         body: pr_data.description,
+        ci_status,
     })
+}
+
+/// Fetch a commit's build statuses and render them one per line. Bitbucket's
+/// counterpart to GitHub check runs; see [`crate::providers::PrMeta::ci_status`] for
+/// why the reviewer is given this at all.
+///
+/// `None` means no status has reported — "unknown", not "nothing ran".
+///
+/// # Errors
+/// If credentials are missing, the request fails, or the response can't be parsed.
+pub async fn get_build_status(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    sha: &str,
+) -> Result<Option<String>> {
+    #[derive(serde::Deserialize)]
+    struct Status {
+        key: Option<String>,
+        name: Option<String>,
+        /// `SUCCESSFUL` | `FAILED` | `INPROGRESS` | `STOPPED`.
+        state: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Page {
+        values: Option<Vec<Status>>,
+    }
+
+    let url = format!(
+        "{}/repositories/{repo}/commit/{sha}/statuses?pagelen=50",
+        cfg.bitbucket_api_base
+    );
+    let res = client
+        .get(url)
+        .header(reqwest::header::AUTHORIZATION, auth_header(cfg)?)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "Bitbucket getStatuses {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 200)
+        );
+    }
+    let values = res.json::<Page>().await?.values.unwrap_or_default();
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let rendered = values
+        .iter()
+        .map(|s| {
+            let name = s
+                .name
+                .as_deref()
+                .or(s.key.as_deref())
+                .unwrap_or("(unnamed build)");
+            format!("- {name}: {}", s.state.as_deref().unwrap_or("unknown"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Some(rendered))
 }
 
 /// Post a standalone PR comment (NOT deduped) — used for `/ask` answers and

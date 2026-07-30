@@ -38,6 +38,46 @@ Rules:
 
 Output only the JSON object."#;
 
+/// Calibration and verification rules shared by every review path — the plain
+/// OpenRouter review, the agentic review, and the agent-CLI backends that live
+/// outside this crate. Appended to whichever system prompt is in play so the three
+/// cannot drift.
+///
+/// Every rule here was written from a recorded production failure, not from theory:
+///
+/// - **Severity.** Two repos and two stacks filed bugs that *throw* as `LOW`, while
+///   another filed two non-defects as `BLOCKING`. Severity was tracking how the
+///   finding felt rather than what it costs.
+/// - **Cited rules.** A finding asserted an ESLint violation from a prose rules doc
+///   while the actual config had that rule `off`.
+/// - **Build claims.** Two `BLOCKING` findings asserted a broken build on a commit
+///   whose CI was green — a claim one status query falsifies.
+/// - **Vendored code.** Three separate findings proposed edits to, or hygiene fixes
+///   for, third-party source the repo's own rules forbid touching.
+/// - **Repetition.** One claim about 111 files read as 111 problems.
+pub const REVIEW_RULES: &str = r#"
+## Severity
+
+Severity is blast radius × how silently it fails — NOT how confident or annoyed you are.
+- BLOCKING: merging causes data loss, a security breach, or a production break, AND you have direct evidence. A wrong BLOCKING is the most expensive error you can make: it stops a merge. When unsure, it is not BLOCKING.
+- HIGH: a correctness or security bug that will reach users or callers.
+- MEDIUM: a bug on a reachable path — anything that throws, corrupts state, or degrades behaviour — or a real maintainability hazard. A bug that THROWS is never LOW.
+- LOW: latent risk, an observation, or a nit. If it costs nothing to ignore, it is LOW.
+
+## Verify before you assert
+
+- A cited rule must be checked against the config that ENFORCES it. Before claiming code violates a lint/format/type rule, read that config (eslint.config.*, .eslintrc*, tsconfig.json, clippy.toml, ruff.toml, .editorconfig, …) and confirm the rule is enabled. Prose docs (CONTRIBUTING.md, CLAUDE.md, .claude/rules/*) state INTENT and routinely drift from the config; they are never evidence a rule is active. If you cannot find the config, drop the citation and argue the change on its merits.
+- Do NOT assert that a change "breaks the build", "fails tests", or "won't compile" unless you have evidence. If a CI status block is provided, consult it: a passing check on the reviewed commit falsifies the claim outright — drop the finding or restate it as the underlying observation ("these files rely on a transitive include") at LOW.
+- If a finding depends on a mechanism you could not verify, say so in the body: "Unverified: I could not confirm X." A right-conclusion/wrong-reason finding is worse than none — it gets checked, found wrong, and dismissed.
+
+## Vendored and generated code
+
+Third-party source under vendored paths (thirdparty/, vendor/, third_party/, external/, node_modules/, or whatever the repo declares) is committed on purpose. Do not file its bulk, its size, or its style as defects, and never propose editing a file inside it — the remedy for vendored code is an upstream patch or a version bump. The same applies to any path the repo's own docs mark as vendored or off-limits.
+
+## One claim, one finding
+
+If the same observation applies to many files, raise it ONCE, name the pattern, and say how many files it covers. Do not emit one finding per file."#;
+
 /// System prompt for the optional second-pass self-critique. Given the diff and a
 /// JSON array of proposed findings, the model prunes noise and re-scores what it
 /// keeps, returning ONLY a JSON array of the surviving findings.
@@ -114,10 +154,90 @@ pub fn build_user_prompt(
             "\n\n[NOTE: diff was truncated to fit the size limit — review what is shown.]",
         );
     }
+    // CI results for the reviewed commit, when the provider reported any. Placed
+    // before the diff so it frames everything read after it: a green check here
+    // settles "does this build" without the model reasoning about it at all.
+    if let Some(ci) = &meta.ci_status {
+        if !ci.trim().is_empty() {
+            header.push_str(&format!(
+                "\n\n## CI status for the reviewed commit\n{ci}\n\
+                 (These checks ran on the exact commit under review. A passing check \
+                 FALSIFIES any claim that this change breaks that build — do not \
+                 assert otherwise.)\n"
+            ));
+        }
+    }
     if let Some(ctx) = structural_context {
         if !ctx.trim().is_empty() {
             header.push_str(&format!("\n\n## Structural context\n{ctx}\n"));
         }
     }
     format!("{header}\n\n--- BEGIN DIFF ---\n{diff}\n--- END DIFF ---")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_user_prompt, REVIEW_RULES};
+    use crate::providers::PrMeta;
+
+    fn meta(ci: Option<&str>) -> PrMeta {
+        PrMeta {
+            repo: "o/r".to_string(),
+            pr: 1,
+            title: None,
+            base_branch: None,
+            head_sha: None,
+            body: None,
+            ci_status: ci.map(str::to_string),
+        }
+    }
+
+    /// VinaText#10: two BLOCKING findings asserted a broken build on a commit whose
+    /// CI was green. The reviewer cannot query CI, so the answer has to arrive in the
+    /// prompt — before the diff, with the consequence spelled out.
+    #[test]
+    fn ci_status_is_rendered_before_the_diff_with_its_consequence() {
+        let p = build_user_prompt(
+            &meta(Some("- MFC build (Release|x64): success")),
+            "diff body",
+            false,
+            None,
+            None,
+        );
+        assert!(p.contains("## CI status for the reviewed commit"));
+        assert!(p.contains("- MFC build (Release|x64): success"));
+        assert!(p.contains("FALSIFIES"));
+        assert!(
+            p.find("## CI status").unwrap() < p.find("--- BEGIN DIFF ---").unwrap(),
+            "the CI block must frame the diff, not trail it"
+        );
+    }
+
+    /// No CI block at all when nothing reported — an absent block reads as "unknown",
+    /// whereas an empty one would imply "nothing ran", which is a different claim.
+    #[test]
+    fn no_ci_block_when_the_provider_reported_nothing() {
+        let p = build_user_prompt(&meta(None), "diff body", false, None, None);
+        assert!(!p.contains("CI status"));
+        let empty = build_user_prompt(&meta(Some("  ")), "diff body", false, None, None);
+        assert!(!empty.contains("CI status"));
+    }
+
+    #[test]
+    fn the_shared_rules_cover_each_recorded_failure() {
+        // Cheap guard against a well-meaning edit quietly dropping one.
+        for required in [
+            "BLOCKING", // severity rubric
+            "THROWS is never LOW",
+            "config that ENFORCES it",
+            "breaks the build",
+            "vendored",
+            "raise it ONCE",
+        ] {
+            assert!(
+                REVIEW_RULES.contains(required),
+                "REVIEW_RULES lost the rule containing {required:?}"
+            );
+        }
+    }
 }

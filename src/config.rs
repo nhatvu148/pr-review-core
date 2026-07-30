@@ -50,6 +50,12 @@ pub struct Config {
     /// vendored, minified) — drops noise and saves tokens before the LLM call.
     pub exclude_globs: Vec<String>,
 
+    /// Glob patterns marking vendored third-party source. Diff-hygiene (class D)
+    /// findings are suppressed inside these paths — bulk-committing upstream code is
+    /// the intent of a vendoring PR, not a defect. Empty means the conventional
+    /// defaults ([`crate::diff::DEFAULT_VENDORED_DIRS`]).
+    pub vendored_globs: Vec<String>,
+
     /// When packing a large diff to the size budget, group related changed files
     /// (a source + its test, i18n siblings) into one unit so they stay adjacent
     /// and pack together instead of being scattered by priority. Fail-open.
@@ -134,6 +140,13 @@ pub struct Config {
     /// Max call sites listed per symbol per bucket (callers / tests) (cost guard).
     pub blast_max_refs: usize,
 
+    /// Fetch the head commit's CI results (GitHub check runs / Bitbucket build
+    /// statuses) with the PR metadata and surface them in the prompt, so the
+    /// reviewer can't assert a broken build that CI already decided.
+    ///
+    /// One extra API call per review. Off is for tokens near their rate limit;
+    /// with it off the reviewer simply sees no CI block. Fully fail-open either way.
+    pub ci_status: bool,
     /// Scan changed lockfiles for known-vulnerable dependencies via OSV.dev and
     /// append advisories to the review summary. Fully fail-open — never blocks a
     /// review.
@@ -207,6 +220,9 @@ impl Config {
                 ],
             ),
 
+            // Empty = the conventional vendored directories (see `diff::is_vendored`).
+            vendored_globs: env_globs("VENDORED_GLOBS", &[]),
+
             file_bundling: env_or("FILE_BUNDLING", "true").parse().unwrap_or(true),
 
             self_critique: env_or("SELF_CRITIQUE", "true").parse().unwrap_or(true),
@@ -253,6 +269,7 @@ impl Config {
             blast_max_symbols: env_or("BLAST_MAX_SYMBOLS", "12").parse().unwrap_or(12),
             blast_max_refs: env_or("BLAST_MAX_REFS", "8").parse().unwrap_or(8),
 
+            ci_status: env_or("CI_STATUS", "true").parse().unwrap_or(true),
             cve_scan: env_or("CVE_SCAN", "true").parse().unwrap_or(true),
             cve_max_packages: env_or("CVE_MAX_PACKAGES", "100").parse().unwrap_or(100),
             osv_api_base: env_or("OSV_API_BASE", "https://api.osv.dev"),
@@ -289,6 +306,12 @@ impl Config {
         }
         if let Some(v) = &rc.exclude_globs {
             cfg.exclude_globs = v.clone();
+        }
+        if let Some(v) = &rc.vendored {
+            cfg.vendored_globs = v.clone();
+        }
+        if let Some(v) = rc.ci_status {
+            cfg.ci_status = v;
         }
         if let Some(v) = rc.min_confidence {
             cfg.min_confidence = v;

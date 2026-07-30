@@ -20,6 +20,11 @@ pub struct RepoConfig {
     pub model_explore: Option<String>,
     pub include_globs: Option<Vec<String>>,
     pub exclude_globs: Option<Vec<String>>,
+    /// Globs marking vendored third-party source (`thirdparty/**`, `vendor/**`, …).
+    /// Diff-hygiene findings are suppressed inside them and the reviewer is told not
+    /// to propose edits there — the remedy for vendored code is an upstream patch or
+    /// a version bump. Setting this REPLACES the conventional defaults.
+    pub vendored: Option<Vec<String>>,
     pub min_confidence: Option<u8>,
     pub max_findings: Option<usize>,
     pub self_critique: Option<bool>,
@@ -27,6 +32,8 @@ pub struct RepoConfig {
     /// Toggle grouping related changed files (source + test, i18n siblings) when
     /// packing a large diff, for this repo.
     pub file_bundling: Option<bool>,
+    /// Toggle fetching the head commit's CI results into the prompt for this repo.
+    pub ci_status: Option<bool>,
     /// Toggle the OSV.dev dependency vulnerability scan for this repo.
     pub cve_scan: Option<bool>,
     /// Toggle re-anchoring a finding that drifted just off a diff line to the

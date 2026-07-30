@@ -183,10 +183,13 @@ pub async fn review_diff(
         diff.to_string()
     };
 
-    let system_prompt = if cfg.extra_system_prompt.is_empty() {
-        SYSTEM_PROMPT.to_string()
-    } else {
-        format!("{SYSTEM_PROMPT}\n{}", cfg.extra_system_prompt)
+    let system_prompt = {
+        let base = format!("{SYSTEM_PROMPT}\n{}", crate::prompt::REVIEW_RULES);
+        if cfg.extra_system_prompt.is_empty() {
+            base
+        } else {
+            format!("{base}\n{}", cfg.extra_system_prompt)
+        }
     };
 
     let req = ChatReq {
