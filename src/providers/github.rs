@@ -52,6 +52,16 @@ pub async fn get_diff(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         .header("User-Agent", &cfg.user_agent)
         .send()
         .await?;
+    // 406 is GitHub refusing the `.diff` media type itself — "the diff exceeded the
+    // maximum number of lines (20000)". The PR is fine; only this representation of
+    // it is unavailable, so rebuild the diff from the Files API instead of failing.
+    if res.status() == reqwest::StatusCode::NOT_ACCEPTABLE {
+        tracing::warn!(
+            "GitHub refused the .diff media type for {repo}#{pr} (406, diff too large); \
+             rebuilding from the Files API"
+        );
+        return diff_from_files_api(client, cfg, repo, pr).await;
+    }
     if !res.status().is_success() {
         let status = res.status();
         anyhow::bail!(
@@ -60,6 +70,140 @@ pub async fn get_diff(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         );
     }
     Ok(res.text().await?)
+}
+
+/// One entry from `GET /repos/{repo}/pulls/{pr}/files`.
+#[derive(Debug, Deserialize)]
+pub(super) struct FileEntry {
+    pub filename: String,
+    /// Set only on a rename/copy — the path on the old side.
+    #[serde(default)]
+    pub previous_filename: Option<String>,
+    /// `added` | `removed` | `modified` | `renamed` | `copied` | `changed` | `unchanged`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// The hunks. GitHub omits this for binaries and for files too large to patch.
+    #[serde(default)]
+    pub patch: Option<String>,
+    #[serde(default)]
+    pub additions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
+/// GitHub's own ceiling on the Files API: 30 pages × 100 files.
+const FILES_PER_PAGE: u64 = 100;
+const FILES_MAX_PAGES: u64 = 30;
+
+/// Render Files-API entries as a unified diff equivalent to what the `.diff` media
+/// type would have returned.
+///
+/// The synthesized `diff --git` / `new file mode` / `--- `/`+++ ` headers are what
+/// every downstream consumer keys on — [`crate::diff::split_diff_sections`],
+/// [`crate::diff::parse_valid_lines`], and [`crate::diff::diff_hygiene`] — so the
+/// rebuilt diff anchors inline comments and triggers hygiene findings exactly like a
+/// native one.
+///
+/// Two things the Files API cannot give us are stated in the output rather than
+/// silently dropped, so neither the model nor a reader mistakes a partial diff for a
+/// small change: files whose `patch` GitHub withheld, and a file list truncated at
+/// the 3000-file ceiling.
+pub(super) fn render_files_diff(files: &[FileEntry], truncated: bool) -> String {
+    let mut out = String::new();
+    if truncated {
+        out.push_str(
+            "[note: this PR exceeds GitHub's 3000-file API ceiling — the files below \
+             are the first 3000; later files are NOT shown]\n",
+        );
+    }
+    for f in files {
+        let status = f.status.as_deref().unwrap_or("modified");
+        let old = f.previous_filename.as_deref().unwrap_or(&f.filename);
+        let new = f.filename.as_str();
+
+        out.push_str(&format!("diff --git a/{old} b/{new}\n"));
+        match status {
+            // `new file mode` is the marker diff_hygiene uses to judge *added* files.
+            "added" => out.push_str("new file mode 100644\n"),
+            "removed" => out.push_str("deleted file mode 100644\n"),
+            "renamed" | "copied" => {
+                out.push_str(&format!("rename from {old}\nrename to {new}\n"));
+            }
+            _ => {}
+        }
+
+        let (a, b) = match status {
+            "added" => ("/dev/null".to_string(), format!("b/{new}")),
+            "removed" => (format!("a/{old}"), "/dev/null".to_string()),
+            _ => (format!("a/{old}"), format!("b/{new}")),
+        };
+
+        match &f.patch {
+            Some(patch) => {
+                out.push_str(&format!("--- {a}\n+++ {b}\n"));
+                out.push_str(patch);
+                if !patch.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            // No `patch`. Zero additions and deletions is GitHub's signature for a
+            // binary file; anything else is a text file whose patch was withheld for
+            // size. Deliberately no `+++` line here — there are no hunks to anchor.
+            None if f.additions + f.deletions == 0 => {
+                out.push_str(&format!("Binary files {a} and {b} differ\n"));
+            }
+            None => {
+                out.push_str(&format!(
+                    "[diff omitted by GitHub — file too large to patch: +{} -{}]\n",
+                    f.additions, f.deletions
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Rebuild a PR's diff from `GET /repos/{repo}/pulls/{pr}/files`, which has no
+/// 20000-line limit. Used when the `.diff` media type 406s.
+async fn diff_from_files_api(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<String> {
+    let mut files: Vec<FileEntry> = Vec::new();
+    let mut truncated = false;
+
+    for page in 1..=FILES_MAX_PAGES {
+        let url = format!(
+            "{}/repos/{repo}/pulls/{pr}/files?per_page={FILES_PER_PAGE}&page={page}",
+            cfg.github_api_base
+        );
+        let res = gh(client.get(url), cfg).send().await?;
+        if !res.status().is_success() {
+            let status = res.status();
+            anyhow::bail!(
+                "GitHub getDiff(files page {page}) {status}: {}",
+                clip(&res.text().await.unwrap_or_default(), 300)
+            );
+        }
+        let batch: Vec<FileEntry> = res
+            .json()
+            .await
+            .context("GitHub getDiff(files): unexpected response shape")?;
+        let full_page = batch.len() as u64 == FILES_PER_PAGE;
+        files.extend(batch);
+        if !full_page {
+            break;
+        }
+        // A full last page means there is very likely more we cannot reach.
+        truncated = page == FILES_MAX_PAGES;
+    }
+
+    if files.is_empty() {
+        anyhow::bail!("GitHub getDiff(files): PR {repo}#{pr} reported no files");
+    }
+    tracing::info!(
+        "rebuilt {repo}#{pr} diff from the Files API: {} file(s){}",
+        files.len(),
+        if truncated { " (truncated)" } else { "" }
+    );
+    Ok(render_files_diff(&files, truncated))
 }
 
 pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<PrMeta> {
@@ -591,7 +735,99 @@ pub async fn post_review(
 
 #[cfg(test)]
 mod tests {
-    use super::enc_path;
+    use super::{enc_path, render_files_diff, FileEntry};
+
+    fn entry(filename: &str, status: &str, patch: Option<&str>) -> FileEntry {
+        let (additions, deletions) = patch.map_or((0, 0), |_| (1, 0));
+        FileEntry {
+            filename: filename.to_string(),
+            previous_filename: None,
+            status: Some(status.to_string()),
+            patch: patch.map(str::to_string),
+            additions,
+            deletions,
+        }
+    }
+
+    /// The whole point of the rebuild: a diff assembled from the Files API must be
+    /// parseable by the same machinery as a native one, or findings can't anchor.
+    #[test]
+    fn rebuilt_diff_anchors_lines_like_a_native_one() {
+        let files = vec![entry(
+            "src/a.rs",
+            "modified",
+            Some("@@ -1,2 +1,3 @@\n ctx\n+added\n ctx2\n"),
+        )];
+        let diff = render_files_diff(&files, false);
+
+        let valid = crate::diff::parse_valid_lines(&diff);
+        assert!(
+            valid["src/a.rs"].contains(&2),
+            "the +added line is new-side 2"
+        );
+        let sections = crate::diff::split_diff_sections(&diff);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].0, "src/a.rs");
+    }
+
+    #[test]
+    fn added_and_removed_files_get_dev_null_sides() {
+        let diff = render_files_diff(
+            &[
+                entry("new.rs", "added", Some("@@ -0,0 +1 @@\n+hi\n")),
+                entry("gone.rs", "removed", Some("@@ -1 +0,0 @@\n-bye\n")),
+            ],
+            false,
+        );
+        assert!(diff.contains("new file mode 100644\n--- /dev/null\n+++ b/new.rs"));
+        assert!(diff.contains("deleted file mode 100644\n--- a/gone.rs\n+++ /dev/null"));
+        // A deleted file must not claim new-side lines.
+        assert!(!crate::diff::parse_valid_lines(&diff).contains_key("gone.rs"));
+    }
+
+    #[test]
+    fn a_rename_keeps_both_paths() {
+        let mut f = entry("new/path.rs", "renamed", Some("@@ -1 +1 @@\n-a\n+b\n"));
+        f.previous_filename = Some("old/path.rs".to_string());
+        let diff = render_files_diff(&[f], false);
+        assert!(diff.starts_with("diff --git a/old/path.rs b/new/path.rs\n"));
+        assert!(diff.contains("rename from old/path.rs\nrename to new/path.rs\n"));
+    }
+
+    /// A patch-less entry with no additions/deletions is GitHub's binary signature;
+    /// rendering the marker keeps `diff_hygiene`'s swept-in-binary check working
+    /// through the fallback path.
+    #[test]
+    fn a_binary_file_still_trips_diff_hygiene() {
+        let diff = render_files_diff(&[entry("assets/ime.zip", "added", None)], false);
+        assert!(diff.contains("Binary files /dev/null and b/assets/ime.zip differ"));
+        let issues = crate::diff::diff_hygiene(&diff);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].file, "assets/ime.zip");
+    }
+
+    /// A patch withheld for size is NOT a binary — say so rather than emit a marker
+    /// claiming the file is unchanged.
+    #[test]
+    fn a_withheld_patch_is_reported_not_silently_dropped() {
+        let mut f = entry("huge.sql", "modified", None);
+        f.additions = 40_000;
+        let diff = render_files_diff(&[f], false);
+        assert!(diff.contains("[diff omitted by GitHub — file too large to patch: +40000 -0]"));
+        assert!(!diff.contains("Binary files"));
+    }
+
+    #[test]
+    fn truncation_is_stated_in_the_diff() {
+        let diff = render_files_diff(
+            &[entry("a.rs", "modified", Some("@@ -1 +1 @@\n+x\n"))],
+            true,
+        );
+        assert!(diff.starts_with("[note: this PR exceeds GitHub's 3000-file API ceiling"));
+        // The note must not corrupt parsing of the files that follow.
+        assert_eq!(crate::diff::split_diff_sections(&diff).len(), 2); // preamble + file
+        assert!(crate::diff::parse_valid_lines(&diff).contains_key("a.rs"));
+    }
 
     #[test]
     fn enc_path_preserves_slashes_but_escapes_query_injection() {
