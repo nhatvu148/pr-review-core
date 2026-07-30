@@ -5,3 +5,5 @@ docs/REVIEWER_COVERAGE.md
 docs/bench-corpus.json
 docs/feedback/
 docs/SCOREBOARD.md
+# Generated bench corpora (scripts/swe_to_corpus.py) — regenerate, do not commit
+docs/corpus-*.json

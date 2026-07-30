@@ -148,6 +148,16 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--only-core", action="store_true",
                     help="keep only rust/ts/js/python/go (what our tree-sitter parses)")
+    # Outlier bounds. A reverse-patched refactor can carry hundreds of changed
+    # lines, every one of which becomes a "known issue" — but no reviewer is
+    # expected to flag them all, so such a case can only ever score near-zero
+    # recall while dominating the aggregate and the token bill. Measured on
+    # SWE-bench_Multilingual: median 2 issues/case, mean 25.8, max 1617, and one
+    # 205 KB diff (larger than the reviewer's own MAX_DIFF_CHARS).
+    ap.add_argument("--max-issues", type=int, default=0,
+                    help="drop cases with more than N known issues (0 = no limit)")
+    ap.add_argument("--max-diff-chars", type=int, default=0,
+                    help="drop cases whose diff exceeds N characters (0 = no limit)")
     args = ap.parse_args()
 
     rows = fetch_rows(args.dataset, args.config, args.split, args.limit)
@@ -175,6 +185,12 @@ def main():
         files = sorted({i["file"] for i in uniq})
         lang = infer_lang(r.get("repo", ""), files)
         if args.only_core and lang not in CORE_LANGS:
+            skipped += 1
+            continue
+        if args.max_issues and len(uniq) > args.max_issues:
+            skipped += 1  # a mass refactor, not a scoreable bug
+            continue
+        if args.max_diff_chars and len(diff) > args.max_diff_chars:
             skipped += 1
             continue
         corpus.append({
