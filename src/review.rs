@@ -102,28 +102,84 @@ fn effective_recommendation(model_rec: &str, findings: &[Finding]) -> String {
     }
 }
 
-/// Phrases that mark a finding as asserting a **check outcome** — that the change
-/// breaks a build, fails tests, or won't pass a formatter/linter gate.
-///
-/// Matched on the lowercased body. Deliberately narrow: these are claims a CI run
-/// settles, not opinions about code.
+/// Phrases that assert a **check outcome** on their own — nothing but a build, a
+/// compile, or CI can be their subject.
 const BUILD_CLAIM_MARKERS: &[&str] = &[
     "breaks the build",
     "break the build",
-    "will fail",
-    "would fail",
+    "fails the build",
+    "fail the build",
     "fails to compile",
     "won't compile",
     "will not compile",
-    "fails the build",
-    "fail the build",
     "ci would go red",
     "ci will go red",
     "fails ci",
     "fail ci",
-    "--check will",
-    "--check would",
 ];
+
+/// Failure phrases that are **ambiguous alone** and only count as a check claim when
+/// the body also names a check.
+///
+/// "will fail" is the phrase the reviewer actually used on pr-review-core#28 — and
+/// also the phrase in "this will fail at runtime when the list is empty", a real
+/// HIGH bug that green CI says nothing about, because CI does not run for
+/// correctness. Treating it as a check claim would silently cap a genuine defect to
+/// LOW and soften the recommendation floor with it.
+const WEAK_FAILURE_PHRASES: &[&str] = &["will fail", "would fail", "fails when", "would break"];
+
+/// Whole words that identify the subject as a check. Matched as **words**, not
+/// substrings: "ci" appears inside "specific", "decision", "efficient".
+const CHECK_CONTEXT_WORDS: &[&str] = &[
+    "ci",
+    "build",
+    "builds",
+    "compile",
+    "compiles",
+    "compilation",
+    "clippy",
+    "rustfmt",
+    "fmt",
+    "lint",
+    "linter",
+    "eslint",
+    "pipeline",
+    "workflow",
+];
+
+/// Multi-word check markers, matched as substrings.
+const CHECK_CONTEXT_PHRASES: &[&str] = &[
+    "--check",
+    "cargo fmt",
+    "cargo test",
+    "cargo clippy",
+    "test suite",
+    "check job",
+    "the check",
+    "check will",
+    "check would",
+];
+
+/// Does this finding assert an outcome a CI run settles?
+///
+/// Two tiers, because the obvious one-tier version is wrong. A flat list containing
+/// "will fail" matches ordinary runtime findings, so a real HIGH — "this will fail
+/// at runtime when the list is empty" — would be capped to LOW by a green CI that
+/// never exercised that path.
+fn asserts_check_outcome(body_lower: &str) -> bool {
+    if BUILD_CLAIM_MARKERS.iter().any(|m| body_lower.contains(m)) {
+        return true;
+    }
+    if !WEAK_FAILURE_PHRASES.iter().any(|m| body_lower.contains(m)) {
+        return false;
+    }
+    if CHECK_CONTEXT_PHRASES.iter().any(|p| body_lower.contains(p)) {
+        return true;
+    }
+    body_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| CHECK_CONTEXT_WORDS.contains(&w))
+}
 
 /// Does this CI block report every reported check as passing?
 ///
@@ -172,8 +228,7 @@ fn demote_falsified_build_claims(findings: &mut [Finding], ci_status: Option<&st
         if severity_rank(&f.severity) == 0 {
             continue; // already LOW/unknown — nothing to cap
         }
-        let body = f.body.to_lowercase();
-        if !BUILD_CLAIM_MARKERS.iter().any(|m| body.contains(m)) {
+        if !asserts_check_outcome(&f.body.to_lowercase()) {
             continue;
         }
         tracing::warn!(
@@ -1027,6 +1082,62 @@ mod tests {
                 "wrongly demoted with ci={ci:?}"
             );
         }
+    }
+
+    /// Raised on PR #30, and correct: a flat marker list containing "will fail"
+    /// matches ordinary runtime findings. Green CI would then cap a real HIGH to LOW
+    /// and soften the recommendation floor with it — a silent downgrade of a genuine
+    /// bug, from a mechanism added to *reduce* wrong verdicts. The original test
+    /// missed it by using bodies with no failure phrase at all.
+    #[test]
+    fn a_runtime_failure_claim_is_not_a_check_claim() {
+        let green = "- fmt + clippy + test: success";
+        for body in [
+            "This will fail at runtime when the list is empty.",
+            "The request would fail if the token has expired.",
+            "`parse()` fails when the header is absent, and the error is swallowed.",
+            "This would break existing callers that pass a null id.",
+        ] {
+            let mut findings = vec![f("HIGH", "src/x.rs", body)];
+            demote_falsified_build_claims(&mut findings, Some(green));
+            assert_eq!(
+                findings[0].severity, "HIGH",
+                "green CI wrongly capped a runtime finding: {body:?}"
+            );
+        }
+    }
+
+    /// The other half: the same weak phrase IS a check claim once the body names a
+    /// check, which is the shape pr-review-core#28 actually produced.
+    #[test]
+    fn a_weak_phrase_counts_once_a_check_is_named() {
+        let green = "- fmt + clippy + test: success";
+        for body in [
+            "This line is 118 chars, so `cargo fmt --check` will fail on this commit.",
+            "The clippy job will fail on this unwrap.",
+            "CI will fail because the lockfile is stale.",
+            "This breaks the build on MSVC.",
+        ] {
+            let mut findings = vec![f("BLOCKING", "src/x.rs", body)];
+            demote_falsified_build_claims(&mut findings, Some(green));
+            assert_eq!(findings[0].severity, "LOW", "not capped: {body:?}");
+        }
+    }
+
+    /// "ci" is a substring of ordinary English — match it as a word, not a substring.
+    #[test]
+    fn check_context_words_match_whole_words_only() {
+        let green = "- test: success";
+        let mut findings = vec![f(
+            "HIGH",
+            "src/x.rs",
+            "The specific decision here will fail for efficient callers.",
+        )];
+        demote_falsified_build_claims(&mut findings, Some(green));
+        assert_eq!(
+            findings[0].severity, "HIGH",
+            "'ci' inside specific/decision/efficient must not count as a check"
+        );
     }
 
     /// Only claims about a *check outcome* are capped. A real bug found on a commit
