@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.12.0
+
+Minor: the **added-guard procedure** (coverage class A) plus a `VERSION` const for
+consumers.
+
+**Class A — caller-visible behaviour change**
+
+`REVIEW_RULES` now carries a procedure for the highest-value miss in the corpus.
+From nomnaviet#94: `app.use('/api/ocr', optionalAuth, …)` was added to routes that
+had mounted no auth middleware. `optionalAuth` delegates to `verifyAuth`, which
+returns 401 on a malformed or expired token, so every caller holding a stale token
+went from working to broken — and **nothing in the diff says "401"**.
+
+> When a middleware, guard, decorator, interceptor or wrapper is ADDED to a route,
+> handler or function that did not have one: read its implementation rather than
+> assuming from its name, enumerate every response it can now produce (401, 403,
+> 429, a redirect, a thrown error, a timeout), and say which existing callers that
+> breaks. Severity at least MEDIUM.
+
+The capability was always there — the reviewer can `read_file` the middleware. What
+was missing was a procedure for *behavioural* breakage; the prompt only ever
+described structural breakage (signatures and types).
+
+**`pub const VERSION`**
+
+Consumers can now report which engine they run. A bot binary knows its own version
+but not its engine's, and "is the deployed image current?" was otherwise answerable
+only by reading deploy logs — which cost real time three separate times while
+shipping 0.11.0.
+
+Prompt-only behaviour change plus one additive const; no breaking API change.
+
 ## 0.11.0
 
 Minor: four reviewer-quality changes, each written from a recorded production
