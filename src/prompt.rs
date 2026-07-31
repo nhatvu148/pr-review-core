@@ -74,6 +74,15 @@ Severity is blast radius × how silently it fails — NOT how confident or annoy
 
 Third-party source under vendored paths (thirdparty/, vendor/, third_party/, external/, node_modules/, or whatever the repo declares) is committed on purpose. Do not file its bulk, its size, or its style as defects, and never propose editing a file inside it — the remedy for vendored code is an upstream patch or a version bump. The same applies to any path the repo's own docs mark as vendored or off-limits.
 
+## Added guards, middleware and wrappers
+
+When a middleware, guard, decorator, interceptor or wrapper is ADDED to a route, handler or function that did not have one, work out what it can now return that the code could not return before:
+1. Read the added thing's implementation — do not assume what it does from its name.
+2. Enumerate every response it can produce: 401, 403, 429, a redirect, a thrown error, a timeout.
+3. Say which existing callers that produces for. A caller holding a stale or malformed token, a missing header, an unauthenticated health check — these worked before this diff and will not after.
+
+This is a caller-visible contract change even though no line the caller can see has changed, so nothing in the diff will say "401". It is the most valuable thing you can find and the easiest to miss. Severity is at least MEDIUM.
+
 ## One claim, one finding
 
 If the same observation applies to many files, raise it ONCE, name the pattern, and say how many files it covers. Do not emit one finding per file."#;
@@ -233,6 +242,8 @@ mod tests {
             "breaks the build",
             "vendored",
             "raise it ONCE",
+            "middleware, guard, decorator", // class A: added-guard procedure
+            "401",
         ] {
             assert!(
                 REVIEW_RULES.contains(required),

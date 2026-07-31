@@ -6,6 +6,13 @@
 //! prompt are injected through [`config::Config`] so consumers (bot binaries)
 //! supply their own branding.
 
+/// This crate's version, for consumers that report which engine they are running.
+///
+/// A bot binary knows its own version but not its engine's, and "is the deployed
+/// image current?" is otherwise answerable only by reading deploy logs — which cost
+/// real time three separate times while shipping 0.11.0.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod agent;
 pub mod backend;
 pub mod blast;
