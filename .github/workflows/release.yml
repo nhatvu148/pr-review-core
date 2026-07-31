@@ -1,0 +1,75 @@
+name: Release
+
+# Cut the GitHub Release when a version tag is pushed.
+#
+# The release flow is tag-then-publish, and creating the Release was a separate
+# manual step — so it was forgotten five times running: tags reached v0.12.0 while
+# the Releases page still showed v0.10.1 as Latest. Nothing downstream breaks (cargo
+# reads crates.io, not Releases), but anyone looking at the repo sees a stale crate.
+on:
+  push:
+    # `v*.*.*` deliberately, not `v*`: the consumer repos carry a floating `v1` tag
+    # that is force-moved on every release, and that must not cut a Release.
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to cut a release for (e.g. v0.12.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tag annotations, used as the fallback notes
+
+      - name: Resolve tag
+        run: echo "TAG=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_ENV"
+
+      - name: Build notes from the CHANGELOG
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}" python3 - <<'PY' > notes.md
+          import os, re, subprocess, sys
+          version = os.environ["VERSION"]
+          body = ""
+          try:
+              text = open("CHANGELOG.md").read()
+              # Sections are "## X.Y.Z" until the next "## " heading.
+              m = re.search(rf"^## {re.escape(version)}\s*$(.*?)(?=^## |\Z)", text, re.M | re.S)
+              if m:
+                  body = m.group(1).strip()
+          except FileNotFoundError:
+              pass
+          if not body:
+              # No CHANGELOG entry — fall back to the tag's own annotation rather
+              # than publishing an empty release.
+              tag = os.environ.get("TAG", "")
+              body = subprocess.run(
+                  ["git", "tag", "-l", "--format=%(contents)", tag],
+                  capture_output=True, text=True,
+              ).stdout.strip()
+              print(f"::warning::no CHANGELOG section for {version}; used the tag annotation", file=sys.stderr)
+          print(body or f"Release {version}.")
+          PY
+          echo "--- notes ---"; head -20 notes.md
+        env:
+          TAG: ${{ env.TAG }}
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Idempotent: a re-run (or a tag cut by hand first) must not fail the job.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::notice::release $TAG already exists — updating its notes"
+            gh release edit "$TAG" --notes-file notes.md --latest
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag --latest
+          fi
