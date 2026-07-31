@@ -430,7 +430,11 @@ pub(crate) fn references_in_source(path: &str, source: &str, name: &str) -> Vec<
             // Match the opening/self-closing tag only (not the closing tag) so a
             // paired element `<Comp>…</Comp>` counts once.
             "jsx_opening_element" | "jsx_self_closing_element" => {
-                if node.child_by_field_name("name").and_then(|n| ref_name(n, src)) == Some(name) {
+                if node
+                    .child_by_field_name("name")
+                    .and_then(|n| ref_name(n, src))
+                    == Some(name)
+                {
                     push(node, RefKind::Jsx, &mut out);
                 }
             }
@@ -589,7 +593,9 @@ pub async fn structural_context(
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        out.push_str("Complexity of changed functions (cyclomatic / cognitive; grade A best, F worst):\n");
+        out.push_str(
+            "Complexity of changed functions (cyclomatic / cognitive; grade A best, F worst):\n",
+        );
         out.push_str(&complexity_lines.join("\n"));
     }
 

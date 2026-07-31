@@ -108,14 +108,80 @@ const FILES_MAX_PAGES: u64 = 30;
 fn is_binary_ext(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     const BINARY_EXT: &[&str] = &[
-        ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".jar", ".war", ".exe",
-        ".dll", ".so", ".dylib", ".bin", ".o", ".a", ".lib", ".class", ".wasm", ".pdb", ".obj",
-        ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".avif", ".bmp", ".tiff", ".psd",
-        ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp3", ".mp4", ".mov", ".avi", ".wav",
-        ".webm", ".ogg", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".db",
-        ".sqlite", ".sqlite3", ".mdb", ".onnx", ".pt", ".pth", ".h5", ".pkl", ".npy", ".npz",
-        ".safetensors", ".dmg", ".iso", ".deb", ".rpm", ".msi", ".apk", ".ipa", ".keystore",
-        ".jks", ".p12", ".pfx",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".tgz",
+        ".bz2",
+        ".xz",
+        ".7z",
+        ".rar",
+        ".jar",
+        ".war",
+        ".exe",
+        ".dll",
+        ".so",
+        ".dylib",
+        ".bin",
+        ".o",
+        ".a",
+        ".lib",
+        ".class",
+        ".wasm",
+        ".pdb",
+        ".obj",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".ico",
+        ".webp",
+        ".avif",
+        ".bmp",
+        ".tiff",
+        ".psd",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".otf",
+        ".eot",
+        ".mp3",
+        ".mp4",
+        ".mov",
+        ".avi",
+        ".wav",
+        ".webm",
+        ".ogg",
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".mdb",
+        ".onnx",
+        ".pt",
+        ".pth",
+        ".h5",
+        ".pkl",
+        ".npy",
+        ".npz",
+        ".safetensors",
+        ".dmg",
+        ".iso",
+        ".deb",
+        ".rpm",
+        ".msi",
+        ".apk",
+        ".ipa",
+        ".keystore",
+        ".jks",
+        ".p12",
+        ".pfx",
     ];
     BINARY_EXT.iter().any(|e| p.ends_with(e))
 }
@@ -815,7 +881,14 @@ async fn reconcile_inline(
         if t.fp.is_some() {
             resolved.push(format!("`{}`", t.path));
         }
-        match graphql(client, cfg, RESOLVE_MUTATION, serde_json::json!({ "tid": t.id })).await {
+        match graphql(
+            client,
+            cfg,
+            RESOLVE_MUTATION,
+            serde_json::json!({ "tid": t.id }),
+        )
+        .await
+        {
             Ok(_) => {
                 let reply = format!(
                     "✅ Resolved — no longer flagged as of `{short}`.\n\n_{}_",
@@ -847,7 +920,10 @@ async fn delete_comment(client: &Client, cfg: &Config, repo: &str, comment_id: u
     if comment_id == 0 {
         return;
     }
-    let url = format!("{}/repos/{repo}/pulls/comments/{comment_id}", cfg.github_api_base);
+    let url = format!(
+        "{}/repos/{repo}/pulls/comments/{comment_id}",
+        cfg.github_api_base
+    );
     let _ = gh(client.delete(url), cfg).send().await;
 }
 
@@ -869,7 +945,11 @@ pub async fn post_review(
             resolved = reconcile_inline(client, cfg, meta, sha, &review.inline)
                 .await
                 .unwrap_or_else(|e| {
-                    tracing::warn!("inline reconcile failed for {}#{}: {e:#}", meta.repo, meta.pr);
+                    tracing::warn!(
+                        "inline reconcile failed for {}#{}: {e:#}",
+                        meta.repo,
+                        meta.pr
+                    );
                     Vec::new()
                 });
         }
@@ -1033,7 +1113,10 @@ mod tests {
     #[test]
     fn enc_path_preserves_slashes_but_escapes_query_injection() {
         // Normal nested paths pass through untouched.
-        assert_eq!(enc_path("src/providers/github.rs"), "src/providers/github.rs");
+        assert_eq!(
+            enc_path("src/providers/github.rs"),
+            "src/providers/github.rs"
+        );
         // A path trying to smuggle a query param gets its `?`/`=` escaped.
         assert_eq!(enc_path("foo.rs?ref=evil"), "foo.rs%3Fref%3Devil");
         // Spaces and other unsafe bytes are escaped too.

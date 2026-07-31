@@ -91,9 +91,9 @@ fn effective_recommendation(model_rec: &str, findings: &[Finding]) -> String {
         .max()
         .unwrap_or(0);
     let floor = match max_sev {
-        3 => "BLOCK",                     // a BLOCKING finding
-        2 | 1 => "APPROVE WITH CHANGES",  // HIGH or MEDIUM
-        _ => "APPROVE",                   // LOW-only or none — don't force changes
+        3 => "BLOCK",                    // a BLOCKING finding
+        2 | 1 => "APPROVE WITH CHANGES", // HIGH or MEDIUM
+        _ => "APPROVE",                  // LOW-only or none — don't force changes
     };
     if recommendation_rank(model_rec) >= recommendation_rank(floor) {
         model_rec.trim().to_string()
@@ -256,10 +256,41 @@ fn idents(s: &str) -> Vec<String> {
 /// — the tokens whose presence in a finding body ties the finding to this line.
 fn line_symbols(text: &str) -> Vec<String> {
     const KW: &[&str] = &[
-        "const", "let", "var", "function", "return", "import", "export", "from", "class",
-        "interface", "type", "public", "private", "protected", "static", "async", "await", "for",
-        "while", "new", "void", "null", "true", "false", "this", "self", "def", "func", "pub",
-        "use", "mod", "struct", "enum", "impl", "package",
+        "const",
+        "let",
+        "var",
+        "function",
+        "return",
+        "import",
+        "export",
+        "from",
+        "class",
+        "interface",
+        "type",
+        "public",
+        "private",
+        "protected",
+        "static",
+        "async",
+        "await",
+        "for",
+        "while",
+        "new",
+        "void",
+        "null",
+        "true",
+        "false",
+        "this",
+        "self",
+        "def",
+        "func",
+        "pub",
+        "use",
+        "mod",
+        "struct",
+        "enum",
+        "impl",
+        "package",
     ];
     idents(text)
         .into_iter()
@@ -429,7 +460,10 @@ pub(crate) async fn load_repo_config(
 /// Build the summary comment for a PR with nothing for the LLM to review, from any
 /// dependency advisories and/or deterministic hygiene findings. Pure — no I/O — so
 /// the "a swept-in binary must still produce a comment" path is directly testable.
-fn render_no_review_summary(advisories: &[crate::deps::DepAdvisory], hygiene: &[Finding]) -> String {
+fn render_no_review_summary(
+    advisories: &[crate::deps::DepAdvisory],
+    hygiene: &[Finding],
+) -> String {
     let mut s = String::from(
         "🤖 **Automated review**\n\nNo reviewable source changes (all files excluded by filters).",
     );
@@ -891,11 +925,20 @@ mod tests {
             "APPROVE WITH CHANGES"
         );
         // A BLOCKING finding forces a block.
-        assert_eq!(effective_recommendation("APPROVE", &[finding("BLOCKING")]), "BLOCK");
+        assert_eq!(
+            effective_recommendation("APPROVE", &[finding("BLOCKING")]),
+            "BLOCK"
+        );
         // A LOW-only finding does NOT force changes.
-        assert_eq!(effective_recommendation("APPROVE", &[finding("LOW")]), "APPROVE");
+        assert_eq!(
+            effective_recommendation("APPROVE", &[finding("LOW")]),
+            "APPROVE"
+        );
         // The model's stronger verdict is never softened by weaker findings.
-        assert_eq!(effective_recommendation("BLOCK", &[finding("LOW")]), "BLOCK");
+        assert_eq!(
+            effective_recommendation("BLOCK", &[finding("LOW")]),
+            "BLOCK"
+        );
         // No findings → the model's verdict is kept verbatim.
         assert_eq!(effective_recommendation("APPROVE", &[]), "APPROVE");
     }
@@ -919,7 +962,9 @@ mod tests {
     fn line_symbols_drops_keywords_and_short_tokens() {
         let s = line_symbols("export function calcTotal(o) {");
         assert!(s.contains(&"calcTotal".to_string()));
-        assert!(!s.iter().any(|w| w == "export" || w == "function" || w == "o"));
+        assert!(!s
+            .iter()
+            .any(|w| w == "export" || w == "function" || w == "o"));
     }
 
     #[test]
@@ -930,7 +975,12 @@ mod tests {
         texts.insert(10, "  return calcTotal(order, tax);".to_string());
         texts.insert(12, "}".to_string());
         // Finding drifted to line 9; its body names calcTotal, which is on line 10.
-        let got = reanchor(9, &valid, &texts, "`calcTotal` now needs a tax arg. Fix: pass it.");
+        let got = reanchor(
+            9,
+            &valid,
+            &texts,
+            "`calcTotal` now needs a tax arg. Fix: pass it.",
+        );
         assert_eq!(got, Some(10));
     }
 
@@ -940,7 +990,10 @@ mod tests {
         let mut texts = HashMap::new();
         texts.insert(8, "  const x = 1;".to_string());
         texts.insert(10, "  const y = 2;".to_string());
-        assert_eq!(reanchor(9, &valid, &texts, "Missing null check on user.roles"), None);
+        assert_eq!(
+            reanchor(9, &valid, &texts, "Missing null check on user.roles"),
+            None
+        );
     }
 
     #[test]
@@ -961,7 +1014,10 @@ mod tests {
         let mut texts = HashMap::new();
         texts.insert(8, "  calcTotal(order);".to_string());
         texts.insert(10, "  calcTotal(basket);".to_string());
-        assert_eq!(reanchor(9, &valid, &texts, "calcTotal needs a tax arg"), Some(8));
+        assert_eq!(
+            reanchor(9, &valid, &texts, "calcTotal needs a tax arg"),
+            Some(8)
+        );
     }
 
     #[test]

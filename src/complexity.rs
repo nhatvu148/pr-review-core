@@ -104,8 +104,12 @@ impl Lang {
         let k = node.kind();
         match self {
             Lang::Rust => match k {
-                "if_expression" | "while_expression" | "while_let_expression"
-                | "for_expression" | "loop_expression" | "match_arm" => 1,
+                "if_expression"
+                | "while_expression"
+                | "while_let_expression"
+                | "for_expression"
+                | "loop_expression"
+                | "match_arm" => 1,
                 "binary_expression" => bool_ops(node, src),
                 _ => 0,
             },
@@ -116,8 +120,12 @@ impl Lang {
                 _ => 0,
             },
             Lang::Py => match k {
-                "if_statement" | "elif_clause" | "for_statement" | "while_statement"
-                | "except_clause" | "conditional_expression" => 1,
+                "if_statement"
+                | "elif_clause"
+                | "for_statement"
+                | "while_statement"
+                | "except_clause"
+                | "conditional_expression" => 1,
                 "boolean_operator" => 1,
                 _ => 0,
             },
@@ -390,7 +398,11 @@ fn score(x: i32) -> i32 {
         // 1 base + if + (&&) + for + if + 3 match_arms = 8
         assert_eq!(f.cyclomatic, 8, "cyclomatic");
         assert_eq!(f.grade(), 'B');
-        assert!(f.cognitive >= 4, "cognitive reflects nesting: {}", f.cognitive);
+        assert!(
+            f.cognitive >= 4,
+            "cognitive reflects nesting: {}",
+            f.cognitive
+        );
     }
 
     #[test]

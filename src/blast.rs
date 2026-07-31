@@ -147,9 +147,7 @@ fn call_sites(ws: &Workspace, name: &str, def: Option<(&str, u64, u64)>) -> Call
     let mut callers: Vec<Ref> = Vec::new();
     let mut tests: Vec<Ref> = Vec::new();
     let mut types: Vec<Ref> = Vec::new();
-    let in_def_span = |path: &str, line: u64| {
-        matches!(def, Some((df, s, e)) if path == df && line >= s && line <= e)
-    };
+    let in_def_span = |path: &str, line: u64| matches!(def, Some((df, s, e)) if path == df && line >= s && line <= e);
 
     // JS-family: parse each distinct candidate file once, classify every reference.
     let mut seen_js: HashSet<String> = HashSet::new();
@@ -160,7 +158,9 @@ fn call_sites(ws: &Workspace, name: &str, def: Option<(&str, u64, u64)>) -> Call
         if !is_js_family(&path) || !seen_js.insert(path.clone()) {
             continue;
         }
-        let Ok(src) = ws.read_raw(&path) else { continue };
+        let Ok(src) = ws.read_raw(&path) else {
+            continue;
+        };
         let is_test = is_test_path(&path);
         for r in references_in_source(&path, &src, name) {
             if in_def_span(&path, r.line) {
@@ -428,7 +428,10 @@ diff --git a/src/orders.rs b/src/orders.rs
 
     #[test]
     fn looks_like_definition_flags_defs_not_calls() {
-        assert!(looks_like_definition("pub fn process(o: Order) -> i32 {", "process"));
+        assert!(looks_like_definition(
+            "pub fn process(o: Order) -> i32 {",
+            "process"
+        ));
         assert!(looks_like_definition("def process(order):", "process"));
         assert!(!looks_like_definition("    let n = process(o);", "process"));
     }
@@ -453,7 +456,10 @@ diff --git a/src/orders.rs b/src/orders.rs
         );
         // The definition line itself must not appear in either bucket.
         assert!(
-            !cs.callers.iter().chain(cs.tests.iter()).any(|r| r.path == "src/orders.rs"),
+            !cs.callers
+                .iter()
+                .chain(cs.tests.iter())
+                .any(|r| r.path == "src/orders.rs"),
             "definition excluded"
         );
         // A small fixture never hits the fetch ceiling.
@@ -508,12 +514,18 @@ diff --git a/src/orders.rs b/src/orders.rs
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("src")).unwrap();
         let w = |rel: &str, body: &str| fs::write(dir.path().join(rel), body).unwrap();
-        w("src/Card.tsx", "export function Card() {\n  return null;\n}\n");
+        w(
+            "src/Card.tsx",
+            "export function Card() {\n  return null;\n}\n",
+        );
         w(
             "src/App.tsx",
             "import { Card } from './Card';\nexport function App() {\n  return <Card />;\n}\n",
         );
-        w("src/types.ts", "export interface Finding {\n  id: string;\n}\n");
+        w(
+            "src/types.ts",
+            "export interface Finding {\n  id: string;\n}\n",
+        );
         w(
             "src/analyze.ts",
             "import { Finding } from './types';\nexport function analyze(f: Finding): Finding {\n  return f;\n}\n",
@@ -543,7 +555,10 @@ diff --git a/src/orders.rs b/src/orders.rs
         let out = references(&ws, "Finding", 8);
         assert!(out.contains("type uses"), "type bucket present: {out}");
         assert!(out.contains("src/analyze.ts"), "{out}");
-        assert!(!out.contains("callers ("), "no call sites for a pure type: {out}");
+        assert!(
+            !out.contains("callers ("),
+            "no call sites for a pure type: {out}"
+        );
     }
 
     #[test]
@@ -564,7 +579,11 @@ diff --git a/src/orders.rs b/src/orders.rs
         .unwrap();
         let ws = Workspace::from_dir(dir.path());
         let out = references(&ws, "Card", 8);
-        assert_eq!(out.matches("src/use.tsx:1").count(), 1, "listed once: {out}");
+        assert_eq!(
+            out.matches("src/use.tsx:1").count(),
+            1,
+            "listed once: {out}"
+        );
         assert!(out.contains("callers (1)"), "{out}");
     }
 
