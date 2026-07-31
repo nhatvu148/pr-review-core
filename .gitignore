@@ -1,9 +1,7 @@
 /target
 
-# Local reviewer-tuning notes and benchmark data — kept out of the public crate
-docs/REVIEWER_COVERAGE.md
-docs/bench-corpus.json
-docs/feedback/
-docs/SCOREBOARD.md
-# Generated bench corpora (scripts/swe_to_corpus.py) — regenerate, do not commit
-docs/corpus-*.json
+# Reviewer-tuning notes, corpus and measurements — kept out of the public crate.
+# The whole directory, not a list of paths: it is its own PRIVATE repo
+# (nhatvu148/pr-review-docs) and contains client-confidential material, so a new
+# file added there must never reach this public repo by default.
+docs/
