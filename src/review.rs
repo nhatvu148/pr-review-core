@@ -851,7 +851,9 @@ pub async fn run_review_with(
     // confidence floor, severity sort, and a hard cap — cuts noise before posting.
     let mut findings = result.review.findings.clone();
     if cfg.self_critique && !findings.is_empty() {
-        findings = match crate::llm::critique_findings(&client, cfg, &meta, &diff, &findings).await
+        // Through the backend seam, so the critique runs on whatever produced the
+        // review — not always OpenRouter.
+        findings = match crate::llm::critique_findings(cfg, backend, &meta, &diff, &findings).await
         {
             Ok(f) => f,
             Err(e) => {
@@ -1087,6 +1089,146 @@ mod orchestrator_tests {
                 "the backend never received the rule containing {rule:?}"
             );
         }
+    }
+
+    /// Proposes two findings, and answers `complete()` with whatever the test
+    /// configured — the critique reply, or an error. Records what it was asked.
+    struct CritiqueSpy {
+        asked: Arc<Mutex<Vec<(String, String)>>>,
+        reply: Option<&'static str>,
+    }
+
+    fn proposed(file: &str, body: &str) -> crate::llm::Finding {
+        crate::llm::Finding {
+            severity: "MEDIUM".to_string(),
+            file: file.to_string(),
+            line: None,
+            body: body.to_string(),
+            confidence: Some(80),
+        }
+    }
+
+    #[async_trait]
+    impl ReviewBackend for CritiqueSpy {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "two things".to_string(),
+                    recommendation: "APPROVE WITH CHANGES".to_string(),
+                    findings: vec![
+                        proposed("src/a.rs", "a real problem"),
+                        proposed("src/a.rs", "a noisy nit"),
+                    ],
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+
+        async fn complete(&self, _cfg: &Config, system: &str, user: &str) -> Result<String> {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((system.to_string(), user.to_string()));
+            match self.reply {
+                Some(r) => Ok(r.to_string()),
+                None => anyhow::bail!("backend is down"),
+            }
+        }
+    }
+
+    fn critique_cfg(base: &str) -> Config {
+        let mut c = cfg_for(base);
+        c.self_critique = true;
+        c.min_confidence = 0; // isolate the critique from the confidence floor
+        c
+    }
+
+    /// The critique used to post to OpenRouter directly, so a consumer running its
+    /// own backend silently lost the noise filter. It must now travel the seam.
+    #[tokio::test]
+    async fn the_critique_runs_on_the_backend_that_produced_the_review() {
+        let srv = github_stub().await;
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let backend = CritiqueSpy {
+            asked: Arc::clone(&asked),
+            reply: Some(
+                r#"[{"severity":"MEDIUM","file":"src/a.rs","body":"a real problem","confidence":90}]"#,
+            ),
+        };
+
+        let out = run_review_with(&critique_cfg(&srv.uri()), input(), &backend)
+            .await
+            .expect("the review runs");
+
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), 1, "complete() carried the critique");
+        let (system, user) = &asked[0];
+        assert!(
+            system.contains("skeptical senior reviewer"),
+            "the critique system prompt reached the backend: {system}"
+        );
+        assert!(
+            user.contains("PROPOSED FINDINGS") && user.contains("a noisy nit"),
+            "the proposed findings reached the backend"
+        );
+        assert_eq!(
+            out.findings_detail.len(),
+            1,
+            "the critique's pruning is honored"
+        );
+        assert!(out.findings_detail[0].body.contains("a real problem"));
+    }
+
+    /// Fail-open: a critique that errors must never cost the review its findings.
+    #[tokio::test]
+    async fn a_failed_critique_keeps_the_original_findings() {
+        let srv = github_stub().await;
+        let backend = CritiqueSpy {
+            asked: Arc::new(Mutex::new(Vec::new())),
+            reply: None, // complete() errors
+        };
+
+        let out = run_review_with(&critique_cfg(&srv.uri()), input(), &backend)
+            .await
+            .expect("the review still succeeds");
+
+        assert_eq!(out.findings_detail.len(), 2, "both proposals survive");
+    }
+
+    /// The shape guard: elements came back but none parsed, so the critique is
+    /// broken rather than decisive — error, and the caller keeps everything.
+    /// Returning the empty list would delete every finding in the review.
+    #[tokio::test]
+    async fn an_unparseable_critique_keeps_the_original_findings() {
+        let srv = github_stub().await;
+        let backend = CritiqueSpy {
+            asked: Arc::new(Mutex::new(Vec::new())),
+            reply: Some(r#"[{"nonsense":true},{"also":"nonsense"}]"#),
+        };
+
+        let out = run_review_with(&critique_cfg(&srv.uri()), input(), &backend)
+            .await
+            .expect("the review still succeeds");
+
+        assert_eq!(out.findings_detail.len(), 2, "both proposals survive");
+    }
+
+    /// A critique that legitimately drops everything is still obeyed — the guard
+    /// above keys on *unparseable* elements, not on an honest empty verdict.
+    #[tokio::test]
+    async fn an_empty_critique_verdict_is_obeyed() {
+        let srv = github_stub().await;
+        let backend = CritiqueSpy {
+            asked: Arc::new(Mutex::new(Vec::new())),
+            reply: Some("[]"),
+        };
+
+        let out = run_review_with(&critique_cfg(&srv.uri()), input(), &backend)
+            .await
+            .expect("the review still succeeds");
+
+        assert_eq!(out.findings_detail.len(), 0, "all findings were noise");
     }
 
     #[tokio::test]
