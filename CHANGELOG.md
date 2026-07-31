@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.13.0
+
+Minor: **a build claim CI has already falsified is capped at LOW** — enforced in
+code, after the prompt was given two chances and did not take.
+
+**The history this comes from**
+
+- `VinaText#10`: two **BLOCKING** findings claiming a broken MFC build on a commit
+  whose CI was green. Via the recommendation floor, that posted a `BLOCK`.
+- 0.11.0 shipped the CI-status block plus an explicit rule — *a passing check
+  FALSIFIES any claim that this change breaks that build*.
+- `pr-review-core#28` filed the same shape anyway: BLOCKING, then MEDIUM on a re-run
+  once the rules actually reached the claude-code backend. Never dropped, never
+  restated at LOW. The model lowered its confidence **without re-examining the
+  claim**, and its second attempt supplied *more argument* for the same wrong
+  conclusion.
+
+**What now happens**
+
+`review::demote_falsified_build_claims` caps such a finding at LOW when every check
+on the reviewed commit reports success, and says so in the body.
+
+- **Demote, not delete.** The observation underneath is usually true — the line
+  really is 118 characters. It is the inference to "the check will fail" that CI
+  refutes. LOW keeps the observation while removing what it costs, since via the
+  recommendation floor a MEDIUM or above turns the verdict into "approve with
+  changes" or "block".
+- **Two-tier matching.** Unambiguous phrases (`breaks the build`, `fails to
+  compile`, `fails ci`) stand alone. Ambiguous ones (`will fail`, `would fail`)
+  only count when the body also names a check — `cargo fmt/test/clippy`, `--check`,
+  or a whole word like `ci`/`build`/`compile`/`clippy`/`lint`. Whole words, not
+  substrings: `ci` lives inside *specific*, *decision*, *efficient*. Without this,
+  "this will fail at runtime when the list is empty" — a real HIGH that green CI
+  says nothing about — would be silently capped.
+- **Conservative on the CI side.** No CI block, an empty one, any non-success
+  state, or a *truncated* list (where a hidden failure is exactly the risk) all mean
+  "not known green", and nothing is demoted.
+
+**Also**
+
+- `BENCH_SHOW_FINDINGS=1` now works in `examples/bench_local.rs` too, so all three
+  harnesses can print finding text. Recall alone only says a finding hit the right
+  line, not that it made the right claim — that flag is how the 0.12.0 class-A
+  procedure was verified (`auth-mount-401`, recall 1.00 ± 0.00 at n=3).
+
+No API change.
+
 ## 0.12.0
 
 Minor: the **added-guard procedure** (coverage class A) plus a `VERSION` const for
