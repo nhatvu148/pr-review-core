@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+Three changes that together let a consumer review a **local diff** — a branch, a
+worktree, staged changes — on its own backend, with the same calibration and the
+same post-processing the PR path gets. Written for vexar's convergence loop, which
+reviews a worktree with no PR behind it.
+
+**Orchestrator-injected rules.** `prompt::REVIEW_RULES` was a const each
+`ReviewBackend` was trusted to append, and the deployed claude-code backend ran for
+months without it — invisibly, because a review with no calibration rules still
+reads like a review (`docs/feedback/2026-07-31-pr-review-core-28.md`).
+`run_review_with` now composes the rules plus the consumer's `extra_system_prompt`
+once and hands them over on `ReviewContext.injected_rules`;
+`ReviewContext::system_prompt(rubric)` joins them to whatever rubric the backend
+uses. What the model receives is byte-identical on both OpenRouter paths, pinned by
+a test against the old formula.
+
+**Critique behind the seam.** `llm::critique_findings` posted to OpenRouter
+directly, so a consumer with its own backend lost the noise filter unless it also
+held an OpenRouter key — and lost it silently, since the caller fails open. It now
+runs on `ReviewBackend::complete()`. The default backend still resolves that to the
+same OpenRouter call, so the bot is unchanged.
+
+**`review::run_review_local`.** Takes a `LocalReviewInput { diff, repo_root, label }`
+and runs the same pipeline as `run_review_with` — glob filtering, diff hygiene,
+packing, structural context, self-critique, confidence floor, burst collapse,
+recommendation floor, cap, line anchoring — minus the three stages that only mean
+something for a PR: no provider fetch, no posting, and **no CVE scan** (the OSV scan
+reads added dependency lines out of a lockfile diff, and a local diff carries no
+guarantee of lockfile semantics). The stages are extracted into `prepare_diff` and
+`finish_review` and shared, not forked: the local path is what the convergence loop
+scores itself on, and a filter that applied to only one path would make those
+numbers incomparable with the bot's. `structure::structural_context_local` reads
+new-side files from the checkout instead of the provider.
+
+**Breaking (API):**
+
+- `ReviewContext` gains `injected_rules` and `local_root`, and its `provider` is now
+  `Option<&Provider>` — `None` on the local path, where inventing a host would make
+  an agentic backend try to clone a repo that isn't there.
+- `llm::review_diff` and `agent::agentic_review` take the prepared `system_prompt`.
+  Callers driving them directly can build it with `prompt::review_system_prompt`.
+- `llm::critique_findings` takes `(cfg, backend, ...)` instead of `(client, cfg, ...)`.
+
 ## 0.13.0
 
 Minor: **a build claim CI has already falsified is capped at LOW** — enforced in

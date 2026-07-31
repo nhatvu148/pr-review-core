@@ -26,7 +26,7 @@ pub struct RunReviewInput {
 }
 
 /// Result of one review run (serialized as the HTTP/CLI response).
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunReviewOutput {
     pub provider: String,
@@ -679,6 +679,193 @@ async fn post_advisory_only(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Shared pipeline stages
+//
+// Both entry points — the PR orchestrator and the local diff-first one — run the
+// SAME stages either side of the model call. They live here as functions rather
+// than being copied because the two paths drifting apart is the failure this
+// crate can least afford: the local path is the one the convergence loop scores
+// itself on, and a filter or a demotion rule that applies to only one of them
+// makes those numbers incomparable with the bot's.
+// ---------------------------------------------------------------------------
+
+/// Everything derived from the raw diff before the model sees anything.
+struct PreparedDiff {
+    /// Glob-filtered and size-packed — what the backend reviews. Empty when every
+    /// changed file was filtered out.
+    diff: String,
+    /// Deterministic diff-hygiene findings (class D), computed from the RAW diff so
+    /// a glob-excluded file (a vendored tree, a swept-in binary) is still seen.
+    hygiene: Vec<Finding>,
+    /// Note naming whole files packed out to fit the budget (NOT reviewed).
+    omitted_note: Option<String>,
+}
+
+/// Glob-filter, hygiene-scan, and size-pack a raw diff.
+fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
+    // Drop noisy files (lockfiles, generated, vendored, minified) before the LLM
+    // sees the diff — saves tokens and noise. Fail-open: never loses the review.
+    let (diff, dropped) =
+        crate::diff::filter_diff_by_globs(raw_diff, &cfg.include_globs, &cfg.exclude_globs);
+    if !dropped.is_empty() {
+        tracing::info!("skipped {} file(s) by glob: {:?}", dropped.len(), dropped);
+    }
+
+    // Computed from the RAW diff, and BEFORE the caller's empty-diff short-circuit,
+    // so an all-excluded change still reports its swept-in binary.
+    let hygiene: Vec<Finding> = crate::diff::diff_hygiene_with(raw_diff, &cfg.vendored_globs)
+        .into_iter()
+        .map(|h| Finding {
+            severity: h.severity.to_string(),
+            file: h.file,
+            line: None,
+            body: h.body,
+            confidence: Some(100),
+        })
+        .collect();
+
+    if diff.trim().is_empty() {
+        return PreparedDiff {
+            diff,
+            hygiene,
+            omitted_note: None,
+        };
+    }
+
+    // Smart size handling: keep whole files, dropping the lowest-priority ones
+    // first, until the diff fits `max_diff_chars` — instead of a blunt mid-file
+    // char cut. Applied ONCE here so every review path gets the same packed diff.
+    let (diff, packed_dropped) = if cfg.file_bundling {
+        crate::diff::pack_diff_bundled(&diff, cfg.max_diff_chars)
+    } else {
+        crate::diff::pack_diff(&diff, cfg.max_diff_chars)
+    };
+    if !packed_dropped.is_empty() {
+        tracing::info!(
+            "packed diff: omitted {} lower-priority file(s) to fit budget: {:?}",
+            packed_dropped.len(),
+            packed_dropped
+        );
+    }
+    // Surfaced to the model so it knows these files were NOT reviewed.
+    let omitted_note = (!packed_dropped.is_empty()).then(|| {
+        format!(
+            "{} file(s) were omitted to fit the size limit and were NOT reviewed: {}",
+            packed_dropped.len(),
+            packed_dropped.join(", ")
+        )
+    });
+
+    PreparedDiff {
+        diff,
+        hygiene,
+        omitted_note,
+    }
+}
+
+/// A review after every post-processing stage, ready to post or to render.
+struct FinishedReview {
+    findings: Vec<Finding>,
+    recommendation: String,
+    summary: String,
+    inline: Vec<InlineComment>,
+}
+
+/// Everything between the backend's answer and a postable review: self-critique,
+/// confidence floor, hygiene merge, CI demotion, burst collapse, severity sort,
+/// recommendation floor, cap, line anchoring, and the summary.
+async fn finish_review(
+    cfg: &Config,
+    backend: &dyn ReviewBackend,
+    meta: &PrMeta,
+    diff: &str,
+    result: &ReviewResult,
+    hygiene: Vec<Finding>,
+) -> FinishedReview {
+    // Post-process findings before anchoring: optional self-critique pass, then a
+    // confidence floor, severity sort, and a hard cap — cuts noise before posting.
+    let mut findings = result.review.findings.clone();
+    if cfg.self_critique && !findings.is_empty() {
+        // Through the backend seam, so the critique runs on whatever produced the
+        // review — not always OpenRouter.
+        findings = match crate::llm::critique_findings(cfg, backend, meta, diff, &findings).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("self-critique failed ({e:#}); keeping original findings");
+                findings
+            }
+        };
+    }
+    findings.retain(|f| f.confidence.unwrap_or(100) >= cfg.min_confidence);
+    // Merge the diff-hygiene findings. Added after self-critique/confidence-floor —
+    // they're facts, not guesses — but before the severity sort + cap, so they
+    // compete like any other finding.
+    findings.extend(hygiene);
+    // A claim that CI has already falsified is capped at LOW — see the function.
+    // A local review carries no CI block, so this is a no-op there.
+    demote_falsified_build_claims(&mut findings, meta.ci_status.as_deref());
+    // Collapse a burst of one claim repeated across many files into a single finding
+    // that states the count — before the sort, so the survivor competes on merit.
+    findings = collapse_bursts(findings);
+    findings.sort_by(|a, b| {
+        severity_rank(&b.severity)
+            .cmp(&severity_rank(&a.severity))
+            .then(b.confidence.unwrap_or(0).cmp(&a.confidence.unwrap_or(0)))
+    });
+    // Recommendation reflects the *merged* findings (incl. deterministic hygiene the
+    // model never saw), upgraded from — never softening — the model's own verdict.
+    // Computed BEFORE the cap so a hygiene finding truncated out of the posted list
+    // still can't leave the recommendation understating a real problem.
+    let recommendation = effective_recommendation(&result.review.recommendation, &findings);
+    findings.truncate(cfg.max_findings);
+
+    let valid = parse_valid_lines(diff);
+    // Line texts are only needed to confirm a re-anchor (content match).
+    let line_texts = if cfg.reanchor_findings {
+        crate::diff::diff_line_texts(diff)
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Anchor findings whose (file, line) is actually in the diff. A finding that
+    // just missed (model off-by-a-few / drift) is re-anchored to a nearby diff line
+    // when its code matches; the rest fold into the summary so the provider never
+    // rejects an out-of-diff anchor.
+    let mut inline: Vec<InlineComment> = Vec::new();
+    let mut unanchored: Vec<&Finding> = Vec::new();
+    for f in &findings {
+        let mut anchor = f
+            .line
+            .filter(|l| valid.get(&f.file).is_some_and(|s| s.contains(l)));
+        if anchor.is_none() && cfg.reanchor_findings {
+            if let (Some(l), Some(v), Some(t)) =
+                (f.line, valid.get(&f.file), line_texts.get(&f.file))
+            {
+                anchor = reanchor(l, v, t, &f.body);
+            }
+        }
+        match anchor {
+            Some(line) => inline.push(InlineComment {
+                path: f.file.clone(),
+                line,
+                body: inline_body(f),
+            }),
+            None => unanchored.push(f),
+        }
+    }
+
+    // `recommendation` was computed from the pre-truncation findings above.
+    let summary = render_summary(&result.review, &recommendation, &unanchored, inline.len());
+
+    FinishedReview {
+        findings,
+        recommendation,
+        summary,
+        inline,
+    }
+}
+
 /// Review one pull request end-to-end, using the default [`OpenRouterBackend`]
 /// (a Claude model via OpenRouter).
 ///
@@ -748,64 +935,33 @@ pub async fn run_review_with(
         );
     }
 
-    // Drop noisy files (lockfiles, generated, vendored, minified) before the LLM
-    // sees the diff — saves tokens and noise. Fail-open: never loses the review.
-    let (diff, dropped) =
-        crate::diff::filter_diff_by_globs(&raw_diff, &cfg.include_globs, &cfg.exclude_globs);
-    if !dropped.is_empty() {
-        tracing::info!("skipped {} file(s) by glob: {:?}", dropped.len(), dropped);
-    }
-
-    // Deterministic diff-hygiene findings (class D). Computed from the RAW diff so a
-    // glob-excluded file (a vendored tree, a swept-in binary) is still seen — which
-    // is the whole point, so it must run *before* the empty-diff short-circuit below.
-    let hygiene: Vec<Finding> = crate::diff::diff_hygiene_with(&raw_diff, &cfg.vendored_globs)
-        .into_iter()
-        .map(|h| Finding {
-            severity: h.severity.to_string(),
-            file: h.file,
-            line: None,
-            body: h.body,
-            confidence: Some(100),
-        })
-        .collect();
+    let prepared = prepare_diff(cfg, &raw_diff);
 
     // If every changed file was filtered out (e.g. a lockfile-only PR) there's
     // nothing for the LLM to review — but a dependency advisory or a hygiene finding
     // on those files still deserves a comment. Post the no-review summary and return.
-    if diff.trim().is_empty() {
-        if !advisories.is_empty() || !hygiene.is_empty() {
-            return post_advisory_only(&provider, &client, cfg, &meta, &input, advisories, hygiene)
-                .await;
+    if prepared.diff.trim().is_empty() {
+        if !advisories.is_empty() || !prepared.hygiene.is_empty() {
+            return post_advisory_only(
+                &provider,
+                &client,
+                cfg,
+                &meta,
+                &input,
+                advisories,
+                prepared.hygiene,
+            )
+            .await;
         }
         anyhow::bail!(
             "PR diff is empty (all files excluded by globs, or no changes) — nothing to review."
         );
     }
-
-    // Smart size handling: keep whole files, dropping the lowest-priority ones
-    // first, until the diff fits `max_diff_chars` — instead of a blunt mid-file
-    // char cut. Applied ONCE here so both review paths get the same packed diff.
-    let (diff, packed_dropped) = if cfg.file_bundling {
-        crate::diff::pack_diff_bundled(&diff, cfg.max_diff_chars)
-    } else {
-        crate::diff::pack_diff(&diff, cfg.max_diff_chars)
-    };
-    if !packed_dropped.is_empty() {
-        tracing::info!(
-            "packed diff: omitted {} lower-priority file(s) to fit budget: {:?}",
-            packed_dropped.len(),
-            packed_dropped
-        );
-    }
-    // Surfaced to the model so it knows these files were NOT reviewed.
-    let omitted_note = (!packed_dropped.is_empty()).then(|| {
-        format!(
-            "{} file(s) were omitted to fit the size limit and were NOT reviewed: {}",
-            packed_dropped.len(),
-            packed_dropped.join(", ")
-        )
-    });
+    let PreparedDiff {
+        diff,
+        hygiene,
+        omitted_note,
+    } = prepared;
 
     // Structural context: name the enclosing function/symbol of each changed line
     // so the model knows every change's scope. Tier B (tree-sitter over fetched
@@ -838,7 +994,10 @@ pub async fn run_review_with(
     let ctx = ReviewContext {
         client: &client,
         cfg,
-        provider: &provider,
+        provider: Some(&provider),
+        // A PR's code is only reachable by cloning; the agentic path does that
+        // itself when enabled.
+        local_root: None,
         repo: &input.repo,
         meta: &meta,
         diff: &diff,
@@ -847,84 +1006,20 @@ pub async fn run_review_with(
         injected_rules: &injected_rules,
     };
     let result = backend.review(&ctx).await?;
-    // Post-process findings before anchoring: optional self-critique pass, then a
-    // confidence floor, severity sort, and a hard cap — cuts noise before posting.
-    let mut findings = result.review.findings.clone();
-    if cfg.self_critique && !findings.is_empty() {
-        // Through the backend seam, so the critique runs on whatever produced the
-        // review — not always OpenRouter.
-        findings = match crate::llm::critique_findings(cfg, backend, &meta, &diff, &findings).await
-        {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("self-critique failed ({e:#}); keeping original findings");
-                findings
-            }
-        };
-    }
-    findings.retain(|f| f.confidence.unwrap_or(100) >= cfg.min_confidence);
-    // Merge the diff-hygiene findings (computed earlier, before the empty-diff
-    // short-circuit). Added after self-critique/confidence-floor — they're facts,
-    // not guesses — but before the severity sort + cap, so they compete like any.
-    findings.extend(hygiene);
-    // A claim that CI has already falsified is capped at LOW — see the function.
-    demote_falsified_build_claims(&mut findings, meta.ci_status.as_deref());
-    // Collapse a burst of one claim repeated across many files into a single finding
-    // that states the count — before the sort, so the survivor competes on merit.
-    findings = collapse_bursts(findings);
-    findings.sort_by(|a, b| {
-        severity_rank(&b.severity)
-            .cmp(&severity_rank(&a.severity))
-            .then(b.confidence.unwrap_or(0).cmp(&a.confidence.unwrap_or(0)))
-    });
-    // Recommendation reflects the *merged* findings (incl. deterministic hygiene the
-    // model never saw), upgraded from — never softening — the model's own verdict.
-    // Computed BEFORE the cap so a hygiene finding truncated out of the posted list
-    // still can't leave the recommendation understating a real problem.
-    let recommendation = effective_recommendation(&result.review.recommendation, &findings);
-    findings.truncate(cfg.max_findings);
-
-    let valid = parse_valid_lines(&diff);
-    // Line texts are only needed to confirm a re-anchor (content match).
-    let line_texts = if cfg.reanchor_findings {
-        crate::diff::diff_line_texts(&diff)
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    // Anchor findings whose (file, line) is actually in the diff. A finding that
-    // just missed (model off-by-a-few / drift) is re-anchored to a nearby diff line
-    // when its code matches; the rest fold into the summary so the provider never
-    // rejects an out-of-diff anchor.
-    let mut inline: Vec<InlineComment> = Vec::new();
-    let mut unanchored: Vec<&Finding> = Vec::new();
-    for f in &findings {
-        let mut anchor = f
-            .line
-            .filter(|l| valid.get(&f.file).is_some_and(|s| s.contains(l)));
-        if anchor.is_none() && cfg.reanchor_findings {
-            if let (Some(l), Some(v), Some(t)) =
-                (f.line, valid.get(&f.file), line_texts.get(&f.file))
-            {
-                anchor = reanchor(l, v, t, &f.body);
-            }
-        }
-        match anchor {
-            Some(line) => inline.push(InlineComment {
-                path: f.file.clone(),
-                line,
-                body: inline_body(f),
-            }),
-            None => unanchored.push(f),
-        }
-    }
-
-    // `recommendation` was computed from the pre-truncation findings above.
-    let mut summary = render_summary(&result.review, &recommendation, &unanchored, inline.len());
+    let mut finished = finish_review(cfg, backend, &meta, &diff, &result, hygiene).await;
     if !advisories.is_empty() {
-        summary.push_str("\n\n");
-        summary.push_str(&crate::deps::render_advisories(&advisories));
+        finished.summary.push_str("\n\n");
+        finished
+            .summary
+            .push_str(&crate::deps::render_advisories(&advisories));
     }
+
+    let FinishedReview {
+        findings,
+        recommendation,
+        summary,
+        inline,
+    } = finished;
     let inline_count = inline.len();
     let post = ReviewPost {
         summary: summary.clone(),
@@ -936,9 +1031,9 @@ pub async fn run_review_with(
         repo: input.repo.clone(),
         pr: input.pr,
         model: result.model,
-        recommendation: recommendation.clone(),
+        recommendation,
         findings: findings.len(),
-        findings_detail: findings.clone(),
+        findings_detail: findings,
         inline_posted: inline_count,
         posted: false,
         comment_url: None,
@@ -952,6 +1047,392 @@ pub async fn run_review_with(
     }
 
     Ok(out)
+}
+
+/// A review of a diff that is **not** a pull request: a branch, a worktree, a set
+/// of staged changes. No host, no PR number, nothing to post to.
+pub struct LocalReviewInput {
+    /// The raw unified diff to review, as `git diff` prints it.
+    pub diff: String,
+    /// A checkout the new-side files can be read from, for structural context.
+    /// Optional: without it the review still runs, on hunk-header context alone.
+    pub repo_root: Option<std::path::PathBuf>,
+    /// What to call this change in the prompt and the output — a branch name, a
+    /// session id, `"staged changes"`. Purely descriptive.
+    pub label: String,
+}
+
+/// Review a local diff with a caller-supplied [`ReviewBackend`].
+///
+/// The same pipeline as [`run_review_with`] — glob filtering, diff hygiene,
+/// packing, structural context, the backend call, self-critique, the confidence
+/// floor, burst collapse, the recommendation floor, the cap, and line anchoring —
+/// minus the three stages that only mean something for a pull request:
+///
+/// - **no provider fetch**: the caller supplies the diff.
+/// - **no posting**: there is nothing to post to. `posted` is always false, and the
+///   rendered summary is returned for the caller to display.
+/// - **no CVE scan**: [`crate::deps::scan`] reads added dependency lines out of a
+///   *lockfile* diff, and a local diff carries no guarantee of lockfile semantics
+///   (a worktree mid-edit, a partial `git add`). Running it on a diff those
+///   assumptions don't hold for would report advisories nobody can act on.
+///
+/// Findings come back in `findings_detail`, anchored to diff lines exactly as they
+/// would be on a PR; `inline_posted` counts the ones that anchored.
+///
+/// # Errors
+/// If the diff is empty or entirely excluded by globs (and no hygiene finding
+/// applies), or the backend fails.
+pub async fn run_review_local(
+    cfg: &Config,
+    input: LocalReviewInput,
+    backend: &dyn ReviewBackend,
+) -> Result<RunReviewOutput> {
+    let client = reqwest::Client::new();
+    // A synthetic PrMeta so every shared stage below reads the same shape it does
+    // on a PR. `pr: 0` and the absent head SHA / CI block are honest: there is no
+    // PR number, no reviewed commit, and nothing has been checked.
+    let meta = PrMeta {
+        repo: input.label.clone(),
+        pr: 0,
+        title: (!input.label.trim().is_empty()).then(|| input.label.clone()),
+        base_branch: None,
+        head_sha: None,
+        body: None,
+        ci_status: None,
+    };
+
+    let prepared = prepare_diff(cfg, &input.diff);
+    if prepared.diff.trim().is_empty() {
+        // No LLM review is possible, but a hygiene finding on an excluded file (a
+        // swept-in binary) is still a real result — return it rather than erroring.
+        if !prepared.hygiene.is_empty() {
+            let summary = render_no_review_summary(&[], &prepared.hygiene);
+            let recommendation = effective_recommendation("APPROVE", &prepared.hygiene);
+            return Ok(RunReviewOutput {
+                provider: LOCAL_PROVIDER.to_string(),
+                repo: input.label,
+                pr: 0,
+                model: String::new(),
+                recommendation,
+                findings: prepared.hygiene.len(),
+                findings_detail: prepared.hygiene,
+                inline_posted: 0,
+                posted: false,
+                comment_url: None,
+                summary_markdown: summary,
+                usage: None,
+            });
+        }
+        anyhow::bail!(
+            "Diff is empty (all files excluded by globs, or no changes) — nothing to review."
+        );
+    }
+    let PreparedDiff {
+        diff,
+        hygiene,
+        omitted_note,
+    } = prepared;
+
+    // Structural context from the checkout when there is one; hunk headers (Tier A)
+    // otherwise. Fail-open, like the PR path — an empty string just omits the block.
+    let structural = match (cfg.structural_context, input.repo_root.as_deref()) {
+        (true, Some(root)) => crate::structure::structural_context_local(cfg, root, &diff),
+        (true, None) => crate::structure::hunk_context(&diff),
+        (false, _) => String::new(),
+    };
+    if !structural.is_empty() {
+        tracing::info!(
+            "structural context for {}: {} line(s)",
+            input.label,
+            structural.lines().count()
+        );
+    }
+
+    let injected_rules = crate::prompt::injected_rules(cfg);
+    let ctx = ReviewContext {
+        client: &client,
+        cfg,
+        provider: None,
+        local_root: input.repo_root.as_deref(),
+        repo: &input.label,
+        meta: &meta,
+        diff: &diff,
+        omitted_note: omitted_note.as_deref(),
+        structural_context: (!structural.is_empty()).then_some(structural.as_str()),
+        injected_rules: &injected_rules,
+    };
+    let result = backend.review(&ctx).await?;
+    let finished = finish_review(cfg, backend, &meta, &diff, &result, hygiene).await;
+
+    Ok(RunReviewOutput {
+        provider: LOCAL_PROVIDER.to_string(),
+        repo: input.label,
+        pr: 0,
+        model: result.model,
+        recommendation: finished.recommendation,
+        findings: finished.findings.len(),
+        findings_detail: finished.findings,
+        inline_posted: finished.inline.len(),
+        posted: false,
+        comment_url: None,
+        summary_markdown: finished.summary,
+        usage: result.usage,
+    })
+}
+
+/// The `provider` a local review reports. Not a [`Provider`] — that enum is the set
+/// of hosts this crate can post to, and this review has no host.
+pub const LOCAL_PROVIDER: &str = "local";
+
+#[cfg(test)]
+mod local_review_tests {
+    //! The diff-first entry point: no provider, no PR, no posting. These pin that
+    //! it really is the same pipeline — anchoring, glob filtering, structural
+    //! context — and not a second reviewer that happens to look similar.
+
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+
+    use super::{run_review_local, LocalReviewInput, LOCAL_PROVIDER};
+    use crate::backend::{ReviewBackend, ReviewContext};
+    use crate::config::Config;
+    use crate::llm::{Finding, Review, ReviewResult};
+
+    /// A change to `src/order.rs`: new-side line 1 is context, 2–4 are added.
+    const DIFF: &str = "diff --git a/src/order.rs b/src/order.rs\n\
+         --- a/src/order.rs\n\
+         +++ b/src/order.rs\n\
+         @@ -1,3 +1,5 @@\n\
+         \x20fn total(items: &[u32]) -> u32 {\n\
+         -    items.iter().sum()\n\
+         +    let mut t = 0;\n\
+         +    for i in items { t += i; }\n\
+         +    t\n\
+         \x20}\n";
+
+    /// What a checkout of the new side looks like, for the structural-context test.
+    const NEW_SIDE: &str = "fn total(items: &[u32]) -> u32 {\n    let mut t = 0;\n    for i in items { t += i; }\n    t\n}\n";
+
+    /// What the backend was handed, for assertions.
+    struct SeenCtx {
+        structural: Option<String>,
+        had_provider: bool,
+    }
+
+    type Seen = Arc<Mutex<Vec<SeenCtx>>>;
+
+    /// Returns one finding anchored to a line the diff really contains, and records
+    /// the context it was handed.
+    struct LocalSpy {
+        seen: Seen,
+    }
+
+    #[async_trait]
+    impl ReviewBackend for LocalSpy {
+        async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.seen.lock().unwrap().push(SeenCtx {
+                structural: ctx.structural_context.map(str::to_string),
+                had_provider: ctx.provider.is_some(),
+            });
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "an accumulator replaced a fold".to_string(),
+                    recommendation: "APPROVE WITH CHANGES".to_string(),
+                    findings: vec![Finding {
+                        severity: "MEDIUM".to_string(),
+                        file: "src/order.rs".to_string(),
+                        line: Some(3),
+                        body: "`t` can overflow on a long list. Fix: use checked_add.".to_string(),
+                        confidence: Some(90),
+                    }],
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    fn cfg() -> Config {
+        let mut c = Config::from_env();
+        c.self_critique = false; // exercised separately, through the seam
+        c.min_confidence = 0;
+        c.extra_system_prompt = String::new();
+        c
+    }
+
+    fn spy() -> (LocalSpy, Seen) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            LocalSpy {
+                seen: Arc::clone(&seen),
+            },
+            seen,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_local_diff_returns_anchored_findings() {
+        let (backend, seen) = spy();
+        let out = run_review_local(
+            &cfg(),
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: None,
+                label: "vexar/session-7".to_string(),
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert_eq!(out.findings_detail.len(), 1);
+        assert_eq!(
+            out.inline_posted, 1,
+            "the finding anchored to a real diff line"
+        );
+        assert_eq!(out.recommendation, "APPROVE WITH CHANGES");
+        assert_eq!(out.provider, LOCAL_PROVIDER);
+        assert_eq!(out.repo, "vexar/session-7");
+        assert_eq!(out.pr, 0);
+        assert!(!out.posted, "a local review has nothing to post to");
+        assert!(out
+            .summary_markdown
+            .contains("an accumulator replaced a fold"));
+
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen[0].had_provider,
+            "no provider is invented for a local diff"
+        );
+    }
+
+    /// A finding on a line the diff doesn't contain must fold into the summary
+    /// rather than claiming an anchor — the same rule the PR path enforces.
+    #[tokio::test]
+    async fn a_finding_off_the_diff_folds_into_the_summary() {
+        struct OffDiff;
+        #[async_trait]
+        impl ReviewBackend for OffDiff {
+            async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+                Ok(ReviewResult {
+                    review: Review {
+                        summary: "s".to_string(),
+                        recommendation: "APPROVE".to_string(),
+                        findings: vec![Finding {
+                            severity: "LOW".to_string(),
+                            file: "src/order.rs".to_string(),
+                            line: Some(900),
+                            body: "something far away entirely".to_string(),
+                            confidence: Some(50),
+                        }],
+                    },
+                    model: "spy".to_string(),
+                    usage: None,
+                })
+            }
+        }
+
+        let out = run_review_local(
+            &cfg(),
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: None,
+                label: "branch".to_string(),
+            },
+            &OffDiff,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert_eq!(out.inline_posted, 0);
+        assert!(out.summary_markdown.contains("something far away entirely"));
+    }
+
+    /// With a checkout, Tier B names the enclosing symbol from the file on disk —
+    /// the local equivalent of fetching the new-side file from the provider.
+    #[tokio::test]
+    async fn a_repo_root_supplies_tree_sitter_structural_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/order.rs"), NEW_SIDE).unwrap();
+
+        let (backend, seen) = spy();
+        let mut c = cfg();
+        c.structural_context = true;
+        run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: Some(dir.path().to_path_buf()),
+                label: "branch".to_string(),
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        let seen = seen.lock().unwrap();
+        let structural = seen[0].structural.as_deref().unwrap_or_default();
+        assert!(
+            structural.contains("Changed symbols") && structural.contains("total"),
+            "Tier B did not name the enclosing function from the checkout: {structural:?}"
+        );
+    }
+
+    /// Glob filtering is a shared stage, so a lockfile-only change never reaches
+    /// the backend here either.
+    #[tokio::test]
+    async fn an_all_excluded_diff_never_reaches_the_backend() {
+        let (backend, seen) = spy();
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+
+        let out = run_review_local(
+            &cfg(),
+            LocalReviewInput {
+                diff: lockfile.to_string(),
+                repo_root: None,
+                label: "branch".to_string(),
+            },
+            &backend,
+        )
+        .await;
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the backend was not called"
+        );
+        // Either an honest "nothing to review" error, or a hygiene-only result —
+        // never a fabricated review.
+        if let Ok(o) = out {
+            assert!(!o.findings_detail.is_empty());
+            assert_eq!(o.inline_posted, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_diff_is_an_error_not_an_empty_review() {
+        let (backend, _seen) = spy();
+        let err = run_review_local(
+            &cfg(),
+            LocalReviewInput {
+                diff: String::new(),
+                repo_root: None,
+                label: "branch".to_string(),
+            },
+            &backend,
+        )
+        .await
+        .expect_err("an empty diff has nothing to review");
+        assert!(err.to_string().contains("nothing to review"));
+    }
 }
 
 #[cfg(test)]

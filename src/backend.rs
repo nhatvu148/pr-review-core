@@ -26,14 +26,23 @@ use crate::review::run_agentic;
 /// `structural_context` are optional hints the backend may fold into its prompt.
 ///
 /// A backend that wants a working tree (e.g. to point an agent CLI's `cwd` at a
-/// checkout) can clone one itself via [`Provider::clone_url`] + `Workspace::clone`
-/// using `provider` and `repo`.
+/// checkout) should prefer `local_root` when it is set — the caller already has the
+/// code on disk — and otherwise clone one via [`Provider::clone_url`] +
+/// `Workspace::clone` using `provider` and `repo`.
 pub struct ReviewContext<'a> {
     pub client: &'a reqwest::Client,
     pub cfg: &'a Config,
-    pub provider: &'a Provider,
-    /// `owner/repo` (GitHub) or `workspace/repo` (Bitbucket).
+    /// The host this change lives on, or `None` on the local diff-first path
+    /// ([`crate::review::run_review_local`]) where there is no PR and no host.
+    /// A backend that needs one must handle its absence rather than assume it.
+    pub provider: Option<&'a Provider>,
+    /// A checkout of the code under review, when the caller has one. Set on the
+    /// local path; `None` for a PR, where the code is only reachable by cloning.
+    pub local_root: Option<&'a std::path::Path>,
+    /// `owner/repo` (GitHub) or `workspace/repo` (Bitbucket). On the local path
+    /// this is the caller's label for the change, not a host coordinate.
     pub repo: &'a str,
+    /// PR metadata, synthesized on the local path (`pr: 0`, no head SHA, no CI).
     pub meta: &'a PrMeta,
     /// The filtered, packed diff the model should review.
     pub diff: &'a str,
@@ -95,9 +104,12 @@ impl ReviewBackend for OpenRouterBackend {
         // Both paths take their system prompt from the context: the rubric differs
         // (the agentic one describes tools), the injected rules never do.
         let diff_only = ctx.system_prompt(crate::prompt::SYSTEM_PROMPT);
-        if ctx.cfg.agentic {
+        // The agentic path reads the repo from a clone, which needs a host to clone
+        // from. On the local path there is none, so it reviews the diff alone rather
+        // than pretending it explored the tree.
+        if let (true, Some(provider)) = (ctx.cfg.agentic, ctx.provider) {
             match run_agentic(
-                ctx.provider,
+                provider,
                 ctx.client,
                 ctx.cfg,
                 ctx.meta,
