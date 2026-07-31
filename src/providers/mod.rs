@@ -238,8 +238,14 @@ mod tests {
         let b = finding_fingerprint("src/lib.rs", "missing null   check.  fix: guard it.");
         assert_eq!(a, b);
         // Different file or body → different fingerprint.
-        assert_ne!(a, finding_fingerprint("src/other.rs", "Missing null check. Fix: guard it."));
-        assert_ne!(a, finding_fingerprint("src/lib.rs", "A totally different problem."));
+        assert_ne!(
+            a,
+            finding_fingerprint("src/other.rs", "Missing null check. Fix: guard it.")
+        );
+        assert_ne!(
+            a,
+            finding_fingerprint("src/lib.rs", "A totally different problem.")
+        );
         assert_eq!(a.len(), 12); // 6 bytes hex-encoded
     }
 

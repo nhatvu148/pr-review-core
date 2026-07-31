@@ -178,10 +178,22 @@ async fn run_once(cfg: &Config, corpus: &[Case]) -> RunAgg {
         n_find += f.len();
         tp_issue += hit_i;
         n_issue += case.issues.len();
-        tokens += out.usage.and_then(|u| u.total_tokens).map(u64::from).unwrap_or(0);
+        tokens += out
+            .usage
+            .and_then(|u| u.total_tokens)
+            .map(u64::from)
+            .unwrap_or(0);
     }
-    let precision = if n_find == 0 { 0.0 } else { tp_find as f64 / n_find as f64 };
-    let recall = if n_issue == 0 { 0.0 } else { tp_issue as f64 / n_issue as f64 };
+    let precision = if n_find == 0 {
+        0.0
+    } else {
+        tp_find as f64 / n_find as f64
+    };
+    let recall = if n_issue == 0 {
+        0.0
+    } else {
+        tp_issue as f64 / n_issue as f64
+    };
     RunAgg {
         precision,
         recall,
@@ -223,7 +235,10 @@ async fn main() {
 
     let bar = "─".repeat(72);
     println!("{bar}");
-    println!("{:<10}{:>12}{:>12}{:>10}{:>12}", "run", "precision", "recall", "F1", "tokens");
+    println!(
+        "{:<10}{:>12}{:>12}{:>10}{:>12}",
+        "run", "precision", "recall", "F1", "tokens"
+    );
     println!("{bar}");
 
     let mut aggs: Vec<RunAgg> = Vec::with_capacity(runs);
@@ -236,7 +251,11 @@ async fn main() {
             a.recall,
             a.f1,
             a.tokens,
-            if a.errors > 0 { format!("  ({} err)", a.errors) } else { String::new() }
+            if a.errors > 0 {
+                format!("  ({} err)", a.errors)
+            } else {
+                String::new()
+            }
         );
         aggs.push(a);
     }
@@ -267,7 +286,10 @@ async fn main() {
         let (plo, phi) = rng(&ps);
         println!("range   precision {plo:.2}–{phi:.2}   recall {rlo:.2}–{rhi:.2}");
         if rhi - rlo >= 0.01 {
-            println!("        ⚠ recall spans {:.2} across runs — treat small mean gaps as noise.", rhi - rlo);
+            println!(
+                "        ⚠ recall spans {:.2} across runs — treat small mean gaps as noise.",
+                rhi - rlo
+            );
         }
     }
     println!(

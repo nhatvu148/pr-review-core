@@ -66,7 +66,11 @@ async fn main() {
             eprintln!("could not parse URL: {url}\nuse: <provider> <owner/repo> <pr>");
             std::process::exit(2);
         }),
-        [p, r, n] => (p.clone(), r.clone(), n.parse().expect("pr must be a number")),
+        [p, r, n] => (
+            p.clone(),
+            r.clone(),
+            n.parse().expect("pr must be a number"),
+        ),
         _ => {
             eprintln!("usage: cargo run --example ab_review -- <provider> <owner/repo> <pr>");
             eprintln!("   or: cargo run --example ab_review -- <github-pr-url>");
@@ -88,9 +92,15 @@ async fn main() {
     println!("{bar}");
     println!("{:<28}{:>16}{:>16}", "metric", "blast OFF", "blast ON");
     println!("{bar}");
-    println!("{:<28}{:>16}{:>16}", "recommendation", off.recommendation, on.recommendation);
+    println!(
+        "{:<28}{:>16}{:>16}",
+        "recommendation", off.recommendation, on.recommendation
+    );
     println!("{:<28}{:>16}{:>16}", "findings", off.findings, on.findings);
-    println!("{:<28}{:>16}{:>16}", "inline posted", off.inline_posted, on.inline_posted);
+    println!(
+        "{:<28}{:>16}{:>16}",
+        "inline posted", off.inline_posted, on.inline_posted
+    );
     println!(
         "{:<28}{:>16}{:>16}",
         "total tokens",

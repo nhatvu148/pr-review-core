@@ -210,7 +210,9 @@ async fn run_review_file(
                     cfg,
                     repo,
                     pr,
-                    &format!("> **/review-file** `{path}`\n\nCouldn't find that file at the PR head."),
+                    &format!(
+                        "> **/review-file** `{path}`\n\nCouldn't find that file at the PR head."
+                    ),
                 )
                 .await?;
             return Ok(CommandOutcome {

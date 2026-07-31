@@ -254,9 +254,32 @@ pub fn pack_diff_bundled(diff: &str, max_chars: usize) -> (String, Vec<String>) 
 fn is_locale(s: &str) -> bool {
     matches!(
         s,
-        "en" | "zh" | "ja" | "ko" | "fr" | "de" | "es" | "it" | "pt" | "ru" | "vi" | "th" | "ar"
-            | "hi" | "id" | "nl" | "pl" | "tr" | "uk" | "cs" | "sv" | "da" | "fi" | "no" | "ro"
-            | "hu" | "el"
+        "en" | "zh"
+            | "ja"
+            | "ko"
+            | "fr"
+            | "de"
+            | "es"
+            | "it"
+            | "pt"
+            | "ru"
+            | "vi"
+            | "th"
+            | "ar"
+            | "hi"
+            | "id"
+            | "nl"
+            | "pl"
+            | "tr"
+            | "uk"
+            | "cs"
+            | "sv"
+            | "da"
+            | "fi"
+            | "no"
+            | "ro"
+            | "hu"
+            | "el"
     )
 }
 
@@ -335,8 +358,12 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> (String, Vec<String>
 
     let len_of = |i: usize| sections[i].1.chars().count();
     let unit_len = |u: &[usize]| -> usize { u.iter().map(|&i| len_of(i)).sum() };
-    let unit_priority =
-        |u: &[usize]| -> u8 { u.iter().map(|&i| file_priority(&sections[i].0)).max().unwrap_or(0) };
+    let unit_priority = |u: &[usize]| -> u8 {
+        u.iter()
+            .map(|&i| file_priority(&sections[i].0))
+            .max()
+            .unwrap_or(0)
+    };
 
     // Rank units: priority DESC, then total length ASC (more, smaller, high-value).
     let mut order: Vec<usize> = (0..units.len()).collect();
