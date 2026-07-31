@@ -102,6 +102,150 @@ fn effective_recommendation(model_rec: &str, findings: &[Finding]) -> String {
     }
 }
 
+/// Phrases that assert a **check outcome** on their own — nothing but a build, a
+/// compile, or CI can be their subject.
+const BUILD_CLAIM_MARKERS: &[&str] = &[
+    "breaks the build",
+    "break the build",
+    "fails the build",
+    "fail the build",
+    "fails to compile",
+    "won't compile",
+    "will not compile",
+    "ci would go red",
+    "ci will go red",
+    "fails ci",
+    "fail ci",
+];
+
+/// Failure phrases that are **ambiguous alone** and only count as a check claim when
+/// the body also names a check.
+///
+/// "will fail" is the phrase the reviewer actually used on pr-review-core#28 — and
+/// also the phrase in "this will fail at runtime when the list is empty", a real
+/// HIGH bug that green CI says nothing about, because CI does not run for
+/// correctness. Treating it as a check claim would silently cap a genuine defect to
+/// LOW and soften the recommendation floor with it.
+const WEAK_FAILURE_PHRASES: &[&str] = &["will fail", "would fail", "fails when", "would break"];
+
+/// Whole words that identify the subject as a check. Matched as **words**, not
+/// substrings: "ci" appears inside "specific", "decision", "efficient".
+const CHECK_CONTEXT_WORDS: &[&str] = &[
+    "ci",
+    "build",
+    "builds",
+    "compile",
+    "compiles",
+    "compilation",
+    "clippy",
+    "rustfmt",
+    "fmt",
+    "lint",
+    "linter",
+    "eslint",
+    "pipeline",
+    "workflow",
+];
+
+/// Multi-word check markers, matched as substrings.
+const CHECK_CONTEXT_PHRASES: &[&str] = &[
+    "--check",
+    "cargo fmt",
+    "cargo test",
+    "cargo clippy",
+    "test suite",
+    "check job",
+    "the check",
+    "check will",
+    "check would",
+];
+
+/// Does this finding assert an outcome a CI run settles?
+///
+/// Two tiers, because the obvious one-tier version is wrong. A flat list containing
+/// "will fail" matches ordinary runtime findings, so a real HIGH — "this will fail
+/// at runtime when the list is empty" — would be capped to LOW by a green CI that
+/// never exercised that path.
+fn asserts_check_outcome(body_lower: &str) -> bool {
+    if BUILD_CLAIM_MARKERS.iter().any(|m| body_lower.contains(m)) {
+        return true;
+    }
+    if !WEAK_FAILURE_PHRASES.iter().any(|m| body_lower.contains(m)) {
+        return false;
+    }
+    if CHECK_CONTEXT_PHRASES.iter().any(|p| body_lower.contains(p)) {
+        return true;
+    }
+    body_lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|w| CHECK_CONTEXT_WORDS.contains(&w))
+}
+
+/// Does this CI block report every reported check as passing?
+///
+/// Conservative in both directions: an empty block, a block with any non-passing
+/// state, or one carrying the truncation notice means "not known green", so nothing
+/// is demoted. Only an unambiguously all-green report licenses the demotion.
+fn ci_is_all_green(ci_status: Option<&str>) -> bool {
+    let Some(ci) = ci_status.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    // The Files-API-style truncation notice means the list is incomplete, so a
+    // hidden failure is possible — exactly the case that must NOT be demoted.
+    if ci.contains("NOT shown") {
+        return false;
+    }
+    let states: Vec<&str> = ci
+        .lines()
+        .filter_map(|l| l.rsplit_once(':').map(|(_, s)| s.trim()))
+        .collect();
+    !states.is_empty()
+        && states
+            .iter()
+            .all(|s| s.eq_ignore_ascii_case("success") || s.eq_ignore_ascii_case("successful"))
+}
+
+/// Cap at LOW any finding that asserts a check outcome the reviewed commit's CI has
+/// already decided green, and say so in the body.
+///
+/// The prompt has asked for this twice and not got it. On `VinaText#10` the reviewer
+/// filed two BLOCKING findings claiming a broken MFC build on a green commit; after
+/// the CI block and an explicit "a passing check FALSIFIES this claim" rule shipped,
+/// `pr-review-core#28` filed the same shape again — BLOCKING first, then MEDIUM once
+/// the rules reached that backend, but never dropped and never restated at LOW. The
+/// model downgraded its confidence without re-examining the claim.
+///
+/// So this is enforced in code instead. **Demote, not delete:** the *observation*
+/// under such a finding is often true (a line really is 118 characters); it is the
+/// inference to "the check will fail" that CI refutes. LOW keeps the observation
+/// visible while removing what it costs — via the recommendation floor, a MEDIUM or
+/// above turns the posted verdict into "approve with changes" or "block".
+fn demote_falsified_build_claims(findings: &mut [Finding], ci_status: Option<&str>) {
+    if !ci_is_all_green(ci_status) {
+        return;
+    }
+    for f in findings.iter_mut() {
+        if severity_rank(&f.severity) == 0 {
+            continue; // already LOW/unknown — nothing to cap
+        }
+        if !asserts_check_outcome(&f.body.to_lowercase()) {
+            continue;
+        }
+        tracing::warn!(
+            "demoting a {} finding on {} to LOW: it asserts a check outcome CI reports green",
+            f.severity,
+            f.file
+        );
+        f.severity = "LOW".to_string();
+        f.body = format!(
+            "{}\n\n(Every CI check on the reviewed commit passed, which contradicts the \
+             claim that this fails a check — capped at LOW. The underlying observation may \
+             still be worth acting on; the predicted failure is not.)",
+            f.body.trim_end()
+        );
+    }
+}
+
 /// This many findings making the same claim about different files are collapsed
 /// into one. Three is the point where a list stops reading as several observations
 /// and starts reading as one pattern.
@@ -713,6 +857,8 @@ pub async fn run_review_with(
     // short-circuit). Added after self-critique/confidence-floor — they're facts,
     // not guesses — but before the severity sort + cap, so they compete like any.
     findings.extend(hygiene);
+    // A claim that CI has already falsified is capped at LOW — see the function.
+    demote_falsified_build_claims(&mut findings, meta.ci_status.as_deref());
     // Collapse a burst of one claim repeated across many files into a single finding
     // that states the count — before the sort, so the survivor competes on merit.
     findings = collapse_bursts(findings);
@@ -801,8 +947,8 @@ pub async fn run_review_with(
 #[cfg(test)]
 mod tests {
     use super::{
-        burst_key, collapse_bursts, effective_recommendation, idents, line_symbols, reanchor,
-        render_no_review_summary,
+        burst_key, collapse_bursts, demote_falsified_build_claims, effective_recommendation,
+        idents, line_symbols, reanchor, render_no_review_summary,
     };
     use crate::llm::Finding;
     use std::collections::{HashMap, HashSet};
@@ -896,6 +1042,121 @@ mod tests {
         let out = collapse_bursts(findings);
         assert_eq!(out.len(), 3, "2 LOW + 1 MEDIUM: neither reaches 3");
         assert!(out.iter().all(|f| !f.body.contains("other file(s)")));
+    }
+
+    /// pr-review-core#28, twice: a BLOCKING then MEDIUM finding claiming
+    /// `cargo fmt --check` would fail, on a commit whose three checks were green.
+    /// The prompt rule did not stop it, so this is enforced here.
+    #[test]
+    fn a_build_claim_is_capped_at_low_when_ci_is_green() {
+        let green = "- fmt + clippy + test: success\n- cargo package: success";
+        let mut findings = vec![f(
+            "BLOCKING",
+            "src/blast.rs",
+            "This line is 118 chars, so `cargo fmt --check` will fail on this commit.",
+        )];
+        demote_falsified_build_claims(&mut findings, Some(green));
+        assert_eq!(findings[0].severity, "LOW");
+        assert!(findings[0]
+            .body
+            .contains("Every CI check on the reviewed commit passed"));
+        // Demoted, never deleted — the observation survives.
+        assert!(findings[0].body.contains("118 chars"));
+    }
+
+    #[test]
+    fn a_build_claim_survives_when_ci_is_not_green() {
+        let body = "`cargo fmt --check` will fail on this commit.";
+        for ci in [
+            None,                                    // no CI reported
+            Some("- fmt: failure\n- test: success"), // a real failure
+            Some("- fmt: in_progress"),              // not finished
+            Some(""),                                // empty block
+            // Truncated list: a hidden failure is possible, so this must not demote.
+            Some("- a: success\n- [12 further check(s) NOT shown — this commit has 312.]"),
+        ] {
+            let mut findings = vec![f("BLOCKING", "src/x.rs", body)];
+            demote_falsified_build_claims(&mut findings, ci);
+            assert_eq!(
+                findings[0].severity, "BLOCKING",
+                "wrongly demoted with ci={ci:?}"
+            );
+        }
+    }
+
+    /// Raised on PR #30, and correct: a flat marker list containing "will fail"
+    /// matches ordinary runtime findings. Green CI would then cap a real HIGH to LOW
+    /// and soften the recommendation floor with it — a silent downgrade of a genuine
+    /// bug, from a mechanism added to *reduce* wrong verdicts. The original test
+    /// missed it by using bodies with no failure phrase at all.
+    #[test]
+    fn a_runtime_failure_claim_is_not_a_check_claim() {
+        let green = "- fmt + clippy + test: success";
+        for body in [
+            "This will fail at runtime when the list is empty.",
+            "The request would fail if the token has expired.",
+            "`parse()` fails when the header is absent, and the error is swallowed.",
+            "This would break existing callers that pass a null id.",
+        ] {
+            let mut findings = vec![f("HIGH", "src/x.rs", body)];
+            demote_falsified_build_claims(&mut findings, Some(green));
+            assert_eq!(
+                findings[0].severity, "HIGH",
+                "green CI wrongly capped a runtime finding: {body:?}"
+            );
+        }
+    }
+
+    /// The other half: the same weak phrase IS a check claim once the body names a
+    /// check, which is the shape pr-review-core#28 actually produced.
+    #[test]
+    fn a_weak_phrase_counts_once_a_check_is_named() {
+        let green = "- fmt + clippy + test: success";
+        for body in [
+            "This line is 118 chars, so `cargo fmt --check` will fail on this commit.",
+            "The clippy job will fail on this unwrap.",
+            "CI will fail because the lockfile is stale.",
+            "This breaks the build on MSVC.",
+        ] {
+            let mut findings = vec![f("BLOCKING", "src/x.rs", body)];
+            demote_falsified_build_claims(&mut findings, Some(green));
+            assert_eq!(findings[0].severity, "LOW", "not capped: {body:?}");
+        }
+    }
+
+    /// "ci" is a substring of ordinary English — match it as a word, not a substring.
+    #[test]
+    fn check_context_words_match_whole_words_only() {
+        let green = "- test: success";
+        let mut findings = vec![f(
+            "HIGH",
+            "src/x.rs",
+            "The specific decision here will fail for efficient callers.",
+        )];
+        demote_falsified_build_claims(&mut findings, Some(green));
+        assert_eq!(
+            findings[0].severity, "HIGH",
+            "'ci' inside specific/decision/efficient must not count as a check"
+        );
+    }
+
+    /// Only claims about a *check outcome* are capped. A real bug found on a commit
+    /// with green CI is not evidence of anything — CI does not run for correctness.
+    #[test]
+    fn an_ordinary_finding_is_untouched_by_green_ci() {
+        let green = "- test: success";
+        let mut findings = vec![
+            f("HIGH", "a.rs", "Unvalidated input reaches the SQL query."),
+            f(
+                "MEDIUM",
+                "b.rs",
+                "This handler can panic on an empty slice.",
+            ),
+        ];
+        demote_falsified_build_claims(&mut findings, Some(green));
+        assert_eq!(findings[0].severity, "HIGH");
+        assert_eq!(findings[1].severity, "MEDIUM");
+        assert!(!findings[0].body.contains("CI check"));
     }
 
     #[test]

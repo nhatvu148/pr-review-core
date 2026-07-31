@@ -192,6 +192,18 @@ async fn run_once(cfg: &Config, client: &reqwest::Client, corpus: &[Case]) -> Ru
         } else {
             &case.lang
         };
+        // `BENCH_SHOW_FINDINGS=1` prints what was actually said — the same flag the
+        // other two harnesses carry. A recall of 1.00 only says a finding landed on
+        // the right line; whether it made the right *claim* is in the text.
+        if std::env::var("BENCH_SHOW_FINDINGS").is_ok_and(|v| v == "1") {
+            for x in findings {
+                let anchor = x
+                    .line
+                    .map_or_else(|| "summary".to_string(), |l| l.to_string());
+                let body: String = x.body.chars().take(300).collect();
+                eprintln!("      [{}] {}:{anchor} — {body}", x.severity, x.file);
+            }
+        }
         per_lang
             .entry(lang.to_string())
             .or_default()
