@@ -134,9 +134,49 @@ async fn run_once(cfg: &Config, corpus: &[Case]) -> RunAgg {
             }
         };
         let f = &out.findings_detail;
-        tp_find += f.iter().filter(|x| case.issues.iter().any(|i| hits(x, i))).count();
+        let hit_f = f
+            .iter()
+            .filter(|x| case.issues.iter().any(|i| hits(x, i)))
+            .count();
+        let hit_i = case
+            .issues
+            .iter()
+            .filter(|i| f.iter().any(|x| hits(x, i)))
+            .count();
+        // Per-case line. The aggregate alone cannot distinguish "emitted nothing"
+        // from "emitted findings that all missed" — both print precision 0.00 — and
+        // on a clean case (issues: []) the first is a pass and the second a failure.
+        eprintln!(
+            "  {}#{}: {} finding(s), {hit_f} hit · {}/{} known issue(s) found{}",
+            case.repo,
+            case.pr,
+            f.len(),
+            hit_i,
+            case.issues.len(),
+            if case.issues.is_empty() && f.is_empty() {
+                "  ← clean case, no findings (correct)"
+            } else if case.issues.is_empty() {
+                "  ← clean case, FALSE POSITIVES"
+            } else {
+                ""
+            }
+        );
+        // `BENCH_SHOW_FINDINGS=1` prints what was actually said. A score alone can't
+        // tell you whether a clean case failed because the reviewer hallucinated or
+        // because the ground truth is wrong — and that is the first question worth
+        // asking about any row that scores 0.
+        if std::env::var("BENCH_SHOW_FINDINGS").is_ok_and(|v| v == "1") {
+            for x in f {
+                let anchor = x
+                    .line
+                    .map_or_else(|| "summary".to_string(), |l| l.to_string());
+                let body: String = x.body.chars().take(220).collect();
+                eprintln!("      [{}] {}:{anchor} — {body}", x.severity, x.file);
+            }
+        }
+        tp_find += hit_f;
         n_find += f.len();
-        tp_issue += case.issues.iter().filter(|i| f.iter().any(|x| hits(x, i))).count();
+        tp_issue += hit_i;
         n_issue += case.issues.len();
         tokens += out.usage.and_then(|u| u.total_tokens).map(u64::from).unwrap_or(0);
     }
