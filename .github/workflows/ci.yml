@@ -1,0 +1,93 @@
+name: CI
+
+# This crate is published and three services depend on it, yet it was the only
+# repo here with no gate — both bots already block their deploy on
+# fmt + clippy + test. Runs on PRs so a review has mechanical signal, and on main
+# so a direct push can't skip it.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", ".gitignore", "LICENSE-*"]
+  pull_request:
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-features --all-targets -- -D warnings
+      # --all-features so the agentic path compiles too, and doc-tests run: the
+      # rustdoc examples are part of the public API contract.
+      - run: cargo test --all-features
+
+  package:
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Catches a publish that would fail on metadata or a missing include long
+      # before `cargo publish` is typed — the flow here is tag-then-publish, where
+      # a broken package means a burnt version number.
+      - run: cargo package
+
+  downstream:
+    name: downstream compiles
+    runs-on: ubuntu-latest
+    # Why this job exists: 0.11.0 added a field to the public `PrMeta` struct.
+    # Every test in this repo passed, and pr-review-bot then failed to compile
+    # against it. A breaking change to a published crate is invisible to its own
+    # test suite — only a consumer build sees it.
+    #
+    # Each consumer's dependency is REPOINTED at this checkout rather than patched
+    # via [patch.crates-io], because a patch must satisfy the consumer's version
+    # requirement — so every version-bump PR would fail for the wrong reason.
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: core }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: kaniscope-action
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/nhatvu148/kaniscope-action.git consumer
+          cd consumer
+          sed -i 's|^pr-review-core = .*|pr-review-core = { path = "../core" }|' Cargo.toml
+          grep -n '^pr-review-core' Cargo.toml
+          cargo check --all-targets
+
+      - name: pr-review-bot
+        env:
+          TOKEN: ${{ secrets.DOWNSTREAM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # pr-review-bot is private, so this needs a read-scoped PAT in the
+          # DOWNSTREAM_TOKEN secret. Skipped rather than failed when unset — but
+          # note the bot is the consumer that actually constructs PrMeta, so
+          # WITHOUT this secret the job would not have caught the 0.11.0 break.
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::warning::DOWNSTREAM_TOKEN unset — skipping pr-review-bot. This is the"
+            echo "::warning::consumer that catches breaking changes to PrMeta/Config."
+            exit 0
+          fi
+          git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/nhatvu148/pr-review-bot.git" bot
+          cd bot
+          sed -i 's|^pr-review-core = .*|pr-review-core = { path = "../core" }|' Cargo.toml
+          grep -n '^pr-review-core' Cargo.toml
+          cargo check --all-targets --features claude-code
