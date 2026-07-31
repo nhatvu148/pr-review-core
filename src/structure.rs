@@ -503,14 +503,66 @@ pub async fn structural_context(
         _ => return hunk_context(diff),
     };
 
-    let valid = parse_valid_lines(diff);
-    let mut covered: HashSet<String> = HashSet::new();
-    let mut ts_blocks: Vec<String> = Vec::new();
-    let mut complexity_lines: Vec<String> = Vec::new();
-    let mut attempted = 0usize;
+    let mut loaded: Vec<(ChangedFile, String)> = Vec::new();
+    for f in attemptable_files(cfg, diff) {
+        // Fetch the full new-side file; skip on empty/None/Err or if it's huge.
+        match provider
+            .get_file_contents(client, cfg, repo, head, &f.path)
+            .await
+        {
+            Ok(Some(c)) if c.len() <= MAX_FILE_BYTES => loaded.push((f, c)),
+            _ => continue,
+        }
+    }
+    build_context(cfg, diff, &loaded)
+}
 
+/// Compute structural context from a **local checkout** instead of a provider —
+/// the convergence loop reviews a worktree diff, where the new-side files are
+/// already on disk and there is no PR to fetch against.
+///
+/// Same two tiers and the same fail-open discipline as [`structural_context`]: an
+/// unreadable, oversized, unsupported, or unparsable file is skipped and falls
+/// through to Tier A hunk regions. Paths are taken from the diff, so anything
+/// absolute or containing `..` is refused rather than read from outside `root`.
+pub fn structural_context_local(cfg: &Config, root: &std::path::Path, diff: &str) -> String {
+    let mut loaded: Vec<(ChangedFile, String)> = Vec::new();
+    for f in attemptable_files(cfg, diff) {
+        // A diff is untrusted input; never let a path in it escape the checkout.
+        if f.path.starts_with('/') || f.path.split('/').any(|seg| seg == "..") {
+            continue;
+        }
+        match std::fs::read_to_string(root.join(&f.path)) {
+            Ok(c) if c.len() <= MAX_FILE_BYTES => loaded.push((f, c)),
+            _ => continue,
+        }
+    }
+    build_context(cfg, diff, &loaded)
+}
+
+/// Skip anything bigger than this: a generated or vendored blob costs a slow parse
+/// and tells the reviewer nothing.
+const MAX_FILE_BYTES: usize = 400_000;
+
+/// A changed file Tier B will attempt: a supported language with at least one
+/// changed new-side line.
+pub(crate) struct ChangedFile {
+    path: String,
+    lang: Lang,
+    /// New-side line numbers this diff touches.
+    lines: HashSet<u64>,
+}
+
+/// The files Tier B attempts, in diff order, capped at `cfg.structural_max_files`.
+///
+/// Selection is identical for both entry points — only how the content is obtained
+/// differs (provider fetch vs local read), which is exactly why it lives here: the
+/// cap must count the same files whichever way the review was started.
+fn attemptable_files(cfg: &Config, diff: &str) -> Vec<ChangedFile> {
+    let valid = parse_valid_lines(diff);
+    let mut out = Vec::new();
     for path in diff_file_order(diff) {
-        if attempted >= cfg.structural_max_files {
+        if out.len() >= cfg.structural_max_files {
             break;
         }
         let Some(lang) = language_for_path(&path) else {
@@ -519,22 +571,30 @@ pub async fn structural_context(
         let Some(lines) = valid.get(&path).filter(|s| !s.is_empty()) else {
             continue;
         };
-        attempted += 1;
+        out.push(ChangedFile {
+            path,
+            lang,
+            lines: lines.clone(),
+        });
+    }
+    out
+}
 
-        // Fetch the full new-side file; skip on empty/None/Err or if it's huge.
-        let content = match provider
-            .get_file_contents(client, cfg, repo, head, &path)
-            .await
-        {
-            Ok(Some(c)) if c.len() <= 400_000 => c,
-            _ => continue,
-        };
+/// Render the context block from files whose content has already been loaded:
+/// tree-sitter symbols for what parsed (Tier B), hunk regions for the rest
+/// (Tier A), and the complexity of changed functions when enabled.
+fn build_context(cfg: &Config, diff: &str, loaded: &[(ChangedFile, String)]) -> String {
+    let mut covered: HashSet<String> = HashSet::new();
+    let mut ts_blocks: Vec<String> = Vec::new();
+    let mut complexity_lines: Vec<String> = Vec::new();
 
-        // Parse the fetched content ONCE; structural symbols and complexity metrics
-        // share the tree (same grammar per extension) — no double parse, no refetch.
+    for (f, content) in loaded {
+        let (path, lang, lines) = (&f.path, f.lang, &f.lines);
+        // Parse the content ONCE; structural symbols and complexity metrics share
+        // the tree (same grammar per extension) — no double parse, no reread.
         let mut parser = Parser::new();
         let tree = if parser.set_language(&lang.ts_language()).is_ok() {
-            parser.parse(&content, None)
+            parser.parse(content, None)
         } else {
             None
         };
@@ -543,25 +603,25 @@ pub async fn structural_context(
         };
         let root = tree.root_node();
 
-        let syms = symbols_in_tree(lang, root, &content, lines);
+        let syms = symbols_in_tree(lang, root, content, lines);
         if !syms.is_empty() {
             covered.insert(path.clone());
-            ts_blocks.push(format_symbols(&path, &syms));
+            ts_blocks.push(format_symbols(path, &syms));
         }
 
         // Complexity of the changed functions, from the same tree. Only surface
         // functions at/above the threshold so this stays a risk flag, not noise.
         if cfg.complexity_metrics {
-            for f in crate::complexity::changed_fn_complexity_in(&path, root, &content, lines) {
-                if f.cyclomatic >= cfg.complexity_min_cyclomatic {
+            for c in crate::complexity::changed_fn_complexity_in(path, root, content, lines) {
+                if c.cyclomatic >= cfg.complexity_min_cyclomatic {
                     complexity_lines.push(format!(
                         "- {} {} ({}): cyclomatic {}, cognitive {} — grade {}",
-                        f.label,
-                        f.name,
+                        c.label,
+                        c.name,
                         path,
-                        f.cyclomatic,
-                        f.cognitive,
-                        f.grade()
+                        c.cyclomatic,
+                        c.cognitive,
+                        c.grade()
                     ));
                 }
             }

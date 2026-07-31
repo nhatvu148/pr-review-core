@@ -1,6 +1,7 @@
 //! The review prompt. Asks the model for a STRUCTURED JSON review so findings
 //! can be posted as inline comments anchored to file + line.
 
+use crate::config::Config;
 use crate::providers::PrMeta;
 
 /// System prompt: instructs the model to return a single JSON object with an
@@ -86,6 +87,44 @@ This is a caller-visible contract change even though no line the caller can see 
 ## One claim, one finding
 
 If the same observation applies to many files, raise it ONCE, name the pattern, and say how many files it covers. Do not emit one finding per file."#;
+
+/// Everything the orchestrator injects into a backend's system prompt:
+/// [`REVIEW_RULES`] followed by the consumer's `extra_system_prompt`.
+///
+/// This exists because "a const each backend is trusted to append" is not a seam.
+/// The deployed claude-code backend shipped for months without [`REVIEW_RULES`] —
+/// invisibly, because a review with no calibration rules still *looks* like a
+/// review (written up as the 2026-07-31 pr-review-core#28 incident in the private
+/// `pr-review-docs` repo). So the rules are
+/// now composed once by [`crate::review::run_review_with`] and handed to the
+/// backend on [`crate::backend::ReviewContext`]; a backend that wants them has to
+/// take them from the context it was given.
+pub fn injected_rules(cfg: &Config) -> String {
+    if cfg.extra_system_prompt.is_empty() {
+        REVIEW_RULES.to_string()
+    } else {
+        format!("{REVIEW_RULES}\n{}", cfg.extra_system_prompt)
+    }
+}
+
+/// Join a backend's own rubric to the orchestrator-injected rules. The single
+/// place that decides how the two are separated, so the diff-only path, the
+/// agentic path, and any out-of-crate backend cannot drift apart.
+pub fn with_injected_rules(rubric: &str, injected_rules: &str) -> String {
+    if injected_rules.trim().is_empty() {
+        rubric.to_string()
+    } else {
+        format!("{rubric}\n{injected_rules}")
+    }
+}
+
+/// The complete system prompt for a plain diff-only review: the [`SYSTEM_PROMPT`]
+/// rubric plus the injected rules. Reviews normally get this through
+/// [`crate::backend::ReviewContext::system_prompt`]; this is the same string for
+/// callers that drive [`crate::llm::review_diff`] directly (the bench harness).
+pub fn review_system_prompt(cfg: &Config) -> String {
+    with_injected_rules(SYSTEM_PROMPT, &injected_rules(cfg))
+}
 
 /// System prompt for the optional second-pass self-critique. Given the diff and a
 /// JSON array of proposed findings, the model prunes noise and re-scores what it
@@ -230,6 +269,30 @@ mod tests {
         assert!(!p.contains("CI status"));
         let empty = build_user_prompt(&meta(Some("  ")), "diff body", false, None, None);
         assert!(!empty.contains("CI status"));
+    }
+
+    /// The refactor that moved rule composition from each backend to the
+    /// orchestrator must not change one byte of what the model receives — a
+    /// prompt change and a plumbing change in the same commit are impossible to
+    /// tell apart in the bench numbers afterwards.
+    #[test]
+    fn composition_is_byte_identical_to_the_per_backend_formula() {
+        use super::{injected_rules, with_injected_rules, SYSTEM_PROMPT};
+        let mut cfg = crate::config::Config::from_env();
+
+        cfg.extra_system_prompt = String::new();
+        let old = format!("{SYSTEM_PROMPT}\n{REVIEW_RULES}");
+        assert_eq!(
+            with_injected_rules(SYSTEM_PROMPT, &injected_rules(&cfg)),
+            old
+        );
+
+        cfg.extra_system_prompt = "House conventions.".to_string();
+        let old = format!("{SYSTEM_PROMPT}\n{REVIEW_RULES}\nHouse conventions.");
+        assert_eq!(
+            with_injected_rules(SYSTEM_PROMPT, &injected_rules(&cfg)),
+            old
+        );
     }
 
     #[test]

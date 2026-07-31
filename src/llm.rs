@@ -9,7 +9,7 @@ use crate::clip;
 use crate::config::{require, Config};
 use crate::prompt::{
     build_user_prompt, ASK_SYSTEM_PROMPT, CRITIQUE_SYSTEM_PROMPT, DESCRIBE_SYSTEM_PROMPT,
-    FILE_REVIEW_SYSTEM_PROMPT, SYSTEM_PROMPT,
+    FILE_REVIEW_SYSTEM_PROMPT,
 };
 use crate::providers::PrMeta;
 
@@ -161,6 +161,11 @@ pub(crate) fn extract_json_array(text: &str) -> Option<&str> {
 /// they were NOT reviewed. A SAFETY clamp (`take(max_diff_chars)`) still applies
 /// so a single un-packable oversized file can't blow the budget.
 ///
+/// `system_prompt` is supplied by the caller: the orchestrator composes it from the
+/// rubric and the injected rules, and hands it to the backend on
+/// [`crate::backend::ReviewContext`]. Callers driving this function directly can
+/// build the same string with [`crate::prompt::review_system_prompt`].
+///
 /// # Errors
 /// If `OPENROUTER_API_KEY` is missing, OpenRouter returns an error status, or the
 /// response can't be parsed as the expected review JSON.
@@ -171,6 +176,7 @@ pub async fn review_diff(
     diff: &str,
     omitted_note: Option<String>,
     structural_context: Option<&str>,
+    system_prompt: &str,
 ) -> Result<ReviewResult> {
     require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
 
@@ -183,15 +189,6 @@ pub async fn review_diff(
         diff.to_string()
     };
 
-    let system_prompt = {
-        let base = format!("{SYSTEM_PROMPT}\n{}", crate::prompt::REVIEW_RULES);
-        if cfg.extra_system_prompt.is_empty() {
-            base
-        } else {
-            format!("{base}\n{}", cfg.extra_system_prompt)
-        }
-    };
-
     let req = ChatReq {
         model: cfg.openrouter_model.clone(),
         max_tokens: cfg.openrouter_max_tokens,
@@ -199,7 +196,7 @@ pub async fn review_diff(
         messages: vec![
             Msg {
                 role: "system".into(),
-                content: system_prompt,
+                content: system_prompt.to_string(),
             },
             Msg {
                 role: "user".into(),
@@ -265,24 +262,28 @@ pub async fn review_diff(
 
 /// Second-pass "self-critique": ask the model to prune false positives, duplicates,
 /// and out-of-scope nits from a set of proposed findings, and to assign an honest
-/// confidence to each survivor. Uses the same OpenRouter call pattern as
-/// [`review_diff`] (same headers, base URL, and synthesis model).
+/// confidence to each survivor.
+///
+/// Runs on `backend` — the same backend that produced the review — via
+/// [`crate::backend::ReviewBackend::complete`]. It used to post to OpenRouter
+/// directly, which meant any consumer with its own backend (an agent CLI, a local
+/// model) lost the noise filter entirely unless it also held an OpenRouter key. The
+/// default backend still resolves `complete()` to the OpenRouter chat path, so
+/// nothing changes for the bot.
 ///
 /// The caller MUST treat any error as fail-open (keep the original findings) — a
 /// critique hiccup must never drop the review.
 ///
 /// # Errors
-/// If `OPENROUTER_API_KEY` is missing, OpenRouter returns an error status, or the
-/// response can't be parsed as a JSON array of findings.
+/// If the backend call fails, or the response can't be parsed as a JSON array of
+/// findings.
 pub async fn critique_findings(
-    client: &Client,
     cfg: &Config,
+    backend: &dyn crate::backend::ReviewBackend,
     meta: &PrMeta,
     diff: &str,
     findings: &[Finding],
 ) -> Result<Vec<Finding>> {
-    require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
-
     let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
     let findings_json = serde_json::to_string_pretty(findings)
         .map_err(|e| anyhow::anyhow!("could not serialize findings for critique: {e}"))?;
@@ -291,54 +292,7 @@ pub async fn critique_findings(
         meta.repo, meta.pr,
     );
 
-    let req = ChatReq {
-        model: cfg.openrouter_model.clone(),
-        max_tokens: cfg.openrouter_max_tokens,
-        temperature: cfg.openrouter_temperature,
-        messages: vec![
-            Msg {
-                role: "system".into(),
-                content: CRITIQUE_SYSTEM_PROMPT.to_string(),
-            },
-            Msg {
-                role: "user".into(),
-                content: user,
-            },
-        ],
-    };
-
-    let res = client
-        .post(format!("{}/chat/completions", cfg.openrouter_base_url))
-        .bearer_auth(&cfg.openrouter_api_key)
-        .header("HTTP-Referer", &cfg.http_referer)
-        .header("X-Title", &cfg.x_title)
-        .json(&req)
-        .send()
-        .await?;
-
-    let status = res.status();
-    let text = res.text().await?;
-    let data: ChatRes = serde_json::from_str(&text).map_err(|e| {
-        anyhow::anyhow!(
-            "OpenRouter {status}: non-JSON response ({e}): {}",
-            clip(&text, 300)
-        )
-    })?;
-
-    if !status.is_success() || data.error.is_some() {
-        let msg = data
-            .error
-            .and_then(|e| e.message)
-            .unwrap_or_else(|| clip(&text, 500));
-        anyhow::bail!("OpenRouter {status}: {msg}");
-    }
-
-    let content = data
-        .choices
-        .and_then(|c| c.into_iter().next())
-        .and_then(|c| c.message)
-        .and_then(|m| m.content)
-        .ok_or_else(|| anyhow::anyhow!("OpenRouter returned an empty critique response."))?;
+    let content = backend.complete(cfg, CRITIQUE_SYSTEM_PROMPT, &user).await?;
 
     let json = extract_json_array(&content).ok_or_else(|| {
         anyhow::anyhow!(
