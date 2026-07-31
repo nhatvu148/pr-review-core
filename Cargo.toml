@@ -36,14 +36,20 @@ tempfile = "3"
 toml = "0.8"
 
 # Structural context (Tier B): name the enclosing definition of changed lines.
-# tree-sitter 0.24 with grammar crates pinned to their 0.23 line (mutually
-# ABI-compatible). Any grammar that won't build against this tree-sitter should
-# be dropped rather than left broken.
-tree-sitter = "0.24"
-tree-sitter-rust = "0.23"
+#
+# tree-sitter carries `links = "tree-sitter"`, so cargo permits exactly ONE
+# version of it anywhere in a dependency graph. That makes this line a
+# compatibility contract with every consumer rather than a private choice:
+# vexar-core is on 0.26 for its own semantic index, and while this crate sat on
+# 0.24 the two could not coexist at all — `cargo build` failed to resolve before
+# either crate compiled. Moved to 0.26 with the grammar versions vexar already
+# uses. Any grammar that won't build against this tree-sitter should be dropped
+# rather than left broken.
+tree-sitter = "0.26"
+tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
 tree-sitter-go = "0.23"
 
 [dev-dependencies]
