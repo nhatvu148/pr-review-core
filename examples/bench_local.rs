@@ -169,7 +169,10 @@ async fn run_once(cfg: &Config, client: &reqwest::Client, corpus: &[Case]) -> Ru
 
     for case in corpus {
         let meta = synthetic_meta(case);
-        let res = review_diff(client, cfg, &meta, &case.diff, None, None).await;
+        // The same system prompt the orchestrator injects into a backend, so the
+        // bench scores the reviewer the reviewer actually is.
+        let system = pr_review_core::prompt::review_system_prompt(cfg);
+        let res = review_diff(client, cfg, &meta, &case.diff, None, None, &system).await;
         let res = match res {
             Ok(r) => r,
             Err(e) => {

@@ -540,6 +540,7 @@ pub(crate) async fn run_agentic(
     omitted_note: Option<&str>,
     structural_context: Option<&str>,
     repo: &str,
+    system_prompt: &str,
 ) -> Result<ReviewResult> {
     let url = provider.clone_url(cfg, repo)?;
     let sha = meta.head_sha.clone();
@@ -553,6 +554,7 @@ pub(crate) async fn run_agentic(
         omitted_note,
         structural_context,
         &ws,
+        system_prompt,
     )
     .await
 }
@@ -828,6 +830,11 @@ pub async fn run_review_with(
     // Delegate the model step to the backend. The default OpenRouterBackend runs
     // the agentic path (clone + tools) when enabled and falls back to diff-only
     // on failure; a custom backend (e.g. an agent CLI) decides its own strategy.
+    //
+    // The calibration rules are composed HERE and handed over on the context —
+    // not left as a const each backend is trusted to append, which is how the
+    // deployed claude-code backend ran without them for months.
+    let injected_rules = crate::prompt::injected_rules(cfg);
     let ctx = ReviewContext {
         client: &client,
         cfg,
@@ -837,6 +844,7 @@ pub async fn run_review_with(
         diff: &diff,
         omitted_note: omitted_note.as_deref(),
         structural_context: structural_opt,
+        injected_rules: &injected_rules,
     };
     let result = backend.review(&ctx).await?;
     // Post-process findings before anchoring: optional self-critique pass, then a
@@ -942,6 +950,170 @@ pub async fn run_review_with(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod orchestrator_tests {
+    //! End-to-end tests of the orchestrator over a mocked provider, with a fake
+    //! [`ReviewBackend`] standing in for the model.
+    //!
+    //! These exist because of `docs/feedback/2026-07-31-pr-review-core-28.md`: the
+    //! calibration rules were a const each backend was trusted to append, and the
+    //! deployed claude-code backend ran for months without them. Nothing in the
+    //! output says "the rules are missing" — a miscalibrated review still reads
+    //! like a review — so the only honest guard is a test that watches what a
+    //! backend is actually handed.
+
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::{run_review_with, RunReviewInput};
+    use crate::backend::{ReviewBackend, ReviewContext};
+    use crate::config::Config;
+    use crate::llm::{Review, ReviewResult};
+
+    const DIFF: &str = "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,3 @@\n fn alpha() {}\n+fn beta() {}\n";
+
+    /// Records the system prompt it is handed, and returns an empty review.
+    ///
+    /// Note what this backend does NOT do: import anything from `prompt.rs`. Its
+    /// rubric is its own string; every calibration rule has to arrive on the
+    /// context or it never sees one. That is the whole point of the test.
+    struct SpyBackend {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ReviewBackend for SpyBackend {
+        async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(ctx.system_prompt("MY OWN RUBRIC."));
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "nothing to report".to_string(),
+                    recommendation: "APPROVE".to_string(),
+                    findings: Vec::new(),
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    /// A GitHub stub serving one PR's metadata and diff. Anything else — notably
+    /// `.prbot.toml` — 404s, which the provider reads as "absent".
+    async fn github_stub() -> MockServer {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/1"))
+            .and(header("accept", "application/vnd.github.diff"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/1"))
+            .and(header("accept", "application/vnd.github+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "a change",
+                "body": null,
+                "base": { "ref": "main" },
+                "head": { "sha": "deadbeef" },
+            })))
+            .mount(&s)
+            .await;
+        s
+    }
+
+    fn cfg_for(base: &str) -> Config {
+        let mut c = Config::from_env();
+        c.github_api_base = base.to_string();
+        c.github_token = "test-token".to_string();
+        c.extra_system_prompt = String::new(); // don't inherit a real one from env
+                                               // Everything that would otherwise reach the network past the two stubs.
+        c.ci_status = false;
+        c.cve_scan = false;
+        c.structural_context = false;
+        c.self_critique = false;
+        c.agentic = false;
+        c
+    }
+
+    fn input() -> RunReviewInput {
+        RunReviewInput {
+            provider: "github".to_string(),
+            repo: "o/r".to_string(),
+            pr: 1,
+            dry_run: true,
+            placeholder: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_orchestrator_hands_the_review_rules_to_every_backend() {
+        let srv = github_stub().await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = SpyBackend {
+            seen: Arc::clone(&seen),
+        };
+
+        run_review_with(&cfg_for(&srv.uri()), input(), &backend)
+            .await
+            .expect("the review runs");
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the backend was called once");
+        let prompt = &seen[0];
+        assert!(
+            prompt.starts_with("MY OWN RUBRIC."),
+            "the backend's own rubric leads; the rules follow it"
+        );
+        // One assertion per recorded production failure the rules encode.
+        for rule in [
+            "THROWS is never LOW",
+            "config that ENFORCES it",
+            "breaks the build",
+            "vendored",
+            "raise it ONCE",
+            "middleware, guard, decorator",
+        ] {
+            assert!(
+                prompt.contains(rule),
+                "the backend never received the rule containing {rule:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_consumers_extra_prompt_rides_along_with_the_rules() {
+        let srv = github_stub().await;
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.extra_system_prompt = "House rule: never widen a public API.".to_string();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let backend = SpyBackend {
+            seen: Arc::clone(&seen),
+        };
+
+        run_review_with(&cfg, input(), &backend)
+            .await
+            .expect("the review runs");
+
+        let seen = seen.lock().unwrap();
+        let prompt = &seen[0];
+        assert!(
+            prompt.contains("THROWS is never LOW"),
+            "rules still present"
+        );
+        assert!(
+            prompt.contains("House rule: never widen a public API."),
+            "a consumer's extra prompt reaches the backend too"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use crate::clip;
 use crate::config::{require, Config};
 use crate::prompt::{
     build_user_prompt, ASK_SYSTEM_PROMPT, CRITIQUE_SYSTEM_PROMPT, DESCRIBE_SYSTEM_PROMPT,
-    FILE_REVIEW_SYSTEM_PROMPT, SYSTEM_PROMPT,
+    FILE_REVIEW_SYSTEM_PROMPT,
 };
 use crate::providers::PrMeta;
 
@@ -161,6 +161,11 @@ pub(crate) fn extract_json_array(text: &str) -> Option<&str> {
 /// they were NOT reviewed. A SAFETY clamp (`take(max_diff_chars)`) still applies
 /// so a single un-packable oversized file can't blow the budget.
 ///
+/// `system_prompt` is supplied by the caller: the orchestrator composes it from the
+/// rubric and the injected rules, and hands it to the backend on
+/// [`crate::backend::ReviewContext`]. Callers driving this function directly can
+/// build the same string with [`crate::prompt::review_system_prompt`].
+///
 /// # Errors
 /// If `OPENROUTER_API_KEY` is missing, OpenRouter returns an error status, or the
 /// response can't be parsed as the expected review JSON.
@@ -171,6 +176,7 @@ pub async fn review_diff(
     diff: &str,
     omitted_note: Option<String>,
     structural_context: Option<&str>,
+    system_prompt: &str,
 ) -> Result<ReviewResult> {
     require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
 
@@ -183,15 +189,6 @@ pub async fn review_diff(
         diff.to_string()
     };
 
-    let system_prompt = {
-        let base = format!("{SYSTEM_PROMPT}\n{}", crate::prompt::REVIEW_RULES);
-        if cfg.extra_system_prompt.is_empty() {
-            base
-        } else {
-            format!("{base}\n{}", cfg.extra_system_prompt)
-        }
-    };
-
     let req = ChatReq {
         model: cfg.openrouter_model.clone(),
         max_tokens: cfg.openrouter_max_tokens,
@@ -199,7 +196,7 @@ pub async fn review_diff(
         messages: vec![
             Msg {
                 role: "system".into(),
-                content: system_prompt,
+                content: system_prompt.to_string(),
             },
             Msg {
                 role: "user".into(),

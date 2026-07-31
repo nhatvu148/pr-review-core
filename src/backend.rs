@@ -41,6 +41,25 @@ pub struct ReviewContext<'a> {
     pub omitted_note: Option<&'a str>,
     /// Enclosing-symbol context for changed lines, if computed.
     pub structural_context: Option<&'a str>,
+    /// Calibration/verification rules + the consumer's `extra_system_prompt`,
+    /// composed by the orchestrator (see [`crate::prompt::injected_rules`]).
+    ///
+    /// A backend MUST fold this into whatever system prompt it sends — use
+    /// [`ReviewContext::system_prompt`] rather than composing it by hand, and
+    /// never reach for [`crate::prompt::REVIEW_RULES`] directly. A backend that
+    /// skips these rules produces a review that looks normal and is
+    /// systematically miscalibrated; that failure shipped undetected for months.
+    pub injected_rules: &'a str,
+}
+
+impl ReviewContext<'_> {
+    /// The system prompt to send: this backend's own rubric, followed by the
+    /// orchestrator-injected rules. `rubric` is the backend's task description
+    /// (output shape, what to look for); everything about *calibration* comes
+    /// from the orchestrator so every backend is judged on the same scale.
+    pub fn system_prompt(&self, rubric: &str) -> String {
+        crate::prompt::with_injected_rules(rubric, self.injected_rules)
+    }
 }
 
 /// Produces a structured [`ReviewResult`] from a prepared [`ReviewContext`].
@@ -73,6 +92,9 @@ pub struct OpenRouterBackend;
 #[async_trait]
 impl ReviewBackend for OpenRouterBackend {
     async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+        // Both paths take their system prompt from the context: the rubric differs
+        // (the agentic one describes tools), the injected rules never do.
+        let diff_only = ctx.system_prompt(crate::prompt::SYSTEM_PROMPT);
         if ctx.cfg.agentic {
             match run_agentic(
                 ctx.provider,
@@ -83,6 +105,7 @@ impl ReviewBackend for OpenRouterBackend {
                 ctx.omitted_note,
                 ctx.structural_context,
                 ctx.repo,
+                &ctx.system_prompt(crate::agent::AGENT_SYSTEM_PROMPT),
             )
             .await
             {
@@ -100,6 +123,7 @@ impl ReviewBackend for OpenRouterBackend {
                         ctx.diff,
                         ctx.omitted_note.map(str::to_string),
                         ctx.structural_context,
+                        &diff_only,
                     )
                     .await
                 }
@@ -112,6 +136,7 @@ impl ReviewBackend for OpenRouterBackend {
                 ctx.diff,
                 ctx.omitted_note.map(str::to_string),
                 ctx.structural_context,
+                &diff_only,
             )
             .await
         }

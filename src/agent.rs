@@ -29,7 +29,10 @@ use crate::llm::{extract_json, Review, ReviewResult, Usage};
 use crate::providers::PrMeta;
 use crate::repo::Workspace;
 
-const AGENT_SYSTEM_PROMPT: &str = r#"You are an expert software engineer reviewing a pull request. You are given the PR's unified diff and READ-ONLY tools to explore the rest of the repository (a clone at the PR head):
+/// The agentic reviewer's rubric — task and output shape only. Calibration comes
+/// from the orchestrator-injected rules, joined on by
+/// [`crate::backend::ReviewContext::system_prompt`].
+pub(crate) const AGENT_SYSTEM_PROMPT: &str = r#"You are an expert software engineer reviewing a pull request. You are given the PR's unified diff and READ-ONLY tools to explore the rest of the repository (a clone at the PR head):
 - grep(pattern): regex search across the repo
 - read_file(path, start?, end?): read a file (optionally a 1-indexed line range)
 - list_dir(path): list a directory
@@ -219,9 +222,13 @@ fn build_registry(ws: &Workspace, cfg: &Config) -> ToolRegistry {
 /// history compaction all live in `agent-core`; this function frames the diff,
 /// supplies the tools, and parses the synthesized JSON back into a [`Review`].
 ///
+/// `system_prompt` arrives already composed (rubric + orchestrator-injected
+/// rules) — see [`crate::backend::ReviewContext::system_prompt`].
+///
 /// # Errors
 /// On missing API key, OpenRouter failure, or if the synthesis model doesn't
 /// return a parseable review.
+#[allow(clippy::too_many_arguments)]
 pub async fn agentic_review(
     _client: &Client,
     cfg: &Config,
@@ -230,6 +237,7 @@ pub async fn agentic_review(
     omitted_note: Option<&str>,
     structural_context: Option<&str>,
     ws: &Workspace,
+    system_prompt: &str,
 ) -> Result<ReviewResult> {
     require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
 
@@ -262,15 +270,6 @@ pub async fn agentic_review(
         meta.title.as_deref().map(|t| format!(" — {t}")).unwrap_or_default(),
         if truncated { "\n[diff truncated]" } else { "" },
     );
-
-    let system_prompt = {
-        let base = format!("{AGENT_SYSTEM_PROMPT}\n{}", crate::prompt::REVIEW_RULES);
-        if cfg.extra_system_prompt.is_empty() {
-            base
-        } else {
-            format!("{base}\n{}", cfg.extra_system_prompt)
-        }
-    };
 
     let chat = ChatClient::new(ProviderConfig {
         base_url: cfg.openrouter_base_url.clone(),
@@ -312,7 +311,7 @@ pub async fn agentic_review(
     let outcome = backend
         .run(
             RunRequest {
-                system_prompt,
+                system_prompt: system_prompt.to_string(),
                 user_prompt: user,
                 messages: Vec::new(),
                 tool_scope: Vec::new(),
@@ -479,6 +478,13 @@ mod tests {
 
     const DIFF: &str = "--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1,2 @@\n fn alpha() {}\n+fn beta() {}\n";
 
+    /// The system prompt production hands this function — the agent rubric plus
+    /// the orchestrator-injected rules — so the tests exercise the real shape
+    /// rather than a bare rubric.
+    fn sys(cfg: &Config) -> String {
+        crate::prompt::with_injected_rules(AGENT_SYSTEM_PROMPT, &crate::prompt::injected_rules(cfg))
+    }
+
     /// Find the messages array sent on request `i`.
     fn messages(reqs: &[Value], i: usize) -> &Vec<Value> {
         reqs[i]["messages"].as_array().unwrap()
@@ -497,9 +503,18 @@ mod tests {
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
 
-        let out = agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .expect("review succeeds");
+        let out = agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .expect("review succeeds");
 
         assert_eq!(seq.calls(), 3, "2 explore turns + 1 synthesis");
         let reqs = seq.requests();
@@ -535,9 +550,18 @@ mod tests {
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
 
-        agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap();
+        agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             seq.calls(),
@@ -559,9 +583,18 @@ mod tests {
         cfg.max_turns = 2;
         let (_d, ws) = workspace();
 
-        agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .expect("hitting the turn cap is not an error");
+        agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .expect("hitting the turn cap is not an error");
 
         assert_eq!(
             seq.calls(),
@@ -581,9 +614,18 @@ mod tests {
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
 
-        agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap();
+        agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap();
 
         let reqs = seq.requests();
         let second = messages(&reqs, 1);
@@ -612,9 +654,18 @@ mod tests {
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
 
-        agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap();
+        agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap();
 
         let reqs = seq.requests();
         let tool_msgs: Vec<_> = messages(&reqs, 1)
@@ -645,9 +696,18 @@ mod tests {
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
 
-        agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .expect("unknown tool does not fail the review");
+        agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .expect("unknown tool does not fail the review");
 
         let reqs = seq.requests();
         let content = messages(&reqs, 1)
@@ -676,9 +736,18 @@ mod tests {
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
 
-        agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap();
+        agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap();
 
         let reqs = seq.requests();
         let content = messages(&reqs, 1)
@@ -708,9 +777,18 @@ mod tests {
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
 
-        let out = agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap();
+        let out = agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap();
 
         let usage = out.usage.expect("usage reported when tokens > 0");
         assert_eq!(usage.total_tokens, Some(60));
@@ -725,17 +803,35 @@ mod tests {
         let (srv, _s) = server(vec![text_turn("ok", 1), text_turn(REVIEW_JSON, 1)]).await;
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
-        let out = agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap();
+        let out = agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap();
         assert_eq!(out.model, "main/model (explore: explore/model)");
 
         let (srv2, _s2) = server(vec![text_turn("ok", 1), text_turn(REVIEW_JSON, 1)]).await;
         let mut same = cfg_for(&srv2.uri());
         same.openrouter_model_explore = same.openrouter_model.clone();
-        let out2 = agentic_review(&Client::new(), &same, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap();
+        let out2 = agentic_review(
+            &Client::new(),
+            &same,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&same),
+        )
+        .await
+        .unwrap();
         assert_eq!(out2.model, "main/model");
     }
 
@@ -751,9 +847,18 @@ mod tests {
         let cfg = cfg_for(&srv.uri());
         let (_d, ws) = workspace();
 
-        let err = agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap_err();
+        let err = agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap_err();
         assert!(
             err.to_string().contains("agent returned no JSON"),
             "got: {err}"
@@ -767,9 +872,18 @@ mod tests {
         cfg.openrouter_api_key = String::new();
         let (_d, ws) = workspace();
 
-        let err = agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap_err();
+        let err = agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("OPENROUTER_API_KEY"), "got: {err}");
         assert_eq!(seq.calls(), 0);
     }
@@ -792,9 +906,18 @@ mod tests {
         // old code had none. `cfg_for` sets max_retries = 0, so this asserts the
         // single-attempt behaviour: a 429 with retries off aborts, surfacing as
         // a rate-limit error rather than the old raw passthrough.
-        let err = agentic_review(&Client::new(), &cfg, &meta(), DIFF, None, None, &ws)
-            .await
-            .unwrap_err();
+        let err = agentic_review(
+            &Client::new(),
+            &cfg,
+            &meta(),
+            DIFF,
+            None,
+            None,
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("rate limited"), "got: {err}");
     }
 
