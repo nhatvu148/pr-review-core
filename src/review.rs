@@ -1113,6 +1113,15 @@ pub async fn run_review_local(
                 provider: LOCAL_PROVIDER.to_string(),
                 repo: input.label,
                 pr: 0,
+                // Empty because no model ran — these findings are deterministic.
+                // The PR path's equivalent branch reports `cfg.openrouter_model`
+                // here, which is the asymmetry a reviewer will notice; it is
+                // deliberate, and the two are NOT going to be reconciled by copying
+                // it. This path's backend may not be OpenRouter at all, so naming
+                // that model would attribute a deterministic result to a model that
+                // was never called and may not even be configured. (The PR path is
+                // arguably wrong for the same reason, but its `model` field is in a
+                // serialized response pr-review-bot consumes — a separate change.)
                 model: String::new(),
                 recommendation,
                 findings: prepared.hygiene.len(),
@@ -1440,7 +1449,7 @@ mod orchestrator_tests {
     //! End-to-end tests of the orchestrator over a mocked provider, with a fake
     //! [`ReviewBackend`] standing in for the model.
     //!
-    //! These exist because of `docs/feedback/2026-07-31-pr-review-core-28.md`: the
+    //! These exist because of the 2026-07-31 pr-review-core#28 incident: the
     //! calibration rules were a const each backend was trusted to append, and the
     //! deployed claude-code backend ran for months without them. Nothing in the
     //! output says "the rules are missing" — a miscalibrated review still reads

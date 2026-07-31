@@ -10,7 +10,8 @@ reviews a worktree with no PR behind it.
 **Orchestrator-injected rules.** `prompt::REVIEW_RULES` was a const each
 `ReviewBackend` was trusted to append, and the deployed claude-code backend ran for
 months without it — invisibly, because a review with no calibration rules still
-reads like a review (`docs/feedback/2026-07-31-pr-review-core-28.md`).
+reads like a review. (The incident is written up in the private `pr-review-docs`
+repo; `docs/` is gitignored here on purpose, so it is not a path in this tree.)
 `run_review_with` now composes the rules plus the consumer's `extra_system_prompt`
 once and hands them over on `ReviewContext.injected_rules`;
 `ReviewContext::system_prompt(rubric)` joins them to whatever rubric the backend

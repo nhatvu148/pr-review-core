@@ -167,11 +167,13 @@ async fn run_once(cfg: &Config, client: &reqwest::Client, corpus: &[Case]) -> Ru
     let mut per_lang: BTreeMap<String, Tally> = BTreeMap::new();
     let (mut tokens, mut errors) = (0u64, 0usize);
 
+    // The same system prompt the orchestrator injects into a backend, so the bench
+    // scores the reviewer the reviewer actually is. `cfg` is fixed for the pass, so
+    // this is built once rather than per case.
+    let system = pr_review_core::prompt::review_system_prompt(cfg);
+
     for case in corpus {
         let meta = synthetic_meta(case);
-        // The same system prompt the orchestrator injects into a backend, so the
-        // bench scores the reviewer the reviewer actually is.
-        let system = pr_review_core::prompt::review_system_prompt(cfg);
         let res = review_diff(client, cfg, &meta, &case.diff, None, None, &system).await;
         let res = match res {
             Ok(r) => r,

@@ -94,7 +94,8 @@ If the same observation applies to many files, raise it ONCE, name the pattern, 
 /// This exists because "a const each backend is trusted to append" is not a seam.
 /// The deployed claude-code backend shipped for months without [`REVIEW_RULES`] —
 /// invisibly, because a review with no calibration rules still *looks* like a
-/// review (see `docs/feedback/2026-07-31-pr-review-core-28.md`). So the rules are
+/// review (written up as the 2026-07-31 pr-review-core#28 incident in the private
+/// `pr-review-docs` repo). So the rules are
 /// now composed once by [`crate::review::run_review_with`] and handed to the
 /// backend on [`crate::backend::ReviewContext`]; a backend that wants them has to
 /// take them from the context it was given.
