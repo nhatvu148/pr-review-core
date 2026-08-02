@@ -47,12 +47,21 @@ jobs:
       - run: cargo package
 
   downstream:
-    name: downstream compiles
+    # Named for what it ACTUALLY covers. This job can only build the public
+    # consumers; the private ones (pr-review-bot, and a client-org bot that is
+    # deliberately not named in a public workflow) are not checked here. A job
+    # called "downstream compiles" that silently skips the consumers most likely to
+    # break buys false confidence — the green tick was reporting success for builds
+    # it never ran.
+    #
+    # The full check is a RELEASE step instead: compile EVERY consumer against the
+    # release candidate before cutting a version. See "Releasing" in README.md.
+    name: downstream compiles (public consumers)
     runs-on: ubuntu-latest
-    # Why this job exists: 0.11.0 added a field to the public `PrMeta` struct.
-    # Every test in this repo passed, and pr-review-bot then failed to compile
-    # against it. A breaking change to a published crate is invisible to its own
-    # test suite — only a consumer build sees it.
+    # Why this job exists at all: 0.11.0 added a field to the public `PrMeta`
+    # struct. Every test in this repo passed, and pr-review-bot then failed to
+    # compile against it. A breaking change to a published crate is invisible to
+    # its own test suite — only a consumer build sees it.
     #
     # Each consumer's dependency is REPOINTED at this checkout rather than patched
     # via [patch.crates-io], because a patch must satisfy the consumer's version
@@ -78,12 +87,13 @@ jobs:
         run: |
           set -euo pipefail
           # pr-review-bot is private, so this needs a read-scoped PAT in the
-          # DOWNSTREAM_TOKEN secret. Skipped rather than failed when unset — but
-          # note the bot is the consumer that actually constructs PrMeta, so
-          # WITHOUT this secret the job would not have caught the 0.11.0 break.
+          # DOWNSTREAM_TOKEN secret. OPTIONAL by design: the release checklist
+          # compiles every consumer by hand, which covers more than this job can
+          # (it also reaches the client-org bot, which is not named here). Setting
+          # the secret just moves that check earlier, to every PR.
           if [ -z "${TOKEN:-}" ]; then
-            echo "::warning::DOWNSTREAM_TOKEN unset — skipping pr-review-bot. This is the"
-            echo "::warning::consumer that catches breaking changes to PrMeta/Config."
+            echo "::warning::DOWNSTREAM_TOKEN unset — pr-review-bot not built here."
+            echo "::warning::The release checklist in README.md covers it; this job does not."
             exit 0
           fi
           git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/nhatvu148/pr-review-bot.git" bot
