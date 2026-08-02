@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.14.0
 
 Three changes that together let a consumer review a **local diff** — a branch, a
 worktree, staged changes — on its own backend, with the same calibration and the
@@ -44,6 +44,29 @@ new-side files from the checkout instead of the provider.
 - `llm::review_diff` and `agent::agentic_review` take the prepared `system_prompt`.
   Callers driving them directly can build it with `prompt::review_system_prompt`.
 - `llm::critique_findings` takes `(cfg, backend, ...)` instead of `(client, cfg, ...)`.
+
+**Consumer migration.** All three known consumers were compiled against this
+release before it was cut:
+
+| consumer | change needed |
+|---|---|
+| `pr-review-bot` | `ctx.provider` is an `Option`; `review_diff` takes a system prompt; the claude-code backend now takes its rules from `ctx.system_prompt(..)` instead of importing `REVIEW_RULES` |
+| `simcel-pr-bot` | same two, via `try_clone` and its `review_system_prompt` helper |
+| `kaniscope-action` | none — it only uses `Config` / `run_review` / `RunReviewInput` |
+
+**Behaviour change, latent rather than live:** a backend overriding
+`ReviewBackend::complete` (both bots do) now runs the self-critique pass on *itself*
+rather than on OpenRouter. Both bots deploy with `SELF_CRITIQUE=false`, so upgrading
+changes nothing for them — the flag was set because the pass could never succeed on
+a non-OpenRouter backend, not as a preference.
+
+What changes is that enabling it is now *possible* there. It should be enabled as
+its own decision, A/B'd on the bench corpus: the pass prunes findings, and it has
+never been measured on the claude-code path.
+
+Note also that `tree-sitter` moved to 0.26 (it carries `links = "tree-sitter"`, so
+exactly one version may exist in a dependency graph — this line is a compatibility
+contract with every consumer, not a private choice).
 
 ## 0.13.0
 

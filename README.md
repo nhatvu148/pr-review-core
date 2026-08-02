@@ -141,6 +141,46 @@ Route them from a bot binary with [`command::parse_command`] + [`command::run_co
 [`command::parse_command`]: src/command.rs
 [`command::run_command`]: src/command.rs
 
+## Releasing
+
+**Compile every consumer against the release candidate before cutting a version.**
+
+This is a manual step on purpose. CI's `downstream compiles (public consumers)` job
+can only reach the public ones — the private consumers are invisible to it, and one
+lives in a client org that is deliberately not named in a public workflow. A check
+that skips the consumers most likely to break and reports green anyway is worse than
+no check.
+
+The failure this catches is specific and has happened: **0.11.0 added a field to the
+public `PrMeta` struct. Every test here passed, and a consumer then failed to
+compile.** A breaking change to a published crate is invisible to its own test
+suite — only a consumer build sees it.
+
+```sh
+# In each consumer: repoint the dep at this checkout, then build and test it.
+# Repoint rather than [patch.crates-io] — a patch must satisfy the consumer's
+# version requirement, so every version-bump PR would fail for the wrong reason.
+#
+# `perl -i` rather than `sed -i`: in-place editing is the one place the two seds
+# disagree. BSD/macOS needs `sed -i ''`, GNU/Linux rejects it; GNU takes `sed -i`,
+# BSD then eats the next argument as the backup suffix. This runs on both.
+perl -i -pe 's|^pr-review-core = .*|pr-review-core = { path = "../pr-review-core" }|' Cargo.toml
+cargo check --all-targets     # add --features claude-code where the consumer has it
+cargo test
+```
+
+Then:
+
+1. Bump `version` in `Cargo.toml`; promote `## Unreleased` in `CHANGELOG.md`.
+2. **Record each breaking change and which consumer it touches.** The changelog's
+   migration table is what a consumer reads to find out what broke.
+3. **Flag behaviour changes separately from API breaks.** An API break fails the
+   build and announces itself; a behaviour change ships silently. 0.14.0 is the
+   example — routing self-critique through the backend seam broke no consumer's
+   compile, but moved what runs at review time.
+4. `cargo publish --dry-run`, then publish, then tag `vX.Y.Z`.
+5. Bump each consumer's dep to the published version and commit.
+
 ## License
 
 Licensed under either of
