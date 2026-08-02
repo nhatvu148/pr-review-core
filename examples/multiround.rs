@@ -137,16 +137,50 @@ fn hits(f: &Finding, i: &Issue) -> bool {
         }
 }
 
-/// Identity for deduping a finding across rounds.
+/// Unique findings across rounds, deduped by the **same rule** [`hits`] uses.
 ///
-/// Line-bucketed to the same tolerance used for matching: a reviewer that reports
-/// the same defect one line apart in two rounds has not found a second defect, and
-/// counting it twice would inflate the "new findings per round" figure this
-/// experiment exists to measure.
-fn finding_key(f: &Finding) -> String {
-    match f.line {
-        Some(l) => format!("{}:{}", f.file, l as i64 / (TOLERANCE + 1)),
-        None => format!("{}:summary", f.file),
+/// This started as fixed-size bucketing (`line / (TOLERANCE + 1)`) whose comment
+/// claimed "the same tolerance used for matching" — and did not deliver it.
+/// Bucketing splits two findings one line apart when they straddle a boundary
+/// (4 and 5) and merges two further apart inside one bucket (4 and 7). Those two
+/// errors run in opposite directions and both land on the unique-FP count that
+/// kill criterion 2 is computed from, so the approximation sat in exactly the
+/// wrong place.
+///
+/// A sliding window has no closed-form key, so this keeps the seen lines per file
+/// and scans. Deduping is greedy — the first finding of a cluster claims the
+/// window — which is order-dependent in principle but reproduces `hits()` for the
+/// question actually being asked: *is this the same defect I already counted?*
+#[derive(Default)]
+struct UniqueFindings {
+    /// file → lines of findings already counted.
+    anchored: BTreeMap<String, Vec<u64>>,
+    /// Files with a summary-level (line-less) finding. Anchored and summary
+    /// findings never merge, matching `hits`'s refusal to cross-match them.
+    summary: BTreeSet<String>,
+}
+
+impl UniqueFindings {
+    /// Record a finding. Returns `true` when it was **new**.
+    fn insert(&mut self, f: &Finding) -> bool {
+        match f.line {
+            None => self.summary.insert(f.file.clone()),
+            Some(line) => {
+                let seen = self.anchored.entry(f.file.clone()).or_default();
+                if seen
+                    .iter()
+                    .any(|&s| (s as i64 - line as i64).abs() <= TOLERANCE)
+                {
+                    return false;
+                }
+                seen.push(line);
+                true
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.anchored.values().map(Vec::len).sum::<usize>() + self.summary.len()
     }
 }
 
@@ -163,7 +197,7 @@ struct CaseRun {
 /// Run one case `rounds` times and accumulate unions.
 async fn run_case(cfg: &Config, client: &reqwest::Client, case: &Case, rounds: usize) -> CaseRun {
     let mut hit_issues: BTreeSet<usize> = BTreeSet::new();
-    let mut seen_fps: BTreeSet<String> = BTreeSet::new();
+    let mut seen_fps = UniqueFindings::default();
     let mut caught = Vec::with_capacity(rounds);
     let mut fps = Vec::with_capacity(rounds);
     let mut errored = false;
@@ -209,7 +243,7 @@ async fn run_case(cfg: &Config, client: &reqwest::Client, case: &Case, rounds: u
                         }
                     }
                     if !hit_any {
-                        seen_fps.insert(finding_key(f));
+                        seen_fps.insert(f);
                     }
                 }
                 eprintln!(
@@ -345,7 +379,15 @@ async fn main() {
             while let Some(joined) = set.join_next().await {
                 match joined {
                     Ok(pair) => ordered.push(pair),
-                    Err(e) => eprintln!("      task panicked: {e}"),
+                    // A panicked task is a lost case-replicate exactly like an
+                    // errored round, and has to be counted as one. Dropping it
+                    // silently would exempt panics from the 10% exclusion ceiling
+                    // and from the loss report this file promises — the same
+                    // shape of hole the other three guards were added to close.
+                    Err(e) => {
+                        eprintln!("      task panicked, excluded: {e}");
+                        errors += 1;
+                    }
                 }
             }
         }
@@ -367,8 +409,12 @@ async fn main() {
             // stays visible.
             if run.errored {
                 errors += 1;
-                eprintln!("      \u{21b3} excluded from the aggregate (a round failed)");
-                per_case.entry(label).or_default().push(run);
+                eprintln!("      \u{21b3} excluded (a round failed)");
+                // Excluded from the per-case table as well as the aggregate.
+                // Keeping it here would average a truncated run in beside complete
+                // ones, and the per-case column is exactly what a reader uses to
+                // judge WHERE the gains are — the density observation is read off
+                // it. Same exclusion, same reason, both places.
                 continue;
             }
             issues_total += run.issues;
@@ -554,4 +600,91 @@ async fn main() {
         "\n(recall = planted bugs a finding hit, ±{TOLERANCE} line tolerance; \
          FPs deduped by file+line bucket across rounds)"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn finding(file: &str, line: Option<u64>) -> Finding {
+        Finding {
+            severity: "LOW".to_string(),
+            file: file.to_string(),
+            line,
+            body: "x".to_string(),
+            confidence: Some(50),
+        }
+    }
+
+    /// The old bucketing's failure mode, and the reason it mattered: two findings
+    /// ONE line apart are the same defect, but `3/4 = 0` and `4/4 = 1` put them in
+    /// different buckets and counted two. Every such split inflated the unique-FP
+    /// count that kill criterion 2 is computed from.
+    #[test]
+    fn findings_within_tolerance_are_one_finding() {
+        let mut u = UniqueFindings::default();
+        assert!(u.insert(&finding("a.rs", Some(3))));
+        assert!(
+            !u.insert(&finding("a.rs", Some(4))),
+            "1 line apart is one defect"
+        );
+        assert!(
+            !u.insert(&finding("a.rs", Some(6))),
+            "3 apart is still within tolerance"
+        );
+        assert_eq!(u.len(), 1);
+    }
+
+    #[test]
+    fn findings_beyond_tolerance_are_distinct() {
+        let mut u = UniqueFindings::default();
+        assert!(u.insert(&finding("a.rs", Some(10))));
+        assert!(
+            u.insert(&finding("a.rs", Some(14))),
+            "4 apart exceeds tolerance"
+        );
+        assert_eq!(u.len(), 2);
+    }
+
+    #[test]
+    fn the_same_line_in_two_files_is_two_findings() {
+        let mut u = UniqueFindings::default();
+        assert!(u.insert(&finding("a.rs", Some(10))));
+        assert!(u.insert(&finding("b.rs", Some(10))));
+        assert_eq!(u.len(), 2);
+    }
+
+    /// Anchored and summary findings never merge — matching `hits`, which refuses
+    /// to cross-match them so one vague finding cannot absorb a located one.
+    #[test]
+    fn summary_and_anchored_findings_do_not_merge() {
+        let mut u = UniqueFindings::default();
+        assert!(u.insert(&finding("a.rs", None)));
+        assert!(u.insert(&finding("a.rs", Some(10))));
+        assert!(!u.insert(&finding("a.rs", None)), "one summary per file");
+        assert_eq!(u.len(), 2);
+    }
+
+    /// The direction of the old error, which is what makes it worth reporting:
+    /// with TOLERANCE=3 the bucket width was 4, so two lines in one bucket were
+    /// always within tolerance — bucketing could therefore only ever SPLIT a
+    /// cluster, never merge one. Old unique-FP counts were an upper bound, and
+    /// criterion 2 fired on `added_fps > added_catches`.
+    #[test]
+    fn the_old_bucketing_could_only_overcount() {
+        let bucket = |l: i64| l / (TOLERANCE + 1);
+        for a in 0..200i64 {
+            for b in a..(a + 10).min(200) {
+                let same_bucket = bucket(a) == bucket(b);
+                let within_tolerance = (b - a) <= TOLERANCE;
+                if same_bucket {
+                    assert!(
+                        within_tolerance,
+                        "lines {a},{b} shared a bucket but exceed tolerance — \
+                         bucketing would have merged two distinct findings"
+                    );
+                }
+            }
+        }
+    }
 }
