@@ -160,7 +160,11 @@ suite — only a consumer build sees it.
 # In each consumer: repoint the dep at this checkout, then build and test it.
 # Repoint rather than [patch.crates-io] — a patch must satisfy the consumer's
 # version requirement, so every version-bump PR would fail for the wrong reason.
-sed -i '' 's|^pr-review-core = .*|pr-review-core = { path = "../pr-review-core" }|' Cargo.toml
+#
+# `perl -i` rather than `sed -i`: in-place editing is the one place the two seds
+# disagree. BSD/macOS needs `sed -i ''`, GNU/Linux rejects it; GNU takes `sed -i`,
+# BSD then eats the next argument as the backup suffix. This runs on both.
+perl -i -pe 's|^pr-review-core = .*|pr-review-core = { path = "../pr-review-core" }|' Cargo.toml
 cargo check --all-targets     # add --features claude-code where the consumer has it
 cargo test
 ```
