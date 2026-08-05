@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.15.3
+
+**Doc fix on `post_review_failure`.** 0.15.2 claimed it "never creates a comment
+where the engine did not already leave one". It does: the upsert underneath
+(`github::upsert_summary`) creates the summary comment when no marker comment
+exists. Called on a PR the engine never commented on, it would post a failure
+notice into silence. The contract is now stated correctly — only call it for a
+review that actually posted a placeholder. No behaviour change.
+
+
 ## 0.15.2
 
 **A dead review no longer looks like a finished one.** The engine posts a

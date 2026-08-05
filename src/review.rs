@@ -573,13 +573,14 @@ fn render_failed(err: &str) -> String {
 
 /// Replace a "Reviewing…" placeholder with an honest failure notice.
 ///
-/// Call this when a review that posted a placeholder then failed. It never creates
-/// a comment where the engine did not already leave one — `post_review` upserts the
-/// same marker comment — so a caller that did not request a placeholder gets a
-/// no-op update rather than new noise.
+/// **Only call this for a review that actually posted a placeholder.** The upsert
+/// underneath *creates* the summary comment when none exists
+/// (`github::upsert_summary`), so calling it on a PR the engine never commented on
+/// posts a failure notice where there was silence — noise, on a PR nobody asked to
+/// have reviewed. `RunReviewInput::placeholder` is the caller's record of that.
 ///
-/// Best-effort: a failure to report a failure is logged and swallowed, because the
-/// original error is the one the caller needs to surface.
+/// Best-effort otherwise: a failure to report a failure is logged and swallowed,
+/// because the original error is the one the caller needs to surface.
 pub async fn post_review_failure(
     provider_name: &str,
     cfg: &Config,
