@@ -523,10 +523,96 @@ fn render_summary(
     s
 }
 
+/// Hidden marker on a summary comment that is **not** a finished review.
+///
+/// Machine-readable on purpose. A consumer's boot reconciliation asks "has this PR
+/// been reviewed at its current head?", and answers it from the newest bot comment
+/// — so a placeholder counted as a review makes a *died-mid-flight* review look
+/// finished, which is precisely the case reconciliation exists to catch. Matching
+/// on the prose instead would break the moment anyone rewords it.
+pub const REVIEW_PENDING_MARKER: &str = "<!-- prbot-status:pending -->";
+
+/// Hidden marker on a summary comment recording a review that **failed**.
+pub const REVIEW_FAILED_MARKER: &str = "<!-- prbot-status:failed -->";
+
+/// Prose from placeholders posted before the markers existed. Kept so comments
+/// already sitting on open PRs are still recognised; new ones carry the marker.
+const LEGACY_PENDING_PROSE: &str = "⏳ _Reviewing this PR…";
+
+/// Whether a bot summary comment represents something **other** than a completed
+/// review — a placeholder for one still running, or a notice that one failed.
+///
+/// Consumers deciding "does this PR still need a review?" must treat both as *no
+/// review*. A placeholder means one was promised; a failure notice means one was
+/// attempted. Neither is a review.
+pub fn is_incomplete_review(body: &str) -> bool {
+    body.contains(REVIEW_PENDING_MARKER)
+        || body.contains(REVIEW_FAILED_MARKER)
+        || body.contains(LEGACY_PENDING_PROSE)
+}
+
 /// Placeholder summary body shown immediately while the review runs.
 fn render_pending() -> String {
-    "🤖 **Automated review**\n\n⏳ _Reviewing this PR… (this comment will update shortly)_"
-        .to_string()
+    format!(
+        "🤖 **Automated review**\n\n⏳ _Reviewing this PR… (this comment will update \
+         shortly)_\n\n{REVIEW_PENDING_MARKER}"
+    )
+}
+
+/// Summary body replacing a placeholder whose review died.
+///
+/// The placeholder is upserted, so this **replaces** it rather than adding a
+/// comment: without it the PR keeps promising a review that will never arrive.
+fn render_failed(err: &str) -> String {
+    format!(
+        "🤖 **Automated review**\n\n⚠️ _This review failed and produced no findings. \
+         The error was:_\n\n```\n{}\n```\n\n_Re-run with `/review`._\n\n{REVIEW_FAILED_MARKER}",
+        crate::clip(err, 500)
+    )
+}
+
+/// Replace a "Reviewing…" placeholder with an honest failure notice.
+///
+/// Call this when a review that posted a placeholder then failed. It never creates
+/// a comment where the engine did not already leave one — `post_review` upserts the
+/// same marker comment — so a caller that did not request a placeholder gets a
+/// no-op update rather than new noise.
+///
+/// Best-effort: a failure to report a failure is logged and swallowed, because the
+/// original error is the one the caller needs to surface.
+pub async fn post_review_failure(
+    provider_name: &str,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    err: &str,
+) {
+    let provider = match Provider::from_name(provider_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("could not retract placeholder for {repo}#{pr}: {e:#}");
+            return;
+        }
+    };
+    // Summary-only, so no `head_sha` is needed: that field only anchors inline
+    // comments, and a failure notice has none.
+    let meta = PrMeta {
+        repo: repo.to_string(),
+        pr,
+        title: None,
+        base_branch: None,
+        head_sha: None,
+        body: None,
+        ci_status: None,
+    };
+    let post = ReviewPost {
+        summary: render_failed(err),
+        inline: Vec::new(),
+    };
+    let client = reqwest::Client::new();
+    if let Err(e) = provider.post_review(&client, cfg, &meta, &post).await {
+        tracing::warn!("could not retract placeholder for {repo}#{pr}: {e:#}");
+    }
 }
 
 /// Clone the repo (off the async runtime) and run the agentic reviewer.
@@ -2093,5 +2179,68 @@ mod tests {
         // 20 is 11 rows from 9 — outside REANCHOR_WINDOW, so no snap even though the
         // symbol matches.
         assert_eq!(reanchor(9, &valid, &texts, "calcTotal issue"), None);
+    }
+}
+
+#[cfg(test)]
+mod placeholder_tests {
+    use super::*;
+
+    /// The whole point: a placeholder must not read as a finished review, or a
+    /// consumer's boot sweep counts a died-mid-flight review as covered — which is
+    /// exactly the case it exists to catch.
+    #[test]
+    fn a_placeholder_is_not_a_completed_review() {
+        assert!(is_incomplete_review(&render_pending()));
+        assert!(is_incomplete_review(&render_failed("boom")));
+    }
+
+    /// The other direction. A real review misread as incomplete would be reviewed
+    /// again on every boot — duplicate comments, duplicate spend, forever.
+    #[test]
+    fn a_real_review_is_not_flagged_incomplete() {
+        let real = render_summary(
+            &Review {
+                summary: "Looks fine.".into(),
+                recommendation: "APPROVE".into(),
+                findings: vec![],
+            },
+            "APPROVE",
+            &[],
+            0,
+        );
+        assert!(
+            !is_incomplete_review(&real),
+            "a finished review must never look incomplete: {real}"
+        );
+        // And nothing incidental trips it.
+        assert!(!is_incomplete_review(
+            "🤖 **Automated review**\n\nAll good."
+        ));
+    }
+
+    /// Placeholders posted before the markers existed are still on open PRs right
+    /// now. If the predicate only knew about the marker, those would stay invisible
+    /// to reconciliation permanently — the exact bug, just grandfathered.
+    #[test]
+    fn a_legacy_placeholder_without_the_marker_is_still_recognised() {
+        let legacy = "🤖 **Automated review**\n\n⏳ _Reviewing this PR… (this comment \
+                      will update shortly)_\n\n_🤖 pr-review-bot_";
+        assert!(
+            is_incomplete_review(legacy),
+            "a placeholder already sitting on a PR must be recognised too"
+        );
+    }
+
+    /// The failure notice has to carry the error, or it is just a different lie.
+    #[test]
+    fn the_failure_notice_names_the_error_and_how_to_retry() {
+        let body = render_failed("subtype=error_max_turns, after 31/30 turn(s)");
+        assert!(body.contains("error_max_turns"), "{body}");
+        assert!(body.contains("/review"), "says how to retry: {body}");
+        assert!(
+            !body.contains("update shortly"),
+            "no longer promises an update"
+        );
     }
 }

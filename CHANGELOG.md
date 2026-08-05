@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.15.2
+
+**A dead review no longer looks like a finished one.** The engine posts a
+"⏳ Reviewing this PR…" placeholder before the slow call, and upserts the real
+review over it. If the review then dies — turn cap, OOM, timeout, a crash — the
+placeholder stays. Two consequences, both bad:
+
+- The PR promises a review that will never arrive, permanently.
+- A consumer's boot reconciliation asks "has this PR been reviewed at its current
+  head?" and answers it from the newest bot comment. The placeholder is *newer*
+  than the head, so the PR reads as covered — and the one case reconciliation
+  exists to catch becomes the one case it cannot see.
+
+Observed on `nhatvu148/VinaText#49`: head at 08:12:56Z, placeholder at 08:13:34Z,
+review dead at 08:18:45Z, and the next boot sweep reported "nothing missing".
+
+`is_incomplete_review(body)` answers it properly, matching hidden
+`REVIEW_PENDING_MARKER` / `REVIEW_FAILED_MARKER` markers rather than prose — which
+would break the moment anyone rewords it. It also matches the legacy placeholder
+text, so comments already sitting on open PRs are recognised instead of being
+grandfathered into the bug.
+
+`post_review_failure(...)` replaces a placeholder with the error and a `/review`
+retry hint. It upserts the same marker comment, so it never adds noise where the
+engine did not already leave a comment, and it is best-effort — failing to report
+a failure must not mask the original one.
+
+
 ## 0.15.1
 
 **`parse_review_with_repair` and `add_usage` are public.** 0.15.0 shipped them
