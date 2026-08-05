@@ -36,9 +36,16 @@ through the same two lines. Both in-core sites now salvage.
 `complete()` returns bare `String`, so its `usage` was unreachable — a repaired
 review would report only the first call's tokens. Added as a **defaulted** method
 returning `Completion { text, model, usage }` rather than by widening `complete()`,
-so no existing implementation breaks: a backend that overrides only `complete` keeps
-working and reports no usage. `chat_completion` also stops discarding the `usage` it
-already parsed out of the OpenRouter response.
+so no existing implementation breaks.
+
+The default **delegates to `complete`**, which matters more than it looks: routing
+it to OpenRouter instead would mean a consumer running an agent CLI has its repair
+answered by a different service and model, and fails outright without an
+`OPENROUTER_API_KEY` — a review discarded by the very mechanism meant to salvage it.
+So a backend overriding only `complete` keeps every call, repair included, on its
+own backend, and simply reports no usage. `OpenRouterBackend` overrides
+`complete_detailed` to report real figures, and `chat_completion` stops discarding
+the `usage` it already parsed out of the response.
 
 
 ## 0.14.0

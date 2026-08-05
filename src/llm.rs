@@ -568,6 +568,16 @@ mod tests {
     }
 }
 
+/// [`chat_completion`] when only the text is wanted.
+pub(crate) async fn chat_text(
+    client: &Client,
+    cfg: &Config,
+    system: &str,
+    user: &str,
+) -> Result<String> {
+    Ok(chat_completion(client, cfg, system, user).await?.text)
+}
+
 // ─── Review JSON salvage ────────────────────────────────────────────────────
 //
 // A single unescaped `"` in a finding's `body` used to discard an entire review.
