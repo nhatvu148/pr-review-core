@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.15.0 (unreleased)
+
+**Review JSON salvage, in core rather than in one backend.** A single unescaped
+`"` in a finding's `body` discarded an entire review: `serde_json::from_str` failed
+at the *syntax* layer, before `lenient_findings` — which only drops findings that
+fail to *deserialize* — ever saw one. On `SIMCEL/simcel-saas#3` that threw away 265
+seconds of agent work and left the PR sitting on a stale placeholder with nothing
+to retry it.
+
+On a syntax error, `parse_review_with_repair` hands the broken object back to the
+model with no tools and asks for the same data as valid JSON. One attempt; if the
+repair also fails, the **original** error is reported. Deliberately not a
+sanitizer: whether a bare `"` closes a string or belongs to the prose needs the
+surrounding meaning, and guessing wrong silently mangles text a human is about to
+read.
+
+Alongside it: `json_error_context` quotes a window around the flagged column
+instead of clipping the head (which, for a pretty-printed review, is always the
+`summary` — never the break), converting serde's **byte** column to a char index
+first so em dashes and curly quotes don't slide the window off the very spot it
+exists to show. Truncation (`Category::Eof`) is split from a stray character and
+noted in the review's own `summary`, because the repair prompt closes an open value
+— keeping what arrived and silently dropping the rest — and a partial review must
+not read as a complete one to whoever is deciding the merge. Finding counts are
+compared across the pass and warn on divergence; the before-count is a substring
+count over text that by definition does not parse, so it can never fail a review.
+
+**Why this is a core change and not a backend one.** It was fixed in one consumer
+backend by hand while three other paths kept the bug — `review_diff`, `review_file`,
+and every downstream agent backend. All of them turn model output into a `Review`
+through the same two lines. Both in-core sites now salvage.
+
+**`ReviewBackend::complete_detailed`.** The repair is a second billed call, and
+`complete()` returns bare `String`, so its `usage` was unreachable — a repaired
+review would report only the first call's tokens. Added as a **defaulted** method
+returning `Completion { text, model, usage }` rather than by widening `complete()`,
+so no existing implementation breaks: a backend that overrides only `complete` keeps
+working and reports no usage. `chat_completion` also stops discarding the `usage` it
+already parsed out of the OpenRouter response.
+
+
 ## 0.14.0
 
 Three changes that together let a consumer review a **local diff** — a branch, a

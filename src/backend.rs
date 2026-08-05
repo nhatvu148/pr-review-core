@@ -85,8 +85,25 @@ pub trait ReviewBackend: Send + Sync {
     /// commands, so they run on the same backend as reviews instead of always
     /// OpenRouter. Default: the OpenRouter chat path.
     async fn complete(&self, cfg: &Config, system: &str, user: &str) -> Result<String> {
+        Ok(self.complete_detailed(cfg, system, user).await?.text)
+    }
+
+    /// [`Self::complete`] plus what the call reported about itself — the model used
+    /// and the tokens spent.
+    ///
+    /// Defaulted rather than folded into `complete`, so adding it breaks no
+    /// existing implementation: a backend that only overrides `complete` still
+    /// works and simply reports no usage. Override it when the backend knows more,
+    /// which the JSON repair pass needs — it is a second billed call on the same
+    /// review, and usage that omits it invents a smaller bill than the real one.
+    async fn complete_detailed(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+    ) -> Result<crate::llm::Completion> {
         let client = reqwest::Client::new();
-        crate::llm::chat_text(&client, cfg, system, user).await
+        crate::llm::chat_completion(&client, cfg, system, user).await
     }
 }
 
