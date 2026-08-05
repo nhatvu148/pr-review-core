@@ -638,7 +638,7 @@ fn count_findings_hint(raw: &str) -> usize {
 ///
 /// Every count is independently optional, so a missing figure on one side must not
 /// erase a present one on the other — absent means "not reported", not zero.
-pub(crate) fn add_usage(review: Option<Usage>, repair: Option<Usage>) -> Option<Usage> {
+pub fn add_usage(review: Option<Usage>, repair: Option<Usage>) -> Option<Usage> {
     fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
         match (a, b) {
             (Some(a), Some(b)) => Some(a.saturating_add(b)),
@@ -693,9 +693,12 @@ fn json_error_context(json: &str, err: &serde_json::Error) -> String {
 /// Parse a review, salvaging it with one model-driven repair pass when the JSON
 /// does not parse.
 ///
-/// `repair` is supplied by the caller because the two call sites reach a model
-/// differently — [`review_diff`] holds an HTTP client, [`review_file`] holds a
-/// [`ReviewBackend`]. Bounded to **one** attempt; if the repair also fails, the
+/// `repair` is supplied by the caller because the call sites reach a model
+/// differently — [`review_diff`] and `agentic_review` hold an HTTP client,
+/// [`review_file`] holds a [`ReviewBackend`]. **Public** so a downstream backend
+/// that parses its own review JSON gets the salvage by calling this, rather than
+/// re-porting it by hand — which is the duplication this function exists to end.
+/// The repair system prompt is handed to the closure, so callers do not need it. Bounded to **one** attempt; if the repair also fails, the
 /// **original** error is reported, not the repair's.
 ///
 /// Deliberately not a hand-written sanitizer: deciding whether a bare `"` closes a
@@ -709,7 +712,7 @@ fn json_error_context(json: &str, err: &serde_json::Error) -> String {
 /// Returns the repair's own usage, `None` when the JSON parsed first time.
 ///
 /// [`ReviewBackend`]: crate::backend::ReviewBackend
-pub(crate) async fn parse_review_with_repair<F, Fut>(
+pub async fn parse_review_with_repair<F, Fut>(
     json: &str,
     what: &str,
     repair: F,

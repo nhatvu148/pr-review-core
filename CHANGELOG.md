@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.15.1
+
+**`parse_review_with_repair` and `add_usage` are public.** 0.15.0 shipped them
+`pub(crate)`, which quietly falsified that release's own claim that downstream
+backends "get the salvage on this version bump instead of another hand-port".
+They got it for `review_diff`, `review_file` and `agentic_review` — every path
+*inside* core — but a consumer implementing `ReviewBackend::review` and parsing its
+own model output could not reach the function at all, which is precisely the case
+the change was written for. No behaviour change; visibility only.
+
+
 ## 0.15.0
 
 **Review JSON salvage, in core rather than in one backend.** A single unescaped
