@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.15.0 (unreleased)
+## 0.15.0
 
 **Review JSON salvage, in core rather than in one backend.** A single unescaped
 `"` in a finding's `body` discarded an entire review: `serde_json::from_str` failed
