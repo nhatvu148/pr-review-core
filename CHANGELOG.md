@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.15.0 (unreleased)
+
+**Review JSON salvage, in core rather than in one backend.** A single unescaped
+`"` in a finding's `body` discarded an entire review: `serde_json::from_str` failed
+at the *syntax* layer, before `lenient_findings` — which only drops findings that
+fail to *deserialize* — ever saw one. On `SIMCEL/simcel-saas#3` that threw away 265
+seconds of agent work and left the PR sitting on a stale placeholder with nothing
+to retry it.
+
+On a syntax error, `parse_review_with_repair` hands the broken object back to the
+model with no tools and asks for the same data as valid JSON. One attempt; if the
+repair also fails, the **original** error is reported. Deliberately not a
+sanitizer: whether a bare `"` closes a string or belongs to the prose needs the
+surrounding meaning, and guessing wrong silently mangles text a human is about to
+read.
+
+Alongside it: `json_error_context` quotes a window around the flagged column
+instead of clipping the head (which, for a pretty-printed review, is always the
+`summary` — never the break), converting serde's **byte** column to a char index
+first so em dashes and curly quotes don't slide the window off the very spot it
+exists to show. Truncation (`Category::Eof`) is split from a stray character and
+noted in the review's own `summary`, because the repair prompt closes an open value
+— keeping what arrived and silently dropping the rest — and a partial review must
+not read as a complete one to whoever is deciding the merge. Finding counts are
+compared across the pass and warn on divergence; the before-count is a substring
+count over text that by definition does not parse, so it can never fail a review.
+
+The repair is attempted **only** on `Category::Syntax` or `Eof` — the failures the
+prompt is written for. A `Data` failure (valid JSON of the wrong shape, e.g. a
+missing `recommendation`) returns its error directly rather than paying for a call
+that would come back unchanged. The prompt is deliberately *not* broadened to
+backfill missing fields: the absent field there is the review's verdict, and a
+second model told to supply one would invent an `APPROVE` or a `BLOCK` that no
+reviewer ever reached. Losing a judgement is better than manufacturing one.
+
+**Why this is a core change and not a backend one.** It was fixed in one consumer
+backend by hand while every other path kept the bug — `review_diff`, `review_file`,
+`agent::agentic_review` (this crate's own default agentic path, not a downstream
+consumer), and every downstream agent backend. All of them turn model output into a
+`Review` through the same two lines. **All three in-core sites now salvage**, and the
+agentic one folds its repair tokens into the review's.
+
+**`ReviewBackend::complete_detailed`.** The repair is a second billed call, and
+`complete()` returns bare `String`, so its `usage` was unreachable — a repaired
+review would report only the first call's tokens. Added as a **defaulted** method
+returning `Completion { text, model, usage }` rather than by widening `complete()`,
+so no existing implementation breaks.
+
+The default **delegates to `complete`**, which matters more than it looks: routing
+it to OpenRouter instead would mean a consumer running an agent CLI has its repair
+answered by a different service and model, and fails outright without an
+`OPENROUTER_API_KEY` — a review discarded by the very mechanism meant to salvage it.
+So a backend overriding only `complete` keeps every call, repair included, on its
+own backend, and simply reports no usage. `OpenRouterBackend` overrides
+`complete_detailed` to report real figures, and `chat_completion` stops discarding
+the `usage` it already parsed out of the response.
+
+
 ## 0.14.0
 
 Three changes that together let a consumer review a **local diff** — a branch, a

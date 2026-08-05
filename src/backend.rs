@@ -88,6 +88,34 @@ pub trait ReviewBackend: Send + Sync {
         let client = reqwest::Client::new();
         crate::llm::chat_text(&client, cfg, system, user).await
     }
+
+    /// [`Self::complete`] plus what the call reported about itself — the model used
+    /// and the tokens spent. Powers the JSON repair pass, which is a second billed
+    /// call on the same review: usage that omits it invents a smaller bill.
+    ///
+    /// **The default delegates to [`Self::complete`]**, so a backend that overrides
+    /// only `complete` keeps every call — including the repair — on its own
+    /// backend, and simply reports no usage. It deliberately does *not* fall back to
+    /// the OpenRouter path: a consumer running an agent CLI would then have its
+    /// repair silently answered by a different service and model, and would fail
+    /// outright if it has no `OPENROUTER_API_KEY` — a review discarded by the very
+    /// mechanism meant to salvage it.
+    ///
+    /// Override it to report usage. Overriding it does not replace `complete`;
+    /// backends that want both should implement this and have `complete` return its
+    /// `.text`.
+    async fn complete_detailed(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+    ) -> Result<crate::llm::Completion> {
+        Ok(crate::llm::Completion {
+            text: self.complete(cfg, system, user).await?,
+            model: None,
+            usage: None,
+        })
+    }
 }
 
 /// Default backend: reviews with a Claude model via OpenRouter.
@@ -100,6 +128,19 @@ pub struct OpenRouterBackend;
 
 #[async_trait]
 impl ReviewBackend for OpenRouterBackend {
+    /// Reports usage, which the trait default cannot: it goes through `complete`,
+    /// whose `String` return has nowhere to put it. This is the backend that
+    /// actually makes the OpenRouter call, so it has the figures to hand.
+    async fn complete_detailed(
+        &self,
+        cfg: &Config,
+        system: &str,
+        user: &str,
+    ) -> Result<crate::llm::Completion> {
+        let client = reqwest::Client::new();
+        crate::llm::chat_completion(&client, cfg, system, user).await
+    }
+
     async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
         // Both paths take their system prompt from the context: the rubric differs
         // (the agentic one describes tools), the injected rules never do.
@@ -152,5 +193,58 @@ impl ReviewBackend for OpenRouterBackend {
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod complete_seam_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A consumer backend of the shape the trait docs invite: it overrides
+    /// `complete` and nothing else.
+    struct OverridesCompleteOnly(AtomicUsize);
+
+    #[async_trait]
+    impl ReviewBackend for OverridesCompleteOnly {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            unimplemented!("not exercised")
+        }
+        async fn complete(&self, _cfg: &Config, _system: &str, user: &str) -> Result<String> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(format!("answered by the consumer backend: {user}"))
+        }
+    }
+
+    /// The repair pass runs through `complete_detailed`. If its default reached for
+    /// OpenRouter instead of `self.complete`, a consumer running an agent CLI would
+    /// have its repair answered by a different service and model — and would fail
+    /// outright with no `OPENROUTER_API_KEY`, discarding the review by the very
+    /// mechanism meant to salvage it.
+    ///
+    /// No network is configured here, so if this ever regresses to the OpenRouter
+    /// path it fails rather than silently passing.
+    #[tokio::test]
+    async fn the_default_complete_detailed_stays_on_the_consumer_backend() {
+        let backend = OverridesCompleteOnly(AtomicUsize::new(0));
+        // from_env with no OPENROUTER_API_KEY set: if this ever regresses to the
+        // OpenRouter path it errors on the missing key rather than passing quietly.
+        let cfg = Config::from_env();
+
+        let out = backend
+            .complete_detailed(&cfg, "sys", "repair this")
+            .await
+            .expect("must not reach for OpenRouter");
+
+        assert!(out.text.contains("answered by the consumer backend"));
+        assert_eq!(
+            backend.0.load(Ordering::Relaxed),
+            1,
+            "complete_detailed must delegate to the backend's own complete"
+        );
+        assert!(
+            out.usage.is_none(),
+            "no usage is honest; a wrong figure is not"
+        );
     }
 }
