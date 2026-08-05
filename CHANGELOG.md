@@ -27,6 +27,14 @@ not read as a complete one to whoever is deciding the merge. Finding counts are
 compared across the pass and warn on divergence; the before-count is a substring
 count over text that by definition does not parse, so it can never fail a review.
 
+The repair is attempted **only** on `Category::Syntax` or `Eof` — the failures the
+prompt is written for. A `Data` failure (valid JSON of the wrong shape, e.g. a
+missing `recommendation`) returns its error directly rather than paying for a call
+that would come back unchanged. The prompt is deliberately *not* broadened to
+backfill missing fields: the absent field there is the review's verdict, and a
+second model told to supply one would invent an `APPROVE` or a `BLOCK` that no
+reviewer ever reached. Losing a judgement is better than manufacturing one.
+
 **Why this is a core change and not a backend one.** It was fixed in one consumer
 backend by hand while every other path kept the bug — `review_diff`, `review_file`,
 `agent::agentic_review` (this crate's own default agentic path, not a downstream

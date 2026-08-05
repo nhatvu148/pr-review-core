@@ -722,6 +722,27 @@ where
         Ok(review) => return Ok((review, None)),
         Err(e) => e,
     };
+    // Only attempt a repair on a failure the repair prompt can actually address.
+    // `JSON_REPAIR_SYSTEM` says "fix syntax only", so a `Data` failure — valid JSON
+    // of the wrong shape, e.g. a missing `recommendation` — would burn a second
+    // billed call and come back the same, surfacing this error anyway.
+    //
+    // Deliberately *not* fixed by broadening the prompt to backfill missing fields.
+    // The absent field here is the review's verdict; a second model told to supply
+    // one would invent an APPROVE or a BLOCK that no reviewer ever reached. That is
+    // a fabricated recommendation on a PR, which is worse than a failed review —
+    // the whole point of the salvage is to avoid losing a judgement, not to
+    // manufacture one.
+    if !matches!(
+        err.classify(),
+        serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+    ) {
+        return Err(anyhow::anyhow!(
+            "could not parse review JSON ({err}) {}; not a syntax error, so the repair \
+             pass would not have helped",
+            json_error_context(json, &err)
+        ));
+    }
     tracing::warn!(
         "{what}: review JSON did not parse ({err}) {}; asking the model to repair it",
         json_error_context(json, &err)
@@ -1047,5 +1068,57 @@ mod salvage_tests {
         .expect("both present");
         assert_eq!(neither.total_tokens, None);
         assert!(add_usage(None, None).is_none(), "nothing reported at all");
+    }
+}
+
+#[cfg(test)]
+mod repair_gating_tests {
+    use super::*;
+
+    /// `JSON_REPAIR_SYSTEM` says "fix syntax only", so a shape failure is not
+    /// something it can fix: the model would return the same object and the second
+    /// call is billed for nothing.
+    ///
+    /// The closure panics if reached, so a regression is loud rather than merely
+    /// expensive.
+    #[tokio::test]
+    async fn a_shape_failure_does_not_burn_a_repair_call() {
+        // Valid JSON, missing the required `recommendation` — Category::Data.
+        let wrong_shape = r#"{"summary": "s", "findings": []}"#;
+        let err = serde_json::from_str::<Review>(wrong_shape).expect_err("wrong shape");
+        assert_eq!(
+            err.classify(),
+            serde_json::error::Category::Data,
+            "precondition: a shape failure, not a syntax one"
+        );
+
+        let err = parse_review_with_repair(wrong_shape, "t", |_s, _b| async {
+            panic!("a Data failure must not reach the repair pass")
+        })
+        .await
+        .expect_err("still fails, just without paying for it");
+        assert!(format!("{err:#}").contains("not a syntax error"), "{err:#}");
+    }
+
+    /// The other side of the gate: the failures the prompt *is* written for must
+    /// still reach it. Getting this backwards silently disables the whole feature.
+    #[tokio::test]
+    async fn syntax_and_truncation_still_reach_the_repair_pass() {
+        for (label, broken) in [
+            ("syntax", r#"{"summary": "s", "recommendation": "A",}"#),
+            ("truncation", r#"{"summary": "cut off"#),
+        ] {
+            let fixed = r#"{"summary": "s", "recommendation": "APPROVE", "findings": []}"#;
+            let (review, _) = parse_review_with_repair(broken, "t", |_s, _b| async move {
+                Ok(Completion {
+                    text: fixed.to_string(),
+                    model: None,
+                    usage: None,
+                })
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{label} must be repaired, got: {e:#}"));
+            assert_eq!(review.recommendation, "APPROVE", "{label}");
+        }
     }
 }
