@@ -25,7 +25,7 @@ use serde::Deserialize;
 
 use crate::clip;
 use crate::config::{require, Config};
-use crate::llm::{extract_json, Review, ReviewResult, Usage};
+use crate::llm::{extract_json, ReviewResult, Usage};
 use crate::providers::PrMeta;
 use crate::repo::Workspace;
 
@@ -230,7 +230,7 @@ fn build_registry(ws: &Workspace, cfg: &Config) -> ToolRegistry {
 /// return a parseable review.
 #[allow(clippy::too_many_arguments)]
 pub async fn agentic_review(
-    _client: &Client,
+    client: &Client,
     cfg: &Config,
     meta: &PrMeta,
     diff: &str,
@@ -325,9 +325,19 @@ pub async fn agentic_review(
     let content = outcome.content.as_deref().unwrap_or_default();
     let parsed = extract_json(content)
         .ok_or_else(|| anyhow::anyhow!("agent returned no JSON: {}", clip(content, 300)))?;
-    let review: Review = serde_json::from_str(parsed).map_err(|e| {
-        anyhow::anyhow!("could not parse agent review ({e}): {}", clip(parsed, 300))
-    })?;
+    // The same salvage as the other two parse sites. This one is the crate's own
+    // default agentic path (`cfg.agentic`), not a downstream consumer — and an
+    // agent review is the most expensive kind to lose, since a stray `\"` discards
+    // however many minutes of tool-driven exploration produced it.
+    let (review, repair_usage) =
+        crate::llm::parse_review_with_repair(
+            parsed,
+            "agentic review",
+            |system, broken| async move {
+                crate::llm::chat_completion(client, cfg, system, &broken).await
+            },
+        )
+        .await?;
 
     let usage = (outcome.total_tokens > 0).then_some(Usage {
         prompt_tokens: None,
@@ -339,7 +349,8 @@ pub async fn agentic_review(
     Ok(ReviewResult {
         review,
         model: outcome.model,
-        usage,
+        // The repair is a second billed call; its tokens still count.
+        usage: crate::llm::add_usage(usage, repair_usage),
     })
 }
 

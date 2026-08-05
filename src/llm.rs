@@ -638,7 +638,7 @@ fn count_findings_hint(raw: &str) -> usize {
 ///
 /// Every count is independently optional, so a missing figure on one side must not
 /// erase a present one on the other — absent means "not reported", not zero.
-fn add_usage(review: Option<Usage>, repair: Option<Usage>) -> Option<Usage> {
+pub(crate) fn add_usage(review: Option<Usage>, repair: Option<Usage>) -> Option<Usage> {
     fn add(a: Option<u32>, b: Option<u32>) -> Option<u32> {
         match (a, b) {
             (Some(a), Some(b)) => Some(a.saturating_add(b)),
@@ -812,9 +812,6 @@ mod salvage_tests {
         }
     }
 
-    /// A repair that returns whatever it is told to, so the whole salvage path can
-    /// be driven without a model. This is the thing that was untestable while the
-    /// salvage lived in a backend: there, repairing meant spawning a real CLI.
     /// What a repair pass would have returned. Paired with an inline
     /// `|_, _| async move { Ok(completion(...)) }` closure, this drives the whole
     /// salvage path without a model — the thing that was untestable while the

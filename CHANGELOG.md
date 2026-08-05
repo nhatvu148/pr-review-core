@@ -28,9 +28,11 @@ compared across the pass and warn on divergence; the before-count is a substring
 count over text that by definition does not parse, so it can never fail a review.
 
 **Why this is a core change and not a backend one.** It was fixed in one consumer
-backend by hand while three other paths kept the bug — `review_diff`, `review_file`,
-and every downstream agent backend. All of them turn model output into a `Review`
-through the same two lines. Both in-core sites now salvage.
+backend by hand while every other path kept the bug — `review_diff`, `review_file`,
+`agent::agentic_review` (this crate's own default agentic path, not a downstream
+consumer), and every downstream agent backend. All of them turn model output into a
+`Review` through the same two lines. **All three in-core sites now salvage**, and the
+agentic one folds its repair tokens into the review's.
 
 **`ReviewBackend::complete_detailed`.** The repair is a second billed call, and
 `complete()` returns bare `String`, so its `usage` was unreachable — a repaired
