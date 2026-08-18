@@ -21,32 +21,32 @@ env:
 jobs:
   check:
     name: fmt + clippy + test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-features --all-targets -- -D warnings
+    uses: nhatvu148/shared-workflows/.github/workflows/rust-ci.yml@v2
+    with:
+      components: rustfmt, clippy
       # --all-features so the agentic path compiles too, and doc-tests run: the
       # rustdoc examples are part of the public API contract.
-      - run: cargo test --all-features
+      commands: |
+        cargo fmt --check
+        cargo clippy --all-features --all-targets -- -D warnings
+        cargo test --all-features
 
   package:
     name: cargo package
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+    uses: nhatvu148/shared-workflows/.github/workflows/rust-ci.yml@v2
+    with:
       # Catches a publish that would fail on metadata or a missing include long
       # before `cargo publish` is typed — the flow here is tag-then-publish, where
       # a broken package means a burnt version number.
-      - run: cargo package
+      commands: |
+        cargo package
 
   downstream:
+    # Deliberately NOT on the shared workflow. It checks out into a named path
+    # (`path: core`) so consumers can repoint at it, and it needs a secret. The
+    # shared workflow fixes the setup precisely so callers cannot vary it, which
+    # is right for the common case and wrong for this one.
+    #
     # Named for what it ACTUALLY covers. This job can only build the public
     # consumers; the private ones (pr-review-bot, and a client-org bot that is
     # deliberately not named in a public workflow) are not checked here. A job
