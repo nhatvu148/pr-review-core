@@ -67,18 +67,26 @@ pub struct Funnel {
     pub unanchored: usize,
 }
 
-/// One finding as logged: its metadata, whether it anchored, and its text.
+/// One finding as logged: its metadata, where it was posted, and its text.
 #[derive(Debug, Clone, Serialize)]
 pub struct LoggedFinding {
     pub severity: String,
     pub file: String,
+    /// The line the *model* named. Not necessarily where the comment went — see
+    /// `anchored_line`.
     pub line: Option<u64>,
     pub confidence: Option<u8>,
     /// True when this finding was posted as an inline comment rather than folded
-    /// into the summary. The join key for any later outcome pass: an inline
-    /// comment on `(file, line)` is the thing a human replies to, resolves, or
-    /// the reconciler later deletes.
+    /// into the summary.
     pub anchored: bool,
+    /// The line the inline comment was actually posted on, or `None` when the
+    /// finding folded into the summary.
+    ///
+    /// Differs from `line` whenever the re-anchor step moved the finding onto a
+    /// nearby diff line — which `REANCHOR_FINDINGS` does by default. This, not
+    /// `line`, is the join key for any later outcome pass: `(file, anchored_line)`
+    /// is what a human replies to and what the reconciler later deletes.
+    pub anchored_line: Option<u64>,
     pub body: String,
 }
 
@@ -151,26 +159,32 @@ impl RunLog {
     }
 }
 
-/// Build the logged findings, marking which ones anchored.
+/// Build the logged findings, given the line each one was posted on.
 ///
-/// A finding anchored iff an inline comment was posted at its `(file, line)`.
-/// Matching on the pair rather than on position is what keeps this correct after
-/// the re-anchor step moves a finding's line.
-pub fn logged_findings(
-    findings: &[Finding],
-    inline: &[crate::providers::InlineComment],
-) -> Vec<LoggedFinding> {
+/// `anchors` is index-aligned with `findings`: `anchors[i]` is the line finding
+/// `i` was anchored to, or `None` if it folded into the summary. It has to be
+/// carried out of the anchoring loop rather than re-derived here, because the
+/// re-anchor step posts a comment on a line the finding itself never records —
+/// re-matching on the finding's own `(file, line)` would report every re-anchored
+/// finding as unanchored, which is the common case with `REANCHOR_FINDINGS` on.
+///
+/// A shorter `anchors` reads as "not anchored" for the remaining findings, which
+/// is what the advisory-only path (no model, no inline comments) wants.
+pub fn logged_findings(findings: &[Finding], anchors: &[Option<u64>]) -> Vec<LoggedFinding> {
     findings
         .iter()
-        .map(|f| LoggedFinding {
-            severity: f.severity.clone(),
-            file: f.file.clone(),
-            line: f.line,
-            confidence: f.confidence,
-            anchored: inline
-                .iter()
-                .any(|c| c.path == f.file && Some(c.line) == f.line),
-            body: f.body.clone(),
+        .enumerate()
+        .map(|(i, f)| {
+            let anchored_line = anchors.get(i).copied().flatten();
+            LoggedFinding {
+                severity: f.severity.clone(),
+                file: f.file.clone(),
+                line: f.line,
+                confidence: f.confidence,
+                anchored: anchored_line.is_some(),
+                anchored_line,
+                body: f.body.clone(),
+            }
         })
         .collect()
 }
@@ -248,6 +262,7 @@ mod tests {
                 line: Some(12),
                 confidence: Some(90),
                 anchored: true,
+                anchored_line: Some(12),
                 body: "unwrap on an empty vec".into(),
             }],
             usage: None,
@@ -288,35 +303,48 @@ mod tests {
         append(&blocker.join("under/runs.jsonl"), &rec());
     }
 
-    /// Anchoring is decided by `(file, line)`, not by index — a finding that
-    /// folded into the summary must not be marked anchored because another one
-    /// happened to post at its position.
-    #[test]
-    fn anchored_is_matched_on_file_and_line() {
-        let findings = vec![
-            Finding {
-                severity: "HIGH".into(),
-                file: "src/a.rs".into(),
-                line: Some(12),
-                body: "anchored".into(),
-                confidence: None,
-            },
-            Finding {
-                severity: "LOW".into(),
-                file: "src/b.rs".into(),
-                line: Some(99),
-                body: "out of diff".into(),
-                confidence: None,
-            },
-        ];
-        let inline = vec![crate::providers::InlineComment {
-            path: "src/a.rs".into(),
-            line: 12,
-            body: "anchored".into(),
-        }];
+    fn finding(file: &str, line: Option<u64>) -> Finding {
+        Finding {
+            severity: "HIGH".into(),
+            file: file.into(),
+            line,
+            body: "a body".into(),
+            confidence: None,
+        }
+    }
 
-        let logged = logged_findings(&findings, &inline);
+    /// The posted line comes from `anchors`, and is never re-derived from the
+    /// finding's own line: a re-anchored finding keeps the line the model named
+    /// while its comment goes somewhere else, and both belong in the record.
+    #[test]
+    fn the_posted_line_comes_from_the_anchors_not_the_finding() {
+        let findings = vec![
+            finding("src/a.rs", Some(12)), // anchored where the model said
+            finding("src/a.rs", Some(20)), // re-anchored two lines down
+            finding("src/b.rs", Some(99)), // folded into the summary
+        ];
+        let anchors = vec![Some(12), Some(22), None];
+
+        let logged = logged_findings(&findings, &anchors);
+
         assert!(logged[0].anchored);
-        assert!(!logged[1].anchored, "no inline comment at (src/b.rs, 99)");
+        assert_eq!(logged[0].anchored_line, Some(12));
+
+        assert!(logged[1].anchored, "a re-anchored finding IS anchored");
+        assert_eq!(logged[1].line, Some(20), "the model's line is preserved");
+        assert_eq!(logged[1].anchored_line, Some(22), "the posted line differs");
+
+        assert!(!logged[2].anchored);
+        assert_eq!(logged[2].anchored_line, None);
+    }
+
+    /// The advisory-only path has findings and no anchors at all.
+    #[test]
+    fn a_short_anchors_slice_reads_as_unanchored() {
+        let findings = vec![finding("src/a.rs", Some(1)), finding("src/b.rs", None)];
+        let logged = logged_findings(&findings, &[]);
+        assert!(logged
+            .iter()
+            .all(|f| !f.anchored && f.anchored_line.is_none()));
     }
 }

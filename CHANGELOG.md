@@ -18,7 +18,12 @@ salvage fires at in production.
 The funnel is collected inside `finish_review`, because that is the only place it
 exists: each stage consumes its predecessor's vector, so a caller holding the
 posted findings cannot reconstruct what the critique, the confidence floor, or
-the cap removed.
+the cap removed. Each finding's resolved anchor comes out of the same place and
+for the same reason: `reanchor` posts a comment on a line the finding itself
+never records, so a record carries both `line` (what the model said) and
+`anchored_line` (where the comment went). The second is the join key for any
+later outcome pass — the first would find nothing whenever `REANCHOR_FINDINGS`
+moved a finding, which is the default and the common case.
 
 Two limits, stated because a run log invites both mistakes:
 

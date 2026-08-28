@@ -778,8 +778,9 @@ struct RunLogParts<'a> {
     advisories: usize,
     truncated_salvage: bool,
     funnel: crate::runlog::Funnel,
-    /// The inline comments actually built, to mark which findings anchored.
-    inline: &'a [InlineComment],
+    /// The line each posted finding anchored to, index-aligned with
+    /// `out.findings_detail`; empty means none anchored.
+    anchors: &'a [Option<u64>],
     started: std::time::Instant,
 }
 
@@ -810,7 +811,7 @@ fn log_run(cfg: &Config, p: RunLogParts<'_>) {
         truncated_salvage: p.truncated_salvage,
         recommendation: p.out.recommendation.clone(),
         funnel: p.funnel,
-        findings: crate::runlog::logged_findings(&p.out.findings_detail, p.inline),
+        findings: crate::runlog::logged_findings(&p.out.findings_detail, p.anchors),
         usage: p.out.usage.clone(),
         duration_ms: p.started.elapsed().as_millis() as u64,
     };
@@ -913,6 +914,14 @@ struct FinishedReview {
     /// predecessor's vector, so a caller holding only the final findings cannot
     /// reconstruct what the critique, the confidence floor, or the cap removed.
     funnel: crate::runlog::Funnel,
+    /// The line each of `findings` was anchored to, index-aligned, or `None` for
+    /// the ones that folded into the summary.
+    ///
+    /// Also only knowable here. The re-anchor step posts a comment on a line the
+    /// finding itself never records, so `(file, line)` on a finding is NOT enough
+    /// to find its comment afterwards — re-deriving it that way reports every
+    /// re-anchored finding as unanchored.
+    anchors: Vec<Option<u64>>,
 }
 
 /// Everything between the backend's answer and a postable review: self-critique,
@@ -986,6 +995,7 @@ async fn finish_review(
     // rejects an out-of-diff anchor.
     let mut inline: Vec<InlineComment> = Vec::new();
     let mut unanchored: Vec<&Finding> = Vec::new();
+    let mut anchors: Vec<Option<u64>> = Vec::with_capacity(findings.len());
     for f in &findings {
         let mut anchor = f
             .line
@@ -997,6 +1007,7 @@ async fn finish_review(
                 anchor = reanchor(l, v, t, &f.body);
             }
         }
+        anchors.push(anchor);
         match anchor {
             Some(line) => inline.push(InlineComment {
                 path: f.file.clone(),
@@ -1019,6 +1030,7 @@ async fn finish_review(
         summary,
         inline,
         funnel,
+        anchors,
     }
 }
 
@@ -1130,7 +1142,7 @@ pub async fn run_review_with(
                         unanchored: n,
                         ..Default::default()
                     },
-                    inline: &[],
+                    anchors: &[],
                     started,
                 },
             );
@@ -1209,11 +1221,9 @@ pub async fn run_review_with(
         summary,
         inline,
         funnel,
+        anchors,
     } = finished;
     let inline_count = inline.len();
-    // Built before `inline` is moved into the post — anchoring is decided by
-    // `(file, line)`, and the comments are the only record of which findings got one.
-    let logged_inline = inline.clone();
     let post = ReviewPost {
         summary: summary.clone(),
         inline,
@@ -1252,7 +1262,7 @@ pub async fn run_review_with(
             // the only signal for it that survives to here.
             truncated_salvage: truncated,
             funnel,
-            inline: &logged_inline,
+            anchors: &anchors,
             started,
         },
     );
@@ -1712,11 +1722,17 @@ mod orchestrator_tests {
     /// A GitHub stub serving one PR's metadata and diff. Anything else — notably
     /// `.prbot.toml` — 404s, which the provider reads as "absent".
     async fn github_stub() -> MockServer {
+        github_stub_with(DIFF).await
+    }
+
+    /// [`github_stub`] over a caller-chosen diff, for tests that need particular
+    /// line numbers on the new side.
+    async fn github_stub_with(diff: &str) -> MockServer {
         let s = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/pulls/1"))
             .and(header("accept", "application/vnd.github.diff"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+            .respond_with(ResponseTemplate::new(200).set_body_string(diff.to_string()))
             .mount(&s)
             .await;
         Mock::given(method("GET"))
@@ -1884,8 +1900,77 @@ mod orchestrator_tests {
         assert_eq!(findings[0]["severity"], "HIGH");
         assert_eq!(findings[0]["confidence"], 90);
         assert_eq!(findings[0]["anchored"], true);
+        assert_eq!(findings[0]["anchored_line"], 2);
         assert_eq!(findings[2]["file"], "src/zzz.rs");
         assert_eq!(findings[2]["anchored"], false);
+        assert!(findings[2]["anchored_line"].is_null());
+    }
+
+    /// New-side lines: 1 is context, 2 and 3 are added. A finding that names
+    /// `calcTotal` but claims line 5 re-anchors onto line 3.
+    const DRIFT_DIFF: &str = "diff --git a/src/order.ts b/src/order.ts\n--- a/src/order.ts\n+++ b/src/order.ts\n@@ -1,1 +1,3 @@\n const items = [];\n+const subtotal = sum(items);\n+return calcTotal(order, tax);\n";
+
+    /// Proposes one finding whose line is off the diff but whose body names a
+    /// symbol on a nearby added line — the re-anchor path.
+    struct DriftBackend;
+
+    #[async_trait]
+    impl ReviewBackend for DriftBackend {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "one drifted finding".to_string(),
+                    recommendation: "APPROVE WITH CHANGES".to_string(),
+                    findings: vec![crate::llm::Finding {
+                        severity: "HIGH".to_string(),
+                        file: "src/order.ts".to_string(),
+                        line: Some(5),
+                        body: "`calcTotal` now needs a tax arg.".to_string(),
+                        confidence: Some(90),
+                    }],
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    /// A re-anchored finding must be logged as anchored, at the line the comment
+    /// actually went to.
+    ///
+    /// The first version of this module decided `anchored` by re-matching the
+    /// finding's own `(file, line)` against the posted comments. `reanchor` only
+    /// ever returns a line *different* from the finding's, and the finding is
+    /// never updated with it — so every re-anchored finding logged as
+    /// `anchored: false` despite having a comment on the PR. With
+    /// `REANCHOR_FINDINGS` defaulting to on, that is the common case, and the
+    /// per-finding flags would have disagreed with `funnel.anchored` in most
+    /// production records.
+    #[tokio::test]
+    async fn a_reanchored_finding_logs_the_line_its_comment_went_to() {
+        let srv = github_stub_with(DRIFT_DIFF).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.reanchor_findings = true; // the default, and the bug's precondition
+        cfg.run_log_path = Some(log.clone());
+
+        run_review_with(&cfg, input(), &DriftBackend)
+            .await
+            .expect("the review runs");
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        let v: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("one parseable JSON line");
+
+        assert_eq!(v["funnel"]["anchored"], 1, "the comment was posted inline");
+        assert_eq!(v["funnel"]["unanchored"], 0);
+
+        let f = &v["findings"][0];
+        assert_eq!(f["line"], 5, "the line the model named is preserved");
+        assert_eq!(f["anchored"], true, "it did anchor — this was the bug");
+        assert_eq!(f["anchored_line"], 3, "onto the line naming calcTotal");
     }
 
     /// The privacy default. A record carries review commentary on someone's
