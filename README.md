@@ -124,6 +124,44 @@ size caps) are also read from the environment — see `src/config.rs`.
 | `CVE_MAX_PACKAGES` | `100` | Max distinct packages queried against OSV per review. |
 | `OSV_API_BASE` | `https://api.osv.dev` | OSV API base (override for a mirror/test double). |
 
+## Run log (local, opt-in)
+
+Set `PRBOT_RUN_LOG` to a file path and every review appends one JSON line
+describing the run: the funnel of findings through each post-processing stage,
+the findings themselves, token usage, and wall time.
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `PRBOT_RUN_LOG` | *(unset = off)* | Path to a JSONL run log. Parent directories are created. Empty string also means off. |
+
+It exists to answer the questions a bug-corpus benchmark structurally cannot,
+because they are about the runs that actually happen rather than about planted
+defects: how often the `MAX_FINDINGS` cap truncates, how often `SELF_CRITIQUE`
+drops a finding, how often a review is salvaged from a response the model cut
+off, what the severity mix looks like on a given repo.
+
+```console
+$ export PRBOT_RUN_LOG=~/.local/share/pr-review/runs.jsonl
+$ jq -s 'map(.funnel) | {
+    runs: length,
+    proposed: (map(.model_raw) | add),
+    posted: (map(.posted_findings) | add),
+    capped: (map(.after_collapse - .posted_findings) | add),
+    unanchored: (map(.unanchored) | add),
+  }' "$PRBOT_RUN_LOG"
+```
+
+Two things it is not:
+
+- **It is not a recall measurement.** Nothing in a record knows whether a finding
+  was correct, and a real PR never reveals what the reviewer missed. These
+  records measure the reviewer's *behaviour*; no aggregate over them turns into a
+  hit rate.
+- **It is not telemetry.** A record contains the finding text, which is review
+  commentary on someone's source. The log is off by default, is written only to
+  the local path you name, and nothing in this crate uploads it. Point it
+  somewhere private — and if that is inside a repo, gitignore it.
+
 ## PR commands
 
 Wire a comment webhook (see the bot binaries) and the reviewer answers these

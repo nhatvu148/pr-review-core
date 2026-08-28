@@ -155,6 +155,14 @@ pub struct Config {
     pub cve_max_packages: usize,
     /// Base URL of the OSV.dev API (override for a mirror or a test double).
     pub osv_api_base: String,
+
+    /// Path of a local JSONL run log, one line per review — `PRBOT_RUN_LOG`.
+    ///
+    /// `None` (the default) disables logging entirely. Opt-in because a record
+    /// carries the finding text, which is review commentary on someone's source:
+    /// a deployed bot must log nothing unless its operator asked it to, and the
+    /// file never leaves the machine that wrote it. See [`crate::runlog`].
+    pub run_log_path: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -273,6 +281,13 @@ impl Config {
             cve_scan: env_or("CVE_SCAN", "true").parse().unwrap_or(true),
             cve_max_packages: env_or("CVE_MAX_PACKAGES", "100").parse().unwrap_or(100),
             osv_api_base: env_or("OSV_API_BASE", "https://api.osv.dev"),
+
+            // Empty or unset both mean off, so `PRBOT_RUN_LOG=` in an env file
+            // disables it without deleting the line.
+            run_log_path: env::var("PRBOT_RUN_LOG")
+                .ok()
+                .filter(|p| !p.trim().is_empty())
+                .map(std::path::PathBuf::from),
         }
     }
 
