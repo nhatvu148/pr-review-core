@@ -1199,18 +1199,34 @@ pub async fn run_review_with(
     // so the model knows every change's scope. Tier B (tree-sitter over fetched
     // files) with a Tier A (hunk-header) fallback — fully fail-open, so a hiccup
     // just yields an empty string and the review proceeds without it.
-    let (structural, change_map) = if cfg.structural_context {
-        crate::structure::structural_context_mapped(
-            &provider,
-            &client,
-            cfg,
-            &input.repo,
-            &meta,
-            &diff,
-        )
-        .await
-    } else {
-        (String::new(), crate::changemap::ChangeMap::default())
+    // The map costs a pass the prompt block does not need, so it is only asked
+    // for when something downstream will render it.
+    let want_map = cfg.walkthrough || cfg.diagram;
+    let (structural, change_map) = match (cfg.structural_context, want_map) {
+        (true, true) => {
+            crate::structure::structural_context_mapped(
+                &provider,
+                &client,
+                cfg,
+                &input.repo,
+                &meta,
+                &diff,
+            )
+            .await
+        }
+        (true, false) => (
+            crate::structure::structural_context(
+                &provider,
+                &client,
+                cfg,
+                &input.repo,
+                &meta,
+                &diff,
+            )
+            .await,
+            crate::changemap::ChangeMap::default(),
+        ),
+        (false, _) => (String::new(), crate::changemap::ChangeMap::default()),
     };
     if !structural.is_empty() {
         tracing::info!(
@@ -1416,7 +1432,13 @@ pub async fn run_review_local(
 
     // Structural context from the checkout when there is one; hunk headers (Tier A)
     // otherwise. Fail-open, like the PR path — an empty string just omits the block.
+    let mut change_map = crate::changemap::ChangeMap::default();
     let structural = match (cfg.structural_context, input.repo_root.as_deref()) {
+        (true, Some(root)) if cfg.walkthrough || cfg.diagram => {
+            let (block, map) = crate::structure::structural_context_local_mapped(cfg, root, &diff);
+            change_map = map;
+            block
+        }
         (true, Some(root)) => crate::structure::structural_context_local(cfg, root, &diff),
         (true, None) => crate::structure::hunk_context(&diff),
         (false, _) => String::new(),
@@ -1443,7 +1465,17 @@ pub async fn run_review_local(
         injected_rules: &injected_rules,
     };
     let result = backend.review(&ctx).await?;
-    let finished = finish_review(cfg, backend, &meta, &diff, &result, hygiene).await;
+    let mut finished = finish_review(cfg, backend, &meta, &diff, &result, hygiene).await;
+    // Same feature on this path: a local review's deliverable *is* its
+    // `summary_markdown`, so leaving it unwired made WALKTHROUGH/DIAGRAM silently
+    // a no-op for every caller of this entry point.
+    append_change_map(
+        cfg,
+        LOCAL_PROVIDER,
+        &change_map,
+        &finished.findings,
+        &mut finished.summary,
+    );
 
     Ok(RunReviewOutput {
         provider: LOCAL_PROVIDER.to_string(),
@@ -1633,6 +1665,80 @@ mod local_review_tests {
 
     /// With a checkout, Tier B names the enclosing symbol from the file on disk —
     /// the local equivalent of fetching the new-side file from the provider.
+    /// The feature was wired on the PR path only, so every caller of this entry
+    /// point got `WALKTHROUGH=true` and no walkthrough. Reported by review on #38.
+    #[tokio::test]
+    async fn the_local_path_renders_the_walkthrough_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/order.rs"), NEW_SIDE).unwrap();
+
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.structural_context = true;
+        c.walkthrough = true;
+
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: Some(dir.path().to_path_buf()),
+                label: "branch".to_string(),
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert!(
+            out.summary_markdown.contains("Walkthrough"),
+            "{}",
+            out.summary_markdown
+        );
+        assert!(
+            out.summary_markdown.contains("`fn total`"),
+            "{}",
+            out.summary_markdown
+        );
+    }
+
+    /// ...and stays off when it is off, on the same path.
+    #[tokio::test]
+    async fn the_local_path_appends_nothing_when_the_feature_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/order.rs"), NEW_SIDE).unwrap();
+
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.structural_context = true;
+        c.walkthrough = false;
+        c.diagram = false;
+
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: Some(dir.path().to_path_buf()),
+                label: "branch".to_string(),
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert!(
+            !out.summary_markdown.contains("Walkthrough"),
+            "{}",
+            out.summary_markdown
+        );
+        assert!(
+            !out.summary_markdown.contains("mermaid"),
+            "{}",
+            out.summary_markdown
+        );
+    }
+
     #[tokio::test]
     async fn a_repo_root_supplies_tree_sitter_structural_context() {
         let dir = tempfile::tempdir().unwrap();

@@ -571,7 +571,14 @@ pub fn render_diagram(map: &ChangeMap) -> String {
 /// Posting the block there would leave a wall of raw mermaid source in the
 /// comment, so the diagram is simply skipped.
 pub fn supports_mermaid(provider: &str) -> bool {
-    matches!(provider, "github" | "gitlab")
+    // `local` is not a host at all: a local review posts nowhere and hands its
+    // markdown straight back to the caller, so there is no renderer to be
+    // incompatible with. Withholding the diagram there would be withholding it
+    // from the one caller guaranteed to be able to display it.
+    matches!(
+        provider,
+        "github" | "gitlab" | crate::review::LOCAL_PROVIDER
+    )
 }
 
 #[cfg(test)]
@@ -1012,6 +1019,7 @@ mod tests {
     fn bitbucket_gets_no_mermaid_because_it_would_not_render_it() {
         assert!(supports_mermaid("github"));
         assert!(supports_mermaid("gitlab"));
+        assert!(supports_mermaid(crate::review::LOCAL_PROVIDER));
         assert!(!supports_mermaid("bitbucket"));
     }
 }

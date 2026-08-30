@@ -45,6 +45,15 @@ ordinary, and the all-or-nothing ceiling meant the diagram never appeared on a
 real PR. Test scaffolding sorts last in that ranking, including a `mod tests`
 inside a source file, which no path-based rule can see.
 
+The map is built only when a caller asks for it. `structural_context` and its
+local sibling take the cheap path and return an empty map, so a review with both
+features off pays nothing for either — the prompt block it produces is
+byte-identical either way. The complexity pass runs once per file and feeds both
+the prompt block and the map, rather than walking every changed function twice.
+
+Both features work on the diff-first `run_review_local` path too, whose
+deliverable *is* its `summary_markdown`.
+
 The diagram is skipped on Bitbucket, which renders no mermaid — the block would
 post as a wall of source. It is also skipped whenever there are no edges: a
 picture of disconnected boxes restates the table in a form that is harder to

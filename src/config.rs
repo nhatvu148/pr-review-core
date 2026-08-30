@@ -146,9 +146,11 @@ pub struct Config {
     /// tree-sitter spans, never model-written. Skipped on providers that don't
     /// render mermaid (Bitbucket) and whenever there are no edges to draw.
     pub diagram: bool,
-    /// Ceiling on changed symbols before edge-linking is skipped entirely — the
-    /// pairwise scan is cheap but quadratic, and a 200-node diagram is unreadable
-    /// anyway.
+    /// Ceiling on how many changed symbols edge-linking considers. The pairwise
+    /// span scan is cheap but quadratic, and a 200-node diagram is unreadable
+    /// anyway. Past this the scan **narrows** — it ranks by complexity (test
+    /// scaffolding last) and links the top slice — rather than giving up, and the
+    /// diagram says it narrowed. Giving up meant no diagram on any real PR.
     pub diagram_max_nodes: usize,
 
     /// Compute a "blast radius" for the agentic reviewer: from the clone, find the
