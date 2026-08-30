@@ -74,6 +74,11 @@ prompt through [`Config`].
   complexity, backend) can be A/B'd by re-running with the flag toggled. Dry-run;
   needs an OpenRouter key. `RunReviewOutput.findings_detail` exposes the structured
   findings for tooling.
+- **Walkthrough & change diagram** (opt-in): a per-file table (line counts, changed
+  definitions, worst complexity grade, findings filed there) and a mermaid graph of
+  how the changed symbols reference each other — both *derived* from the tree-sitter
+  parse that already ran, never model-written, so every row and arrow can be checked
+  against the code. `WALKTHROUGH` / `DIAGRAM`.
 - **Noise control**: an optional self-critique pass drops false positives / nits,
   a per-finding confidence score drives ranking, and a per-PR cap keeps reviews
   focused.
@@ -123,6 +128,47 @@ size caps) are also read from the environment — see `src/config.rs`.
 | `CVE_SCAN` | `true` | Scan changed lockfiles for known-vulnerable deps via OSV.dev. |
 | `CVE_MAX_PACKAGES` | `100` | Max distinct packages queried against OSV per review. |
 | `OSV_API_BASE` | `https://api.osv.dev` | OSV API base (override for a mirror/test double). |
+
+## Walkthrough & change diagram (opt-in)
+
+Two renderings appended to the summary comment, both **derived from the parse the
+reviewer already ran** — no model call, no extra fetch, no extra token.
+
+`WALKTHROUGH=true` adds a per-file table: line counts, the definitions the change
+landed in, the worst complexity grade among them, and the findings filed there.
+
+`DIAGRAM=true` adds a mermaid graph of the changed symbols, with an arrow wherever
+one names another inside its own definition.
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `WALKTHROUGH` | `false` | Append the per-file walkthrough table to the summary comment. |
+| `WALKTHROUGH_MAX_SYMBOLS` | `6` | Symbols listed per file before the cell collapses to `(+N more)`. |
+| `DIAGRAM` | `false` | Append the mermaid change diagram. Skipped on Bitbucket (no native mermaid) and whenever there are no edges to draw. |
+| `DIAGRAM_MAX_NODES` | `25` | Symbols considered for edge linking. Past this, linking narrows to the highest-complexity symbols (test scaffolding last) and the diagram says so. |
+
+Both need `STRUCTURAL_CONTEXT` (on by default); the complexity column additionally
+needs `COMPLEXITY_METRICS` (also on by default).
+
+**Why nothing here is model-written.** A diagram a model draws from a diff cannot
+be checked by the reader: a plausible arrow that doesn't exist in the code is
+indistinguishable from a real one, and the reader will believe it. Every arrow
+here is a call-shaped occurrence of one changed symbol's name inside another
+changed symbol's tree-sitter span, so a suspicious one can be looked up. It is a
+narrow claim, and it is the claim the caption makes — candidate references, only
+between symbols this PR changed, with same-name symbols across modules not
+disambiguated (a call through an unresolved receiver, `x.append(`, draws dotted
+rather than solid).
+
+See it before it posts on anyone's PR:
+
+```console
+$ git diff main... > /tmp/pr.diff
+$ cargo run --example changemap_demo -- . /tmp/pr.diff
+```
+
+The example also prints every edge with the span it came from, so an arrow can be
+checked against the file rather than argued about.
 
 ## Run log (opt-in)
 

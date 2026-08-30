@@ -523,6 +523,37 @@ fn render_summary(
     s
 }
 
+/// Append the change map's renderings to a summary comment.
+///
+/// Both are opt-in and both are *derived* — nothing here asks a model anything, so
+/// a reader can check every row and every arrow against the code. Each render
+/// returns an empty string when it has nothing worth showing (no files; no edges),
+/// and an empty render appends nothing rather than an empty `<details>`.
+fn append_change_map(
+    cfg: &Config,
+    provider: &str,
+    map: &crate::changemap::ChangeMap,
+    findings: &[Finding],
+    summary: &mut String,
+) {
+    if cfg.walkthrough {
+        let w = crate::changemap::render_walkthrough(map, findings, cfg.walkthrough_max_symbols);
+        if !w.is_empty() {
+            summary.push_str("\n\n");
+            summary.push_str(&w);
+        }
+    }
+    // Mermaid that a provider won't render is a wall of source in the comment —
+    // strictly worse than no diagram.
+    if cfg.diagram && crate::changemap::supports_mermaid(provider) {
+        let d = crate::changemap::render_diagram(map);
+        if !d.is_empty() {
+            summary.push_str("\n\n");
+            summary.push_str(&d);
+        }
+    }
+}
+
 /// Hidden marker on a summary comment that is **not** a finished review.
 ///
 /// Machine-readable on purpose. A consumer's boot reconciliation asks "has this PR
@@ -1168,11 +1199,18 @@ pub async fn run_review_with(
     // so the model knows every change's scope. Tier B (tree-sitter over fetched
     // files) with a Tier A (hunk-header) fallback — fully fail-open, so a hiccup
     // just yields an empty string and the review proceeds without it.
-    let structural = if cfg.structural_context {
-        crate::structure::structural_context(&provider, &client, cfg, &input.repo, &meta, &diff)
-            .await
+    let (structural, change_map) = if cfg.structural_context {
+        crate::structure::structural_context_mapped(
+            &provider,
+            &client,
+            cfg,
+            &input.repo,
+            &meta,
+            &diff,
+        )
+        .await
     } else {
-        String::new()
+        (String::new(), crate::changemap::ChangeMap::default())
     };
     if !structural.is_empty() {
         tracing::info!(
@@ -1215,6 +1253,17 @@ pub async fn run_review_with(
             .summary
             .push_str(&crate::deps::render_advisories(&advisories));
     }
+    // Derived renderings of the change, appended last: they describe what the PR
+    // touched, which is context for the findings above rather than a finding
+    // itself. Both collapse into `<details>`, so a reader who wants only the
+    // verdict never has to scroll past them.
+    append_change_map(
+        cfg,
+        provider.name(),
+        &change_map,
+        &finished.findings,
+        &mut finished.summary,
+    );
 
     let FinishedReview {
         findings,
@@ -2507,6 +2556,126 @@ mod tests {
         // 20 is 11 rows from 9 — outside REANCHOR_WINDOW, so no snap even though the
         // symbol matches.
         assert_eq!(reanchor(9, &valid, &texts, "calcTotal issue"), None);
+    }
+}
+
+#[cfg(test)]
+mod change_map_tests {
+    use super::*;
+    use crate::changemap::{ChangeMap, Edge, EdgeKind, FileEntry, SymbolNode};
+
+    fn map() -> ChangeMap {
+        ChangeMap {
+            symbols: vec![
+                SymbolNode {
+                    label: "fn",
+                    name: "caller".into(),
+                    file: "a.rs".into(),
+                    start: 1,
+                    end: 3,
+                    cyclomatic: Some(12),
+                    cognitive: Some(9),
+                },
+                SymbolNode {
+                    label: "fn",
+                    name: "callee".into(),
+                    file: "b.rs".into(),
+                    start: 1,
+                    end: 2,
+                    cyclomatic: None,
+                    cognitive: None,
+                },
+            ],
+            files: vec![
+                FileEntry {
+                    path: "a.rs".into(),
+                    added: 3,
+                    removed: 1,
+                    symbols: vec![0],
+                },
+                FileEntry {
+                    path: "b.rs".into(),
+                    added: 2,
+                    removed: 0,
+                    symbols: vec![1],
+                },
+            ],
+            edges: vec![Edge {
+                from: 0,
+                to: 1,
+                kind: EdgeKind::Call,
+            }],
+            edges_truncated: false,
+        }
+    }
+
+    fn conf(walkthrough: bool, diagram: bool) -> Config {
+        let mut c = Config::from_env();
+        c.walkthrough = walkthrough;
+        c.diagram = diagram;
+        c
+    }
+
+    #[test]
+    fn both_blocks_land_on_the_summary_when_enabled() {
+        let mut s = "🤖 **Automated review**".to_string();
+        append_change_map(&conf(true, true), "github", &map(), &[], &mut s);
+        assert!(s.contains("🗺️ <b>Walkthrough</b>"), "{s}");
+        assert!(s.contains("```mermaid"), "{s}");
+    }
+
+    /// Both are off by default: they change what every review comment looks like,
+    /// and that is the operator's call, not this crate's.
+    #[test]
+    fn nothing_is_appended_when_both_are_off() {
+        let before = "🤖 **Automated review**".to_string();
+        let mut s = before.clone();
+        append_change_map(&conf(false, false), "github", &map(), &[], &mut s);
+        assert_eq!(s, before);
+    }
+
+    /// Bitbucket renders no mermaid, so the block would post as a wall of source.
+    /// The walkthrough is plain markdown and still goes out.
+    #[test]
+    fn bitbucket_gets_the_table_but_not_the_diagram() {
+        let mut s = String::new();
+        append_change_map(&conf(true, true), "bitbucket", &map(), &[], &mut s);
+        assert!(s.contains("Walkthrough"), "{s}");
+        assert!(!s.contains("mermaid"), "{s}");
+    }
+
+    /// A review with no structural context (parse failed, feature off, no head
+    /// SHA) must append nothing at all rather than an empty `<details>` block.
+    #[test]
+    fn an_empty_map_appends_nothing() {
+        let mut s = String::new();
+        append_change_map(
+            &conf(true, true),
+            "github",
+            &ChangeMap::default(),
+            &[],
+            &mut s,
+        );
+        assert!(s.is_empty(), "{s}");
+    }
+
+    /// The findings column is the join that makes the table worth reading: it
+    /// says *where* the review landed, not just what changed.
+    #[test]
+    fn the_table_attributes_each_finding_to_its_file() {
+        let findings = vec![Finding {
+            severity: "BLOCKING".into(),
+            file: "b.rs".into(),
+            line: Some(1),
+            body: "x".into(),
+            confidence: None,
+        }];
+        let mut s = String::new();
+        append_change_map(&conf(true, false), "github", &map(), &findings, &mut s);
+        let b_row = s.lines().find(|l| l.contains("`b.rs`")).expect("b.rs row");
+        assert!(b_row.contains("🚨"), "{b_row}");
+        let a_row = s.lines().find(|l| l.contains("`a.rs`")).expect("a.rs row");
+        assert!(a_row.contains("| — |"), "{a_row}");
     }
 }
 

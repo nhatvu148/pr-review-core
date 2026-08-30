@@ -10,11 +10,12 @@
 //!   and uses tree-sitter to name the smallest enclosing definition of every
 //!   changed line. Falls back to Tier A for any file it can't cover.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use reqwest::Client;
 use tree_sitter::{Node, Parser, Point};
 
+use crate::changemap::ChangeMap;
 use crate::config::Config;
 use crate::diff::{parse_valid_lines, split_diff_sections};
 use crate::providers::{PrMeta, Provider};
@@ -497,10 +498,31 @@ pub async fn structural_context(
     meta: &PrMeta,
     diff: &str,
 ) -> String {
-    // Without a head SHA there's nothing to fetch against — Tier A only.
+    structural_context_mapped(provider, client, cfg, repo, meta, diff)
+        .await
+        .0
+}
+
+/// [`structural_context`] that also returns the [`ChangeMap`] the same parse
+/// produced, for callers that render a walkthrough or diagram from it.
+///
+/// A separate entry point on purpose: [`structural_context`]'s signature is public
+/// API that downstream bots call, and this crate has already shipped one release
+/// where adding to a public type compiled here and broke a consumer. Adding a
+/// function cannot.
+pub async fn structural_context_mapped(
+    provider: &Provider,
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    meta: &PrMeta,
+    diff: &str,
+) -> (String, ChangeMap) {
+    // Without a head SHA there's nothing to fetch against — Tier A only, and no
+    // file contents means no map.
     let head = match meta.head_sha.as_deref() {
         Some(s) if !s.is_empty() => s,
-        _ => return hunk_context(diff),
+        _ => return (hunk_context(diff), ChangeMap::default()),
     };
 
     let mut loaded: Vec<(ChangedFile, String)> = Vec::new();
@@ -526,6 +548,17 @@ pub async fn structural_context(
 /// through to Tier A hunk regions. Paths are taken from the diff, so anything
 /// absolute or containing `..` is refused rather than read from outside `root`.
 pub fn structural_context_local(cfg: &Config, root: &std::path::Path, diff: &str) -> String {
+    structural_context_local_mapped(cfg, root, diff).0
+}
+
+/// [`structural_context_local`] that also returns the [`ChangeMap`]. See
+/// [`structural_context_mapped`] for why this is an additional function rather
+/// than a changed signature.
+pub fn structural_context_local_mapped(
+    cfg: &Config,
+    root: &std::path::Path,
+    diff: &str,
+) -> (String, ChangeMap) {
     let mut loaded: Vec<(ChangedFile, String)> = Vec::new();
     for f in attemptable_files(cfg, diff) {
         // A diff is untrusted input; never let a path in it escape the checkout.
@@ -583,10 +616,20 @@ fn attemptable_files(cfg: &Config, diff: &str) -> Vec<ChangedFile> {
 /// Render the context block from files whose content has already been loaded:
 /// tree-sitter symbols for what parsed (Tier B), hunk regions for the rest
 /// (Tier A), and the complexity of changed functions when enabled.
-fn build_context(cfg: &Config, diff: &str, loaded: &[(ChangedFile, String)]) -> String {
+fn build_context(
+    cfg: &Config,
+    diff: &str,
+    loaded: &[(ChangedFile, String)],
+) -> (String, ChangeMap) {
     let mut covered: HashSet<String> = HashSet::new();
     let mut ts_blocks: Vec<String> = Vec::new();
     let mut complexity_lines: Vec<String> = Vec::new();
+    // The same parse feeds two consumers now: the prompt block below, and a
+    // structured `ChangeMap` the summary renders from. Keeping it costs nothing —
+    // the alternative is re-fetching and re-parsing every file to draw a table of
+    // what we already looked at.
+    let mut map = ChangeMap::default();
+    let mut sym_index: HashMap<String, Vec<usize>> = HashMap::new();
 
     for (f, content) in loaded {
         let (path, lang, lines) = (&f.path, f.lang, &f.lines);
@@ -607,6 +650,30 @@ fn build_context(cfg: &Config, diff: &str, loaded: &[(ChangedFile, String)]) -> 
         if !syms.is_empty() {
             covered.insert(path.clone());
             ts_blocks.push(format_symbols(path, &syms));
+        }
+        // Complexity, keyed by (name, start), so each node carries the grade of
+        // its own definition rather than the file's worst.
+        let graded: HashMap<(String, u64), (u32, u32)> = if cfg.complexity_metrics {
+            crate::complexity::changed_fn_complexity_in(path, root, content, lines)
+                .into_iter()
+                .map(|c| ((c.name, c.start), (c.cyclomatic, c.cognitive)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+        for sym in &syms {
+            let m = graded.get(&(sym.name.clone(), sym.start));
+            let idx = map.symbols.len();
+            map.symbols.push(crate::changemap::SymbolNode {
+                label: sym.label,
+                name: sym.name.clone(),
+                file: path.clone(),
+                start: sym.start,
+                end: sym.end,
+                cyclomatic: m.map(|(c, _)| *c),
+                cognitive: m.map(|(_, g)| *g),
+            });
+            sym_index.entry(path.clone()).or_default().push(idx);
         }
 
         // Complexity of the changed functions, from the same tree. Only surface
@@ -659,12 +726,91 @@ fn build_context(cfg: &Config, diff: &str, loaded: &[(ChangedFile, String)]) -> 
         out.push_str(&complexity_lines.join("\n"));
     }
 
-    out
+    // Every file in the diff gets a row — including the ones tree-sitter never
+    // attempted (unsupported language, over the size cap, past
+    // `structural_max_files`). A walkthrough that silently omitted them would
+    // under-report the change, which is the one thing a walkthrough must not do.
+    let counts = crate::changemap::diff_line_counts(diff);
+    for path in diff_file_order(diff) {
+        let (added, removed) = counts.get(&path).copied().unwrap_or((0, 0));
+        let symbols = sym_index.remove(&path).unwrap_or_default();
+        map.files.push(crate::changemap::FileEntry {
+            path,
+            added,
+            removed,
+            symbols,
+        });
+    }
+    let contents: HashMap<&str, &str> = loaded
+        .iter()
+        .map(|(f, c)| (f.path.as_str(), c.as_str()))
+        .collect();
+    crate::changemap::link_edges(&mut map, &contents, cfg.diagram_max_nodes);
+
+    (out, map)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// End-to-end over a real checkout: the same parse that builds the prompt
+    /// block must also yield a map with the changed symbols, their grades, and a
+    /// call edge between two of them — no second read, no second parse.
+    #[test]
+    fn the_local_parse_yields_a_change_map_with_a_real_call_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn caller(n: u32) -> u32 {\n    callee(n)\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.rs"),
+            "fn callee(n: u32) -> u32 {\n    n + 1\n}\n",
+        )
+        .unwrap();
+        let diff = concat!(
+            "+++ b/a.rs\n@@ -1,2 +1,3 @@\n+    callee(n)\n",
+            "+++ b/b.rs\n@@ -1,2 +1,3 @@\n+    n + 1\n",
+        );
+
+        let mut cfg = Config::from_env();
+        // Pin what this test depends on: an env override in the runner's shell
+        // must not decide whether the map has grades or a node ceiling.
+        cfg.structural_context = true;
+        cfg.complexity_metrics = true;
+        cfg.diagram_max_nodes = 25;
+        let (block, map) = structural_context_local_mapped(&cfg, dir.path(), diff);
+
+        assert!(block.contains("Changed symbols"), "{block}");
+        assert_eq!(map.files.len(), 2, "{:?}", map.files);
+        let names: Vec<&str> = map.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["caller", "callee"], "{names:?}");
+        assert_eq!(map.edges.len(), 1, "{:?}", map.edges);
+        assert_eq!(map.edges[0].kind, crate::changemap::EdgeKind::Call);
+        assert_eq!(map.symbols[map.edges[0].from].name, "caller");
+        assert_eq!(map.symbols[map.edges[0].to].name, "callee");
+    }
+
+    /// The map must not depend on the feature that renders it: with the structural
+    /// parse off there is nothing to map, and the render is skipped rather than
+    /// producing an empty table.
+    #[test]
+    fn an_unparsed_file_still_earns_a_row_but_no_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "# hi\n").unwrap();
+        let diff = "+++ b/notes.md\n@@ -1,1 +1,2 @@\n+# hi\n";
+
+        let mut cfg = Config::from_env();
+        cfg.structural_context = true;
+        let (_, map) = structural_context_local_mapped(&cfg, dir.path(), diff);
+        assert_eq!(map.files.len(), 1);
+        assert_eq!(map.files[0].path, "notes.md");
+        assert_eq!(map.files[0].added, 1);
+        assert!(map.symbols.is_empty());
+        assert!(map.edges.is_empty());
+    }
 
     #[test]
     fn hunk_context_extracts_trailing_signature() {

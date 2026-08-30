@@ -131,6 +131,26 @@ pub struct Config {
     /// this — keeps the block a high-signal risk flag, not noise for trivial code.
     pub complexity_min_cyclomatic: u32,
 
+    /// Append a **walkthrough table** to the summary comment: one row per changed
+    /// file with its line counts, the definitions the change landed in, the worst
+    /// complexity grade among them, and the findings filed there. Rendered from
+    /// the structural parse that already ran — no model call, no extra token.
+    /// Needs `structural_context`; off by default because it changes what every
+    /// review comment looks like.
+    pub walkthrough: bool,
+    /// Max distinct symbols listed per file in the walkthrough before the cell
+    /// collapses to `(+N more)` — a readability guard, not a cost one.
+    pub walkthrough_max_symbols: usize,
+    /// Append a **mermaid change diagram** to the summary comment: changed symbols
+    /// grouped by file, with an arrow wherever one names another. Derived from
+    /// tree-sitter spans, never model-written. Skipped on providers that don't
+    /// render mermaid (Bitbucket) and whenever there are no edges to draw.
+    pub diagram: bool,
+    /// Ceiling on changed symbols before edge-linking is skipped entirely — the
+    /// pairwise scan is cheap but quadratic, and a 200-node diagram is unreadable
+    /// anyway.
+    pub diagram_max_nodes: usize,
+
     /// Compute a "blast radius" for the agentic reviewer: from the clone, find the
     /// callers and tests of each changed symbol and seed the prompt with them (also
     /// exposes a `references` tool). Agentic path only — needs the clone. Fail-open.
@@ -272,6 +292,11 @@ impl Config {
             complexity_min_cyclomatic: env_or("COMPLEXITY_MIN_CYCLOMATIC", "8")
                 .parse()
                 .unwrap_or(8),
+
+            walkthrough: env_or("WALKTHROUGH", "false").parse().unwrap_or(false),
+            walkthrough_max_symbols: env_or("WALKTHROUGH_MAX_SYMBOLS", "6").parse().unwrap_or(6),
+            diagram: env_or("DIAGRAM", "false").parse().unwrap_or(false),
+            diagram_max_nodes: env_or("DIAGRAM_MAX_NODES", "25").parse().unwrap_or(25),
 
             blast_radius: env_or("BLAST_RADIUS", "true").parse().unwrap_or(true),
             blast_max_symbols: env_or("BLAST_MAX_SYMBOLS", "12").parse().unwrap_or(12),

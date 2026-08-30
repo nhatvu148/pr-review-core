@@ -1,5 +1,66 @@
 # Changelog
 
+## Unreleased
+
+**A derived walkthrough table and change diagram — `WALKTHROUGH` / `DIAGRAM`.**
+Both off by default; both change what every review comment looks like, which is
+the operator's call rather than this crate's.
+
+The walkthrough is one row per changed file: line counts, the definitions the
+change landed in, the worst complexity grade among them, and the findings the
+review filed there. The diagram groups changed symbols by file and draws an arrow
+wherever one names another inside its own definition.
+
+Every column and every arrow already existed. `structural_context` parses each
+changed file with tree-sitter to name the enclosing definition of each changed
+line, and `changed_fn_complexity_in` grades the functions from that same tree —
+then all of it was flattened into a prompt string and discarded. The new
+`ChangeMap` keeps it: no extra fetch, no extra parse, no extra token, no model
+call.
+
+**Nothing here asks a model anything, and that is the feature.** A diagram a
+model draws from a diff cannot be checked by the reader — a plausible arrow that
+does not exist in the code is indistinguishable from a real one, and a reader
+will believe it. Every arrow drawn here is a call-shaped occurrence of one
+changed symbol's name inside another changed symbol's resolved span, so a
+suspicious one can be looked up. Four false-arrow classes were found by running
+`examples/changemap_demo` against this crate's own diff and are now pinned by
+tests:
+
+- `name {` was read as a Rust struct literal. It is also `if cond {`, `-> T {`,
+  and `match x {`; the rule is gone, and losing real struct literals is the
+  cheaper error.
+- A container (`mod`, `impl`, `class`) was an edge source. Everything inside its
+  span is referenced by a function nested in it, not by the container.
+- `<Name` was labelled a JSX render in Rust, where it is `Vec<T>`. The file's
+  language now decides.
+- `x.append(` was drawn solid at this crate's `append`. A call through an
+  unresolved receiver is now a dotted "names" edge.
+
+Two guards, both learned from that same demo run: symbol cells collapse to
+`(+N more)` past `WALKTHROUGH_MAX_SYMBOLS` (a one-line `lib.rs` edit resolved to
+thirteen `mod` declarations), and past `DIAGRAM_MAX_NODES` edge linking narrows
+to the highest-complexity symbols instead of bailing out — a 71-symbol change is
+ordinary, and the all-or-nothing ceiling meant the diagram never appeared on a
+real PR. Test scaffolding sorts last in that ranking, including a `mod tests`
+inside a source file, which no path-based rule can see.
+
+The diagram is skipped on Bitbucket, which renders no mermaid — the block would
+post as a wall of source. It is also skipped whenever there are no edges: a
+picture of disconnected boxes restates the table in a form that is harder to
+read.
+
+`structural_context` and `structural_context_local` keep their signatures; the
+map comes from new `*_mapped` siblings. Adding to a public type is what broke a
+consumer at 0.11.0. Adding a function cannot.
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `WALKTHROUGH` | `false` | Append the per-file walkthrough table to the summary. |
+| `WALKTHROUGH_MAX_SYMBOLS` | `6` | Symbols listed per file before `(+N more)`. |
+| `DIAGRAM` | `false` | Append the mermaid change diagram (GitHub/GitLab only). |
+| `DIAGRAM_MAX_NODES` | `25` | Symbols considered for edge linking, ranked by complexity. |
+
 ## 0.17.0
 
 **The run log can write to stdout — `PRBOT_RUN_LOG=-`.** 0.16.0 could only append
@@ -40,7 +101,6 @@ The field is an enum rather than an `Option<PathBuf>` holding a magic `-`,
 because the two sinks have genuinely different mechanics — one creates
 directories and appends, the other locks a shared stream — and a path-shaped type
 that is sometimes not a path invites precisely one bug: `create_dir_all("-")`.
-
 
 ## 0.16.0
 
