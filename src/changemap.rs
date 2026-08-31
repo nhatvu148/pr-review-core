@@ -123,10 +123,16 @@ pub struct FileEntry {
 /// How one changed symbol names another.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EdgeKind {
-    /// Named, but not resolvably *called*: a generic/type position (`Vec<T>`), or
-    /// a call through a receiver (`x.name()`) whose type this pass cannot resolve,
+    /// A call through a receiver (`x.name()`) whose type this pass cannot resolve,
     /// so the target may be a same-named method on something else entirely.
-    Mention,
+    ///
+    /// Kept apart from [`EdgeKind::Type`], which used to share a variant with it,
+    /// because the two have opposite reliability and only one of them needs
+    /// guarding. See [`link_edges`] for the same-file rule this kind is subject to.
+    Receiver,
+    /// A type position — `Vec<T>`, `: T`, `Foo<T>`. Unambiguous: a type name in
+    /// type position is that type.
+    Type,
     /// A JSX element: `<Name/>`.
     Jsx,
     /// A call: `name(`.
@@ -220,7 +226,7 @@ fn classify_occurrence(hay: &str, at: usize, name: &str, js: bool) -> Option<Edg
     // "renders" is the kind of confidently-wrong caption a derived diagram exists
     // to avoid, so the language decides which it is.
     if hay[..at].ends_with('<') {
-        return Some(if js { EdgeKind::Jsx } else { EdgeKind::Mention });
+        return Some(if js { EdgeKind::Jsx } else { EdgeKind::Type });
     }
     // `name(` / `name (` / `name::<T>(` — a call.
     let t = after.trim_start();
@@ -230,7 +236,7 @@ fn classify_occurrence(hay: &str, at: usize, name: &str, js: bool) -> Option<Edg
         // (`OpenOptions::append` vs this crate's `append`). Real enough to draw,
         // not certain enough to draw solid.
         return Some(if hay[..at].ends_with('.') {
-            EdgeKind::Mention
+            EdgeKind::Receiver
         } else {
             EdgeKind::Call
         });
@@ -334,6 +340,21 @@ pub(crate) fn link_edges(map: &mut ChangeMap, contents: &HashMap<&str, &str>, ma
                 continue;
             }
             if let Some(kind) = strongest_reference(body, &b.name, js) {
+                // A receiver-call names a method on a value whose type this pass
+                // never resolved, so across files it is a name collision as often
+                // as a reference — and method names collide constantly in OO code.
+                //
+                // The case that forced this: an Angular widget's
+                // `this.loadKpis(token)` was drawn as an arrow to a *different*
+                // widget's same-named `loadKpis` in another file. The call was to
+                // its own class's method all along. Restricting the kind to
+                // same-file targets makes that draw nothing, which is the right
+                // answer — a false arrow is the one thing this render cannot
+                // afford, and it is worth losing true cross-file method calls to
+                // be rid of it.
+                if kind == EdgeKind::Receiver && a.file != b.file {
+                    continue;
+                }
                 if seen.insert((from, to)) {
                     new_edges.push(Edge { from, to, kind });
                 }
@@ -599,15 +620,18 @@ pub fn render_diagram(map: &ChangeMap) -> String {
         let arrow = match e.kind {
             EdgeKind::Call => "-->",
             EdgeKind::Jsx => "-.->|renders|",
-            EdgeKind::Mention => "-.->|names|",
+            EdgeKind::Receiver => "-.->|names|",
+            EdgeKind::Type => "-.->|type|",
         };
         s.push_str(&format!("  n{} {arrow} n{}\n", e.from, e.to));
     }
     s.push_str(
         "```\n\n_Derived from tree-sitter spans, not written by the model: an arrow means one \
          changed symbol names another inside its own definition. Candidate references — \
-         same-name symbols across modules are not disambiguated. Only changed symbols appear; \
-         untouched callers are out of scope. A grade is shown only at C or worse._",
+         a bare call to a name that several modules define is not disambiguated, and a \
+         call through a receiver (`x.name()`) is drawn only within one file, where it is \
+         likely to mean what it looks like. Only changed symbols appear; untouched callers \
+         are out of scope. A grade is shown only at C or worse._",
     );
     if map.edges_truncated {
         s.push_str(
@@ -861,7 +885,7 @@ mod tests {
                 "LoggedFinding",
                 false
             ),
-            Some(EdgeKind::Mention)
+            Some(EdgeKind::Type)
         );
         assert_eq!(
             strongest_reference("return <LoggedFinding />;", "LoggedFinding", true),
@@ -875,12 +899,73 @@ mod tests {
     fn a_receiver_call_is_weaker_than_a_bare_call() {
         assert_eq!(
             strongest_reference("f.append(true)", "append", false),
-            Some(EdgeKind::Mention)
+            Some(EdgeKind::Receiver)
         );
         assert_eq!(
             strongest_reference("append(&path, &rec)", "append", false),
             Some(EdgeKind::Call)
         );
+    }
+
+    /// The simcel-saas#75 case. An Angular widget's `this.loadKpis(token)` was
+    /// drawn as an arrow to a *different* widget's same-named `loadKpis` in
+    /// another file; the call was to its own class's method all along. A
+    /// receiver-call only links within one file now, so this draws nothing.
+    #[test]
+    fn a_receiver_call_never_reaches_across_files() {
+        let mut map = ChangeMap {
+            symbols: vec![
+                sym("loadKpisForScenario", "kpi-table-widget.ts", 1, 3, None),
+                sym("loadKpis", "pl-chart-widget.ts", 1, 2, None),
+            ],
+            files: vec![],
+            edges: vec![],
+            edges_truncated: false,
+        };
+        let a = "loadKpisForScenario() {\n    this.loadKpis(token);\n}\n";
+        let contents: HashMap<&str, &str> = [("kpi-table-widget.ts", a)].into_iter().collect();
+        link_edges(&mut map, &contents, 25);
+        assert!(map.edges.is_empty(), "{:?}", map.edges);
+    }
+
+    /// ...but within one file `this.helper()` is very likely that file's helper,
+    /// so the weaker edge is still worth drawing there.
+    #[test]
+    fn a_receiver_call_inside_one_file_still_links() {
+        let mut map = ChangeMap {
+            symbols: vec![
+                sym("caller", "w.ts", 1, 3, None),
+                sym("helper", "w.ts", 5, 6, None),
+            ],
+            files: vec![],
+            edges: vec![],
+            edges_truncated: false,
+        };
+        let a = "caller() {\n    this.helper();\n}\n\nhelper() {\n}\n";
+        let contents: HashMap<&str, &str> = [("w.ts", a)].into_iter().collect();
+        link_edges(&mut map, &contents, 25);
+        assert_eq!(map.edges.len(), 1, "{:?}", map.edges);
+        assert_eq!(map.edges[0].kind, EdgeKind::Receiver);
+    }
+
+    /// A type-position reference is unambiguous and crosses files freely — it was
+    /// only ever guarded because it shared a variant with the receiver case.
+    #[test]
+    fn a_type_reference_still_crosses_files() {
+        let mut map = ChangeMap {
+            symbols: vec![
+                sym("holder", "a.rs", 1, 3, None),
+                sym("LoggedFinding", "b.rs", 1, 2, None),
+            ],
+            files: vec![],
+            edges: vec![],
+            edges_truncated: false,
+        };
+        let a = "struct holder {\n    items: Vec<LoggedFinding>,\n}\n";
+        let contents: HashMap<&str, &str> = [("a.rs", a)].into_iter().collect();
+        link_edges(&mut map, &contents, 25);
+        assert_eq!(map.edges.len(), 1, "{:?}", map.edges);
+        assert_eq!(map.edges[0].kind, EdgeKind::Type);
     }
 
     #[test]
