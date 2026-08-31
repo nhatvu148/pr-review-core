@@ -786,13 +786,14 @@ struct RunLogParts<'a> {
 
 /// Append this run to the local JSONL run log, if one is configured.
 ///
-/// A no-op — and costs nothing to build the record — when `run_log_path` is unset,
+/// A no-op — and costs nothing to build the record — when `run_log` is unset,
 /// which is the default. Never fails: see [`crate::runlog::append`].
 fn log_run(cfg: &Config, p: RunLogParts<'_>) {
-    let Some(path) = cfg.run_log_path.as_deref() else {
+    let Some(sink) = cfg.run_log.as_ref() else {
         return;
     };
     let rec = crate::runlog::RunLog {
+        kind: crate::runlog::KIND,
         schema: crate::runlog::SCHEMA,
         ts_unix: crate::runlog::RunLog::now_unix(),
         core_version: crate::VERSION.to_string(),
@@ -815,7 +816,7 @@ fn log_run(cfg: &Config, p: RunLogParts<'_>) {
         usage: p.out.usage.clone(),
         duration_ms: p.started.elapsed().as_millis() as u64,
     };
-    crate::runlog::append(path, &rec);
+    crate::runlog::write(sink, &rec);
 }
 
 // ---------------------------------------------------------------------------
@@ -1858,7 +1859,7 @@ mod orchestrator_tests {
         cfg.min_confidence = 50; // drops the conf-10 finding
         cfg.max_findings = 3; // drops the lowest-ranked survivor
         cfg.reanchor_findings = false; // keep anchoring exact for the assertions
-        cfg.run_log_path = Some(log.clone());
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
 
         run_review_with(&cfg, input(), &FunnelBackend)
             .await
@@ -1954,7 +1955,7 @@ mod orchestrator_tests {
 
         let mut cfg = cfg_for(&srv.uri());
         cfg.reanchor_findings = true; // the default, and the bug's precondition
-        cfg.run_log_path = Some(log.clone());
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
 
         run_review_with(&cfg, input(), &DriftBackend)
             .await
@@ -1982,7 +1983,7 @@ mod orchestrator_tests {
         let dir = tempfile::tempdir().expect("tempdir");
 
         let mut cfg = cfg_for(&srv.uri());
-        cfg.run_log_path = None;
+        cfg.run_log = None;
 
         run_review_with(&cfg, input(), &FunnelBackend)
             .await
