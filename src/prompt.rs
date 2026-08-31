@@ -107,27 +107,25 @@ pub fn injected_rules(cfg: &Config) -> String {
     }
 }
 
-/// The `/describe` system prompt with the consumer's conventions applied.
+/// The `/describe` system prompt with the consumer's layout instructions applied.
 ///
-/// Every other prompt in this crate honours `extra_system_prompt` and a repo's
-/// `.prbot.toml` instructions; `/describe` silently did not, so a consumer that
-/// injected a whole conventions block still got the built-in three-section shape
-/// and had no way to change it short of forking. That is the gap this closes.
+/// **`extra_system_prompt` deliberately does not reach this prompt.** The first
+/// version of this function applied it, reasoning that every other prompt in the
+/// crate honours the consumer's injected block and this one silently did not.
+/// That consistency argument was wrong, and what showed it was looking at what a
+/// real consumer actually puts there: a *review rubric*. The deployed SIMCEL block
+/// is a hundred lines whose opening instruction is "weigh these project-specific
+/// conventions and RAISE a finding when the diff violates one". Handing that to a
+/// prompt whose job is to describe a change invites descriptions that read like
+/// reviews, and spends a review rubric's tokens on a task with no use for one.
+/// Consistency across prompts is not a virtue when the prompts do different jobs.
 ///
-/// Two inputs, applied in order of specificity:
-///
-/// - `extra_system_prompt` — the consumer's house conventions, the same block the
-///   review prompts get.
-/// - `describe_instructions` — free-form text about *this output's shape*
-///   (`DESCRIBE_INSTRUCTIONS`, or `describe_instructions` in `.prbot.toml`). It
-///   comes last and is told it wins, so a repo can ask for release-notes sections
-///   or a contributor table and actually get them rather than a blend.
+/// So: one input, one job — `describe_instructions` (`DESCRIBE_INSTRUCTIONS`, or
+/// `describe_instructions` in `.prbot.toml`). A consumer that wants project
+/// context in its descriptions writes that context here, where it is scoped and
+/// visible, rather than inheriting a rubric aimed at something else.
 pub fn describe_system_prompt(cfg: &Config) -> String {
     let mut s = DESCRIBE_SYSTEM_PROMPT.to_string();
-    if !cfg.extra_system_prompt.trim().is_empty() {
-        s.push('\n');
-        s.push_str(cfg.extra_system_prompt.trim());
-    }
     if !cfg.describe_instructions.trim().is_empty() {
         // Stated explicitly rather than left to ordering. A model handed two
         // section lists without being told which governs will merge them, and the
@@ -278,15 +276,16 @@ mod describe_prompt_tests {
         assert_eq!(describe_system_prompt(&cfg()), DESCRIBE_SYSTEM_PROMPT);
     }
 
-    /// The gap this closes: a consumer injecting house conventions got them on
-    /// every prompt in the crate except this one.
+    /// `extra_system_prompt` is a REVIEW rubric in practice — the deployed SIMCEL
+    /// block opens with "RAISE a finding when the diff violates one" — so it must
+    /// not reach a prompt whose job is to describe a change. An earlier version of
+    /// this function applied it, and would have made descriptions read like reviews.
     #[test]
-    fn the_consumers_conventions_reach_the_describe_prompt() {
+    fn a_review_rubric_never_reaches_the_describe_prompt() {
         let mut c = cfg();
-        c.extra_system_prompt = "Never mention lockfiles.".to_string();
-        let p = describe_system_prompt(&c);
-        assert!(p.starts_with(DESCRIBE_SYSTEM_PROMPT), "{p}");
-        assert!(p.contains("Never mention lockfiles."), "{p}");
+        c.extra_system_prompt =
+            "RAISE a finding when the diff violates one of these conventions.".to_string();
+        assert_eq!(describe_system_prompt(&c), DESCRIBE_SYSTEM_PROMPT);
     }
 
     /// A layout instruction has to be told it outranks the built-in section list,
@@ -308,17 +307,16 @@ mod describe_prompt_tests {
         );
     }
 
-    /// Both at once: conventions first, then the shape that governs.
+    /// A consumer that wants project context in its descriptions puts it here,
+    /// where it is scoped and visible — not by inheriting the review rubric.
     #[test]
-    fn conventions_and_layout_compose_in_order_of_specificity() {
+    fn describe_instructions_are_the_only_way_in() {
         let mut c = cfg();
-        c.extra_system_prompt = "House voice.".to_string();
-        c.describe_instructions = "Release notes only.".to_string();
+        c.extra_system_prompt = "RAISE a finding on any zoneless violation.".to_string();
+        c.describe_instructions = "Angular 21 + NestJS 8 monorepo. Two sections.".to_string();
         let p = describe_system_prompt(&c);
-        assert!(
-            p.find("House voice.").unwrap() < p.find("Release notes only.").unwrap(),
-            "{p}"
-        );
+        assert!(p.contains("Angular 21 + NestJS 8 monorepo."), "{p}");
+        assert!(!p.contains("RAISE a finding"), "{p}");
     }
 
     /// Whitespace-only is not an instruction — it must not bolt an empty
