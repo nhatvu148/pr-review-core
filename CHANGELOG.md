@@ -1,10 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.18.0
 
 **A derived walkthrough table and change diagram — `WALKTHROUGH` / `DIAGRAM`.**
 Both off by default; both change what every review comment looks like, which is
 the operator's call rather than this crate's.
+
+*For consumers:* **no API break and no behaviour change at default settings.**
+`Config` gains four fields, which only breaks a consumer that builds it with a
+struct literal rather than `Config::from_env()` — neither known consumer does, and
+both were compiled and tested against this before the version was cut. With
+`WALKTHROUGH` and `DIAGRAM` unset, a review's comment body is byte-identical to
+0.17.0 and no extra work runs: the change map is not built at all unless something
+asks to render it. Turning either on is a deployment decision, made with an env
+var, and needs no code change.
 
 The walkthrough is one row per changed file: line counts, the definitions the
 change landed in, the worst complexity grade among them, and the findings the
