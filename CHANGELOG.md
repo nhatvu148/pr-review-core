@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.20.0
 
 **`/describe` output is shapeable — `DESCRIBE_INSTRUCTIONS`.** The prompt was a
 hardcoded Summary / Changes / Notes-for-reviewers layout, and `describe_pr`
