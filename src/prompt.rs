@@ -107,6 +107,43 @@ pub fn injected_rules(cfg: &Config) -> String {
     }
 }
 
+/// The `/describe` system prompt with the consumer's conventions applied.
+///
+/// Every other prompt in this crate honours `extra_system_prompt` and a repo's
+/// `.prbot.toml` instructions; `/describe` silently did not, so a consumer that
+/// injected a whole conventions block still got the built-in three-section shape
+/// and had no way to change it short of forking. That is the gap this closes.
+///
+/// Two inputs, applied in order of specificity:
+///
+/// - `extra_system_prompt` — the consumer's house conventions, the same block the
+///   review prompts get.
+/// - `describe_instructions` — free-form text about *this output's shape*
+///   (`DESCRIBE_INSTRUCTIONS`, or `describe_instructions` in `.prbot.toml`). It
+///   comes last and is told it wins, so a repo can ask for release-notes sections
+///   or a contributor table and actually get them rather than a blend.
+pub fn describe_system_prompt(cfg: &Config) -> String {
+    let mut s = DESCRIBE_SYSTEM_PROMPT.to_string();
+    if !cfg.extra_system_prompt.trim().is_empty() {
+        s.push('\n');
+        s.push_str(cfg.extra_system_prompt.trim());
+    }
+    if !cfg.describe_instructions.trim().is_empty() {
+        // Stated explicitly rather than left to ordering. A model handed two
+        // section lists without being told which governs will merge them, and the
+        // repo asking for release notes gets release notes *plus* the default
+        // three sections — which is the failure this whole feature exists to avoid.
+        s.push_str(
+            "\n\nThe following instructions describe the required shape of this \
+             description. Where they conflict with the section layout above, FOLLOW \
+             THESE AND IGNORE THE LAYOUT ABOVE — including replacing the section \
+             headings entirely:\n",
+        );
+        s.push_str(cfg.describe_instructions.trim());
+    }
+    s
+}
+
 /// Join a backend's own rubric to the orchestrator-injected rules. The single
 /// place that decides how the two are separated, so the diff-only path, the
 /// agentic path, and any out-of-crate backend cannot drift apart.
@@ -221,6 +258,77 @@ pub fn build_user_prompt(
         }
     }
     format!("{header}\n\n--- BEGIN DIFF ---\n{diff}\n--- END DIFF ---")
+}
+
+#[cfg(test)]
+mod describe_prompt_tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn cfg() -> Config {
+        let mut c = Config::from_env();
+        c.extra_system_prompt = String::new();
+        c.describe_instructions = String::new();
+        c
+    }
+
+    /// The default shape is unchanged for anyone who configures nothing.
+    #[test]
+    fn a_bare_config_yields_the_builtin_prompt_verbatim() {
+        assert_eq!(describe_system_prompt(&cfg()), DESCRIBE_SYSTEM_PROMPT);
+    }
+
+    /// The gap this closes: a consumer injecting house conventions got them on
+    /// every prompt in the crate except this one.
+    #[test]
+    fn the_consumers_conventions_reach_the_describe_prompt() {
+        let mut c = cfg();
+        c.extra_system_prompt = "Never mention lockfiles.".to_string();
+        let p = describe_system_prompt(&c);
+        assert!(p.starts_with(DESCRIBE_SYSTEM_PROMPT), "{p}");
+        assert!(p.contains("Never mention lockfiles."), "{p}");
+    }
+
+    /// A layout instruction has to be told it outranks the built-in section list,
+    /// or the model returns both — release notes *and* the default three sections.
+    #[test]
+    fn layout_instructions_are_declared_to_outrank_the_default_sections() {
+        let mut c = cfg();
+        c.describe_instructions = "Use: Breaking Changes, New Features, Bug Fixes.".to_string();
+        let p = describe_system_prompt(&c);
+        assert!(
+            p.contains("Breaking Changes, New Features, Bug Fixes."),
+            "{p}"
+        );
+        assert!(p.contains("IGNORE THE LAYOUT ABOVE"), "{p}");
+        // ...and it comes last, so nothing after it can walk it back.
+        assert!(
+            p.rfind("Breaking Changes").unwrap() > p.rfind("Notes for reviewers").unwrap(),
+            "{p}"
+        );
+    }
+
+    /// Both at once: conventions first, then the shape that governs.
+    #[test]
+    fn conventions_and_layout_compose_in_order_of_specificity() {
+        let mut c = cfg();
+        c.extra_system_prompt = "House voice.".to_string();
+        c.describe_instructions = "Release notes only.".to_string();
+        let p = describe_system_prompt(&c);
+        assert!(
+            p.find("House voice.").unwrap() < p.find("Release notes only.").unwrap(),
+            "{p}"
+        );
+    }
+
+    /// Whitespace-only is not an instruction — it must not bolt an empty
+    /// "follow these" clause onto the prompt with nothing after it.
+    #[test]
+    fn whitespace_only_instructions_change_nothing() {
+        let mut c = cfg();
+        c.describe_instructions = "   \n  ".to_string();
+        assert_eq!(describe_system_prompt(&c), DESCRIBE_SYSTEM_PROMPT);
+    }
 }
 
 #[cfg(test)]

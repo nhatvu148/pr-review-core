@@ -41,6 +41,12 @@ pub struct RepoConfig {
     pub reanchor_findings: Option<bool>,
     /// Extra review instructions in plain language, appended to the system prompt.
     pub instructions: Option<String>,
+    /// Instructions shaping the `/describe` output specifically — a house PR
+    /// description layout, release-notes sections, a contributor table. Kept
+    /// separate from `instructions` because that one governs what the reviewer
+    /// looks for, and mixing "be strict about SQL" into a description prompt
+    /// changes the wrong output.
+    pub describe_instructions: Option<String>,
 }
 
 /// Parse a `.prbot.toml` file's text into a [`RepoConfig`].
@@ -61,6 +67,20 @@ pub fn parse(toml_str: &str) -> anyhow::Result<RepoConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_describe_instructions() {
+        let rc = parse("describe_instructions = \"Release notes format.\"").unwrap();
+        assert_eq!(
+            rc.describe_instructions.as_deref(),
+            Some("Release notes format.")
+        );
+        // ...and stays absent when unset, so it can't clobber the env value.
+        assert!(parse("min_confidence = 60")
+            .unwrap()
+            .describe_instructions
+            .is_none());
+    }
 
     #[test]
     fn parses_fields_and_instructions() {

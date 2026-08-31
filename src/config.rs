@@ -116,6 +116,13 @@ pub struct Config {
     /// without changing the library.
     pub extra_system_prompt: String,
 
+    /// Free-form instructions shaping the `/describe` output — release-notes
+    /// sections, a contributor table, a house layout. Appended last to the
+    /// describe prompt and declared to outrank its built-in section list, so a
+    /// repo asking for a different shape gets that shape rather than both.
+    /// Overridable per-repo via `describe_instructions` in `.prbot.toml`.
+    pub describe_instructions: String,
+
     /// Compute "structural context" (the enclosing function/symbol of each changed
     /// line) and inject it into the review prompt so the model knows each change's
     /// scope. Fully fail-open — never blocks a review.
@@ -293,6 +300,8 @@ impl Config {
             x_title: env_or("OPENROUTER_X_TITLE", "pr-review"),
             extra_system_prompt: resolve_extra_system_prompt(),
 
+            describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
+
             structural_context: env_or("STRUCTURAL_CONTEXT", "true").parse().unwrap_or(true),
             structural_max_files: env_or("STRUCTURAL_MAX_FILES", "15").parse().unwrap_or(15),
 
@@ -386,6 +395,15 @@ impl Config {
                 } else {
                     cfg.extra_system_prompt = format!("{}\n{extra}", cfg.extra_system_prompt);
                 }
+            }
+        }
+        // REPLACES rather than appends, unlike `instructions` above. A layout is
+        // not additive: a repo that asks for release-notes sections wants those
+        // sections, not those plus whatever the deployment's default layout said.
+        if let Some(v) = &rc.describe_instructions {
+            let extra = v.trim();
+            if !extra.is_empty() {
+                cfg.describe_instructions = extra.to_string();
             }
         }
         cfg
