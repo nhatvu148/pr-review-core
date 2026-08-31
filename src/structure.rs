@@ -651,126 +651,142 @@ fn attemptable_files(cfg: &Config, diff: &str) -> Vec<ChangedFile> {
 /// Render the context block from files whose content has already been loaded:
 /// tree-sitter symbols for what parsed (Tier B), hunk regions for the rest
 /// (Tier A), and the complexity of changed functions when enabled.
-fn build_context(
-    cfg: &Config,
-    diff: &str,
-    loaded: &[(ChangedFile, String)],
-    detail: MapDetail,
-) -> (String, ChangeMap) {
-    let mut covered: HashSet<String> = HashSet::new();
-    let mut ts_blocks: Vec<String> = Vec::new();
-    let mut complexity_lines: Vec<String> = Vec::new();
-    // The same parse feeds two consumers now: the prompt block below, and a
-    // structured `ChangeMap` the summary renders from. Keeping it costs nothing —
-    // the alternative is re-fetching and re-parsing every file to draw a table of
-    // what we already looked at.
-    let mut map = ChangeMap::default();
-    let mut sym_index: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut worst_by_file: HashMap<String, crate::changemap::WorstFn> = HashMap::new();
-    let want_map = detail != MapDetail::None;
+/// What one parsed file contributes: prompt-block material on one side, change-map
+/// material on the other.
+///
+/// The two are gathered together because they come from **one parse** — the whole
+/// reason the map is cheap — but they are consumed by different renderers, so
+/// keeping them apart here is what lets [`build_context`] stay an orchestrator
+/// rather than the place every concern is mixed.
+struct FileScan {
+    /// Tier B's `Changed symbols:` entry, absent when nothing resolved.
+    ts_block: Option<String>,
+    /// Complexity lines for the prompt, already filtered to the reporting floor.
+    complexity_lines: Vec<String>,
+    /// Map nodes. Empty when the caller didn't ask for a map.
+    symbols: Vec<crate::changemap::SymbolNode>,
+    /// The file's most complex changed function, whether or not it resolved to a
+    /// symbol above.
+    worst: Option<crate::changemap::WorstFn>,
+}
 
-    for (f, content) in loaded {
-        let (path, lang, lines) = (&f.path, f.lang, &f.lines);
-        // Parse the content ONCE; structural symbols and complexity metrics share
-        // the tree (same grammar per extension) — no double parse, no reread.
-        let mut parser = Parser::new();
-        let tree = if parser.set_language(&lang.ts_language()).is_ok() {
-            parser.parse(content, None)
-        } else {
-            None
-        };
-        let Some(tree) = tree else {
-            continue; // unparsable — falls through to the Tier A hunk-header regions
-        };
-        let root = tree.root_node();
+/// Parse one changed file and derive everything both consumers need from it.
+///
+/// Returns `None` when the file can't be parsed — the caller then leaves it to the
+/// Tier A hunk-header regions, which is the fail-open path this module holds to
+/// everywhere.
+fn scan_file(cfg: &Config, f: &ChangedFile, content: &str, want_map: bool) -> Option<FileScan> {
+    let (path, lang, lines) = (&f.path, f.lang, &f.lines);
+    // Parse the content ONCE; structural symbols and complexity metrics share the
+    // tree (same grammar per extension) — no double parse, no reread.
+    let mut parser = Parser::new();
+    parser.set_language(&lang.ts_language()).ok()?;
+    let tree = parser.parse(content, None)?;
+    let root = tree.root_node();
 
-        let syms = symbols_in_tree(lang, root, content, lines);
-        if !syms.is_empty() {
-            covered.insert(path.clone());
-            ts_blocks.push(format_symbols(path, &syms));
-        }
-        // ONE complexity pass per file, feeding both consumers. The first version
-        // of this ran `changed_fn_complexity_in` twice over the same tree — once
-        // for the prompt block, once for the map — which is a second full walk of
-        // every changed function for a value already in hand.
-        let complexity = if cfg.complexity_metrics {
-            crate::complexity::changed_fn_complexity_in(path, root, content, lines)
-        } else {
-            Vec::new()
-        };
+    let syms = symbols_in_tree(lang, root, content, lines);
+    let ts_block = (!syms.is_empty()).then(|| format_symbols(path, &syms));
 
-        let narrowed: Vec<Sym>;
-        if want_map {
-            // File-level worst, taken from the complexity pass itself. Deliberately
-            // NOT derived from the symbols below: Tier B cannot resolve a TS/JS
-            // arrow function, so a join through symbols loses the grade on exactly
-            // the code most likely to have one.
-            if let Some(w) = complexity.iter().max_by_key(|c| c.cyclomatic) {
-                worst_by_file.insert(
-                    path.clone(),
-                    crate::changemap::WorstFn {
-                        name: w.name.clone(),
-                        cyclomatic: w.cyclomatic,
-                        cognitive: w.cognitive,
-                    },
-                );
-            }
+    // ONE complexity pass per file, feeding both consumers. An earlier version ran
+    // `changed_fn_complexity_in` twice over the same tree — once for the prompt
+    // block, once for the map — a second full walk for a value already in hand.
+    let complexity = if cfg.complexity_metrics {
+        crate::complexity::changed_fn_complexity_in(path, root, content, lines)
+    } else {
+        Vec::new()
+    };
 
-            // Resolve the map's symbols from the lines the diff ADDED, not from
-            // every line it showed. A pure-deletion hunk adds nothing, and naming
-            // no symbol at all there would be worse than naming its neighbourhood,
-            // so that case falls back to the wider set.
-            // Re-resolve only when the narrower set differs. A pure-deletion hunk
-            // (`added` empty) and an all-added hunk (`added == lines`) both already
-            // have the right answer in `syms`.
-            let map_syms = if f.added.is_empty() || f.added == *lines {
-                syms.iter().collect::<Vec<_>>()
-            } else {
-                narrowed = symbols_in_tree(lang, root, content, &f.added);
-                narrowed.iter().collect::<Vec<_>>()
-            };
+    // Only surface functions at/above the threshold, so the prompt block stays a
+    // risk flag rather than noise for trivial code.
+    let complexity_lines = complexity
+        .iter()
+        .filter(|c| c.cyclomatic >= cfg.complexity_min_cyclomatic)
+        .map(|c| {
+            format!(
+                "- {} {} ({}): cyclomatic {}, cognitive {} — grade {}",
+                c.label,
+                c.name,
+                path,
+                c.cyclomatic,
+                c.cognitive,
+                c.grade()
+            )
+        })
+        .collect();
 
-            // Keyed by (name, start), so each node carries the grade of its own
-            // definition rather than the file's worst.
-            let graded: HashMap<(&str, u64), (u32, u32)> = complexity
-                .iter()
-                .map(|c| ((c.name.as_str(), c.start), (c.cyclomatic, c.cognitive)))
-                .collect();
-            for sym in map_syms {
-                let m = graded.get(&(sym.name.as_str(), sym.start));
-                let idx = map.symbols.len();
-                map.symbols.push(crate::changemap::SymbolNode {
-                    label: sym.label,
-                    name: sym.name.clone(),
-                    file: path.clone(),
-                    start: sym.start,
-                    end: sym.end,
-                    cyclomatic: m.map(|(c, _)| *c),
-                    cognitive: m.map(|(_, g)| *g),
-                });
-                sym_index.entry(path.clone()).or_default().push(idx);
-            }
-        }
-
-        // Complexity of the changed functions, from the same tree. Only surface
-        // functions at/above the threshold so this stays a risk flag, not noise.
-        {
-            for c in &complexity {
-                if c.cyclomatic >= cfg.complexity_min_cyclomatic {
-                    complexity_lines.push(format!(
-                        "- {} {} ({}): cyclomatic {}, cognitive {} — grade {}",
-                        c.label,
-                        c.name,
-                        path,
-                        c.cyclomatic,
-                        c.cognitive,
-                        c.grade()
-                    ));
-                }
-            }
-        }
+    if !want_map {
+        return Some(FileScan {
+            ts_block,
+            complexity_lines,
+            symbols: Vec::new(),
+            worst: None,
+        });
     }
 
+    // File-level worst, taken from the complexity pass itself. Deliberately NOT
+    // derived from the symbols below: Tier B cannot resolve a TS/JS arrow function,
+    // so a join through symbols loses the grade on exactly the code most likely to
+    // have one.
+    let worst = complexity
+        .iter()
+        .max_by_key(|c| c.cyclomatic)
+        .map(|w| crate::changemap::WorstFn {
+            name: w.name.clone(),
+            cyclomatic: w.cyclomatic,
+            cognitive: w.cognitive,
+        });
+
+    // Resolve the map's symbols from the lines the diff ADDED, not from every line
+    // it showed. Re-resolve only when the narrower set differs: a pure-deletion hunk
+    // (`added` empty) and an all-added hunk (`added == lines`) already have the
+    // right answer in `syms`. The empty case falls back deliberately — naming a
+    // deletion's neighbourhood beats naming nothing.
+    let narrowed;
+    let map_syms: &[Sym] = if f.added.is_empty() || f.added == *lines {
+        &syms
+    } else {
+        narrowed = symbols_in_tree(lang, root, content, &f.added);
+        &narrowed
+    };
+
+    // Keyed by (name, start), so each node carries the grade of its own definition
+    // rather than the file's worst.
+    let graded: HashMap<(&str, u64), (u32, u32)> = complexity
+        .iter()
+        .map(|c| ((c.name.as_str(), c.start), (c.cyclomatic, c.cognitive)))
+        .collect();
+    let symbols = map_syms
+        .iter()
+        .map(|sym| {
+            let m = graded.get(&(sym.name.as_str(), sym.start));
+            crate::changemap::SymbolNode {
+                label: sym.label,
+                name: sym.name.clone(),
+                file: path.clone(),
+                start: sym.start,
+                end: sym.end,
+                cyclomatic: m.map(|(c, _)| *c),
+                cognitive: m.map(|(_, g)| *g),
+            }
+        })
+        .collect();
+
+    Some(FileScan {
+        ts_block,
+        complexity_lines,
+        symbols,
+        worst,
+    })
+}
+
+/// Assemble the prompt block: Tier B symbols, Tier A hunk regions for whatever
+/// Tier B didn't cover, then the complexity flags.
+fn render_prompt_block(
+    diff: &str,
+    ts_blocks: &[String],
+    complexity_lines: &[String],
+    covered: &HashSet<String>,
+) -> String {
     let mut out = String::new();
     if !ts_blocks.is_empty() {
         out.push_str("Changed symbols:\n");
@@ -802,13 +818,19 @@ fn build_context(
         out.push_str(&complexity_lines.join("\n"));
     }
 
-    // Nothing below is free, and none of it is needed by a caller that only wants
-    // the prompt block — which is every caller until someone turns `WALKTHROUGH`
-    // or `DIAGRAM` on. Cost follows the ask.
-    if !want_map {
-        return (out, map);
-    }
+    out
+}
 
+/// Give the map its file rows and, when the diagram will read them, its edges.
+fn assemble_map(
+    map: &mut ChangeMap,
+    cfg: &Config,
+    diff: &str,
+    loaded: &[(ChangedFile, String)],
+    detail: MapDetail,
+    mut sym_index: HashMap<String, Vec<usize>>,
+    mut worst_by_file: HashMap<String, crate::changemap::WorstFn>,
+) {
     // Every file in the diff gets a row — including the ones tree-sitter never
     // attempted (unsupported language, over the size cap, past
     // `structural_max_files`). A walkthrough that silently omitted them would
@@ -826,17 +848,72 @@ fn build_context(
             worst,
         });
     }
+
     // Edge linking is the expensive half and only the diagram reads it, so a
-    // walkthrough-only caller must not pay for it. Reported by review on #38:
-    // "cost follows the ask" was true of the map and not yet of its two halves.
+    // walkthrough-only caller must not pay for it.
     if detail == MapDetail::Full {
         let contents: HashMap<&str, &str> = loaded
             .iter()
             .map(|(f, c)| (f.path.as_str(), c.as_str()))
             .collect();
-        crate::changemap::link_edges(&mut map, &contents, cfg.diagram_max_nodes);
+        crate::changemap::link_edges(map, &contents, cfg.diagram_max_nodes);
+    }
+}
+
+/// Render the context block from files whose content has already been loaded, and
+/// the [`ChangeMap`] the same parse produced when the caller asked for one.
+///
+/// An orchestrator: [`scan_file`] does the per-file work,
+/// [`render_prompt_block`] assembles what the model sees, and [`assemble_map`]
+/// finishes what the summary renders. Keeping the three apart is the point — this
+/// function had grown to hold all of it and its own walkthrough graded it a D.
+fn build_context(
+    cfg: &Config,
+    diff: &str,
+    loaded: &[(ChangedFile, String)],
+    detail: MapDetail,
+) -> (String, ChangeMap) {
+    let want_map = detail != MapDetail::None;
+
+    let mut covered: HashSet<String> = HashSet::new();
+    let mut ts_blocks: Vec<String> = Vec::new();
+    let mut complexity_lines: Vec<String> = Vec::new();
+    let mut map = ChangeMap::default();
+    let mut sym_index: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut worst_by_file: HashMap<String, crate::changemap::WorstFn> = HashMap::new();
+
+    for (f, content) in loaded {
+        // Unparsable — falls through to the Tier A hunk-header regions.
+        let Some(scan) = scan_file(cfg, f, content, want_map) else {
+            continue;
+        };
+        if let Some(block) = scan.ts_block {
+            covered.insert(f.path.clone());
+            ts_blocks.push(block);
+        }
+        complexity_lines.extend(scan.complexity_lines);
+        if let Some(w) = scan.worst {
+            worst_by_file.insert(f.path.clone(), w);
+        }
+        for node in scan.symbols {
+            let idx = map.symbols.len();
+            map.symbols.push(node);
+            sym_index.entry(f.path.clone()).or_default().push(idx);
+        }
     }
 
+    let out = render_prompt_block(diff, &ts_blocks, &complexity_lines, &covered);
+    if want_map {
+        assemble_map(
+            &mut map,
+            cfg,
+            diff,
+            loaded,
+            detail,
+            sym_index,
+            worst_by_file,
+        );
+    }
     (out, map)
 }
 
