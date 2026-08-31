@@ -146,7 +146,10 @@ pub struct Config {
     /// tree-sitter spans, never model-written. Skipped on providers that don't
     /// render mermaid (Bitbucket) and whenever there are no edges to draw.
     pub diagram: bool,
-    /// Ceiling on how many changed symbols edge-linking considers. The pairwise
+    /// Ceiling on how many changed symbols edge-linking considers, which is also
+    /// the diagram's node budget. 12 is a legibility number, not a cost one: at 25
+    /// the rendered graph sprawled past the width of a PR comment and mermaid's own
+    /// pan controls covered a node. The pairwise
     /// span scan is cheap but quadratic, and a 200-node diagram is unreadable
     /// anyway. Past this the scan **narrows** — it ranks by complexity (test
     /// scaffolding last) and links the top slice — rather than giving up, and the
@@ -298,7 +301,7 @@ impl Config {
             walkthrough: env_or("WALKTHROUGH", "false").parse().unwrap_or(false),
             walkthrough_max_symbols: env_or("WALKTHROUGH_MAX_SYMBOLS", "6").parse().unwrap_or(6),
             diagram: env_or("DIAGRAM", "false").parse().unwrap_or(false),
-            diagram_max_nodes: env_or("DIAGRAM_MAX_NODES", "25").parse().unwrap_or(25),
+            diagram_max_nodes: env_or("DIAGRAM_MAX_NODES", "12").parse().unwrap_or(12),
 
             blast_radius: env_or("BLAST_RADIUS", "true").parse().unwrap_or(true),
             blast_max_symbols: env_or("BLAST_MAX_SYMBOLS", "12").parse().unwrap_or(12),

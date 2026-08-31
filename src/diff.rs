@@ -31,6 +31,13 @@ pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
 /// [`parse_valid_lines`] and [`diff_line_texts`] can't drift apart. Removed (`-`)
 /// lines don't advance the new-side counter; `/dev/null` targets are skipped.
 fn for_each_new_side_line(diff: &str, mut f: impl FnMut(&str, u64, &str)) {
+    for_each_new_side_line_kind(diff, |path, line, text, _added| f(path, line, text));
+}
+
+/// [`for_each_new_side_line`] that also says whether the line was **added** (`+`)
+/// rather than carried over as context. Callers that need "what this diff edited"
+/// rather than "what this diff showed" need the distinction.
+fn for_each_new_side_line_kind(diff: &str, mut f: impl FnMut(&str, u64, &str, bool)) {
     let mut cur_path: Option<String> = None;
     let mut new_line: u64 = 0;
 
@@ -46,13 +53,45 @@ fn for_each_new_side_line(diff: &str, mut f: impl FnMut(&str, u64, &str)) {
                 new_line = num.parse().unwrap_or(0);
             }
         } else if let Some(path) = &cur_path {
-            if let Some(text) = line.strip_prefix('+').or_else(|| line.strip_prefix(' ')) {
-                f(path, new_line, text);
+            if let Some(text) = line.strip_prefix('+') {
+                f(path, new_line, text, true);
+                new_line += 1;
+            } else if let Some(text) = line.strip_prefix(' ') {
+                f(path, new_line, text, false);
                 new_line += 1;
             }
             // '-' removed line: new side doesn't advance. Other markers ignored.
         }
     }
+}
+
+/// New-side lines this diff **added**, per file — context lines excluded.
+///
+/// [`parse_valid_lines`] answers "which lines may a comment anchor to", and the
+/// answer there rightly includes context: a finding may land on a line the diff
+/// merely showed. This answers a different question — "which lines did this change
+/// actually edit" — and the two must not be confused.
+///
+/// Naming the difference concretely, because a real review caught it: a one-line
+/// addition to a `lib.rs` full of `mod` declarations has six context lines, each
+/// sitting on a different `mod`. Resolved through `parse_valid_lines`, a
+/// *Changed symbols* column reported seven modules for a change that touched one.
+///
+/// ```
+/// # use pr_review_core::diff::parse_added_lines;
+/// let d = "+++ b/a.rs\n@@ -1,2 +1,3 @@\n ctx\n+added\n ctx2\n";
+/// let m = parse_added_lines(d);
+/// assert!(m["a.rs"].contains(&2));  // the "+added" line
+/// assert!(!m["a.rs"].contains(&1)); // ...and not the context around it
+/// ```
+pub fn parse_added_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
+    let mut map: HashMap<String, HashSet<u64>> = HashMap::new();
+    for_each_new_side_line_kind(diff, |path, new_line, _text, added| {
+        if added {
+            map.entry(path.to_string()).or_default().insert(new_line);
+        }
+    });
+    map
 }
 
 /// Map each new-side file path to `{ line number -> line text }` (added or context

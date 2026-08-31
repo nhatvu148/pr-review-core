@@ -57,6 +57,29 @@ file's worst complexity is a fact about the file and needs no symbol. The
 there only once `def_label` learns to resolve one — a change to the prompt's
 structural context, not to this rendering.
 
+*Changed symbols* resolves the lines the diff **added**, not every line it showed.
+`parse_valid_lines` rightly includes context — a finding may anchor to a line the
+diff merely displayed — but a column with that heading must not. Seen in the real
+GitHub UI: a one-line addition to `src/lib.rs` reported seven changed modules,
+one per context line, because each context line sat on a different `mod`. New
+`diff::parse_added_lines` answers the narrower question; a pure-deletion hunk
+adds nothing and falls back to the wider set rather than naming nothing. The
+prompt block is untouched.
+
+Three legibility changes to the diagram, all from looking at one rendered on a
+real PR. `DIAGRAM_MAX_NODES` drops 25 → 12, which was a cost number and is now a
+legibility one: at 25 the graph sprawled past the width of a comment and
+mermaid's own pan controls covered a node. `flowchart TD` replaces `LR`, because
+a PR comment is a narrow column. And a grade is drawn only at C or worse — most
+changed functions are an A, so annotating every box put a line of text on each
+one and distinguished nothing; now the risky nodes stand out by contrast.
+
+The diagram is deliberately not themed, and that is a decision rather than an
+omission. GitHub renders mermaid with a theme that follows the viewer's
+light/dark preference; an injected `%%{init: {'theme':…}}%%` overrides it, so
+colors tuned on one theme go unreadable on the other and the author never sees
+it.
+
 The map is built only when a caller asks for it, and asks in three sizes rather
 than two. `structural_context` and its local sibling take the cheap path and
 return an empty map, so a review with both features off pays nothing for either —

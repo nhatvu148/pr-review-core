@@ -608,8 +608,14 @@ const MAX_FILE_BYTES: usize = 400_000;
 pub(crate) struct ChangedFile {
     path: String,
     lang: Lang,
-    /// New-side line numbers this diff touches.
+    /// New-side line numbers this diff touches — added **and** context. What the
+    /// prompt block wants: the model should see the scope of every line it can be
+    /// shown.
     lines: HashSet<u64>,
+    /// New-side lines this diff actually **added**. What the change map wants: a
+    /// column headed *Changed symbols* must not name a definition the PR only
+    /// scrolled past. Empty when the file's hunks are pure deletions.
+    added: HashSet<u64>,
 }
 
 /// The files Tier B attempts, in diff order, capped at `cfg.structural_max_files`.
@@ -619,6 +625,7 @@ pub(crate) struct ChangedFile {
 /// cap must count the same files whichever way the review was started.
 fn attemptable_files(cfg: &Config, diff: &str) -> Vec<ChangedFile> {
     let valid = parse_valid_lines(diff);
+    let added = crate::diff::parse_added_lines(diff);
     let mut out = Vec::new();
     for path in diff_file_order(diff) {
         if out.len() >= cfg.structural_max_files {
@@ -630,10 +637,12 @@ fn attemptable_files(cfg: &Config, diff: &str) -> Vec<ChangedFile> {
         let Some(lines) = valid.get(&path).filter(|s| !s.is_empty()) else {
             continue;
         };
+        let added = added.get(&path).cloned().unwrap_or_default();
         out.push(ChangedFile {
             path,
             lang,
             lines: lines.clone(),
+            added,
         });
     }
     out
@@ -690,6 +699,7 @@ fn build_context(
             Vec::new()
         };
 
+        let narrowed: Vec<Sym>;
         if want_map {
             // File-level worst, taken from the complexity pass itself. Deliberately
             // NOT derived from the symbols below: Tier B cannot resolve a TS/JS
@@ -706,13 +716,27 @@ fn build_context(
                 );
             }
 
+            // Resolve the map's symbols from the lines the diff ADDED, not from
+            // every line it showed. A pure-deletion hunk adds nothing, and naming
+            // no symbol at all there would be worse than naming its neighbourhood,
+            // so that case falls back to the wider set.
+            // Re-resolve only when the narrower set differs. A pure-deletion hunk
+            // (`added` empty) and an all-added hunk (`added == lines`) both already
+            // have the right answer in `syms`.
+            let map_syms = if f.added.is_empty() || f.added == *lines {
+                syms.iter().collect::<Vec<_>>()
+            } else {
+                narrowed = symbols_in_tree(lang, root, content, &f.added);
+                narrowed.iter().collect::<Vec<_>>()
+            };
+
             // Keyed by (name, start), so each node carries the grade of its own
             // definition rather than the file's worst.
             let graded: HashMap<(&str, u64), (u32, u32)> = complexity
                 .iter()
                 .map(|c| ((c.name.as_str(), c.start), (c.cyclomatic, c.cognitive)))
                 .collect();
-            for sym in &syms {
+            for sym in map_syms {
                 let m = graded.get(&(sym.name.as_str(), sym.start));
                 let idx = map.symbols.len();
                 map.symbols.push(crate::changemap::SymbolNode {
@@ -896,6 +920,65 @@ mod tests {
         assert!(local_inner(&cfg, dir.path(), diff, MapDetail::None)
             .1
             .is_empty());
+    }
+
+    /// The lib.rs case, seen in the real GitHub UI: a one-line addition to a file
+    /// of `mod` declarations reported seven changed modules, because symbol
+    /// resolution ran over context lines as well as added ones.
+    #[test]
+    fn a_one_line_addition_names_one_symbol_not_its_neighbours() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "mod agent;\nmod backend;\nmod blast;\nmod changemap;\nmod command;\n",
+        )
+        .unwrap();
+        // One `+` line surrounded by context, exactly as `git diff` emits it.
+        let diff = concat!(
+            "+++ b/lib.rs\n@@ -1,4 +1,5 @@\n",
+            " mod agent;\n",
+            " mod backend;\n",
+            " mod blast;\n",
+            "+mod changemap;\n",
+            " mod command;\n",
+        );
+        let mut cfg = Config::from_env();
+        cfg.structural_context = true;
+
+        let (block, map) = structural_context_local_mapped(&cfg, dir.path(), diff);
+
+        let names: Vec<&str> = map.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["changemap"], "{names:?}");
+
+        // The prompt block is unchanged: the model still sees every line's scope,
+        // because a finding may legitimately land on a context line.
+        assert!(block.contains("agent"), "{block}");
+        assert!(block.contains("command"), "{block}");
+    }
+
+    /// A hunk that only deletes adds nothing, and naming no symbol there would be
+    /// worse than naming the neighbourhood — so that case keeps the wider set.
+    #[test]
+    fn a_pure_deletion_falls_back_to_the_wider_line_set() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn keep(n: u32) -> u32 {\n    n\n}\n",
+        )
+        .unwrap();
+        let diff = concat!(
+            "+++ b/a.rs\n@@ -1,4 +1,3 @@\n",
+            " fn keep(n: u32) -> u32 {\n",
+            "-    let unused = 1;\n",
+            "     n\n",
+            " }\n",
+        );
+        let mut cfg = Config::from_env();
+        cfg.structural_context = true;
+
+        let (_, map) = structural_context_local_mapped(&cfg, dir.path(), diff);
+        let names: Vec<&str> = map.symbols.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["keep"], "{names:?}");
     }
 
     /// Only the diagram reads edges, and linking them is the expensive half —

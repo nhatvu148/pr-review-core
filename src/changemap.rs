@@ -552,7 +552,7 @@ pub fn render_diagram(map: &ChangeMap) -> String {
 
     let mut s = String::from(
         "<details>\n<summary>🔗 <b>Change diagram</b> — how the changed symbols reference each \
-         other</summary>\n\n```mermaid\nflowchart LR\n",
+         other</summary>\n\n```mermaid\nflowchart TD\n",
     );
     for (fi, f) in map.files.iter().enumerate() {
         let members: Vec<usize> = f
@@ -570,8 +570,13 @@ pub fn render_diagram(map: &ChangeMap) -> String {
         ));
         for i in members {
             let sym = &map.symbols[i];
+            // Only annotate a grade worth reacting to. Most changed functions are
+            // an A, so printing every grade puts a line of text on every box and
+            // distinguishes nothing; showing only C and worse makes the risky nodes
+            // stand out by contrast, with less ink rather than more.
             let grade = sym
                 .grade()
+                .filter(|g| matches!(g, 'C' | 'D' | 'F'))
                 .map(|g| format!("<br/>grade {g}"))
                 .unwrap_or_default();
             s.push_str(&format!(
@@ -594,7 +599,7 @@ pub fn render_diagram(map: &ChangeMap) -> String {
         "```\n\n_Derived from tree-sitter spans, not written by the model: an arrow means one \
          changed symbol names another inside its own definition. Candidate references — \
          same-name symbols across modules are not disambiguated. Only changed symbols appear; \
-         untouched callers are out of scope._",
+         untouched callers are out of scope. A grade is shown only at C or worse._",
     );
     if map.edges_truncated {
         s.push_str(
@@ -1029,12 +1034,50 @@ mod tests {
         };
         let out = render_diagram(&map);
         assert!(out.contains("```mermaid"), "{out}");
-        assert!(out.contains("flowchart LR"), "{out}");
+        // TD, not LR: a PR comment is a narrow column, and LR sprawled past it.
+        assert!(out.contains("flowchart TD"), "{out}");
         assert!(out.contains("subgraph f0[\"a.rs\"]"), "{out}");
         assert!(out.contains("n0 --> n1"), "{out}");
         // The graded node carries its grade; the unlinked one isn't drawn at all.
         assert!(out.contains("grade C"), "{out}");
         assert!(!out.contains("unrelated"), "{out}");
+    }
+
+    /// A grade on every box is a line of text that distinguishes nothing, since
+    /// most changed functions are an A. Only C and worse earn the annotation.
+    #[test]
+    fn only_a_grade_worth_reacting_to_is_drawn() {
+        let map = ChangeMap {
+            symbols: vec![
+                sym("calm", "a.rs", 1, 2, Some(3)),   // A
+                sym("risky", "b.rs", 1, 2, Some(30)), // F
+            ],
+            files: vec![
+                FileEntry {
+                    path: "a.rs".into(),
+                    added: 1,
+                    removed: 0,
+                    symbols: vec![0],
+                    worst: None,
+                },
+                FileEntry {
+                    path: "b.rs".into(),
+                    added: 1,
+                    removed: 0,
+                    symbols: vec![1],
+                    worst: None,
+                },
+            ],
+            edges: vec![Edge {
+                from: 0,
+                to: 1,
+                kind: EdgeKind::Call,
+            }],
+            edges_truncated: false,
+        };
+        let out = render_diagram(&map);
+        assert!(out.contains("grade F"), "{out}");
+        assert!(!out.contains("grade A"), "{out}");
     }
 
     #[test]

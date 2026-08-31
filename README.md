@@ -145,14 +145,22 @@ one names another inside its own definition.
 | `WALKTHROUGH` | `false` | Append the per-file walkthrough table to the summary comment. |
 | `WALKTHROUGH_MAX_SYMBOLS` | `6` | Symbols listed per file before the cell collapses to `(+N more)`. |
 | `DIAGRAM` | `false` | Append the mermaid change diagram. Skipped on Bitbucket (no native mermaid) and whenever there are no edges to draw. |
-| `DIAGRAM_MAX_NODES` | `25` | Symbols considered for edge linking. Past this, linking narrows to the highest-complexity symbols (test scaffolding last) and the diagram says so. |
+| `DIAGRAM_MAX_NODES` | `12` | Symbols considered for edge linking, and so the diagram's node budget. Past this, linking narrows to the highest-complexity symbols (test scaffolding last) and the diagram says so. |
 
 Both need `STRUCTURAL_CONTEXT` (on by default); the complexity column additionally
 needs `COMPLEXITY_METRICS` (also on by default). Cost follows the ask: with both
 off nothing is built, and with only `WALKTHROUGH` on the edge-linking scan the
 diagram needs is skipped.
 
-One asymmetry worth knowing. The *Worst complexity* column comes from the
+The diagram is deliberately **not themed**. GitHub renders mermaid with a theme
+that follows the viewer's light/dark preference, and an injected
+`%%{init: {'theme':…}}%%` would override it — colors tuned on one theme become
+unreadable on the other, and you would never see it. The legibility levers here
+are node count, direction (`flowchart TD`, because a PR comment is a narrow
+column) and ink: a grade is drawn only at C or worse, since most changed
+functions are an A and annotating every box distinguishes nothing.
+
+Two asymmetries worth knowing. The *Worst complexity* column comes from the
 complexity pass directly, so it grades a TS/JS arrow function
 (`const handleSubmit = () => {}`) like anything else. The *Changed symbols*
 column comes from the structural pass, which resolves a symbol by walking up to
@@ -160,6 +168,13 @@ the nearest declaration it recognises — and that list has no `arrow_function`,
 such a file can show a real grade beside an empty symbol cell. That is the
 structural context's existing shape, and it is the same in the prompt the model
 sees.
+
+And the two columns count different lines. *Changed symbols* resolves only the
+lines the diff **added**, so a one-line edit names one definition rather than
+every neighbour the hunk happened to show (a pure-deletion hunk adds nothing, and
+falls back to the wider set rather than naming nothing). *Worst complexity* keeps
+the wider set, because "the function you are editing near is a D" is a useful
+signal even when the change itself sits beside it.
 
 **Why nothing here is model-written.** A diagram a model draws from a diff cannot
 be checked by the reader: a plausible arrow that doesn't exist in the code is
