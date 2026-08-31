@@ -10,14 +10,26 @@ consumer's injected conventions and this one silently did not, so a deployment
 with a whole conventions block baked into its image still got the built-in shape
 and had no way to change it short of forking.
 
-Two inputs now reach it, in order of specificity: `extra_system_prompt` (the same
-house conventions the review prompts get) and `DESCRIBE_INSTRUCTIONS` — or
-`describe_instructions` in `.prbot.toml` — for this output's shape specifically.
-The two are kept separate because `instructions` governs what the reviewer *looks
-for*, and folding "be strict about SQL" into a description prompt changes the
-wrong output. The per-repo value **replaces** rather than appends, unlike
+`DESCRIBE_INSTRUCTIONS` — or `describe_instructions` in `.prbot.toml` — now
+shapes it. The per-repo value **replaces** rather than appends, unlike
 `instructions`: a layout is not additive, and a repo asking for release-notes
 sections wants those sections rather than those plus the deployment's default.
+
+`extra_system_prompt` deliberately does **not** reach this prompt, though an
+earlier cut of this change made it. The argument for that was consistency —
+every other prompt honours the consumer's injected block. Looking at what a
+consumer actually puts there killed it: the deployed SIMCEL block is a hundred
+lines of *review rubric* opening with "weigh these project-specific conventions
+and RAISE a finding when the diff violates one". Handing that to a prompt whose
+job is to describe a change invites descriptions that read like reviews, and
+spends a rubric's tokens on a task with no use for one. Consistency across
+prompts is not a virtue when the prompts do different jobs. One input, one job;
+a consumer wanting project context in descriptions writes it into
+`describe_instructions`, where it is scoped and visible.
+
+**No behaviour change at default settings**, and none for any existing consumer:
+with `DESCRIBE_INSTRUCTIONS` unset, `/describe` produces exactly what it did
+before.
 
 The layout instruction is appended last and told explicitly that it outranks the
 built-in section list. Left to ordering alone, a model handed two section lists
