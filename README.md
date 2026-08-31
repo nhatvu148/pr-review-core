@@ -182,9 +182,12 @@ indistinguishable from a real one, and the reader will believe it. Every arrow
 here is a call-shaped occurrence of one changed symbol's name inside another
 changed symbol's tree-sitter span, so a suspicious one can be looked up. It is a
 narrow claim, and it is the claim the caption makes — candidate references, only
-between symbols this PR changed, with same-name symbols across modules not
-disambiguated (a call through an unresolved receiver, `x.append(`, draws dotted
-rather than solid).
+between symbols this PR changed. A bare call to a name several modules define is
+not disambiguated. A call through an unresolved receiver (`x.append(`) draws
+dotted rather than solid, and only within a single file: across files a method
+name is a collision as often as a reference, which is how a real review drew an
+Angular widget's `this.loadKpis()` as an arrow to a different widget's
+same-named method.
 
 See it before it posts on anyone's PR:
 

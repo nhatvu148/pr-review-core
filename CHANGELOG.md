@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.19.0
+
+**A receiver-call in the change diagram no longer reaches across files.** Three
+real reviews on 0.18.0 produced one false arrow, and this is it: an Angular
+widget's `this.loadKpis(token)` was drawn as an arrow to a *different* widget's
+same-named `loadKpis` in another file. The call was to its own class's method all
+along — `kpi-table-widget.ts` calls `kpi-table-widget.ts`.
+
+`x.name()` names a method on a value whose type this pass never resolves, and in
+OO code method names collide constantly (`loadKpis`, `refresh`, `update`). Within
+one file `this.helper()` is very likely that file's helper; across files it is a
+collision as often as a reference. So that edge kind is now same-file only.
+Losing true cross-file method calls is worth being rid of the false ones: a
+diagram a reader cannot trust is worse than no diagram, which is the premise the
+whole rendering rests on.
+
+`EdgeKind::Mention` was doing two jobs with opposite reliability and is replaced
+by `Receiver` (the guarded one) and `Type` (`Vec<T>`, `: T` — unambiguous, and it
+crosses files freely). **This is why the version is 0.19.0 rather than 0.18.1:**
+removing a public enum variant breaks any `match` on it. No known consumer
+matches on `EdgeKind` — it landed one day ago — but the crate is public and the
+contract is with users nobody has met.
+
+The other two reviews behaved correctly and needed no change. A Python bench PR
+drew six solid edges, all real. A NestJS controller PR drew none: sibling
+controller methods do not call each other, so there were no edges and the diagram
+was suppressed rather than rendered as disconnected boxes.
+
 ## 0.18.0
 
 **A derived walkthrough table and change diagram — `WALKTHROUGH` / `DIAGRAM`.**
