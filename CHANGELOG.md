@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+**`/describe` output is shapeable — `DESCRIBE_INSTRUCTIONS`.** The prompt was a
+hardcoded Summary / Changes / Notes-for-reviewers layout, and `describe_pr`
+passed it *verbatim*: it applied neither `extra_system_prompt` nor a repo's
+`.prbot.toml` instructions. Every other prompt in the crate honours the
+consumer's injected conventions and this one silently did not, so a deployment
+with a whole conventions block baked into its image still got the built-in shape
+and had no way to change it short of forking.
+
+Two inputs now reach it, in order of specificity: `extra_system_prompt` (the same
+house conventions the review prompts get) and `DESCRIBE_INSTRUCTIONS` — or
+`describe_instructions` in `.prbot.toml` — for this output's shape specifically.
+The two are kept separate because `instructions` governs what the reviewer *looks
+for*, and folding "be strict about SQL" into a description prompt changes the
+wrong output. The per-repo value **replaces** rather than appends, unlike
+`instructions`: a layout is not additive, and a repo asking for release-notes
+sections wants those sections rather than those plus the deployment's default.
+
+The layout instruction is appended last and told explicitly that it outranks the
+built-in section list. Left to ordering alone, a model handed two section lists
+returns both — release notes *and* the default three sections, which is the
+failure the feature exists to avoid.
+
 ## 0.19.0
 
 **A receiver-call in the change diagram no longer reaches across files.** Three

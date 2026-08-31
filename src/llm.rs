@@ -8,8 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::clip;
 use crate::config::{require, Config};
 use crate::prompt::{
-    build_user_prompt, ASK_SYSTEM_PROMPT, CRITIQUE_SYSTEM_PROMPT, DESCRIBE_SYSTEM_PROMPT,
-    FILE_REVIEW_SYSTEM_PROMPT,
+    build_user_prompt, ASK_SYSTEM_PROMPT, CRITIQUE_SYSTEM_PROMPT, FILE_REVIEW_SYSTEM_PROMPT,
 };
 use crate::providers::PrMeta;
 
@@ -453,7 +452,11 @@ pub async fn describe_pr(
     let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
     let truncated = diff.chars().count() > cfg.max_diff_chars;
     let user = build_user_prompt(meta, &clipped, truncated, None, structural_context);
-    backend.complete(cfg, DESCRIBE_SYSTEM_PROMPT, &user).await
+    // The consumer's conventions and any `describe_instructions` are applied here
+    // rather than at the call site, so every caller of `/describe` gets them —
+    // this prompt was the one place in the crate that ignored both.
+    let system = crate::prompt::describe_system_prompt(cfg);
+    backend.complete(cfg, &system, &user).await
 }
 
 /// Deep-review an ENTIRE file (the `/review-file` command): number the file's

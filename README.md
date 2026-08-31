@@ -125,6 +125,7 @@ size caps) are also read from the environment — see `src/config.rs`.
 | `LLM_BASE_URL` | `OPENROUTER_BASE_URL` → openrouter | OpenAI-compatible endpoint (e.g. `http://localhost:11434/v1` for Ollama). |
 | `LLM_API_KEY` | `OPENROUTER_API_KEY` | API key for the endpoint above. |
 | `CI_STATUS` | `true` | Fetch the head commit's CI results (GitHub check runs / Bitbucket build statuses) and show them in the prompt, so the reviewer can't assert a broken build that CI already decided. One extra API call per review; set `false` for tokens near their rate limit. |
+| `DESCRIBE_INSTRUCTIONS` | *(empty)* | Free-form instructions shaping `/describe` output (sections, tables, house layout). Outranks the built-in layout. |
 | `CVE_SCAN` | `true` | Scan changed lockfiles for known-vulnerable deps via OSV.dev. |
 | `CVE_MAX_PACKAGES` | `100` | Max distinct packages queried against OSV per review. |
 | `OSV_API_BASE` | `https://api.osv.dev` | OSV API base (override for a mirror/test double). |
@@ -269,10 +270,32 @@ commands posted as PR comments:
 | --- | --- |
 | `/review` | (Re)run the full review. |
 | `/ask <question>` | Answer a question about the PR, grounded in its diff. |
-| `/describe` | (Re)generate the PR description, merged idempotently into the body. |
+| `/describe` | (Re)generate the PR description, merged idempotently into the body. Shape it with `DESCRIBE_INSTRUCTIONS` (below). |
 | `/review-file <path>` | Deep-review an entire file at the PR head (not just the diff); findings post as a summary comment. |
 
 Route them from a bot binary with [`command::parse_command`] + [`command::run_command`].
+
+### Shaping the PR description
+
+`/describe` writes a Summary / Changes / Notes-for-reviewers layout by default.
+`DESCRIBE_INSTRUCTIONS` (or `describe_instructions` in `.prbot.toml`, which
+**replaces** rather than appends — a layout is not additive) changes that:
+
+```sh
+DESCRIBE_INSTRUCTIONS='Use exactly these sections, omitting any that are empty:
+Breaking Changes, New Features, Bug Fixes, Deprecations, Migration Notes.'
+```
+
+It is appended last and declared to outrank the built-in section list, because a
+model handed two section lists without being told which governs returns both.
+`EXTRA_SYSTEM_PROMPT` reaches this prompt too — every other prompt in the crate
+honoured it and this one didn't.
+
+**Placement.** The generated block is wrapped in
+`<!-- prbot:describe:start -->` / `<!-- prbot:describe:end -->` and rewritten in
+place on each run, so human edits outside it survive. Put that marker pair
+anywhere in the description yourself and the block lands there instead of at the
+top.
 
 [`command::parse_command`]: src/command.rs
 [`command::run_command`]: src/command.rs
