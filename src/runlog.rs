@@ -1,5 +1,4 @@
-//! Local-only JSONL run log: one line per review run, appended to a file on the
-//! machine that ran it.
+//! JSONL run log: one line per review run, written to a local file or to stdout.
 //!
 //! # Why
 //!
@@ -15,19 +14,41 @@
 //! *behaviour*, never recall — the reviewer never learns what it missed on a real
 //! PR, and no aggregate over these records can supply that.
 //!
+//! # Where it goes
+//!
+//! `PRBOT_RUN_LOG` selects the sink ([`Config::run_log`]):
+//!
+//! - unset or empty — **off**, the default. Nothing is written.
+//! - `-` — **stdout**, one JSON line per review.
+//! - anything else — that **file**, appended to, parent directories created.
+//!
+//! The stdout sink exists because a file needs a disk that survives the process,
+//! and the platforms these bots run on increasingly have neither. Cloud Run is
+//! the case that forced it: its filesystem is ephemeral *and* it runs several
+//! instances at once, so every shared-file approach — a mounted volume, a GCS
+//! FUSE bucket — has concurrent appenders corrupting one file. A log stream has
+//! no such problem, and the platform already captures stdout and routes it
+//! (Cloud Logging, then a BigQuery sink) without this crate needing credentials,
+//! a client library, or a network call on the review path.
+//!
 //! # Privacy
 //!
 //! A record contains the finding text, which is review commentary on the source
-//! it was written about. **The log is therefore opt-in and never leaves the
-//! machine**: it is written only when `PRBOT_RUN_LOG` names a path
-//! ([`Config::run_log_path`]), there is no upload path anywhere in this crate,
-//! and the default is off — so a deployed bot logs nothing unless its operator
-//! sets that variable deliberately. Point it somewhere private and gitignored.
+//! it was written about. **Nothing in this crate ships it anywhere**: there is no
+//! upload path, no client, no network call. It goes to the file you name or to
+//! this process's stdout, and the default is off — so a deployed bot logs
+//! nothing unless its operator sets the variable deliberately.
 //!
-//! [`Config::run_log_path`]: crate::config::Config::run_log_path
+//! Note the sinks differ in where the data comes to rest. A file stays on that
+//! disk. Stdout is captured by whatever supervises the process, so on a hosted
+//! platform the records land in that platform's logging system, under its
+//! retention and its access control. Choose accordingly when the code under
+//! review is not yours.
+//!
+//! [`Config::run_log`]: crate::config::Config::run_log
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -38,6 +59,43 @@ use crate::llm::{Finding, Usage};
 /// reader over a log spanning several releases can tell the shapes apart. Adding
 /// a field is not a bump — every consumer of JSONL must tolerate new keys.
 pub const SCHEMA: u32 = 1;
+
+/// Marks a line as one of ours, under the `_kind` key.
+///
+/// Needed because stdout is a *shared* channel: the process's own `tracing`
+/// output goes to the same stream, and on a platform that parses JSON lines into
+/// structured entries (Cloud Logging does) a query cannot tell a run-log record
+/// from any other JSON a library decided to emit. Selecting on "is JSON" would
+/// work today and silently start collecting junk the moment anything else logs
+/// structured output — including this bot's own tracing, if its subscriber is
+/// ever switched to `.json()`.
+pub const KIND: &str = "prbot_run_log";
+
+/// Where a run log is written.
+///
+/// An enum rather than an `Option<PathBuf>` with a magic `-` value: the sinks
+/// have genuinely different mechanics — one creates directories and appends, the
+/// other locks a shared stream — and a path-shaped type that sometimes is not a
+/// path invites exactly one bug, `create_dir_all("-")`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunLogSink {
+    /// Append to this file, creating it and any missing parent directories.
+    File(PathBuf),
+    /// Write one line to this process's stdout, for a platform that captures it.
+    Stdout,
+}
+
+impl RunLogSink {
+    /// Parse the `PRBOT_RUN_LOG` value. `None` for unset/empty (the default,
+    /// off); `-` for stdout; anything else is a file path.
+    pub fn from_env_value(v: &str) -> Option<Self> {
+        match v.trim() {
+            "" => None,
+            "-" => Some(Self::Stdout),
+            path => Some(Self::File(PathBuf::from(path))),
+        }
+    }
+}
 
 /// How many findings survived each stage between the model's answer and the
 /// posted review.
@@ -99,6 +157,10 @@ pub struct LoggedFinding {
 /// [`RunReviewOutput`]: crate::review::RunReviewOutput
 #[derive(Debug, Clone, Serialize)]
 pub struct RunLog {
+    /// Always [`KIND`]. First key in the record so a reader — or a human tailing
+    /// a mixed stdout stream — can identify the line without parsing it all.
+    #[serde(rename = "_kind")]
+    pub kind: &'static str,
     pub schema: u32,
     /// Seconds since the Unix epoch. Deliberately not a formatted timestamp: this
     /// crate has no date dependency, and inventing an RFC 3339 formatter to make
@@ -189,16 +251,57 @@ pub fn logged_findings(findings: &[Finding], anchors: &[Option<u64>]) -> Vec<Log
         .collect()
 }
 
-/// Append one record to the JSONL log at `path`, creating the file and any
-/// missing parent directories.
+/// Write one record to `sink`.
 ///
 /// **Fail-open in every case.** A run log is an observability side effect; a full
-/// disk, a bad path, or a permissions error must never cost a review that has
-/// already been produced and posted. Failures are warned about and dropped.
-pub fn append(path: &Path, rec: &RunLog) {
-    if let Err(e) = try_append(path, rec) {
-        tracing::warn!("run log: could not write {}: {e:#}", path.display());
+/// disk, a bad path, a permissions error or a closed stdout must never cost a
+/// review that has already been produced and posted. Failures are warned about
+/// and dropped.
+pub fn write(sink: &RunLogSink, rec: &RunLog) {
+    let result = match sink {
+        RunLogSink::File(path) => try_append(path, rec),
+        RunLogSink::Stdout => try_write_stdout(rec),
+    };
+    if let Err(e) = result {
+        let where_ = match sink {
+            RunLogSink::File(p) => p.display().to_string(),
+            RunLogSink::Stdout => "<stdout>".to_string(),
+        };
+        tracing::warn!("run log: could not write {where_}: {e:#}");
     }
+}
+
+/// Serialize one record as a single line, newline included.
+///
+/// One `write_all` of the whole line is what keeps concurrent reviews from
+/// interleaving into an unparseable record — true of a shared file and of a
+/// shared stdout alike, so both sinks go through here.
+fn line_for(rec: &RunLog) -> anyhow::Result<String> {
+    let mut line = serde_json::to_string(rec)?;
+    line.push('\n');
+    Ok(line)
+}
+
+fn try_write_stdout(rec: &RunLog) -> anyhow::Result<()> {
+    // Lock once and flush: a supervisor reading the pipe (Cloud Run, a container
+    // runtime) must see the record even if the process is killed moments later,
+    // and Rust's stdout is line-buffered only when it is a terminal — piped, it
+    // is block-buffered and a crash would eat the tail.
+    let out = std::io::stdout();
+    write_one(&mut out.lock(), rec)
+}
+
+/// Serialize and emit one record through `w`, as a single flushed write.
+///
+/// Split out so the stream path is testable: capturing the process's real stdout
+/// from inside a test is not something a unit test should be doing, and the
+/// property worth pinning — one flushed `write_all` of one complete line — is a
+/// property of this function, not of the file descriptor.
+fn write_one<W: Write>(w: &mut W, rec: &RunLog) -> anyhow::Result<()> {
+    let line = line_for(rec)?;
+    w.write_all(line.as_bytes())?;
+    w.flush()?;
+    Ok(())
 }
 
 fn try_append(path: &Path, rec: &RunLog) -> anyhow::Result<()> {
@@ -207,11 +310,7 @@ fn try_append(path: &Path, rec: &RunLog) -> anyhow::Result<()> {
             std::fs::create_dir_all(dir)?;
         }
     }
-    // One `write_all` of a single line ending in `\n`. Two concurrent reviews on
-    // one process append to the same file, and a line assembled by several small
-    // writes could interleave into an unparseable record.
-    let mut line = serde_json::to_string(rec)?;
-    line.push('\n');
+    let line = line_for(rec)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -229,6 +328,7 @@ mod tests {
 
     fn rec() -> RunLog {
         RunLog {
+            kind: KIND,
             schema: SCHEMA,
             ts_unix: 1_700_000_000,
             core_version: "0.0.0-test".into(),
@@ -276,8 +376,8 @@ mod tests {
         // A nested path the caller never created — parent dirs must be made.
         let path = dir.path().join("nested/runs.jsonl");
 
-        append(&path, &rec());
-        append(&path, &rec());
+        write(&RunLogSink::File(path.clone()), &rec());
+        write(&RunLogSink::File(path.clone()), &rec());
 
         let text = std::fs::read_to_string(&path).expect("log written");
         let lines: Vec<&str> = text.lines().collect();
@@ -300,7 +400,7 @@ mod tests {
         // A file where a directory would have to be — create_dir_all must fail.
         let blocker = dir.path().join("blocker");
         std::fs::write(&blocker, b"x").expect("write blocker");
-        append(&blocker.join("under/runs.jsonl"), &rec());
+        write(&RunLogSink::File(blocker.join("under/runs.jsonl")), &rec());
     }
 
     fn finding(file: &str, line: Option<u64>) -> Finding {
@@ -336,6 +436,76 @@ mod tests {
 
         assert!(!logged[2].anchored);
         assert_eq!(logged[2].anchored_line, None);
+    }
+
+    /// `PRBOT_RUN_LOG` is the whole configuration surface, so its parsing is the
+    /// whole way this feature gets turned on, off, or pointed somewhere.
+    #[test]
+    fn the_env_value_selects_the_sink() {
+        use RunLogSink::*;
+        assert_eq!(RunLogSink::from_env_value(""), None, "unset/empty is OFF");
+        assert_eq!(
+            RunLogSink::from_env_value("   "),
+            None,
+            "whitespace is still off — `PRBOT_RUN_LOG= ` in an env file"
+        );
+        assert_eq!(RunLogSink::from_env_value("-"), Some(Stdout));
+        assert_eq!(
+            RunLogSink::from_env_value("  -  "),
+            Some(Stdout),
+            "trimmed, so a stray space in a YAML env block still means stdout"
+        );
+        assert_eq!(
+            RunLogSink::from_env_value("/data/runs.jsonl"),
+            Some(File(PathBuf::from("/data/runs.jsonl")))
+        );
+        // The one that must never be a path: `-` is claimed, but `./-` is a file.
+        assert_eq!(
+            RunLogSink::from_env_value("./-"),
+            Some(File(PathBuf::from("./-")))
+        );
+    }
+
+    /// The stream sink emits exactly one complete line, and it is tagged.
+    ///
+    /// `_kind` is what makes the record findable on stdout, which is a channel
+    /// shared with this process's own tracing output. Without it a Cloud Logging
+    /// query has to select on "is this JSON", which silently starts collecting
+    /// anything else that ever logs structured output.
+    #[test]
+    fn the_stream_sink_writes_one_tagged_line() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_one(&mut buf, &rec()).expect("written");
+        write_one(&mut buf, &rec()).expect("written");
+
+        let text = String::from_utf8(buf).expect("utf-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per record, newline-terminated");
+        assert!(
+            text.ends_with('\n'),
+            "a reader splitting on newline sees both"
+        );
+
+        let v: serde_json::Value = serde_json::from_str(lines[0]).expect("JSON");
+        assert_eq!(v["_kind"], KIND);
+        assert_eq!(v["funnel"]["model_raw"], 5);
+    }
+
+    /// Both sinks serialize identically — the sink chooses the destination, never
+    /// the content, so a file log and a stdout log are the same dataset.
+    #[test]
+    fn both_sinks_produce_the_same_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("runs.jsonl");
+        write(&RunLogSink::File(path.clone()), &rec());
+
+        let mut buf: Vec<u8> = Vec::new();
+        write_one(&mut buf, &rec()).expect("written");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file"),
+            String::from_utf8(buf).expect("utf-8")
+        );
     }
 
     /// The advisory-only path has findings and no anchors at all.

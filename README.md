@@ -124,15 +124,38 @@ size caps) are also read from the environment — see `src/config.rs`.
 | `CVE_MAX_PACKAGES` | `100` | Max distinct packages queried against OSV per review. |
 | `OSV_API_BASE` | `https://api.osv.dev` | OSV API base (override for a mirror/test double). |
 
-## Run log (local, opt-in)
+## Run log (opt-in)
 
-Set `PRBOT_RUN_LOG` to a file path and every review appends one JSON line
-describing the run: the funnel of findings through each post-processing stage,
-the findings themselves, token usage, and wall time.
+Set `PRBOT_RUN_LOG` and every review emits one JSON line describing the run: the
+funnel of findings through each post-processing stage, the findings themselves,
+token usage, and wall time.
 
-| Env var | Default | Effect |
+| `PRBOT_RUN_LOG` | Sink |
+| --- | --- |
+| *unset or empty* | **off** — the default, nothing is written |
+| `-` | **stdout**, one line per review |
+| any other value | that **file**, appended to; parent directories created |
+
+Every record carries `"_kind": "prbot_run_log"`, which is how you find them on
+stdout — a channel shared with the process's own tracing output. Filter on that
+key rather than on "is this line JSON", which works until anything else emits
+structured output.
+
+### Choosing a sink
+
+A file needs a disk that outlives the process; a stream needs something capturing
+stdout. Which one your platform can actually keep is the whole decision:
+
+| platform | sink | why |
 | --- | --- | --- |
-| `PRBOT_RUN_LOG` | *(unset = off)* | Path to a JSONL run log. Parent directories are created. Empty string also means off. |
+| a workstation | file | it has a disk |
+| Fly.io | file on a `[mounts]` volume | logs are retained only briefly and there is no archive, so stdout would need a shipper to be durable |
+| Cloud Run | `-` (stdout) | the filesystem is ephemeral **and** several instances run at once, so any shared file has concurrent appenders corrupting it. Cloud Logging captures stdout; a sink to BigQuery makes it permanent and queryable |
+| an ephemeral CI runner | `-` (stdout) | a file is discarded with the runner; the job log is kept |
+
+On a hosted platform the stdout sink puts records in that platform's logging
+system, under its retention and access control — worth weighing when the code
+under review is not yours.
 
 It exists to answer the questions a bug-corpus benchmark structurally cannot,
 because they are about the runs that actually happen rather than about planted

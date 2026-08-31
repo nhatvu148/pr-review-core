@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.17.0
+
+**The run log can write to stdout — `PRBOT_RUN_LOG=-`.** 0.16.0 could only append
+to a file, which assumes a disk that outlives the process. Cloud Run has neither:
+its filesystem is ephemeral *and* it runs several instances at once, so every
+shared-file answer — a mounted volume, a GCS FUSE bucket — puts concurrent
+appenders on one file and corrupts it. A log stream has no such problem, and the
+platform already captures stdout and routes it onward (Cloud Logging, then a
+BigQuery sink) with no credentials, no client library, and no network call on the
+review path. The same change makes an ephemeral CI runner loggable, where a file
+was simply lost.
+
+Records now carry `"_kind": "prbot_run_log"`. Stdout is shared with the process's
+own tracing output, and a query that selects on "is this line JSON" works right
+up until anything else emits structured output — including these bots' own
+tracing, if its subscriber is ever switched to `.json()`. Additive; the schema
+version is unchanged, because adding a key is not a break for a JSONL reader.
+
+**Fly stays on a file.** Fly retains logs only briefly and has no archive, so
+stdout there would need a log shipper to be durable — more moving parts than the
+$0.15/month volume it replaces. The sink is a deployment choice, not a better
+way; pick the one the platform can actually keep.
+
+### Migration
+
+| before (0.16.0) | after (0.17.0) |
+| --- | --- |
+| `Config::run_log_path: Option<PathBuf>` | `Config::run_log: Option<RunLogSink>` |
+| `runlog::append(&path, &rec)` | `runlog::write(&sink, &rec)` |
+
+A consumer that only calls `Config::from_env()` needs **no change** — verified
+against `pr-review-bot`, `simcel-pr-bot` and `kaniscope-action`. Only code that
+sets or reads the field directly is affected; construct it with
+`RunLogSink::File(path)` or `RunLogSink::Stdout`, or parse a raw env value with
+`RunLogSink::from_env_value`.
+
+The field is an enum rather than an `Option<PathBuf>` holding a magic `-`,
+because the two sinks have genuinely different mechanics — one creates
+directories and appends, the other locks a shared stream — and a path-shaped type
+that is sometimes not a path invites precisely one bug: `create_dir_all("-")`.
+
+
 ## 0.16.0
 
 **A local, opt-in run log — `PRBOT_RUN_LOG`.** Set it to a path and every review
