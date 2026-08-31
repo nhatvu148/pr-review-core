@@ -16,6 +16,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub mod agent;
 pub mod backend;
 pub mod blast;
+pub mod changemap;
 pub mod command;
 pub mod complexity;
 pub mod config;

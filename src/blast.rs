@@ -59,7 +59,7 @@ const RAW_FETCH_CAP: usize = 600;
 
 /// Heuristic: does this path look like a test file? Covers the common conventions
 /// across Rust/TS/JS/Python/Go (dir-based and filename-based).
-fn is_test_path(path: &str) -> bool {
+pub(crate) fn is_test_path(path: &str) -> bool {
     let p = path.to_ascii_lowercase();
     let file = p.rsplit('/').next().unwrap_or(&p);
     p.contains("/tests/")

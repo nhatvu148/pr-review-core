@@ -523,6 +523,52 @@ fn render_summary(
     s
 }
 
+/// How much of the change map this configuration will actually render.
+///
+/// Cost follows the ask, one level finer than it used to: the walkthrough reads
+/// symbols and grades, the diagram additionally reads edges, and edge linking is
+/// the pairwise scan. A walkthrough-only review used to pay for edges nothing
+/// would draw.
+fn map_detail(cfg: &Config) -> crate::changemap::MapDetail {
+    use crate::changemap::MapDetail;
+    match (cfg.walkthrough, cfg.diagram) {
+        (_, true) => MapDetail::Full,
+        (true, false) => MapDetail::Symbols,
+        (false, false) => MapDetail::None,
+    }
+}
+
+/// Append the change map's renderings to a summary comment.
+///
+/// Both are opt-in and both are *derived* — nothing here asks a model anything, so
+/// a reader can check every row and every arrow against the code. Each render
+/// returns an empty string when it has nothing worth showing (no files; no edges),
+/// and an empty render appends nothing rather than an empty `<details>`.
+fn append_change_map(
+    cfg: &Config,
+    provider: &str,
+    map: &crate::changemap::ChangeMap,
+    findings: &[Finding],
+    summary: &mut String,
+) {
+    if cfg.walkthrough {
+        let w = crate::changemap::render_walkthrough(map, findings, cfg.walkthrough_max_symbols);
+        if !w.is_empty() {
+            summary.push_str("\n\n");
+            summary.push_str(&w);
+        }
+    }
+    // Mermaid that a provider won't render is a wall of source in the comment —
+    // strictly worse than no diagram.
+    if cfg.diagram && crate::changemap::supports_mermaid(provider) {
+        let d = crate::changemap::render_diagram(map);
+        if !d.is_empty() {
+            summary.push_str("\n\n");
+            summary.push_str(&d);
+        }
+    }
+}
+
 /// Hidden marker on a summary comment that is **not** a finished review.
 ///
 /// Machine-readable on purpose. A consumer's boot reconciliation asks "has this PR
@@ -1168,11 +1214,22 @@ pub async fn run_review_with(
     // so the model knows every change's scope. Tier B (tree-sitter over fetched
     // files) with a Tier A (hunk-header) fallback — fully fail-open, so a hiccup
     // just yields an empty string and the review proceeds without it.
-    let structural = if cfg.structural_context {
-        crate::structure::structural_context(&provider, &client, cfg, &input.repo, &meta, &diff)
-            .await
+    // Ask for exactly what will be rendered and no more: the map costs a pass the
+    // prompt block doesn't need, and edge linking costs a pairwise span scan only
+    // the diagram reads.
+    let (structural, change_map) = if cfg.structural_context {
+        crate::structure::inner(
+            &provider,
+            &client,
+            cfg,
+            &input.repo,
+            &meta,
+            &diff,
+            map_detail(cfg),
+        )
+        .await
     } else {
-        String::new()
+        (String::new(), crate::changemap::ChangeMap::default())
     };
     if !structural.is_empty() {
         tracing::info!(
@@ -1215,6 +1272,17 @@ pub async fn run_review_with(
             .summary
             .push_str(&crate::deps::render_advisories(&advisories));
     }
+    // Derived renderings of the change, appended last: they describe what the PR
+    // touched, which is context for the findings above rather than a finding
+    // itself. Both collapse into `<details>`, so a reader who wants only the
+    // verdict never has to scroll past them.
+    append_change_map(
+        cfg,
+        provider.name(),
+        &change_map,
+        &finished.findings,
+        &mut finished.summary,
+    );
 
     let FinishedReview {
         findings,
@@ -1367,8 +1435,13 @@ pub async fn run_review_local(
 
     // Structural context from the checkout when there is one; hunk headers (Tier A)
     // otherwise. Fail-open, like the PR path — an empty string just omits the block.
+    let mut change_map = crate::changemap::ChangeMap::default();
     let structural = match (cfg.structural_context, input.repo_root.as_deref()) {
-        (true, Some(root)) => crate::structure::structural_context_local(cfg, root, &diff),
+        (true, Some(root)) => {
+            let (block, map) = crate::structure::local_inner(cfg, root, &diff, map_detail(cfg));
+            change_map = map;
+            block
+        }
         (true, None) => crate::structure::hunk_context(&diff),
         (false, _) => String::new(),
     };
@@ -1394,7 +1467,17 @@ pub async fn run_review_local(
         injected_rules: &injected_rules,
     };
     let result = backend.review(&ctx).await?;
-    let finished = finish_review(cfg, backend, &meta, &diff, &result, hygiene).await;
+    let mut finished = finish_review(cfg, backend, &meta, &diff, &result, hygiene).await;
+    // Same feature on this path: a local review's deliverable *is* its
+    // `summary_markdown`, so leaving it unwired made WALKTHROUGH/DIAGRAM silently
+    // a no-op for every caller of this entry point.
+    append_change_map(
+        cfg,
+        LOCAL_PROVIDER,
+        &change_map,
+        &finished.findings,
+        &mut finished.summary,
+    );
 
     Ok(RunReviewOutput {
         provider: LOCAL_PROVIDER.to_string(),
@@ -1584,6 +1667,80 @@ mod local_review_tests {
 
     /// With a checkout, Tier B names the enclosing symbol from the file on disk —
     /// the local equivalent of fetching the new-side file from the provider.
+    /// The feature was wired on the PR path only, so every caller of this entry
+    /// point got `WALKTHROUGH=true` and no walkthrough. Reported by review on #38.
+    #[tokio::test]
+    async fn the_local_path_renders_the_walkthrough_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/order.rs"), NEW_SIDE).unwrap();
+
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.structural_context = true;
+        c.walkthrough = true;
+
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: Some(dir.path().to_path_buf()),
+                label: "branch".to_string(),
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert!(
+            out.summary_markdown.contains("Walkthrough"),
+            "{}",
+            out.summary_markdown
+        );
+        assert!(
+            out.summary_markdown.contains("`fn total`"),
+            "{}",
+            out.summary_markdown
+        );
+    }
+
+    /// ...and stays off when it is off, on the same path.
+    #[tokio::test]
+    async fn the_local_path_appends_nothing_when_the_feature_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/order.rs"), NEW_SIDE).unwrap();
+
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.structural_context = true;
+        c.walkthrough = false;
+        c.diagram = false;
+
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: Some(dir.path().to_path_buf()),
+                label: "branch".to_string(),
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert!(
+            !out.summary_markdown.contains("Walkthrough"),
+            "{}",
+            out.summary_markdown
+        );
+        assert!(
+            !out.summary_markdown.contains("mermaid"),
+            "{}",
+            out.summary_markdown
+        );
+    }
+
     #[tokio::test]
     async fn a_repo_root_supplies_tree_sitter_structural_context() {
         let dir = tempfile::tempdir().unwrap();
@@ -2507,6 +2664,128 @@ mod tests {
         // 20 is 11 rows from 9 — outside REANCHOR_WINDOW, so no snap even though the
         // symbol matches.
         assert_eq!(reanchor(9, &valid, &texts, "calcTotal issue"), None);
+    }
+}
+
+#[cfg(test)]
+mod change_map_tests {
+    use super::*;
+    use crate::changemap::{ChangeMap, Edge, EdgeKind, FileEntry, SymbolNode};
+
+    fn map() -> ChangeMap {
+        ChangeMap {
+            symbols: vec![
+                SymbolNode {
+                    label: "fn",
+                    name: "caller".into(),
+                    file: "a.rs".into(),
+                    start: 1,
+                    end: 3,
+                    cyclomatic: Some(12),
+                    cognitive: Some(9),
+                },
+                SymbolNode {
+                    label: "fn",
+                    name: "callee".into(),
+                    file: "b.rs".into(),
+                    start: 1,
+                    end: 2,
+                    cyclomatic: None,
+                    cognitive: None,
+                },
+            ],
+            files: vec![
+                FileEntry {
+                    path: "a.rs".into(),
+                    added: 3,
+                    removed: 1,
+                    symbols: vec![0],
+                    worst: None,
+                },
+                FileEntry {
+                    path: "b.rs".into(),
+                    added: 2,
+                    removed: 0,
+                    symbols: vec![1],
+                    worst: None,
+                },
+            ],
+            edges: vec![Edge {
+                from: 0,
+                to: 1,
+                kind: EdgeKind::Call,
+            }],
+            edges_truncated: false,
+        }
+    }
+
+    fn conf(walkthrough: bool, diagram: bool) -> Config {
+        let mut c = Config::from_env();
+        c.walkthrough = walkthrough;
+        c.diagram = diagram;
+        c
+    }
+
+    #[test]
+    fn both_blocks_land_on_the_summary_when_enabled() {
+        let mut s = "🤖 **Automated review**".to_string();
+        append_change_map(&conf(true, true), "github", &map(), &[], &mut s);
+        assert!(s.contains("🗺️ <b>Walkthrough</b>"), "{s}");
+        assert!(s.contains("```mermaid"), "{s}");
+    }
+
+    /// Both are off by default: they change what every review comment looks like,
+    /// and that is the operator's call, not this crate's.
+    #[test]
+    fn nothing_is_appended_when_both_are_off() {
+        let before = "🤖 **Automated review**".to_string();
+        let mut s = before.clone();
+        append_change_map(&conf(false, false), "github", &map(), &[], &mut s);
+        assert_eq!(s, before);
+    }
+
+    /// Bitbucket renders no mermaid, so the block would post as a wall of source.
+    /// The walkthrough is plain markdown and still goes out.
+    #[test]
+    fn bitbucket_gets_the_table_but_not_the_diagram() {
+        let mut s = String::new();
+        append_change_map(&conf(true, true), "bitbucket", &map(), &[], &mut s);
+        assert!(s.contains("Walkthrough"), "{s}");
+        assert!(!s.contains("mermaid"), "{s}");
+    }
+
+    /// A review with no structural context (parse failed, feature off, no head
+    /// SHA) must append nothing at all rather than an empty `<details>` block.
+    #[test]
+    fn an_empty_map_appends_nothing() {
+        let mut s = String::new();
+        append_change_map(
+            &conf(true, true),
+            "github",
+            &ChangeMap::default(),
+            &[],
+            &mut s,
+        );
+        assert!(s.is_empty(), "{s}");
+    }
+
+    /// The findings column is the join that makes the table worth reading: it
+    /// says *where* the review landed, not just what changed.
+    #[test]
+    fn the_table_attributes_each_finding_to_its_file() {
+        let findings = vec![Finding {
+            severity: "BLOCKING".into(),
+            file: "b.rs".into(),
+            line: Some(1),
+            body: "x".into(),
+            confidence: None,
+        }];
+        let mut s = String::new();
+        append_change_map(&conf(true, false), "github", &map(), &findings, &mut s);
+        let b_row = s.lines().find(|l| l.contains("`b.rs`")).expect("b.rs row");
+        assert!(b_row.contains("🚨"), "{b_row}");
+        let a_row = s.lines().find(|l| l.contains("`a.rs`")).expect("a.rs row");
+        assert!(a_row.contains("| — |"), "{a_row}");
     }
 }
 

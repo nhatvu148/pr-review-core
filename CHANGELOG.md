@@ -1,5 +1,113 @@
 # Changelog
 
+## Unreleased
+
+**A derived walkthrough table and change diagram — `WALKTHROUGH` / `DIAGRAM`.**
+Both off by default; both change what every review comment looks like, which is
+the operator's call rather than this crate's.
+
+The walkthrough is one row per changed file: line counts, the definitions the
+change landed in, the worst complexity grade among them, and the findings the
+review filed there. The diagram groups changed symbols by file and draws an arrow
+wherever one names another inside its own definition.
+
+Every column and every arrow already existed. `structural_context` parses each
+changed file with tree-sitter to name the enclosing definition of each changed
+line, and `changed_fn_complexity_in` grades the functions from that same tree —
+then all of it was flattened into a prompt string and discarded. The new
+`ChangeMap` keeps it: no extra fetch, no extra parse, no extra token, no model
+call.
+
+**Nothing here asks a model anything, and that is the feature.** A diagram a
+model draws from a diff cannot be checked by the reader — a plausible arrow that
+does not exist in the code is indistinguishable from a real one, and a reader
+will believe it. Every arrow drawn here is a call-shaped occurrence of one
+changed symbol's name inside another changed symbol's resolved span, so a
+suspicious one can be looked up. Four false-arrow classes were found by running
+`examples/changemap_demo` against this crate's own diff and are now pinned by
+tests:
+
+- `name {` was read as a Rust struct literal. It is also `if cond {`, `-> T {`,
+  and `match x {`; the rule is gone, and losing real struct literals is the
+  cheaper error.
+- A container (`mod`, `impl`, `class`) was an edge source. Everything inside its
+  span is referenced by a function nested in it, not by the container.
+- `<Name` was labelled a JSX render in Rust, where it is `Vec<T>`. The file's
+  language now decides.
+- `x.append(` was drawn solid at this crate's `append`. A call through an
+  unresolved receiver is now a dotted "names" edge.
+
+Two guards, both learned from that same demo run: symbol cells collapse to
+`(+N more)` past `WALKTHROUGH_MAX_SYMBOLS` (a one-line `lib.rs` edit resolved to
+thirteen `mod` declarations), and past `DIAGRAM_MAX_NODES` edge linking narrows
+to the highest-complexity symbols instead of bailing out — a 71-symbol change is
+ordinary, and the all-or-nothing ceiling meant the diagram never appeared on a
+real PR. Test scaffolding sorts last in that ranking, including a `mod tests`
+inside a source file, which no path-based rule can see.
+
+The walkthrough's complexity column is read from the complexity pass directly,
+never joined to a symbol. Tier B resolves a symbol by walking up to the nearest
+node `def_label` recognises, and for TS/JS that list has no `arrow_function` or
+`function_expression` — while the complexity pass's `is_function` has both,
+precisely because `const handleSubmit = () => {}` is the dominant modern
+TS/React style. Joining through symbols meant a React PR got a graded function
+in the prompt block and a bare `—` in the table describing the same change. A
+file's worst complexity is a fact about the file and needs no symbol. The
+*Changed symbols* column still reflects Tier B, so an arrow function is named
+there only once `def_label` learns to resolve one — a change to the prompt's
+structural context, not to this rendering.
+
+*Changed symbols* resolves the lines the diff **added**, not every line it showed.
+`parse_valid_lines` rightly includes context — a finding may anchor to a line the
+diff merely displayed — but a column with that heading must not. Seen in the real
+GitHub UI: a one-line addition to `src/lib.rs` reported seven changed modules,
+one per context line, because each context line sat on a different `mod`. New
+`diff::parse_added_lines` answers the narrower question; a pure-deletion hunk
+adds nothing and falls back to the wider set rather than naming nothing. The
+prompt block is untouched.
+
+Three legibility changes to the diagram, all from looking at one rendered on a
+real PR. `DIAGRAM_MAX_NODES` drops 25 → 12, which was a cost number and is now a
+legibility one: at 25 the graph sprawled past the width of a comment and
+mermaid's own pan controls covered a node. `flowchart TD` replaces `LR`, because
+a PR comment is a narrow column. And a grade is drawn only at C or worse — most
+changed functions are an A, so annotating every box put a line of text on each
+one and distinguished nothing; now the risky nodes stand out by contrast.
+
+The diagram is deliberately not themed, and that is a decision rather than an
+omission. GitHub renders mermaid with a theme that follows the viewer's
+light/dark preference; an injected `%%{init: {'theme':…}}%%` overrides it, so
+colors tuned on one theme go unreadable on the other and the author never sees
+it.
+
+The map is built only when a caller asks for it, and asks in three sizes rather
+than two. `structural_context` and its local sibling take the cheap path and
+return an empty map, so a review with both features off pays nothing for either —
+the prompt block it produces is byte-identical either way. A walkthrough-only
+review resolves symbols and grades but skips edge linking, which is the pairwise
+span scan and which only the diagram reads. The complexity pass runs once per
+file and feeds both the prompt block and the map, rather than walking every
+changed function twice.
+
+Both features work on the diff-first `run_review_local` path too, whose
+deliverable *is* its `summary_markdown`.
+
+The diagram is skipped on Bitbucket, which renders no mermaid — the block would
+post as a wall of source. It is also skipped whenever there are no edges: a
+picture of disconnected boxes restates the table in a form that is harder to
+read.
+
+`structural_context` and `structural_context_local` keep their signatures; the
+map comes from new `*_mapped` siblings. Adding to a public type is what broke a
+consumer at 0.11.0. Adding a function cannot.
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `WALKTHROUGH` | `false` | Append the per-file walkthrough table to the summary. |
+| `WALKTHROUGH_MAX_SYMBOLS` | `6` | Symbols listed per file before `(+N more)`. |
+| `DIAGRAM` | `false` | Append the mermaid change diagram (GitHub/GitLab only). |
+| `DIAGRAM_MAX_NODES` | `25` | Symbols considered for edge linking, ranked by complexity. |
+
 ## 0.17.0
 
 **The run log can write to stdout — `PRBOT_RUN_LOG=-`.** 0.16.0 could only append
@@ -40,7 +148,6 @@ The field is an enum rather than an `Option<PathBuf>` holding a magic `-`,
 because the two sinks have genuinely different mechanics — one creates
 directories and appends, the other locks a shared stream — and a path-shaped type
 that is sometimes not a path invites precisely one bug: `create_dir_all("-")`.
-
 
 ## 0.16.0
 
