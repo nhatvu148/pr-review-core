@@ -766,6 +766,58 @@ async fn post_advisory_only(
     Ok(out)
 }
 
+/// Everything one [`crate::runlog::RunLog`] record needs that isn't already on the
+/// [`RunReviewOutput`]. Grouped into a struct because the alternative is a
+/// ten-argument function whose call sites are positional booleans.
+struct RunLogParts<'a> {
+    out: &'a RunReviewOutput,
+    meta: &'a PrMeta,
+    dry_run: bool,
+    diff_bytes: usize,
+    diff_truncated: bool,
+    advisories: usize,
+    truncated_salvage: bool,
+    funnel: crate::runlog::Funnel,
+    /// The line each posted finding anchored to, index-aligned with
+    /// `out.findings_detail`; empty means none anchored.
+    anchors: &'a [Option<u64>],
+    started: std::time::Instant,
+}
+
+/// Append this run to the local JSONL run log, if one is configured.
+///
+/// A no-op — and costs nothing to build the record — when `run_log_path` is unset,
+/// which is the default. Never fails: see [`crate::runlog::append`].
+fn log_run(cfg: &Config, p: RunLogParts<'_>) {
+    let Some(path) = cfg.run_log_path.as_deref() else {
+        return;
+    };
+    let rec = crate::runlog::RunLog {
+        schema: crate::runlog::SCHEMA,
+        ts_unix: crate::runlog::RunLog::now_unix(),
+        core_version: crate::VERSION.to_string(),
+        provider: p.out.provider.clone(),
+        repo: p.out.repo.clone(),
+        pr: p.out.pr,
+        head_sha: p.meta.head_sha.clone(),
+        base_branch: p.meta.base_branch.clone(),
+        model: p.out.model.clone(),
+        dry_run: p.dry_run,
+        posted: p.out.posted,
+        ci_status_known: p.meta.ci_status.is_some(),
+        diff_bytes: p.diff_bytes,
+        diff_truncated: p.diff_truncated,
+        advisories: p.advisories,
+        truncated_salvage: p.truncated_salvage,
+        recommendation: p.out.recommendation.clone(),
+        funnel: p.funnel,
+        findings: crate::runlog::logged_findings(&p.out.findings_detail, p.anchors),
+        usage: p.out.usage.clone(),
+        duration_ms: p.started.elapsed().as_millis() as u64,
+    };
+    crate::runlog::append(path, &rec);
+}
+
 // ---------------------------------------------------------------------------
 // Shared pipeline stages
 //
@@ -857,6 +909,19 @@ struct FinishedReview {
     recommendation: String,
     summary: String,
     inline: Vec<InlineComment>,
+    /// Per-stage survivor counts through the post-processing above. Collected
+    /// here because this is the only place they exist: every stage consumes its
+    /// predecessor's vector, so a caller holding only the final findings cannot
+    /// reconstruct what the critique, the confidence floor, or the cap removed.
+    funnel: crate::runlog::Funnel,
+    /// The line each of `findings` was anchored to, index-aligned, or `None` for
+    /// the ones that folded into the summary.
+    ///
+    /// Also only knowable here. The re-anchor step posts a comment on a line the
+    /// finding itself never records, so `(file, line)` on a finding is NOT enough
+    /// to find its comment afterwards — re-deriving it that way reports every
+    /// re-anchored finding as unanchored.
+    anchors: Vec<Option<u64>>,
 }
 
 /// Everything between the backend's answer and a postable review: self-critique,
@@ -872,6 +937,10 @@ async fn finish_review(
 ) -> FinishedReview {
     // Post-process findings before anchoring: optional self-critique pass, then a
     // confidence floor, severity sort, and a hard cap — cuts noise before posting.
+    let mut funnel = crate::runlog::Funnel {
+        model_raw: result.review.findings.len(),
+        ..Default::default()
+    };
     let mut findings = result.review.findings.clone();
     if cfg.self_critique && !findings.is_empty() {
         // Through the backend seam, so the critique runs on whatever produced the
@@ -884,7 +953,10 @@ async fn finish_review(
             }
         };
     }
+    funnel.after_critique = findings.len();
     findings.retain(|f| f.confidence.unwrap_or(100) >= cfg.min_confidence);
+    funnel.after_confidence = findings.len();
+    funnel.hygiene_added = hygiene.len();
     // Merge the diff-hygiene findings. Added after self-critique/confidence-floor —
     // they're facts, not guesses — but before the severity sort + cap, so they
     // compete like any other finding.
@@ -895,6 +967,7 @@ async fn finish_review(
     // Collapse a burst of one claim repeated across many files into a single finding
     // that states the count — before the sort, so the survivor competes on merit.
     findings = collapse_bursts(findings);
+    funnel.after_collapse = findings.len();
     findings.sort_by(|a, b| {
         severity_rank(&b.severity)
             .cmp(&severity_rank(&a.severity))
@@ -906,6 +979,7 @@ async fn finish_review(
     // still can't leave the recommendation understating a real problem.
     let recommendation = effective_recommendation(&result.review.recommendation, &findings);
     findings.truncate(cfg.max_findings);
+    funnel.posted_findings = findings.len();
 
     let valid = parse_valid_lines(diff);
     // Line texts are only needed to confirm a re-anchor (content match).
@@ -921,6 +995,7 @@ async fn finish_review(
     // rejects an out-of-diff anchor.
     let mut inline: Vec<InlineComment> = Vec::new();
     let mut unanchored: Vec<&Finding> = Vec::new();
+    let mut anchors: Vec<Option<u64>> = Vec::with_capacity(findings.len());
     for f in &findings {
         let mut anchor = f
             .line
@@ -932,6 +1007,7 @@ async fn finish_review(
                 anchor = reanchor(l, v, t, &f.body);
             }
         }
+        anchors.push(anchor);
         match anchor {
             Some(line) => inline.push(InlineComment {
                 path: f.file.clone(),
@@ -945,11 +1021,16 @@ async fn finish_review(
     // `recommendation` was computed from the pre-truncation findings above.
     let summary = render_summary(&result.review, &recommendation, &unanchored, inline.len());
 
+    funnel.anchored = inline.len();
+    funnel.unanchored = unanchored.len();
+
     FinishedReview {
         findings,
         recommendation,
         summary,
         inline,
+        funnel,
+        anchors,
     }
 }
 
@@ -976,6 +1057,7 @@ pub async fn run_review_with(
     input: RunReviewInput,
     backend: &dyn ReviewBackend,
 ) -> Result<RunReviewOutput> {
+    let started = std::time::Instant::now();
     let provider = Provider::from_name(&input.provider)?;
     let client = reqwest::Client::new();
 
@@ -1029,7 +1111,8 @@ pub async fn run_review_with(
     // on those files still deserves a comment. Post the no-review summary and return.
     if prepared.diff.trim().is_empty() {
         if !advisories.is_empty() || !prepared.hygiene.is_empty() {
-            return post_advisory_only(
+            let advisory_count = advisories.len();
+            let out = post_advisory_only(
                 &provider,
                 &client,
                 cfg,
@@ -1038,7 +1121,32 @@ pub async fn run_review_with(
                 advisories,
                 prepared.hygiene,
             )
-            .await;
+            .await?;
+            // No model ran on this path, so most of the funnel is vacuous: every
+            // finding is deterministic hygiene, and none of them anchor.
+            let n = out.findings_detail.len();
+            log_run(
+                cfg,
+                RunLogParts {
+                    out: &out,
+                    meta: &meta,
+                    dry_run: input.dry_run,
+                    diff_bytes: 0,
+                    diff_truncated: false,
+                    advisories: advisory_count,
+                    truncated_salvage: false,
+                    funnel: crate::runlog::Funnel {
+                        hygiene_added: n,
+                        after_collapse: n,
+                        posted_findings: n,
+                        unanchored: n,
+                        ..Default::default()
+                    },
+                    anchors: &[],
+                    started,
+                },
+            );
+            return Ok(out);
         }
         anyhow::bail!(
             "PR diff is empty (all files excluded by globs, or no changes) — nothing to review."
@@ -1049,6 +1157,11 @@ pub async fn run_review_with(
         hygiene,
         omitted_note,
     } = prepared;
+    // Recorded now: `diff` is what the backend is about to see (post-filter,
+    // post-pack), and an `omitted_note` means whole files were dropped to fit the
+    // budget — i.e. part of this change is going unreviewed.
+    let diff_bytes = diff.len();
+    let diff_truncated = omitted_note.is_some();
 
     // Structural context: name the enclosing function/symbol of each changed line
     // so the model knows every change's scope. Tier B (tree-sitter over fetched
@@ -1093,6 +1206,7 @@ pub async fn run_review_with(
         injected_rules: &injected_rules,
     };
     let result = backend.review(&ctx).await?;
+    let truncated = result.review.summary.contains(crate::llm::TRUNCATED_NOTE);
     let mut finished = finish_review(cfg, backend, &meta, &diff, &result, hygiene).await;
     if !advisories.is_empty() {
         finished.summary.push_str("\n\n");
@@ -1106,6 +1220,8 @@ pub async fn run_review_with(
         recommendation,
         summary,
         inline,
+        funnel,
+        anchors,
     } = finished;
     let inline_count = inline.len();
     let post = ReviewPost {
@@ -1132,6 +1248,24 @@ pub async fn run_review_with(
         out.comment_url = provider.post_review(&client, cfg, &meta, &post).await?;
         out.posted = true;
     }
+
+    log_run(
+        cfg,
+        RunLogParts {
+            out: &out,
+            meta: &meta,
+            dry_run: input.dry_run,
+            diff_bytes,
+            diff_truncated,
+            advisories: advisories.len(),
+            // The salvage marks a cut-off review in its own summary; that marker is
+            // the only signal for it that survives to here.
+            truncated_salvage: truncated,
+            funnel,
+            anchors: &anchors,
+            started,
+        },
+    );
 
     Ok(out)
 }
@@ -1588,11 +1722,17 @@ mod orchestrator_tests {
     /// A GitHub stub serving one PR's metadata and diff. Anything else — notably
     /// `.prbot.toml` — 404s, which the provider reads as "absent".
     async fn github_stub() -> MockServer {
+        github_stub_with(DIFF).await
+    }
+
+    /// [`github_stub`] over a caller-chosen diff, for tests that need particular
+    /// line numbers on the new side.
+    async fn github_stub_with(diff: &str) -> MockServer {
         let s = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/repos/o/r/pulls/1"))
             .and(header("accept", "application/vnd.github.diff"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(DIFF))
+            .respond_with(ResponseTemplate::new(200).set_body_string(diff.to_string()))
             .mount(&s)
             .await;
         Mock::given(method("GET"))
@@ -1666,6 +1806,192 @@ mod orchestrator_tests {
                 "the backend never received the rule containing {rule:?}"
             );
         }
+    }
+
+    /// Returns a fixed set of findings so the run log's funnel has something to
+    /// count at every stage.
+    struct FunnelBackend;
+
+    #[async_trait]
+    impl ReviewBackend for FunnelBackend {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            let f = |sev: &str, file: &str, line: Option<u64>, conf: u8, body: &str| {
+                crate::llm::Finding {
+                    severity: sev.to_string(),
+                    file: file.to_string(),
+                    line,
+                    body: body.to_string(),
+                    confidence: Some(conf),
+                }
+            };
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "several things".to_string(),
+                    recommendation: "APPROVE WITH CHANGES".to_string(),
+                    // New-side line 2 is the added line in DIFF, so it anchors;
+                    // src/zzz.rs is not in the diff at all, so it cannot.
+                    findings: vec![
+                        f("HIGH", "src/a.rs", Some(2), 90, "a null deref"),
+                        f("HIGH", "src/a.rs", Some(2), 80, "an unchecked index"),
+                        f("MEDIUM", "src/zzz.rs", Some(99), 70, "not in this diff"),
+                        f("LOW", "src/a.rs", Some(2), 60, "capped out"),
+                        f("LOW", "src/a.rs", Some(2), 10, "below the floor"),
+                    ],
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    /// The run log's reason to exist: the per-stage counts are the only record of
+    /// what the pipeline removed. A caller holding the posted findings can see
+    /// three of them and cannot tell that the model proposed five, that the
+    /// confidence floor took one, and that the cap took another.
+    #[tokio::test]
+    async fn the_run_log_records_the_full_finding_funnel() {
+        let srv = github_stub().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.min_confidence = 50; // drops the conf-10 finding
+        cfg.max_findings = 3; // drops the lowest-ranked survivor
+        cfg.reanchor_findings = false; // keep anchoring exact for the assertions
+        cfg.run_log_path = Some(log.clone());
+
+        run_review_with(&cfg, input(), &FunnelBackend)
+            .await
+            .expect("the review runs");
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        let v: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("one parseable JSON line");
+
+        assert_eq!(v["repo"], "o/r");
+        assert_eq!(v["pr"], 1);
+        assert_eq!(v["model"], "spy");
+        assert_eq!(v["head_sha"], "deadbeef");
+        assert_eq!(v["dry_run"], true);
+        assert_eq!(v["posted"], false, "a dry run posts nothing");
+        assert_eq!(v["recommendation"], "APPROVE WITH CHANGES");
+
+        let f = &v["funnel"];
+        assert_eq!(f["model_raw"], 5, "what the backend proposed");
+        assert_eq!(
+            f["after_critique"], 5,
+            "self-critique is off in this config"
+        );
+        assert_eq!(
+            f["after_confidence"], 4,
+            "the conf-10 finding fell to the floor"
+        );
+        assert_eq!(f["hygiene_added"], 0);
+        assert_eq!(f["after_collapse"], 4);
+        assert_eq!(
+            f["posted_findings"], 3,
+            "the cap took the lowest-ranked one"
+        );
+        assert_eq!(f["anchored"], 2, "both src/a.rs:2 findings hit a diff line");
+        assert_eq!(f["unanchored"], 1, "src/zzz.rs:99 is not in the diff");
+
+        let findings = v["findings"].as_array().expect("findings array");
+        assert_eq!(findings.len(), 3, "the posted findings, with their text");
+        assert_eq!(findings[0]["severity"], "HIGH");
+        assert_eq!(findings[0]["confidence"], 90);
+        assert_eq!(findings[0]["anchored"], true);
+        assert_eq!(findings[0]["anchored_line"], 2);
+        assert_eq!(findings[2]["file"], "src/zzz.rs");
+        assert_eq!(findings[2]["anchored"], false);
+        assert!(findings[2]["anchored_line"].is_null());
+    }
+
+    /// New-side lines: 1 is context, 2 and 3 are added. A finding that names
+    /// `calcTotal` but claims line 5 re-anchors onto line 3.
+    const DRIFT_DIFF: &str = "diff --git a/src/order.ts b/src/order.ts\n--- a/src/order.ts\n+++ b/src/order.ts\n@@ -1,1 +1,3 @@\n const items = [];\n+const subtotal = sum(items);\n+return calcTotal(order, tax);\n";
+
+    /// Proposes one finding whose line is off the diff but whose body names a
+    /// symbol on a nearby added line — the re-anchor path.
+    struct DriftBackend;
+
+    #[async_trait]
+    impl ReviewBackend for DriftBackend {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "one drifted finding".to_string(),
+                    recommendation: "APPROVE WITH CHANGES".to_string(),
+                    findings: vec![crate::llm::Finding {
+                        severity: "HIGH".to_string(),
+                        file: "src/order.ts".to_string(),
+                        line: Some(5),
+                        body: "`calcTotal` now needs a tax arg.".to_string(),
+                        confidence: Some(90),
+                    }],
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    /// A re-anchored finding must be logged as anchored, at the line the comment
+    /// actually went to.
+    ///
+    /// The first version of this module decided `anchored` by re-matching the
+    /// finding's own `(file, line)` against the posted comments. `reanchor` only
+    /// ever returns a line *different* from the finding's, and the finding is
+    /// never updated with it — so every re-anchored finding logged as
+    /// `anchored: false` despite having a comment on the PR. With
+    /// `REANCHOR_FINDINGS` defaulting to on, that is the common case, and the
+    /// per-finding flags would have disagreed with `funnel.anchored` in most
+    /// production records.
+    #[tokio::test]
+    async fn a_reanchored_finding_logs_the_line_its_comment_went_to() {
+        let srv = github_stub_with(DRIFT_DIFF).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.reanchor_findings = true; // the default, and the bug's precondition
+        cfg.run_log_path = Some(log.clone());
+
+        run_review_with(&cfg, input(), &DriftBackend)
+            .await
+            .expect("the review runs");
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        let v: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("one parseable JSON line");
+
+        assert_eq!(v["funnel"]["anchored"], 1, "the comment was posted inline");
+        assert_eq!(v["funnel"]["unanchored"], 0);
+
+        let f = &v["findings"][0];
+        assert_eq!(f["line"], 5, "the line the model named is preserved");
+        assert_eq!(f["anchored"], true, "it did anchor — this was the bug");
+        assert_eq!(f["anchored_line"], 3, "onto the line naming calcTotal");
+    }
+
+    /// The privacy default. A record carries review commentary on someone's
+    /// source, so an operator who never asked for a log must not get one — and
+    /// the check is a config field being unset, not a path that happens to fail.
+    #[tokio::test]
+    async fn no_run_log_is_written_unless_one_is_configured() {
+        let srv = github_stub().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.run_log_path = None;
+
+        run_review_with(&cfg, input(), &FunnelBackend)
+            .await
+            .expect("the review runs");
+
+        let written: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readable tempdir")
+            .collect();
+        assert!(written.is_empty(), "nothing was logged anywhere");
     }
 
     /// Proposes two findings, and answers `complete()` with whatever the test

@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.16.0
+
+**A local, opt-in run log — `PRBOT_RUN_LOG`.** Set it to a path and every review
+appends one JSON line: the per-stage funnel of findings, the findings themselves,
+usage, and wall time. Unset (the default), nothing is written.
+
+The bench corpus scores the reviewer against *planted* bugs, where the ground
+truth is known. It is silent on the runs that actually happen, and those were
+being discarded the moment the comment posted — so questions with no answer
+anywhere included: how often does the `MAX_FINDINGS` cap truncate a real review,
+how often does `SELF_CRITIQUE` drop a finding, and how often does a review get
+salvaged from a response the model cut off. 0.15.0–0.15.3 were three consecutive
+releases about review-JSON salvage, shipped without a way to observe the rate the
+salvage fires at in production.
+
+The funnel is collected inside `finish_review`, because that is the only place it
+exists: each stage consumes its predecessor's vector, so a caller holding the
+posted findings cannot reconstruct what the critique, the confidence floor, or
+the cap removed. Each finding's resolved anchor comes out of the same place and
+for the same reason: `reanchor` posts a comment on a line the finding itself
+never records, so a record carries both `line` (what the model said) and
+`anchored_line` (where the comment went). The second is the join key for any
+later outcome pass — the first would find nothing whenever `REANCHOR_FINDINGS`
+moved a finding, which is the default and the common case.
+
+Two limits, stated because a run log invites both mistakes:
+
+- **It cannot measure recall.** No record knows whether a finding was correct, and
+  a real PR never reveals what the reviewer missed. This measures behaviour.
+- **It is not telemetry.** Records carry finding text — review commentary on
+  someone's source. Off by default, written only to the local path you name, and
+  no code path in this crate uploads it.
+
+`truncated_salvage` reports the truncation case only, read off the marker the
+salvage leaves in the summary. A plain JSON repair (malformed but complete) stays
+tracing-only: surfacing it would change the signature of the public
+`parse_review_with_repair`, which downstream backends call.
+
+Additive: one new `Config` field, one new module. No behaviour change to any
+existing path.
+
+
 ## 0.15.3
 
 **Doc fix on `post_review_failure`.** 0.15.2 claimed it "never creates a comment

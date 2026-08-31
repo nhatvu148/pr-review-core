@@ -27,6 +27,7 @@ pub mod providers;
 pub mod repo;
 pub mod repo_config;
 pub mod review;
+pub mod runlog;
 pub mod structure;
 pub mod webhook;
 
