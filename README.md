@@ -148,7 +148,18 @@ one names another inside its own definition.
 | `DIAGRAM_MAX_NODES` | `25` | Symbols considered for edge linking. Past this, linking narrows to the highest-complexity symbols (test scaffolding last) and the diagram says so. |
 
 Both need `STRUCTURAL_CONTEXT` (on by default); the complexity column additionally
-needs `COMPLEXITY_METRICS` (also on by default).
+needs `COMPLEXITY_METRICS` (also on by default). Cost follows the ask: with both
+off nothing is built, and with only `WALKTHROUGH` on the edge-linking scan the
+diagram needs is skipped.
+
+One asymmetry worth knowing. The *Worst complexity* column comes from the
+complexity pass directly, so it grades a TS/JS arrow function
+(`const handleSubmit = () => {}`) like anything else. The *Changed symbols*
+column comes from the structural pass, which resolves a symbol by walking up to
+the nearest declaration it recognises — and that list has no `arrow_function`, so
+such a file can show a real grade beside an empty symbol cell. That is the
+structural context's existing shape, and it is the same in the prompt the model
+sees.
 
 **Why nothing here is model-written.** A diagram a model draws from a diff cannot
 be checked by the reader: a plausible arrow that doesn't exist in the code is

@@ -523,6 +523,21 @@ fn render_summary(
     s
 }
 
+/// How much of the change map this configuration will actually render.
+///
+/// Cost follows the ask, one level finer than it used to: the walkthrough reads
+/// symbols and grades, the diagram additionally reads edges, and edge linking is
+/// the pairwise scan. A walkthrough-only review used to pay for edges nothing
+/// would draw.
+fn map_detail(cfg: &Config) -> crate::changemap::MapDetail {
+    use crate::changemap::MapDetail;
+    match (cfg.walkthrough, cfg.diagram) {
+        (_, true) => MapDetail::Full,
+        (true, false) => MapDetail::Symbols,
+        (false, false) => MapDetail::None,
+    }
+}
+
 /// Append the change map's renderings to a summary comment.
 ///
 /// Both are opt-in and both are *derived* — nothing here asks a model anything, so
@@ -1199,34 +1214,22 @@ pub async fn run_review_with(
     // so the model knows every change's scope. Tier B (tree-sitter over fetched
     // files) with a Tier A (hunk-header) fallback — fully fail-open, so a hiccup
     // just yields an empty string and the review proceeds without it.
-    // The map costs a pass the prompt block does not need, so it is only asked
-    // for when something downstream will render it.
-    let want_map = cfg.walkthrough || cfg.diagram;
-    let (structural, change_map) = match (cfg.structural_context, want_map) {
-        (true, true) => {
-            crate::structure::structural_context_mapped(
-                &provider,
-                &client,
-                cfg,
-                &input.repo,
-                &meta,
-                &diff,
-            )
-            .await
-        }
-        (true, false) => (
-            crate::structure::structural_context(
-                &provider,
-                &client,
-                cfg,
-                &input.repo,
-                &meta,
-                &diff,
-            )
-            .await,
-            crate::changemap::ChangeMap::default(),
-        ),
-        (false, _) => (String::new(), crate::changemap::ChangeMap::default()),
+    // Ask for exactly what will be rendered and no more: the map costs a pass the
+    // prompt block doesn't need, and edge linking costs a pairwise span scan only
+    // the diagram reads.
+    let (structural, change_map) = if cfg.structural_context {
+        crate::structure::inner(
+            &provider,
+            &client,
+            cfg,
+            &input.repo,
+            &meta,
+            &diff,
+            map_detail(cfg),
+        )
+        .await
+    } else {
+        (String::new(), crate::changemap::ChangeMap::default())
     };
     if !structural.is_empty() {
         tracing::info!(
@@ -1434,12 +1437,11 @@ pub async fn run_review_local(
     // otherwise. Fail-open, like the PR path — an empty string just omits the block.
     let mut change_map = crate::changemap::ChangeMap::default();
     let structural = match (cfg.structural_context, input.repo_root.as_deref()) {
-        (true, Some(root)) if cfg.walkthrough || cfg.diagram => {
-            let (block, map) = crate::structure::structural_context_local_mapped(cfg, root, &diff);
+        (true, Some(root)) => {
+            let (block, map) = crate::structure::local_inner(cfg, root, &diff, map_detail(cfg));
             change_map = map;
             block
         }
-        (true, Some(root)) => crate::structure::structural_context_local(cfg, root, &diff),
         (true, None) => crate::structure::hunk_context(&diff),
         (false, _) => String::new(),
     };
@@ -2698,12 +2700,14 @@ mod change_map_tests {
                     added: 3,
                     removed: 1,
                     symbols: vec![0],
+                    worst: None,
                 },
                 FileEntry {
                     path: "b.rs".into(),
                     added: 2,
                     removed: 0,
                     symbols: vec![1],
+                    worst: None,
                 },
             ],
             edges: vec![Edge {

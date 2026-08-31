@@ -45,11 +45,26 @@ ordinary, and the all-or-nothing ceiling meant the diagram never appeared on a
 real PR. Test scaffolding sorts last in that ranking, including a `mod tests`
 inside a source file, which no path-based rule can see.
 
-The map is built only when a caller asks for it. `structural_context` and its
-local sibling take the cheap path and return an empty map, so a review with both
-features off pays nothing for either — the prompt block it produces is
-byte-identical either way. The complexity pass runs once per file and feeds both
-the prompt block and the map, rather than walking every changed function twice.
+The walkthrough's complexity column is read from the complexity pass directly,
+never joined to a symbol. Tier B resolves a symbol by walking up to the nearest
+node `def_label` recognises, and for TS/JS that list has no `arrow_function` or
+`function_expression` — while the complexity pass's `is_function` has both,
+precisely because `const handleSubmit = () => {}` is the dominant modern
+TS/React style. Joining through symbols meant a React PR got a graded function
+in the prompt block and a bare `—` in the table describing the same change. A
+file's worst complexity is a fact about the file and needs no symbol. The
+*Changed symbols* column still reflects Tier B, so an arrow function is named
+there only once `def_label` learns to resolve one — a change to the prompt's
+structural context, not to this rendering.
+
+The map is built only when a caller asks for it, and asks in three sizes rather
+than two. `structural_context` and its local sibling take the cheap path and
+return an empty map, so a review with both features off pays nothing for either —
+the prompt block it produces is byte-identical either way. A walkthrough-only
+review resolves symbols and grades but skips edge linking, which is the pairwise
+span scan and which only the diagram reads. The complexity pass runs once per
+file and feeds both the prompt block and the map, rather than walking every
+changed function twice.
 
 Both features work on the diff-first `run_review_local` path too, whose
 deliverable *is* its `summary_markdown`.

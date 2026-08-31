@@ -55,13 +55,47 @@ pub struct SymbolNode {
 impl SymbolNode {
     /// A–F grade, using the same bands as [`crate::complexity::FnComplexity`].
     pub fn grade(&self) -> Option<char> {
-        self.cyclomatic.map(|c| match c {
-            0..=5 => 'A',
-            6..=10 => 'B',
-            11..=15 => 'C',
-            16..=25 => 'D',
-            _ => 'F',
-        })
+        self.cyclomatic.map(grade_for)
+    }
+}
+
+/// A–F from cyclomatic complexity: A ≤5 · B ≤10 · C ≤15 · D ≤25 · F otherwise.
+fn grade_for(cyclomatic: u32) -> char {
+    match cyclomatic {
+        0..=5 => 'A',
+        6..=10 => 'B',
+        11..=15 => 'C',
+        16..=25 => 'D',
+        _ => 'F',
+    }
+}
+
+/// How much of the map a caller wants built. The map is not free, and the two
+/// halves have different prices: resolving symbols is a read of a parse that
+/// already happened, while linking edges is a pairwise span scan. A caller that
+/// renders only the walkthrough needs the first and never reads the second.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapDetail {
+    /// No map at all — the prompt block only.
+    None,
+    /// Files, symbols, and grades. No edge linking.
+    Symbols,
+    /// Everything, including the edges the diagram draws.
+    Full,
+}
+
+/// The most complex function a change touched in one file.
+#[derive(Debug, Clone)]
+pub struct WorstFn {
+    pub name: String,
+    pub cyclomatic: u32,
+    pub cognitive: u32,
+}
+
+impl WorstFn {
+    /// A–F grade, same bands as [`crate::complexity::FnComplexity`].
+    pub fn grade(&self) -> char {
+        grade_for(self.cyclomatic)
     }
 }
 
@@ -73,6 +107,17 @@ pub struct FileEntry {
     pub removed: usize,
     /// Indices into [`ChangeMap::symbols`], in definition order.
     pub symbols: Vec<usize>,
+    /// The file's most complex changed function, taken from the complexity pass
+    /// **directly** rather than by joining through [`FileEntry::symbols`].
+    ///
+    /// The join was the bug. Tier B resolves a symbol by walking up to the nearest
+    /// node `def_label` recognises, and for TS/JS that list has no
+    /// `arrow_function` or `function_expression` — while the complexity pass's
+    /// `is_function` has both, precisely because `const handleSubmit = () => {}`
+    /// is the dominant modern TS/React style. So a React PR got a graded function
+    /// in the prompt block and a bare `—` in the table describing the same change.
+    /// A file's worst complexity is a fact about the file, and needs no symbol.
+    pub worst: Option<WorstFn>,
 }
 
 /// How one changed symbol names another.
@@ -450,14 +495,12 @@ pub fn render_walkthrough(map: &ChangeMap, findings: &[Finding], max_symbols: us
     for f in &map.files {
         let syms: Vec<&SymbolNode> = f.symbols.iter().map(|i| &map.symbols[*i]).collect();
         let names = render_symbol_list(&syms, max_symbols);
-        // Worst = highest cyclomatic among the file's graded functions. Absent
-        // when nothing in the file was graded (not a function, or below the
-        // `COMPLEXITY_MIN_CYCLOMATIC` floor) — an empty cell, never a fake "A".
-        let worst = syms
-            .iter()
-            .filter_map(|s| s.cyclomatic.map(|c| (c, s)))
-            .max_by_key(|(c, _)| *c)
-            .map(|(c, s)| format!("{} ({c})", s.grade().unwrap_or('?')))
+        // Absent when nothing in the file was graded (no function touched, or
+        // `COMPLEXITY_METRICS` off) — an empty cell, never a fake "A".
+        let worst = f
+            .worst
+            .as_ref()
+            .map(|w| format!("{} ({})", w.grade(), w.cyclomatic))
             .unwrap_or_else(|| "—".to_string());
         let empty: Vec<&Finding> = Vec::new();
         let hits = by_file.get(f.path.as_str()).unwrap_or(&empty);
@@ -874,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn the_walkthrough_tabulates_every_file_and_grades_the_worst_symbol() {
+    fn the_walkthrough_tabulates_every_file_and_grades_the_worst_function() {
         let map = ChangeMap {
             symbols: vec![
                 sym("small", "a.rs", 1, 3, Some(4)),
@@ -886,12 +929,20 @@ mod tests {
                     added: 9,
                     removed: 2,
                     symbols: vec![0, 1],
+                    // The grade comes from the complexity pass, never from a join
+                    // through `symbols` — see `FileEntry::worst`.
+                    worst: Some(WorstFn {
+                        name: "big".into(),
+                        cyclomatic: 30,
+                        cognitive: 30,
+                    }),
                 },
                 FileEntry {
                     path: "README.md".into(),
                     added: 1,
                     removed: 0,
                     symbols: vec![],
+                    worst: None,
                 },
             ],
             edges: vec![],
@@ -919,6 +970,7 @@ mod tests {
                 added: 1,
                 removed: 0,
                 symbols: vec![0],
+                worst: None,
             }],
             edges: vec![],
             edges_truncated: false,
@@ -936,6 +988,7 @@ mod tests {
                 added: 1,
                 removed: 0,
                 symbols: vec![0],
+                worst: None,
             }],
             edges: vec![],
             edges_truncated: false,
@@ -957,12 +1010,14 @@ mod tests {
                     added: 3,
                     removed: 0,
                     symbols: vec![0],
+                    worst: None,
                 },
                 FileEntry {
                     path: "b.rs".into(),
                     added: 2,
                     removed: 0,
                     symbols: vec![1, 2],
+                    worst: None,
                 },
             ],
             edges: vec![Edge {
@@ -995,12 +1050,14 @@ mod tests {
                     added: 1,
                     removed: 0,
                     symbols: vec![0],
+                    worst: None,
                 },
                 FileEntry {
                     path: "b.rs".into(),
                     added: 1,
                     removed: 0,
                     symbols: vec![1],
+                    worst: None,
                 },
             ],
             edges: vec![Edge {

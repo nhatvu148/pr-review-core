@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use reqwest::Client;
 use tree_sitter::{Node, Parser, Point};
 
-use crate::changemap::ChangeMap;
+use crate::changemap::{ChangeMap, MapDetail};
 use crate::config::Config;
 use crate::diff::{parse_valid_lines, split_diff_sections};
 use crate::providers::{PrMeta, Provider};
@@ -498,7 +498,7 @@ pub async fn structural_context(
     meta: &PrMeta,
     diff: &str,
 ) -> String {
-    inner(provider, client, cfg, repo, meta, diff, false)
+    inner(provider, client, cfg, repo, meta, diff, MapDetail::None)
         .await
         .0
 }
@@ -518,20 +518,20 @@ pub async fn structural_context_mapped(
     meta: &PrMeta,
     diff: &str,
 ) -> (String, ChangeMap) {
-    inner(provider, client, cfg, repo, meta, diff, true).await
+    inner(provider, client, cfg, repo, meta, diff, MapDetail::Full).await
 }
 
 /// The shared body. `want_map` is what the caller asked for, and it is the only
 /// thing that buys the map's cost — a caller that only needs the prompt block
 /// pays for the prompt block.
-async fn inner(
+pub(crate) async fn inner(
     provider: &Provider,
     client: &Client,
     cfg: &Config,
     repo: &str,
     meta: &PrMeta,
     diff: &str,
-    want_map: bool,
+    detail: MapDetail,
 ) -> (String, ChangeMap) {
     // Without a head SHA there's nothing to fetch against — Tier A only, and no
     // file contents means no map.
@@ -551,7 +551,7 @@ async fn inner(
             _ => continue,
         }
     }
-    build_context(cfg, diff, &loaded, want_map)
+    build_context(cfg, diff, &loaded, detail)
 }
 
 /// Compute structural context from a **local checkout** instead of a provider —
@@ -563,7 +563,7 @@ async fn inner(
 /// through to Tier A hunk regions. Paths are taken from the diff, so anything
 /// absolute or containing `..` is refused rather than read from outside `root`.
 pub fn structural_context_local(cfg: &Config, root: &std::path::Path, diff: &str) -> String {
-    local_inner(cfg, root, diff, false).0
+    local_inner(cfg, root, diff, MapDetail::None).0
 }
 
 /// [`structural_context_local`] that also returns the [`ChangeMap`]. See
@@ -574,16 +574,16 @@ pub fn structural_context_local_mapped(
     root: &std::path::Path,
     diff: &str,
 ) -> (String, ChangeMap) {
-    local_inner(cfg, root, diff, true)
+    local_inner(cfg, root, diff, MapDetail::Full)
 }
 
 /// Shared body for the local pair. See [`inner`] for why `want_map` is a
 /// parameter rather than a config read.
-fn local_inner(
+pub(crate) fn local_inner(
     cfg: &Config,
     root: &std::path::Path,
     diff: &str,
-    want_map: bool,
+    detail: MapDetail,
 ) -> (String, ChangeMap) {
     let mut loaded: Vec<(ChangedFile, String)> = Vec::new();
     for f in attemptable_files(cfg, diff) {
@@ -596,7 +596,7 @@ fn local_inner(
             _ => continue,
         }
     }
-    build_context(cfg, diff, &loaded, want_map)
+    build_context(cfg, diff, &loaded, detail)
 }
 
 /// Skip anything bigger than this: a generated or vendored blob costs a slow parse
@@ -646,7 +646,7 @@ fn build_context(
     cfg: &Config,
     diff: &str,
     loaded: &[(ChangedFile, String)],
-    want_map: bool,
+    detail: MapDetail,
 ) -> (String, ChangeMap) {
     let mut covered: HashSet<String> = HashSet::new();
     let mut ts_blocks: Vec<String> = Vec::new();
@@ -657,6 +657,8 @@ fn build_context(
     // what we already looked at.
     let mut map = ChangeMap::default();
     let mut sym_index: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut worst_by_file: HashMap<String, crate::changemap::WorstFn> = HashMap::new();
+    let want_map = detail != MapDetail::None;
 
     for (f, content) in loaded {
         let (path, lang, lines) = (&f.path, f.lang, &f.lines);
@@ -689,6 +691,21 @@ fn build_context(
         };
 
         if want_map {
+            // File-level worst, taken from the complexity pass itself. Deliberately
+            // NOT derived from the symbols below: Tier B cannot resolve a TS/JS
+            // arrow function, so a join through symbols loses the grade on exactly
+            // the code most likely to have one.
+            if let Some(w) = complexity.iter().max_by_key(|c| c.cyclomatic) {
+                worst_by_file.insert(
+                    path.clone(),
+                    crate::changemap::WorstFn {
+                        name: w.name.clone(),
+                        cyclomatic: w.cyclomatic,
+                        cognitive: w.cognitive,
+                    },
+                );
+            }
+
             // Keyed by (name, start), so each node carries the grade of its own
             // definition rather than the file's worst.
             let graded: HashMap<(&str, u64), (u32, u32)> = complexity
@@ -776,18 +793,25 @@ fn build_context(
     for path in diff_file_order(diff) {
         let (added, removed) = counts.get(&path).copied().unwrap_or((0, 0));
         let symbols = sym_index.remove(&path).unwrap_or_default();
+        let worst = worst_by_file.remove(&path);
         map.files.push(crate::changemap::FileEntry {
             path,
             added,
             removed,
             symbols,
+            worst,
         });
     }
-    let contents: HashMap<&str, &str> = loaded
-        .iter()
-        .map(|(f, c)| (f.path.as_str(), c.as_str()))
-        .collect();
-    crate::changemap::link_edges(&mut map, &contents, cfg.diagram_max_nodes);
+    // Edge linking is the expensive half and only the diagram reads it, so a
+    // walkthrough-only caller must not pay for it. Reported by review on #38:
+    // "cost follows the ask" was true of the map and not yet of its two halves.
+    if detail == MapDetail::Full {
+        let contents: HashMap<&str, &str> = loaded
+            .iter()
+            .map(|(f, c)| (f.path.as_str(), c.as_str()))
+            .collect();
+        crate::changemap::link_edges(&mut map, &contents, cfg.diagram_max_nodes);
+    }
 
     (out, map)
 }
@@ -869,7 +893,90 @@ mod tests {
         assert!(!map.symbols.is_empty());
         assert_eq!(map.edges.len(), 1);
         // ...and the cheap path really did skip it.
-        assert!(local_inner(&cfg, dir.path(), diff, false).1.is_empty());
+        assert!(local_inner(&cfg, dir.path(), diff, MapDetail::None)
+            .1
+            .is_empty());
+    }
+
+    /// Only the diagram reads edges, and linking them is the expensive half —
+    /// a walkthrough-only review must not pay for it. Reported by review on #38.
+    #[test]
+    fn symbols_only_resolves_the_map_without_linking_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn caller(n: u32) -> u32 {\n    callee(n)\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.rs"),
+            "fn callee(n: u32) -> u32 {\n    n + 1\n}\n",
+        )
+        .unwrap();
+        let diff = concat!(
+            "+++ b/a.rs\n@@ -1,2 +1,3 @@\n+    callee(n)\n",
+            "+++ b/b.rs\n@@ -1,2 +1,3 @@\n+    n + 1\n",
+        );
+        let mut cfg = Config::from_env();
+        cfg.structural_context = true;
+
+        let (_, symbols_only) = local_inner(&cfg, dir.path(), diff, MapDetail::Symbols);
+        let (_, full) = local_inner(&cfg, dir.path(), diff, MapDetail::Full);
+
+        // Same files and symbols either way — only the edges differ.
+        assert_eq!(symbols_only.symbols.len(), full.symbols.len());
+        assert_eq!(symbols_only.files.len(), full.files.len());
+        assert!(symbols_only.edges.is_empty());
+        assert_eq!(full.edges.len(), 1);
+    }
+
+    /// A TS arrow function is graded by the complexity pass but never resolved as
+    /// a symbol by Tier B, so joining the grade through symbols lost it on exactly
+    /// the modern React style it matters most for. Reported by review on #38.
+    #[test]
+    fn a_ts_arrow_function_still_grades_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Branchy on purpose: the grade has to be something other than A.
+        let src = concat!(
+            "export const handleSubmit = (n: number) => {\n",
+            "  if (n > 1) { return 1; }\n",
+            "  if (n > 2) { return 2; }\n",
+            "  if (n > 3) { return 3; }\n",
+            "  return n && n || 0;\n",
+            "};\n",
+        );
+        std::fs::write(dir.path().join("a.ts"), src).unwrap();
+        // The added line is inside the arrow function's body, which is where a
+        // real change lands.
+        let diff = concat!(
+            "+++ b/a.ts\n@@ -1,5 +1,6 @@\n",
+            " export const handleSubmit = (n: number) => {\n",
+            "   if (n > 1) { return 1; }\n",
+            "   if (n > 2) { return 2; }\n",
+            "+  if (n > 3) { return 3; }\n",
+            "   return n && n || 0;\n",
+            " };\n",
+        );
+
+        let mut cfg = Config::from_env();
+        cfg.structural_context = true;
+        cfg.complexity_metrics = true;
+
+        let (_, map) = structural_context_local_mapped(&cfg, dir.path(), diff);
+        let file = map
+            .files
+            .iter()
+            .find(|f| f.path == "a.ts")
+            .expect("a.ts row");
+        let worst = file
+            .worst
+            .as_ref()
+            .expect("the arrow function must be graded");
+        assert_eq!(worst.name, "handleSubmit");
+        assert!(worst.cyclomatic > 1, "{worst:?}");
+        // The point of the fix: Tier B resolved no symbol here, and the grade
+        // survives anyway.
+        assert!(file.symbols.is_empty(), "{:?}", file.symbols);
     }
 
     /// The map must not depend on the feature that renders it: with the structural
