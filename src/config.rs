@@ -139,7 +139,10 @@ pub struct Config {
     /// review comment looks like.
     pub walkthrough: bool,
     /// Max distinct symbols listed per file in the walkthrough before the cell
-    /// collapses to `(+N more)` — a readability guard, not a cost one.
+    /// collapses to `(+N more)` — a readability guard, not a cost one. 4 rather
+    /// than 6 because a Rust name runs ~40 characters: six of them made a
+    /// 174-character cell that pushed the *Findings* column off the right edge of
+    /// a real PR comment.
     pub walkthrough_max_symbols: usize,
     /// Append a **mermaid change diagram** to the summary comment: changed symbols
     /// grouped by file, with an arrow wherever one names another. Derived from
@@ -299,7 +302,7 @@ impl Config {
                 .unwrap_or(8),
 
             walkthrough: env_or("WALKTHROUGH", "false").parse().unwrap_or(false),
-            walkthrough_max_symbols: env_or("WALKTHROUGH_MAX_SYMBOLS", "6").parse().unwrap_or(6),
+            walkthrough_max_symbols: env_or("WALKTHROUGH_MAX_SYMBOLS", "4").parse().unwrap_or(4),
             diagram: env_or("DIAGRAM", "false").parse().unwrap_or(false),
             diagram_max_nodes: env_or("DIAGRAM_MAX_NODES", "12").parse().unwrap_or(12),
 

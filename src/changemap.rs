@@ -484,9 +484,17 @@ pub fn render_walkthrough(map: &ChangeMap, findings: &[Finding], max_symbols: us
     }
 
     let sym_total: usize = map.files.iter().map(|f| f.symbols.len()).sum();
+    // Column order is load-bearing, not taste. *Changed symbols* is the one cell
+    // with no width bound — a Rust name runs 40 characters and four of them clear
+    // 120 — so it goes last. A PR comment is a fixed-width column and the table
+    // will overflow on a big change either way; what that costs is decided here.
+    // With the verdict columns on the left, overflow hides the list you can scroll
+    // to. With them on the right, overflow hid *Findings* behind a scrollbar, which
+    // is how this shipped and how it looked in the real UI: a header reading
+    // "Findir" and the review's own conclusions off the edge of the screen.
     let mut s = format!(
         "<details>\n<summary>🗺️ <b>Walkthrough</b> — {} file(s), {} changed symbol(s)</summary>\n\n\
-         | File | +/− | Changed symbols | Worst complexity | Findings |\n\
+         | File | +/− | Worst complexity | Findings | Changed symbols |\n\
          | --- | --- | --- | --- | --- |\n",
         map.files.len(),
         sym_total
@@ -509,9 +517,9 @@ pub fn render_walkthrough(map: &ChangeMap, findings: &[Finding], max_symbols: us
             cell(&f.path),
             f.added,
             f.removed,
-            names,
             worst,
-            findings_cell(hits)
+            findings_cell(hits),
+            names
         ));
     }
     s.push_str("\n</details>");
@@ -955,6 +963,15 @@ mod tests {
         };
         let out = render_walkthrough(&map, &[finding("a.rs", "HIGH")], 6);
         assert!(out.contains("| `a.rs` | +9 −2 |"), "{out}");
+        // Verdict columns before the unbounded one, so overflow can't hide them.
+        let header = out
+            .lines()
+            .find(|l| l.starts_with("| File"))
+            .expect("header");
+        assert!(
+            header.find("Findings") < header.find("Changed symbols"),
+            "{header}"
+        );
         assert!(
             out.contains("`fn small`") && out.contains("`fn big`"),
             "{out}"

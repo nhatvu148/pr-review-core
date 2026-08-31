@@ -143,7 +143,7 @@ one names another inside its own definition.
 | Env var | Default | Effect |
 | --- | --- | --- |
 | `WALKTHROUGH` | `false` | Append the per-file walkthrough table to the summary comment. |
-| `WALKTHROUGH_MAX_SYMBOLS` | `6` | Symbols listed per file before the cell collapses to `(+N more)`. |
+| `WALKTHROUGH_MAX_SYMBOLS` | `4` | Symbols listed per file before the cell collapses to `(+N more)`. A Rust name runs ~40 characters, so six of them overflowed a PR comment. |
 | `DIAGRAM` | `false` | Append the mermaid change diagram. Skipped on Bitbucket (no native mermaid) and whenever there are no edges to draw. |
 | `DIAGRAM_MAX_NODES` | `12` | Symbols considered for edge linking, and so the diagram's node budget. Past this, linking narrows to the highest-complexity symbols (test scaffolding last) and the diagram says so. |
 
