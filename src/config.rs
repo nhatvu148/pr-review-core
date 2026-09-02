@@ -415,6 +415,15 @@ impl Config {
         if let Some(v) = rc.self_critique {
             cfg.self_critique = v;
         }
+        if let Some(v) = rc.pr_body {
+            cfg.pr_body = v;
+        }
+        if let Some(v) = rc.pr_body_max_chars {
+            cfg.pr_body_max_chars = v;
+        }
+        if let Some(v) = rc.grep_context {
+            cfg.grep_context = v;
+        }
         if let Some(v) = rc.agentic {
             cfg.agentic = v;
         }
@@ -497,6 +506,29 @@ pub fn require(value: &str, name: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::repo_config::RepoConfig;
+
+    /// A repo whose PRs carry long descriptions can raise its own cap without an
+    /// env change, a restart, or a deploy — which is the point, since clipping a
+    /// description is what made the reviewer assert a diff exceeded its scope.
+    #[test]
+    fn a_repo_can_tune_the_pr_body_and_grep_context_knobs() {
+        let base = Config::from_env();
+        let rc = crate::repo_config::parse(
+            "pr_body_max_chars = 30000\npr_body = false\ngrep_context = false",
+        )
+        .unwrap();
+        let cfg = base.with_repo_overrides(&rc);
+        assert_eq!(cfg.pr_body_max_chars, 30_000);
+        assert!(!cfg.pr_body);
+        assert!(!cfg.grep_context);
+
+        // And a file that mentions none of them leaves all three at the base.
+        let bare = crate::repo_config::parse("min_confidence = 60").unwrap();
+        let cfg = base.with_repo_overrides(&bare);
+        assert_eq!(cfg.pr_body_max_chars, base.pr_body_max_chars);
+        assert_eq!(cfg.pr_body, base.pr_body);
+        assert_eq!(cfg.grep_context, base.grep_context);
+    }
 
     #[test]
     fn overrides_only_set_fields_and_appends_instructions() {

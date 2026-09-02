@@ -66,8 +66,10 @@ prompt through [`Config`].
   `/review-file <path>` deep-reviews an entire file at the PR head, beyond just the diff.
 - **Per-repo config**: a `.prbot.toml` at the repo root overrides model, globs
   (including `vendored`, which marks third-party source the reviewer must not file
-  hygiene findings on or propose edits inside), confidence/caps, and adds free-text
-  review `instructions`.
+  hygiene findings on or propose edits inside), confidence/caps, `pr_body` and
+  `pr_body_max_chars` (how much of the PR description the reviewer reads — a repo
+  whose PRs run long descriptions wants a higher cap), `grep_context`, and adds
+  free-text review `instructions`.
 - **Benchmark harness**: `examples/bench.rs` scores the reviewer against a corpus
   of PRs with known issues (`examples/bench-corpus.example.json`) — reporting
   precision / recall / F1 and token cost, so a feature's effect (blast radius,

@@ -39,6 +39,21 @@ pub struct RepoConfig {
     /// Toggle re-anchoring a finding that drifted just off a diff line to the
     /// nearest matching diff line (else it folds to the summary), for this repo.
     pub reanchor_findings: Option<bool>,
+    /// Pass this repo's PR descriptions to the reviewer as a statement of intent
+    /// to check the diff against. Off suppresses it for this repo only.
+    pub pr_body: Option<bool>,
+    /// Cap on the description handed to the reviewer, for this repo.
+    ///
+    /// Per-repo because the right value is a property of how a team writes PRs,
+    /// not of the deployment. A repo whose descriptions run long wants a higher
+    /// cap than one whose PRs say "fix typo", and clipping a description makes the
+    /// reviewer assert the diff exceeds its stated scope — so the repo that needs
+    /// the higher cap should be able to set it without an env change, a restart,
+    /// or a conversation with whoever owns the service.
+    pub pr_body_max_chars: Option<usize>,
+    /// Let the agentic reviewer's `grep` return context lines around each match,
+    /// for this repo.
+    pub grep_context: Option<bool>,
     /// Extra review instructions in plain language, appended to the system prompt.
     pub instructions: Option<String>,
     /// Instructions shaping the `/describe` output specifically — a house PR
@@ -67,6 +82,23 @@ pub fn parse(toml_str: &str) -> anyhow::Result<RepoConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The knobs this incident produced are per-repo, like every other
+    /// reviewer-shaping knob here.
+    #[test]
+    fn parses_the_pr_body_and_grep_context_knobs() {
+        let rc = parse("pr_body_max_chars = 30000\npr_body = false\ngrep_context = false").unwrap();
+        assert_eq!(rc.pr_body_max_chars, Some(30_000));
+        assert_eq!(rc.pr_body, Some(false));
+        assert_eq!(rc.grep_context, Some(false));
+
+        // Absent stays absent, so a file that sets one does not silently reset
+        // the others to a default.
+        let bare = parse("min_confidence = 60").unwrap();
+        assert_eq!(bare.pr_body_max_chars, None);
+        assert_eq!(bare.pr_body, None);
+        assert_eq!(bare.grep_context, None);
+    }
 
     #[test]
     fn parses_describe_instructions() {
