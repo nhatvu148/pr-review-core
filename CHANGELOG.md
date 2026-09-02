@@ -55,6 +55,27 @@ the plain sweep is what reveals *sibling* instances of a pattern (pr-review-bot#
 miss), and both halves of the miss class matter, so the tool description teaches
 the two-phase move: sweep wide without context, then re-grep with it.
 
+The description reaches **both** review paths. `agentic_review` builds its user
+message by hand rather than through `build_user_prompt`, and the first cut of this
+wired only the diff-only path — so `PR_BODY` silently did nothing under
+`AGENTIC=true`, which is the mode where it matters most. Caught in review on #44.
+The fence is now rendered by one shared `prompt::untrusted_pr_body_block`, and the
+agentic path derives the body from `cfg` + `meta` itself, so the two cannot
+disagree about whether to include it.
+
+*(Related, pre-existing, and deliberately not changed here: the CI-status block
+also never reaches the agentic prompt. `review::demote_falsified_build_claims`
+still backstops it deterministically, so a green-CI BLOCKING claim is caught
+either way, but the agentic model does not see the check results. Fixing it moves
+the agentic prompt on several axes at once and belongs in its own change.)*
+
+The fence marker carries a **per-review random suffix** rather than being a
+constant. Stripping a constant from the body defeats only an author who
+reproduces it verbatim, while a model reading `untrusted_pr_text` or
+`UNTRUSTED_PR_TEXT.` might treat either as the fence closing — obscurity, not a
+boundary. A suffix that does not exist when the description is written cannot be
+guessed at all. The constant stem is still stripped, as a second line of defence.
+
 **All three ship behind flags, off restores the previous behaviour exactly**, so
 each can be A/B'd with `examples/ab_review.rs` and `examples/bench.rs`:
 `PR_BODY` (default on), `PR_BODY_MAX_CHARS` (4000), `GREP_CONTEXT` (default on).

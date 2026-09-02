@@ -319,8 +319,16 @@ pub async fn agentic_review(
     } else {
         format!("\n\n{blast}")
     };
+    // The author's stated intent, fenced. Derived here from `cfg` + `meta` rather
+    // than taken as a parameter so this path and the diff-only one cannot disagree
+    // about WHETHER to include it — both ask `pr_body_for_review`. `agentic_review`
+    // only ever serves reviews (never `/ask` or `/describe`), so there is no caller
+    // that needs to opt out.
+    let pr_body = crate::prompt::pr_body_for_review(cfg, meta)
+        .map(|b| crate::prompt::untrusted_pr_body_block(&b))
+        .unwrap_or_default();
     let user = format!(
-        "Repository: {}\nPull request: #{}{}{omitted}{structural}{blast}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
+        "Repository: {}\nPull request: #{}{}{omitted}{pr_body}{structural}{blast}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
         meta.repo,
         meta.pr,
         meta.title.as_deref().map(|t| format!(" — {t}")).unwrap_or_default(),
@@ -605,6 +613,80 @@ mod tests {
             .starts_with("Stop investigating now."));
 
         assert_eq!(out.review.recommendation, "APPROVE");
+    }
+
+    /// Regression: the first cut of `PR_BODY` wired the description into
+    /// `build_user_prompt` only, and this path hand-rolls its own header — so the
+    /// feature silently did nothing whenever `AGENTIC=true`, which is the mode
+    /// that matters most. Caught in review on pr-review-core#44.
+    #[tokio::test]
+    async fn the_agentic_prompt_carries_the_fenced_pr_description() {
+        let (srv, seq) = server(vec![
+            text_turn("nothing to look up", 5),
+            text_turn(REVIEW_JSON, 5),
+        ])
+        .await;
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.pr_body = true;
+        cfg.pr_body_max_chars = 4000;
+        let (_d, ws) = workspace();
+        let mut m = meta();
+        m.body = Some("Adds exponential backoff on 5xx.".to_string());
+
+        agentic_review(&Client::new(), &cfg, &m, DIFF, None, None, &ws, &sys(&cfg))
+            .await
+            .unwrap();
+
+        let reqs = seq.requests();
+        let first = messages(&reqs, 0)
+            .iter()
+            .find(|m| m["role"] == "user")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            first.contains("## PR description — written by the PR author"),
+            "{first}"
+        );
+        assert!(
+            first.contains("Adds exponential backoff on 5xx."),
+            "{first}"
+        );
+        assert!(
+            first.find("## PR description").unwrap() < first.find("--- BEGIN DIFF ---").unwrap(),
+            "the claim must precede the code it is checked against: {first}"
+        );
+    }
+
+    /// Off must leave this path byte-identical too, or the A/B measures nothing.
+    #[tokio::test]
+    async fn the_agentic_prompt_omits_the_description_when_the_flag_is_off() {
+        let (srv, seq) = server(vec![
+            text_turn("nothing to look up", 5),
+            text_turn(REVIEW_JSON, 5),
+        ])
+        .await;
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.pr_body = false;
+        let (_d, ws) = workspace();
+        let mut m = meta();
+        m.body = Some("Adds exponential backoff on 5xx.".to_string());
+
+        agentic_review(&Client::new(), &cfg, &m, DIFF, None, None, &ws, &sys(&cfg))
+            .await
+            .unwrap();
+
+        let reqs = seq.requests();
+        let first = messages(&reqs, 0)
+            .iter()
+            .find(|m| m["role"] == "user")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!first.contains("PR description"), "{first}");
+        assert!(!first.contains("exponential backoff"), "{first}");
     }
 
     #[tokio::test]
