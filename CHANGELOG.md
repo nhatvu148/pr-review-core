@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.22.1
+
+**`pr_body`, `pr_body_max_chars` and `grep_context` are settable per repo** in
+`.prbot.toml`, alongside every other reviewer-shaping knob.
+
+0.22.0 added them to `Config` only, which was the wrong shape and 0.22.0's own
+incident is the argument. The right cap is a property of **how a team writes PRs**,
+not of the deployment: a repo whose descriptions run 10,000 characters wants a
+different value from one whose PRs say "fix typo", and clipping a description makes
+the reviewer assert the diff exceeds its stated scope. The repo that needs the
+higher cap should be able to set it by committing one line — no env change, no
+process restart (config is read once at startup), no deploy, and no coordination
+with whoever operates the service.
+
+```toml
+pr_body_max_chars = 30000   # this team writes long PRs
+grep_context      = false   # or turn a feature off for one repo
+```
+
+Additive only; nothing changes for a repo that sets none of them.
+
 ## 0.22.0
 
 **A truncated PR description is now marked as truncated, and the cap is 12,000
