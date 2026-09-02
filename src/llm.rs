@@ -186,6 +186,10 @@ pub(crate) fn extract_json_array(text: &str) -> Option<&str> {
 /// # Errors
 /// If `OPENROUTER_API_KEY` is missing, OpenRouter returns an error status, or the
 /// response can't be parsed as the expected review JSON.
+// Wide by nature: everything the orchestrator prepared has to arrive here, and
+// bundling it into a struct would just be `ReviewContext` with a different name.
+// `agentic_review` and `run_agentic` carry the same allow for the same reason.
+#[allow(clippy::too_many_arguments)]
 pub async fn review_diff(
     client: &Client,
     cfg: &Config,
@@ -193,6 +197,10 @@ pub async fn review_diff(
     diff: &str,
     omitted_note: Option<String>,
     structural_context: Option<&str>,
+    // The PR description, already fenced by `prompt::untrusted_pr_body_block`.
+    // Built once by the orchestrator and handed down — see
+    // `crate::backend::ReviewContext::pr_body`.
+    pr_body_block: Option<&str>,
     system_prompt: &str,
 ) -> Result<ReviewResult> {
     require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
@@ -223,7 +231,7 @@ pub async fn review_diff(
                     truncated,
                     omitted_note.as_deref(),
                     structural_context,
-                    crate::prompt::pr_body_for_review(cfg, meta).as_deref(),
+                    pr_body_block,
                 ),
             },
         ],

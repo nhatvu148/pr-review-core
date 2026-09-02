@@ -292,6 +292,9 @@ pub async fn agentic_review(
     diff: &str,
     omitted_note: Option<&str>,
     structural_context: Option<&str>,
+    // The PR description, already fenced. Handed down rather than derived here:
+    // see `crate::backend::ReviewContext::pr_body`.
+    pr_body_block: Option<&str>,
     ws: &Workspace,
     system_prompt: &str,
 ) -> Result<ReviewResult> {
@@ -319,14 +322,7 @@ pub async fn agentic_review(
     } else {
         format!("\n\n{blast}")
     };
-    // The author's stated intent, fenced. Derived here from `cfg` + `meta` rather
-    // than taken as a parameter so this path and the diff-only one cannot disagree
-    // about WHETHER to include it — both ask `pr_body_for_review`. `agentic_review`
-    // only ever serves reviews (never `/ask` or `/describe`), so there is no caller
-    // that needs to opt out.
-    let pr_body = crate::prompt::pr_body_for_review(cfg, meta)
-        .map(|b| crate::prompt::untrusted_pr_body_block(&b))
-        .unwrap_or_default();
+    let pr_body = pr_body_block.unwrap_or_default();
     let user = format!(
         "Repository: {}\nPull request: #{}{}{omitted}{pr_body}{structural}{blast}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
         meta.repo,
@@ -585,6 +581,7 @@ mod tests {
             DIFF,
             None,
             None,
+            None,
             &ws,
             &sys(&cfg),
         )
@@ -633,9 +630,21 @@ mod tests {
         let mut m = meta();
         m.body = Some("Adds exponential backoff on 5xx.".to_string());
 
-        agentic_review(&Client::new(), &cfg, &m, DIFF, None, None, &ws, &sys(&cfg))
-            .await
-            .unwrap();
+        // Built the way the orchestrator builds it, then handed in.
+        let block = crate::prompt::pr_body_block(&cfg, &m);
+        agentic_review(
+            &Client::new(),
+            &cfg,
+            &m,
+            DIFF,
+            None,
+            None,
+            block.as_deref(),
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap();
 
         let reqs = seq.requests();
         let first = messages(&reqs, 0)
@@ -673,9 +682,21 @@ mod tests {
         let mut m = meta();
         m.body = Some("Adds exponential backoff on 5xx.".to_string());
 
-        agentic_review(&Client::new(), &cfg, &m, DIFF, None, None, &ws, &sys(&cfg))
-            .await
-            .unwrap();
+        let block = crate::prompt::pr_body_block(&cfg, &m);
+        assert!(block.is_none(), "the flag gates composition, not rendering");
+        agentic_review(
+            &Client::new(),
+            &cfg,
+            &m,
+            DIFF,
+            None,
+            None,
+            block.as_deref(),
+            &ws,
+            &sys(&cfg),
+        )
+        .await
+        .unwrap();
 
         let reqs = seq.requests();
         let first = messages(&reqs, 0)
@@ -704,6 +725,7 @@ mod tests {
             &cfg,
             &meta(),
             DIFF,
+            None,
             None,
             None,
             &ws,
@@ -739,6 +761,7 @@ mod tests {
             DIFF,
             None,
             None,
+            None,
             &ws,
             &sys(&cfg),
         )
@@ -768,6 +791,7 @@ mod tests {
             &cfg,
             &meta(),
             DIFF,
+            None,
             None,
             None,
             &ws,
@@ -808,6 +832,7 @@ mod tests {
             &cfg,
             &meta(),
             DIFF,
+            None,
             None,
             None,
             &ws,
@@ -852,6 +877,7 @@ mod tests {
             DIFF,
             None,
             None,
+            None,
             &ws,
             &sys(&cfg),
         )
@@ -890,6 +916,7 @@ mod tests {
             &cfg,
             &meta(),
             DIFF,
+            None,
             None,
             None,
             &ws,
@@ -933,6 +960,7 @@ mod tests {
             DIFF,
             None,
             None,
+            None,
             &ws,
             &sys(&cfg),
         )
@@ -959,6 +987,7 @@ mod tests {
             DIFF,
             None,
             None,
+            None,
             &ws,
             &sys(&cfg),
         )
@@ -974,6 +1003,7 @@ mod tests {
             &same,
             &meta(),
             DIFF,
+            None,
             None,
             None,
             &ws,
@@ -1003,6 +1033,7 @@ mod tests {
             DIFF,
             None,
             None,
+            None,
             &ws,
             &sys(&cfg),
         )
@@ -1026,6 +1057,7 @@ mod tests {
             &cfg,
             &meta(),
             DIFF,
+            None,
             None,
             None,
             &ws,
@@ -1060,6 +1092,7 @@ mod tests {
             &cfg,
             &meta(),
             DIFF,
+            None,
             None,
             None,
             &ws,

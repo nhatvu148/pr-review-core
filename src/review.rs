@@ -672,6 +672,7 @@ pub(crate) async fn run_agentic(
     diff: &str,
     omitted_note: Option<&str>,
     structural_context: Option<&str>,
+    pr_body_block: Option<&str>,
     repo: &str,
     system_prompt: &str,
 ) -> Result<ReviewResult> {
@@ -686,6 +687,7 @@ pub(crate) async fn run_agentic(
         diff,
         omitted_note,
         structural_context,
+        pr_body_block,
         &ws,
         system_prompt,
     )
@@ -1249,6 +1251,8 @@ pub async fn run_review_with(
     // not left as a const each backend is trusted to append, which is how the
     // deployed claude-code backend ran without them for months.
     let injected_rules = crate::prompt::injected_rules(cfg);
+    // Composed here, once, for every backend — see `ReviewContext::pr_body`.
+    let pr_body = crate::prompt::pr_body_block(cfg, &meta);
     let ctx = ReviewContext {
         client: &client,
         cfg,
@@ -1261,6 +1265,7 @@ pub async fn run_review_with(
         diff: &diff,
         omitted_note: omitted_note.as_deref(),
         structural_context: structural_opt,
+        pr_body: pr_body.as_deref(),
         injected_rules: &injected_rules,
     };
     let result = backend.review(&ctx).await?;
@@ -1454,6 +1459,9 @@ pub async fn run_review_local(
     }
 
     let injected_rules = crate::prompt::injected_rules(cfg);
+    // The local path synthesizes `meta` with no body, so this is `None` today; it
+    // is composed anyway so the two context sites cannot drift.
+    let pr_body = crate::prompt::pr_body_block(cfg, &meta);
     let ctx = ReviewContext {
         client: &client,
         cfg,
@@ -1464,6 +1472,7 @@ pub async fn run_review_local(
         diff: &diff,
         omitted_note: omitted_note.as_deref(),
         structural_context: (!structural.is_empty()).then_some(structural.as_str()),
+        pr_body: pr_body.as_deref(),
         injected_rules: &injected_rules,
     };
     let result = backend.review(&ctx).await?;
@@ -1856,11 +1865,18 @@ mod orchestrator_tests {
     /// context or it never sees one. That is the whole point of the test.
     struct SpyBackend {
         seen: Arc<Mutex<Vec<String>>>,
+        /// What arrived on `ctx.pr_body`, per call. `None` is a real answer, not
+        /// an absent recording.
+        bodies: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     #[async_trait]
     impl ReviewBackend for SpyBackend {
         async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.bodies
+                .lock()
+                .unwrap()
+                .push(ctx.pr_body.map(str::to_string));
             self.seen
                 .lock()
                 .unwrap()
@@ -1907,6 +1923,29 @@ mod orchestrator_tests {
         s
     }
 
+    /// [`github_stub`] whose PR carries a description — the class B input.
+    async fn github_stub_with_body(body: &str) -> MockServer {
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/1"))
+            .and(header("accept", "application/vnd.github.diff"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(DIFF.to_string()))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/1"))
+            .and(header("accept", "application/vnd.github+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "a change",
+                "body": body,
+                "base": { "ref": "main" },
+                "head": { "sha": "deadbeef" },
+            })))
+            .mount(&s)
+            .await;
+        s
+    }
+
     fn cfg_for(base: &str) -> Config {
         let mut c = Config::from_env();
         c.github_api_base = base.to_string();
@@ -1931,12 +1970,77 @@ mod orchestrator_tests {
         }
     }
 
+    /// The orchestrator composes the fenced PR description ONCE and hands it to
+    /// whatever backend is in play.
+    ///
+    /// This is the `injected_rules` lesson repeating. `PR_BODY` first shipped
+    /// derived inside the in-crate prompt builders, so it reached the diff-only
+    /// path, then the agentic one after review — and no agent-CLI backend at all,
+    /// because each of those builds its own prompt and never reads `meta.body`.
+    /// A deployment on `backend=claude-code` had the feature silently absent, the
+    /// same shape as the #28 incident this module exists for.
+    #[tokio::test]
+    async fn the_orchestrator_hands_the_fenced_pr_description_to_every_backend() {
+        let srv = github_stub_with_body("Adds exponential backoff on 5xx.").await;
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let backend = SpyBackend {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            bodies: Arc::clone(&bodies),
+        };
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.pr_body = true;
+
+        run_review_with(&cfg, input(), &backend)
+            .await
+            .expect("the review runs");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1, "the backend was called once");
+        let block = bodies[0]
+            .as_deref()
+            .expect("the description reached the backend");
+        assert!(
+            block.contains("Adds exponential backoff on 5xx."),
+            "{block}"
+        );
+        // Handed over ALREADY FENCED, so a backend that appends it verbatim — the
+        // obvious thing to do — cannot lose the fence.
+        assert!(
+            block.contains("## PR description — written by the PR author"),
+            "{block}"
+        );
+        assert!(
+            block.contains(crate::prompt::UNTRUSTED_STEM_FOR_TESTS),
+            "{block}"
+        );
+    }
+
+    /// Off means no backend sees it, so the A/B has a real control arm.
+    #[tokio::test]
+    async fn no_backend_sees_the_description_when_the_flag_is_off() {
+        let srv = github_stub_with_body("Adds exponential backoff on 5xx.").await;
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let backend = SpyBackend {
+            seen: Arc::new(Mutex::new(Vec::new())),
+            bodies: Arc::clone(&bodies),
+        };
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.pr_body = false;
+
+        run_review_with(&cfg, input(), &backend)
+            .await
+            .expect("the review runs");
+
+        assert_eq!(bodies.lock().unwrap()[0], None);
+    }
+
     #[tokio::test]
     async fn the_orchestrator_hands_the_review_rules_to_every_backend() {
         let srv = github_stub().await;
         let seen = Arc::new(Mutex::new(Vec::new()));
         let backend = SpyBackend {
             seen: Arc::clone(&seen),
+            bodies: Arc::new(Mutex::new(Vec::new())),
         };
 
         run_review_with(&cfg_for(&srv.uri()), input(), &backend)
@@ -2300,6 +2404,7 @@ mod orchestrator_tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let backend = SpyBackend {
             seen: Arc::clone(&seen),
+            bodies: Arc::new(Mutex::new(Vec::new())),
         };
 
         run_review_with(&cfg, input(), &backend)

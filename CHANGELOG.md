@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.21.1
+
+**The PR description now reaches agent-CLI backends too.** 0.21.0 derived it
+inside the two in-crate prompt builders, so it reached the diff-only path and the
+agentic one — and **no `ReviewBackend` implementation at all**, because each of
+those builds its own prompt and none of them reads `meta.body`. A deployment
+running `backend=claude-code` had the whole feature silently absent.
+
+This is the `injected_rules` lesson repeating, and the third round of the same
+drift in two releases: diff-only wired but not agentic (caught in review on #44),
+then both in-crate paths wired but no backend (caught by asking why the bench
+could not run on a Claude Code subscription).
+
+`ReviewContext` gains `pr_body`, composed once by the orchestrator exactly as
+`injected_rules` is. It carries the description **already fenced**, not the raw
+text, so the obvious thing for a backend to do — append it verbatim — is also the
+correct thing; a signature handing over raw author-written prose invites splicing
+it in unfenced. `review_diff`, `run_agentic` and `agentic_review` now take the
+composed block rather than deriving it, so there is exactly one composition site
+instead of three.
+
+Guarded where it should have been from the start: `review::orchestrator_tests`,
+the module that exists because of the #28 incident where a deployed backend ran
+for months without the calibration rules. Its spy backend now records what
+arrives on `ctx.pr_body`, and two tests pin that a description reaches every
+backend when `PR_BODY` is on and none when it is off.
+
+`GREP_CONTEXT` deliberately has no equivalent. It gates a tool in this crate's own
+agent loop, so it applies to the OpenRouter agentic path only; a backend driving
+an agent CLI brings its own tools.
+
+**Breaking:** `llm::review_diff` and `agent::agentic_review` take the composed
+description block; `backend::ReviewContext` has a new `pr_body` field. Build the
+block with the new `prompt::pr_body_block`.
+
 ## 0.21.0
 
 **The reviewer reads the PR description — `PR_BODY`.** Every provider already

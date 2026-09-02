@@ -174,7 +174,7 @@ async fn run_once(cfg: &Config, client: &reqwest::Client, corpus: &[Case]) -> Ru
 
     for case in corpus {
         let meta = synthetic_meta(case);
-        let res = review_diff(client, cfg, &meta, &case.diff, None, None, &system).await;
+        let res = review_diff(client, cfg, &meta, &case.diff, None, None, None, &system).await;
         let res = match res {
             Ok(r) => r,
             Err(e) => {

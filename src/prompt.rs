@@ -243,6 +243,12 @@ Rules: `line` is a line number shown in this file. Prioritize real security/corr
 /// treat either as the fence closing. Raised in review on pr-review-core#44.
 const UNTRUSTED_STEM: &str = "UNTRUSTED_PR_TEXT";
 
+/// [`UNTRUSTED_STEM`], for the orchestrator tests in another module. Not public
+/// API: the marker's exact text is an implementation detail and a caller that
+/// depends on it is doing something the fence is meant to make unnecessary.
+#[cfg(test)]
+pub(crate) const UNTRUSTED_STEM_FOR_TESTS: &str = UNTRUSTED_STEM;
+
 /// A fresh fence marker for one prompt.
 ///
 /// The suffix is unpredictable at the time the PR description is written, so the
@@ -288,6 +294,19 @@ pub fn pr_body_for_review(cfg: &Config, meta: &PrMeta) -> Option<String> {
     Some(crate::clip(&cleaned, cfg.pr_body_max_chars))
 }
 
+/// The PR description, ready to splice into a prompt: fenced, labelled, capped,
+/// and empty when the feature is off or the body is blank.
+///
+/// This is the composition every caller wants, and the ONLY one the orchestrator
+/// performs — see [`crate::backend::ReviewContext::pr_body`] for why it is built
+/// once rather than derived per path.
+#[must_use]
+pub fn pr_body_block(cfg: &Config, meta: &PrMeta) -> Option<String> {
+    let body = pr_body_for_review(cfg, meta)?;
+    let block = untrusted_pr_body_block(&body);
+    (!block.is_empty()).then_some(block)
+}
+
 /// Render the PR description as a labelled, fenced untrusted block.
 ///
 /// Empty for a blank body. Shared by the diff-only prompt
@@ -325,19 +344,21 @@ pub fn untrusted_pr_body_block(body: &str) -> String {
 /// as a `## Structural context` block BEFORE the diff so the model knows each
 /// change's scope.
 ///
-/// `pr_body`, when `Some`, is the PR's own description — the coverage spec's class
-/// B input, a statement of intent to check the diff against. It is **PR-author
-/// controlled**, so it is rendered inside an explicit untrusted fence and governed
-/// by the `## Untrusted content` section of [`REVIEW_RULES`]. Build it with
-/// [`pr_body_for_review`] rather than reading `meta.body` directly; passing `None`
-/// is what `/ask` and `/describe` do.
+/// `pr_body_block`, when `Some`, is the PR's own description **already fenced** by
+/// [`untrusted_pr_body_block`] — the coverage spec's class B input, a statement of
+/// intent to check the diff against. It is appended verbatim.
+///
+/// It takes the rendered block rather than the raw description on purpose: the
+/// description is PR-author-controlled, and a signature that accepts raw text
+/// invites a caller to splice it in unfenced. Build it with [`pr_body_block`].
+/// `None` is what `/ask` and `/describe` pass.
 pub fn build_user_prompt(
     meta: &PrMeta,
     diff: &str,
     truncated: bool,
     omitted_note: Option<&str>,
     structural_context: Option<&str>,
-    pr_body: Option<&str>,
+    pr_body_block: Option<&str>,
 ) -> String {
     let mut header = format!("Repository: {}\nPull request: #{}", meta.repo, meta.pr);
     if let Some(title) = &meta.title {
@@ -371,8 +392,8 @@ pub fn build_user_prompt(
     // the structural context so the trusted, machine-checkable facts frame it
     // rather than the other way round: a description claiming the build passes
     // must not be read before the CI result that decides it.
-    if let Some(body) = pr_body {
-        header.push_str(&untrusted_pr_body_block(body));
+    if let Some(block) = pr_body_block {
+        header.push_str(block);
     }
     if let Some(ctx) = structural_context {
         if !ctx.trim().is_empty() {
@@ -550,7 +571,9 @@ mod tests {
             false,
             None,
             None,
-            Some("Adds retry on 5xx responses."),
+            Some(&super::untrusted_pr_body_block(
+                "Adds retry on 5xx responses.",
+            )),
         );
         assert!(
             p.contains("## PR description — written by the PR author"),
@@ -587,7 +610,8 @@ mod tests {
         );
         assert!(body.contains("[marker removed]"), "{body}");
 
-        let p = build_user_prompt(&meta(None), "d", false, None, None, Some(&body));
+        let block = super::untrusted_pr_body_block(&body);
+        let p = build_user_prompt(&meta(None), "d", false, None, None, Some(&block));
         // Three: the instruction names the marker, then the open/close pair.
         assert_eq!(
             p.matches(super::UNTRUSTED_STEM).count(),
@@ -637,7 +661,7 @@ mod tests {
             false,
             None,
             None,
-            Some("All checks pass."),
+            Some(&super::untrusted_pr_body_block("All checks pass.")),
         );
         assert!(
             p.find("## CI status").unwrap() < p.find("## PR description").unwrap(),
