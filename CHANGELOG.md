@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.22.0
+
+**A truncated PR description is now marked as truncated, and the cap is 12,000
+characters.** Found by the first production run of `PR_BODY`, which it made worse
+rather than better.
+
+The description ran 9,757 characters. At character 6,389 it opened a section
+documenting a second change the diff also made. The cap was 4,000, so the
+reviewer read a description that stops mid-sentence 2,389 characters earlier —
+and filed a finding that the diff went beyond its stated scope, recommending the
+second change be split into its own PR.
+
+The description said otherwise, in a part the reviewer never received.
+
+**Truncating a diff and truncating a statement of intent fail differently.** A
+short diff shows less code. A short *intent* invites the reviewer to conclude the
+change exceeds what was declared — the cap manufactures exactly the finding the
+missing text refutes. It also selects for the wrong authors: long descriptions get
+clipped, and the people who write them are the least likely to ship undeclared
+scope.
+
+So the note matters more than the number. `PrBody` now carries `truncated`, and a
+clipped description renders, **outside the fence** where the author cannot forge
+it:
+
+> This description is TRUNCATED: you have the first N of M characters. Do not
+> conclude that anything is undeclared or out of scope because the description
+> does not mention it — the part you cannot see may cover it. Only a DIRECT
+> CONTRADICTION between what you can read and what the diff does is a finding.
+
+The cap moves 4,000 → 12,000 as well. 4,000 was 2% of the 200,000 `MAX_DIFF_CHARS`
+budget and too tight for real PRs: the two that first exercised this feature ran
+6,397 and 9,757 characters. Raising it lowers how often the note is needed; it
+does not replace it.
+
+**The benchmark would not have caught this.** `bench-corpus.json`'s median
+description is 2,624 characters — under the old cap. The A/B would have run clean.
+Two real PRs found it in a morning, which is the argument for running the thing in
+production behind a flag you can flip.
+
+**Breaking:** `prompt::pr_body_for_review` returns `Option<PrBody>` rather than
+`Option<String>`, and `prompt::untrusted_pr_body_block` takes `&PrBody`. Backends
+are unaffected — `ReviewContext::pr_body` is still the rendered `Option<&str>`.
+This is a minor bump rather than a patch on purpose: consumers pin `^0.21.1`, so a
+`0.21.2` carrying it would break them on a routine `cargo update`.
+
 ## 0.21.1
 
 **The PR description now reaches agent-CLI backends too.** 0.21.0 derived it

@@ -86,9 +86,14 @@ pub struct Config {
     /// `## Untrusted content` section of [`crate::prompt::REVIEW_RULES`]. Do not
     /// enable one without the other.
     pub pr_body: bool,
-    /// Max characters of PR description handed to the reviewer. A description is
-    /// context, not the artifact under review, so it gets a small fixed budget
-    /// rather than a share of `max_diff_chars`.
+    /// Max characters of PR description handed to the reviewer.
+    ///
+    /// Was 4,000, which was 2% of the 200,000 `max_diff_chars` budget and too
+    /// tight for real PRs: the two that first exercised this feature ran 6,397 and
+    /// 9,757 characters, and clipping one of them produced a false positive
+    /// (`prompt::untrusted_pr_body_block` documents it). A clipped description is
+    /// still marked as clipped in the prompt — this raises the bar for hitting
+    /// that path, it does not remove the need for the note.
     pub pr_body_max_chars: usize,
 
     /// Let the agentic reviewer's `grep` tool return N lines of context around
@@ -329,7 +334,9 @@ impl Config {
             describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
 
             pr_body: env_or("PR_BODY", "true").parse().unwrap_or(true),
-            pr_body_max_chars: env_or("PR_BODY_MAX_CHARS", "4000").parse().unwrap_or(4000),
+            pr_body_max_chars: env_or("PR_BODY_MAX_CHARS", "12000")
+                .parse()
+                .unwrap_or(12000),
             grep_context: env_or("GREP_CONTEXT", "true").parse().unwrap_or(true),
 
             structural_context: env_or("STRUCTURAL_CONTEXT", "true").parse().unwrap_or(true),
