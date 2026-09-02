@@ -121,7 +121,7 @@ size caps) are also read from the environment — see `src/config.rs`.
 | `REANCHOR_FINDINGS` | `true` | Snap a finding that drifted just off a diff line to the nearest diff line sharing a code symbol (else it folds to the summary). |
 | `PR_BODY` | `true` | Pass the PR's own description to the reviewer as a statement of intent to check the diff against. It is author-written, so it is rendered inside an untrusted fence and can never direct the review — see `REVIEW_RULES` → *Untrusted content*. `/ask` and `/describe` never receive it. |
 | `PR_BODY_MAX_CHARS` | `4000` | Cap on the description handed to the reviewer. |
-| `GREP_CONTEXT` | `true` | Let the agentic reviewer's `grep` ask for 1–8 lines of context around each match, so it can judge what a second site *does* without a `read_file` round trip. Off ignores the argument entirely. |
+| `GREP_CONTEXT` | `true` | Let the agentic reviewer's `grep` ask for 1–8 lines of context around each match, so it can judge what a second site *does* without a `read_file` round trip. Off ignores the argument entirely. **OpenRouter agentic path only** — a `ReviewBackend` driving an agent CLI brings its own tools. |
 | `EXCLUDE_GLOBS` | lockfiles, generated, vendored, minified | Comma-separated globs skipped before the LLM call. |
 | `INCLUDE_GLOBS` | *(empty = all)* | If set, only files matching these globs are reviewed. |
 | `VENDORED_GLOBS` | `thirdparty/`, `third_party/`, `vendor/`, `vendored/`, `external/`, `node_modules/` | Globs marking vendored third-party source. Diff-hygiene findings are suppressed inside them and the reviewer is told not to propose edits there — committing vendored code in bulk is the intent, not a defect. Setting this REPLACES the defaults. |

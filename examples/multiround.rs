@@ -214,6 +214,8 @@ async fn run_case(cfg: &Config, client: &reqwest::Client, case: &Case, rounds: u
                 diff,
                 None,
                 None,
+                // Synthetic meta carries no PR description.
+                None,
                 &pr_review_core::prompt::review_system_prompt(cfg),
             )
             .await
