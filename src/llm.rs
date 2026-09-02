@@ -223,6 +223,7 @@ pub async fn review_diff(
                     truncated,
                     omitted_note.as_deref(),
                     structural_context,
+                    crate::prompt::pr_body_for_review(cfg, meta).as_deref(),
                 ),
             },
         ],
@@ -427,7 +428,10 @@ pub async fn answer_question(
 ) -> Result<String> {
     let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
     let truncated = diff.chars().count() > cfg.max_diff_chars;
-    let context = build_user_prompt(meta, &clipped, truncated, None, structural_context);
+    // No PR body: `/ask` is answering the asker's question, not checking the
+    // author's claim, so the description buys nothing and would add a second
+    // untrusted channel to a prompt that already takes free-form input.
+    let context = build_user_prompt(meta, &clipped, truncated, None, structural_context, None);
     let user = format!("{context}\n\n--- QUESTION ---\n{}", question.trim());
     let system = if cfg.extra_system_prompt.is_empty() {
         ASK_SYSTEM_PROMPT.to_string()
@@ -451,7 +455,10 @@ pub async fn describe_pr(
 ) -> Result<String> {
     let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
     let truncated = diff.chars().count() > cfg.max_diff_chars;
-    let user = build_user_prompt(meta, &clipped, truncated, None, structural_context);
+    // No PR body, deliberately: this prompt WRITES the description. Handing it the
+    // existing one makes the model restate it instead of describing the diff, and
+    // `command::merge_description` already preserves the human-written parts.
+    let user = build_user_prompt(meta, &clipped, truncated, None, structural_context, None);
     // The consumer's conventions and any `describe_instructions` are applied here
     // rather than at the call site, so every caller of `/describe` gets them —
     // this prompt was the one place in the crate that ignored both.
