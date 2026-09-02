@@ -1,5 +1,71 @@
 # Changelog
 
+## 0.21.0
+
+**The reviewer reads the PR description — `PR_BODY`.** Every provider already
+fetched the description; `/describe` was the only thing that read it. The review
+never saw the author's own statement of what the change is for, which is the
+input the coverage spec's class B is built on. It is now passed to the review
+path, so "the body says this retries on 5xx, the diff retries on every status"
+is a finding the reviewer can reach.
+
+`/ask` and `/describe` deliberately do **not** get it. `/describe` *writes* a
+description — handing it the existing one makes the model restate it, and
+`command::merge_description` already preserves the human-written parts. `/ask` is
+answering the asker's question, not checking the author's claim.
+
+**A PR description is written by the person whose change is under review**, so
+this is the first time author-controlled prose enters the review prompt. It is
+rendered inside an explicit fence and governed by a new `## Untrusted content`
+section in `REVIEW_RULES`: everything in the block is data, never instruction,
+and it is usable for exactly one thing — a claim to check the diff against. It
+cannot direct the review, move a severity, or settle what the code does. The
+marker is stripped from the body, so a description cannot close the fence early
+and continue as if it were trusted prompt text.
+
+That rule is the one entry in `REVIEW_RULES` that is preventive rather than
+written from a recorded failure. Two reasons not to wait for the incident: the
+failure mode is a review that quietly does what a PR author told it to, which
+leaves no artifact to recognise afterwards; and a competing reviewer shipped the
+same guard on its agent-facing output during 2026-08, so the exposure is
+measured rather than imagined.
+
+**`grep` can return context lines — `GREP_CONTEXT`.** `grep` returned bare
+matching lines with no way to ask for surrounding code, while
+`AGENT_SYSTEM_PROMPT` told the model to be economical and finish in a few
+lookups. Between them, learning what a second site actually *does* cost a
+`read_file` round trip per candidate, and the prompt discouraged spending it.
+
+That is the wrong shape for this reviewer's most common recorded miss. Its misses
+are overwhelmingly defects that live in the *interaction* of two sites that are
+each correct alone — kuroko#1's `Clone` beside a `Drop` that sends a shutdown,
+wincrust#13's cap of 64 beside a message reporting the count as a total, both of
+vexar#63's — and judging those means seeing both sites, not locating them.
+
+`grep(pattern, context: 1-8)` now returns each match with that many lines either
+side, in ripgrep's shape (`path:N:` for a match, `path-N-` for context, `--`
+between blocks). Overlapping windows merge instead of repeating shared lines, and
+a match falling inside an already-printed window keeps its `:` marker rather than
+being disguised as context.
+
+Context is not free, so it is budgeted rather than blanket: a context sweep
+returns 20 matches against a 12 KB clip, a plain sweep still returns 50 against
+6 KB. Raising the byte budget rather than cutting the hit count is deliberate —
+the plain sweep is what reveals *sibling* instances of a pattern (pr-review-bot#25's
+miss), and both halves of the miss class matter, so the tool description teaches
+the two-phase move: sweep wide without context, then re-grep with it.
+
+**All three ship behind flags, off restores the previous behaviour exactly**, so
+each can be A/B'd with `examples/ab_review.rs` and `examples/bench.rs`:
+`PR_BODY` (default on), `PR_BODY_MAX_CHARS` (4000), `GREP_CONTEXT` (default on).
+With `GREP_CONTEXT=false` a `context` argument is ignored and output is
+byte-identical to 0.20.0.
+
+**Breaking:** `prompt::build_user_prompt` takes a sixth argument, the optional PR
+description — build it with the new `prompt::pr_body_for_review`, or pass `None`
+for the previous behaviour. `Workspace::grep` is unchanged; the new
+`Workspace::grep_with_context` carries the context parameter.
+
 ## 0.20.0
 
 **`/describe` output is shapeable — `DESCRIBE_INSTRUCTIONS`.** The prompt was a

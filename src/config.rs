@@ -75,6 +75,32 @@ pub struct Config {
     /// folding into the summary. Conservative + fail-open.
     pub reanchor_findings: bool,
 
+    /// Pass the PR's own description to the reviewer as a *statement of intent to
+    /// verify the diff against* (coverage spec class B). The body is already
+    /// fetched by every provider for `/describe`; this is what lets the review
+    /// read it.
+    ///
+    /// It is PR-author-controlled text entering the prompt, so it is rendered
+    /// inside the untrusted-content fence built by
+    /// [`crate::prompt::build_user_prompt`] and governed by the
+    /// `## Untrusted content` section of [`crate::prompt::REVIEW_RULES`]. Do not
+    /// enable one without the other.
+    pub pr_body: bool,
+    /// Max characters of PR description handed to the reviewer. A description is
+    /// context, not the artifact under review, so it gets a small fixed budget
+    /// rather than a share of `max_diff_chars`.
+    pub pr_body_max_chars: usize,
+
+    /// Let the agentic reviewer's `grep` tool return N lines of context around
+    /// each match. Off restores the previous behaviour exactly (bare matching
+    /// lines), which is what makes this A/B-able.
+    ///
+    /// Context is what lets the reviewer judge *two sites against each other*
+    /// rather than each line against itself — the recorded miss shape in
+    /// `pr-review-docs/feedback/` (kuroko#1, wincrust#13, vexar#63). A bare
+    /// matching line proves site B exists but not what it does.
+    pub grep_context: bool,
+
     /// Use the agentic reviewer: clone the repo and let the model investigate
     /// cross-file context with tools, instead of a single diff-only call.
     pub agentic: bool,
@@ -301,6 +327,10 @@ impl Config {
             extra_system_prompt: resolve_extra_system_prompt(),
 
             describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
+
+            pr_body: env_or("PR_BODY", "true").parse().unwrap_or(true),
+            pr_body_max_chars: env_or("PR_BODY_MAX_CHARS", "4000").parse().unwrap_or(4000),
+            grep_context: env_or("GREP_CONTEXT", "true").parse().unwrap_or(true),
 
             structural_context: env_or("STRUCTURAL_CONTEXT", "true").parse().unwrap_or(true),
             structural_max_files: env_or("STRUCTURAL_MAX_FILES", "15").parse().unwrap_or(15),

@@ -33,12 +33,12 @@ use crate::repo::Workspace;
 /// from the orchestrator-injected rules, joined on by
 /// [`crate::backend::ReviewContext::system_prompt`].
 pub(crate) const AGENT_SYSTEM_PROMPT: &str = r#"You are an expert software engineer reviewing a pull request. You are given the PR's unified diff and READ-ONLY tools to explore the rest of the repository (a clone at the PR head):
-- grep(pattern): regex search across the repo
+- grep(pattern, context?): regex search across the repo. Without `context` you get one line per match — use it to find every site a pattern has. With `context: 1-8` you also get that many lines either side of each match, so you can see what a site DOES without a second call; fewer matches come back, so sweep first and add context on the ones that matter.
 - read_file(path, start?, end?): read a file (optionally a 1-indexed line range)
 - list_dir(path): list a directory
 - references(symbol): call sites of a symbol across the repo, split into callers and tests (a precise shortcut for "who calls this?")
 
-Investigate the change in context: look up the definitions and CALLERS of changed functions, the types they use, related tests, and config. When a `## Blast radius` block is provided, its callers/tests are already computed — start from those files instead of re-searching, and use `references(symbol)` rather than crafting your own grep for call sites. Be economical: read_file with a NARROW line range (start/end) rather than whole files. Aim to finish in a few focused lookups, not exhaustive crawling.
+Investigate the change in context: look up the definitions and CALLERS of changed functions, the types they use, related tests, and config. When a `## Blast radius` block is provided, its callers/tests are already computed — start from those files instead of re-searching, and use `references(symbol)` rather than crafting your own grep for call sites. Be economical: read_file with a NARROW line range (start/end) rather than whole files, and prefer `grep(..., context: N)` over a grep followed by a read_file on every hit. Aim to finish in a few focused lookups, not exhaustive crawling.
 
 When done, respond with ONLY a JSON object (no tools, no prose) of this shape:
 {
@@ -65,21 +65,57 @@ Rules: only raise findings on lines shown in the diff (set line=null if you can'
 
 const TOOL_CLIP: usize = 6_000;
 
+/// Output budget for a `grep` that asked for context lines.
+///
+/// Larger than [`TOOL_CLIP`] because a context window costs `2 * context + 1`
+/// lines per hit; at the old 6 KB a `context: 3` sweep would fit roughly five
+/// sites, which is fewer than the plain sweep shows and would trade away the
+/// breadth that reveals SIBLING instances of a pattern to buy the depth that
+/// reveals interactions. Both are the miss class this is for, so the budget moves
+/// instead of the hit count.
+///
+/// Still bounded well under `max_history_chars` (45 KB default) so one such call
+/// cannot dominate the agent's accumulated tool history.
+const GREP_CONTEXT_CLIP: usize = 12_000;
+
+/// Matches returned by a `grep` that asked for context, versus [`GREP_MAX_HITS`]
+/// without. Lower because each hit is now many lines; the plain sweep remains the
+/// way to enumerate every site.
+const GREP_CONTEXT_MAX_HITS: usize = 20;
+const GREP_MAX_HITS: usize = 50;
+
+/// Upper bound on requested context lines, so one call cannot ask for a window
+/// that swamps the budget regardless of the clip.
+const GREP_MAX_CONTEXT: u32 = 8;
+
 fn ws_result(r: Result<String>) -> ToolOutput {
+    ws_result_clipped(r, TOOL_CLIP)
+}
+
+fn ws_result_clipped(r: Result<String>, limit: usize) -> ToolOutput {
     match r {
-        Ok(s) => ToolOutput::ok(clip(&s, TOOL_CLIP)),
+        Ok(s) => ToolOutput::ok(clip(&s, limit)),
         Err(e) => ToolOutput::ok(format!("Error: {e}")),
     }
 }
 
 struct GrepTool {
     ws: Arc<Workspace>,
+    /// Honour `context`. Off ignores it and behaves exactly as before, which is
+    /// what makes the change A/B-able (`Config::grep_context`).
+    context_enabled: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct GrepArgs {
     /// Regex to search for across the repository.
     pattern: String,
+    /// Lines of surrounding code to show around each match (0-8, default 0).
+    ///
+    /// Omit it to sweep broadly and see every site a pattern has; set it when you
+    /// need to judge what a site actually DOES.
+    #[serde(default)]
+    context: Option<u32>,
 }
 
 #[async_trait]
@@ -89,16 +125,35 @@ impl Tool for GrepTool {
         "grep"
     }
     fn description(&self) -> &'static str {
-        "Regex search across the repository."
+        "Regex search across the repository. Returns `path:N: text` per match. \
+         Pass `context` (1-8) to also get that many lines either side of each \
+         match, shown as `path-N- text`; with context, fewer matches are returned. \
+         Sweep first WITHOUT context to see every site a pattern has, then re-grep \
+         WITH context on the ones you need to judge."
     }
     async fn call(&self, args: Self::Args) -> std::result::Result<ToolOutput, ToolError> {
-        Ok(ws_result(self.ws.grep(&args.pattern, 50).map(|hits| {
-            if hits.is_empty() {
-                "(no matches)".to_string()
-            } else {
-                hits.join("\n")
-            }
-        })))
+        let context = if self.context_enabled {
+            args.context.unwrap_or(0).min(GREP_MAX_CONTEXT) as usize
+        } else {
+            0
+        };
+        let (max_hits, limit) = if context > 0 {
+            (GREP_CONTEXT_MAX_HITS, GREP_CONTEXT_CLIP)
+        } else {
+            (GREP_MAX_HITS, TOOL_CLIP)
+        };
+        Ok(ws_result_clipped(
+            self.ws
+                .grep_with_context(&args.pattern, max_hits, context)
+                .map(|hits| {
+                    if hits.is_empty() {
+                        "(no matches)".to_string()
+                    } else {
+                        hits.join("\n")
+                    }
+                }),
+            limit,
+        ))
     }
 }
 
@@ -198,6 +253,7 @@ fn build_registry(ws: &Workspace, cfg: &Config) -> ToolRegistry {
     ToolRegistry::new()
         .with(GrepTool {
             ws: Arc::clone(&handle),
+            context_enabled: cfg.grep_context,
         })
         .with(ReadFileTool {
             ws: Arc::clone(&handle),
@@ -979,6 +1035,81 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.starts_with("Error:"), "got: {}", out.content);
+    }
+
+    /// The flag is the A/B seam: off, a `context` argument is ignored and the
+    /// output is the bare-line format the reviewer has always seen.
+    #[tokio::test]
+    async fn grep_context_is_honoured_only_when_enabled() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a.rs"), "one\ntwo\nNEEDLE\nfour\nfive\n").unwrap();
+        let ws = Arc::new(Workspace::from_dir(d.path()));
+
+        let on = GrepTool {
+            ws: Arc::clone(&ws),
+            context_enabled: true,
+        };
+        let out = on
+            .call(GrepArgs {
+                pattern: "NEEDLE".into(),
+                context: Some(1),
+            })
+            .await
+            .unwrap();
+        let text = format!("{out:?}");
+        assert!(text.contains("a.rs:3: NEEDLE"), "{text}");
+        assert!(text.contains("a.rs-2- two"), "context present: {text}");
+
+        let off = GrepTool {
+            ws: Arc::clone(&ws),
+            context_enabled: false,
+        };
+        let out = off
+            .call(GrepArgs {
+                pattern: "NEEDLE".into(),
+                context: Some(1),
+            })
+            .await
+            .unwrap();
+        let text = format!("{out:?}");
+        assert!(text.contains("a.rs:3: NEEDLE"), "{text}");
+        assert!(!text.contains("a.rs-2-"), "context must be ignored: {text}");
+    }
+
+    /// A runaway `context` cannot be used to pull the repo into the prompt.
+    #[tokio::test]
+    async fn grep_context_is_clamped() {
+        let d = tempfile::tempdir().unwrap();
+        let before: String = (0..400).map(|i| format!("before{i}\n")).collect();
+        let after: String = (0..400).map(|i| format!("after{i}\n")).collect();
+        std::fs::write(d.path().join("b.rs"), format!("{before}NEEDLE\n{after}")).unwrap();
+        let ws = Arc::new(Workspace::from_dir(d.path()));
+        let t = GrepTool {
+            ws,
+            context_enabled: true,
+        };
+        let out = t
+            .call(GrepArgs {
+                pattern: "NEEDLE".into(),
+                context: Some(9999),
+            })
+            .await
+            .unwrap();
+        let text = format!("{out:?}");
+        assert!(
+            text.len() <= GREP_CONTEXT_CLIP + 512,
+            "clipped: {}",
+            text.len()
+        );
+        // One match, clamped to GREP_MAX_CONTEXT either side.
+        let n = GREP_MAX_CONTEXT as usize;
+        assert!(text.contains(&format!("before{}", 400 - n)), "{text}");
+        assert!(
+            !text.contains(&format!("before{}", 400 - n - 1)),
+            "over-reach: {text}"
+        );
+        assert!(text.contains(&format!("after{}", n - 1)), "{text}");
+        assert!(!text.contains(&format!("after{n}")), "over-reach: {text}");
     }
 
     #[test]
