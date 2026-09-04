@@ -43,8 +43,18 @@ Match the file you are editing rather than any general style guide.
 
 ## The CHANGELOG
 
-Any user-visible change gets an entry under `## Unreleased`. Write why the old
-behaviour was wrong, not only what changed — the existing entries are the model.
+Any user-visible change gets an entry in [CHANGELOG.md](CHANGELOG.md). Write why
+the old behaviour was wrong, not only what changed — the existing entries are the
+model.
+
+Entries are filed directly under a version heading (`## 0.23.0`). There is no
+`Unreleased` section, and the version in `Cargo.toml` is bumped in the same commit
+as the change it describes.
+
+**If you are contributing from outside, do not pick the version number.** Write
+the entry body and leave the heading to a maintainer — which version a change
+lands under is a release decision, and releasing here requires compiling private
+downstream consumers that CI cannot see.
 
 If the change has a known limit or leaves a gap, say so in the entry. An
 overclaim discovered later costs more than the gap ever did.
