@@ -1060,10 +1060,11 @@ mod tests {
         let cfg = crate::config::Config::from_env();
         let client = reqwest::Client::new();
         let advisories = scan(&client, &cfg, &diff).await;
-        let a = advisories
-            .iter()
-            .find(|a| a.package == "jinja2")
-            .expect(&format!("expected a jinja2 advisory, got: {advisories:?}"));
+        assert!(
+            advisories.iter().any(|a| a.package == "jinja2"),
+            "expected a jinja2 advisory, got: {advisories:?}"
+        );
+        let a = advisories.iter().find(|a| a.package == "jinja2").unwrap();
         assert_eq!(a.ecosystem, "PyPI");
         assert!(a.fixed.is_some(), "should report a fixed version");
         println!("{}", render_advisories(&advisories));
