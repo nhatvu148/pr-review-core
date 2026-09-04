@@ -1,4 +1,27 @@
+# Changelog
+
 ## Unreleased
+
+**The dependency scan now reads `poetry.lock`, `uv.lock` and `pdm.lock`**
+([#40](https://github.com/nhatvu148/pr-review-core/issues/40)).
+
+Python coverage was `requirements.txt` alone, and only its exact `==` pins, so a
+PR that added a dependency in a Poetry, uv or PDM project was scanned as if it had
+added nothing. That is the majority of modern Python repos, and the silence is the
+bad part: an empty advisory block reads as "nothing vulnerable", not as "nothing
+scanned".
+
+All three are TOML `[[package]]` blocks with paired `name` / `version` keys, so
+one parser covers them. It resets on each `[[package]]` header, which keeps a
+block whose `name` is added while its `version` line stays unchanged context from
+binding to the *next* block's version and inventing a pin the PR never made.
+`uv.lock`'s `version = 1` format header and its inline `{ name = ... }` dependency
+edges are both excluded. Verified against the upstream `poetry.lock` (80 packages),
+`uv.lock` (91) and `pdm.lock` (96): every pin recovered, nothing invented.
+
+No configuration change: these files were already matched by the default
+`**/*.lock` exclude glob, and the scan has always run on the raw diff ahead of
+that filter.
 
 **Version bumps are now scanned.** Previously only *newly added* packages were,
 which in real lockfile PRs is a small minority of what changes
@@ -35,40 +58,6 @@ already caught bumps and are unchanged.
 count: 56 packages resolve in ~600ms. `CVE_MAX_PACKAGES` (default 100) still caps
 fan-out; the largest PR measured needed 56, but a big `uv lock --upgrade` can now
 plausibly reach that cap where before it never would.
-
-# Changelog
-
-## Unreleased
-
-**The dependency scan now reads `poetry.lock`, `uv.lock` and `pdm.lock`**
-([#40](https://github.com/nhatvu148/pr-review-core/issues/40)).
-
-Python coverage was `requirements.txt` alone, and only its exact `==` pins, so a
-PR that added a dependency in a Poetry, uv or PDM project was scanned as if it had
-added nothing. That is the majority of modern Python repos, and the silence is the
-bad part: an empty advisory block reads as "nothing vulnerable", not as "nothing
-scanned".
-
-All three are TOML `[[package]]` blocks with paired `name` / `version` keys, so
-one parser covers them. It resets on each `[[package]]` header, which keeps a
-block whose `name` is added while its `version` line stays unchanged context from
-binding to the *next* block's version and inventing a pin the PR never made.
-`uv.lock`'s `version = 1` format header and its inline `{ name = ... }` dependency
-edges are both excluded. Verified against the upstream `poetry.lock` (80 packages),
-`uv.lock` (91) and `pdm.lock` (96): every pin recovered, nothing invented.
-
-**Known limit, unchanged by this release.** The scan reads *added* diff lines
-only, and in a block-structured lockfile a version bump adds the `version` line
-while leaving `name` above it as unchanged context — so the package has no name to
-bind to and the bump is not scanned. Newly *added* packages are caught in full.
-This applies equally to `Cargo.lock`, `package-lock.json` and `composer.lock`, and
-predates this change; the single-line formats (`requirements.txt`, `go.sum`,
-`Gemfile.lock`, `yarn.lock`, `pnpm-lock.yaml`) carry name and version on one added
-line and do catch bumps.
-
-No configuration change: these files were already matched by the default
-`**/*.lock` exclude glob, and the scan has always run on the raw diff ahead of
-that filter.
 
 ## 0.22.1
 
