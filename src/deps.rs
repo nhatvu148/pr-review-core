@@ -158,9 +158,15 @@ pub fn render_advisories(advisories: &[DepAdvisory]) -> String {
     s
 }
 
-/// Extract the `(name, version)` coordinates *added* by the diff from every
-/// changed lockfile it recognizes. Only added lines (`+`, excluding the `+++`
-/// header) are considered, so an unchanged pin is never re-flagged.
+/// Extract the `(name, version)` coordinates a diff *pins* in every changed
+/// lockfile it recognizes.
+///
+/// Emission is gated on the line carrying the **version** being added, so an
+/// unchanged pin is never re-flagged. The name may come from an unchanged
+/// context line: in a block format a version bump rewrites only the `version`
+/// line, and reading the surrounding hunk is what lets that bump be seen at
+/// all. Single-line formats carry both on one added line and read added lines
+/// only.
 ///
 /// Recognized files: `Cargo.lock`, `package-lock.json`, `yarn.lock`,
 /// `pnpm-lock.yaml`, `go.sum`, `requirements.txt`, `poetry.lock`, `uv.lock`,
@@ -184,25 +190,35 @@ pub fn changed_packages(diff: &str) -> Vec<PackageQuery> {
             .next()
             .unwrap_or(&path)
             .to_ascii_lowercase();
-        // Collect the added lines (payload without the leading '+').
+        // Single-line formats carry name and version on the same line, so the
+        // added lines alone are enough. Block formats keep the name on a header
+        // line that a version bump leaves untouched, so they get the whole hunk
+        // and resolve the name from context — see `parse_toml_package_blocks`.
         let added: Vec<&str> = section
             .lines()
             .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
             .map(|l| &l[1..])
             .collect();
+        let hunk: Vec<&str> = section
+            .lines()
+            .filter(|l| !l.starts_with("+++") && !l.starts_with("---"))
+            .collect();
+        // Nothing added means nothing to report: every parser gates emission on
+        // an added version line.
         if added.is_empty() {
             continue;
         }
         let parsed: Vec<(String, String)> = match base.as_str() {
-            "cargo.lock" => parse_cargo_lock(&added),
-            "package-lock.json" => parse_package_lock(&added),
+            "cargo.lock" | "poetry.lock" | "uv.lock" | "pdm.lock" => {
+                parse_toml_package_blocks(&hunk)
+            }
+            "package-lock.json" => parse_package_lock(&hunk),
+            "composer.lock" => parse_composer_lock(&hunk),
             "yarn.lock" => parse_yarn_lock(&added),
             "pnpm-lock.yaml" => parse_pnpm_lock(&added),
             "go.sum" => parse_go_sum(&added),
             "requirements.txt" => parse_requirements_txt(&added),
-            "poetry.lock" | "uv.lock" | "pdm.lock" => parse_python_toml_lock(&added),
             "gemfile.lock" => parse_gemfile_lock(&added),
-            "composer.lock" => parse_composer_lock(&added),
             _ => continue,
         };
         let ecosystem = ecosystem_for(&base);
@@ -249,21 +265,64 @@ fn is_concrete_version(v: &str) -> bool {
         })
 }
 
-// ── per-ecosystem lockfile parsers (added lines only) ───────────────────────
+// ── per-ecosystem lockfile parsers ──────────────────────────────────────────
+//
+// Block-format parsers read the whole hunk; single-line parsers read only the
+// added lines. Either way a pair is emitted ONLY when the line carrying the
+// version was added, so an untouched pin is never re-flagged.
 
-/// `Cargo.lock`: paired `name = "x"` / `version = "y"` TOML lines.
-fn parse_cargo_lock(added: &[&str]) -> Vec<(String, String)> {
+/// Classify one raw diff line for a block parser.
+///
+/// `None` means the line can never contribute a name: a removal (whose name
+/// belongs to the pre-image, and must not bind to a post-image version) or a
+/// hunk header (whose boundary the caller uses to drop any half-built pair, so
+/// a name cannot leak from one hunk into the next).
+fn hunk_line(line: &str) -> Option<(bool, &str)> {
+    match line.as_bytes().first() {
+        Some(b'-') => None,
+        Some(b'+') => Some((true, &line[1..])),
+        _ => Some((false, line.strip_prefix(' ').unwrap_or(line))),
+    }
+}
+
+/// TOML `[[package]]` blocks with paired `name` / `version` keys: `Cargo.lock`,
+/// `poetry.lock`, `uv.lock` and `pdm.lock` all share this shape.
+///
+/// Reads the whole hunk, not just added lines. A version bump rewrites only the
+/// `version` line and leaves `name` above it as context, so resolving the name
+/// from context is what lets a bump be scanned at all; emission is still gated
+/// on the version line being added.
+///
+/// A `[[package]]` header — added or context — clears any half-built pair, as
+/// does a hunk boundary, so a name can never bind to a later block's version.
+///
+/// `uv.lock` writes dependency edges as inline tables (`{ name = "idna" }`) and
+/// its lock-format header as `version = 1`; neither survives the pairing, the
+/// former because it never matches the bare `name = ` prefix and the latter
+/// because it precedes every `[[package]]`.
+fn parse_toml_package_blocks(hunk: &[&str]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut pending: Option<String> = None;
-    for line in added {
-        let t = line.trim();
-        if let Some(rest) = t.strip_prefix("name = ") {
+    for &line in hunk {
+        if line.starts_with("@@") {
+            pending = None;
+            continue;
+        }
+        let Some((added, text)) = hunk_line(line) else {
+            continue;
+        };
+        let t = text.trim();
+        if t.starts_with("[[package]]") {
+            pending = None;
+        } else if let Some(rest) = t.strip_prefix("name = ") {
             pending = Some(unquote(rest).to_string());
         } else if let Some(rest) = t.strip_prefix("version = ") {
-            if let Some(name) = pending.take() {
-                let v = unquote(rest);
-                if is_concrete_version(v) {
-                    out.push((name, v.to_string()));
+            if added {
+                if let Some(name) = pending.take() {
+                    let v = unquote(rest);
+                    if is_concrete_version(v) {
+                        out.push((name, v.to_string()));
+                    }
                 }
             }
         }
@@ -271,25 +330,36 @@ fn parse_cargo_lock(added: &[&str]) -> Vec<(String, String)> {
     out
 }
 
-/// `package-lock.json` (v2/v3): `"node_modules/<name>": {` then `"version": "x"`.
-fn parse_package_lock(added: &[&str]) -> Vec<(String, String)> {
+/// `package-lock.json` (v2/v3): a `"node_modules/<name>": {` key, then a
+/// `"version": "x"` inside it. Reads the whole hunk — a bump rewrites only the
+/// version line and leaves the key above it as context — and emits only when
+/// the version line was added.
+fn parse_package_lock(hunk: &[&str]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut pending: Option<String> = None;
-    for line in added {
-        let t = line.trim();
+    for &line in hunk {
+        if line.starts_with("@@") {
+            pending = None;
+            continue;
+        }
+        let Some((added, text)) = hunk_line(line) else {
+            continue;
+        };
+        let t = text.trim();
         if let Some(rest) = t.strip_prefix("\"node_modules/") {
-            // Key looks like `"node_modules/<name>": {`. A nested path keeps only
-            // the final package (after the last `node_modules/`).
+            // A nested path keeps only the final package.
             if let Some(end) = rest.find("\":") {
                 let full = &rest[..end];
                 let name = full.rsplit("node_modules/").next().unwrap_or(full);
                 pending = Some(name.to_string());
             }
         } else if let Some(rest) = t.strip_prefix("\"version\":") {
-            if let Some(name) = pending.take() {
-                let v = unquote(rest.trim_end_matches(','));
-                if is_concrete_version(v) {
-                    out.push((name, v.to_string()));
+            if added {
+                if let Some(name) = pending.take() {
+                    let v = unquote(rest.trim_end_matches(','));
+                    if is_concrete_version(v) {
+                        out.push((name, v.to_string()));
+                    }
                 }
             }
         }
@@ -410,38 +480,6 @@ fn parse_requirements_txt(added: &[&str]) -> Vec<(String, String)> {
     out
 }
 
-/// `poetry.lock` / `uv.lock` / `pdm.lock`: TOML `[[package]]` blocks holding
-/// paired `name = "x"` / `version = "y"` keys.
-///
-/// A `[[package]]` header clears any half-built pair, so a block whose `name`
-/// is added but whose `version` line is unchanged context cannot bind to the
-/// *next* block's version and invent a package that was never pinned.
-///
-/// `uv.lock` writes its dependency edges as inline tables (`{ name = "idna" }`)
-/// and its lock-format header as `version = 1`; neither survives the pairing —
-/// the former never matches the bare `name = ` prefix, and the latter precedes
-/// every `[[package]]`.
-fn parse_python_toml_lock(added: &[&str]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut pending: Option<String> = None;
-    for line in added {
-        let t = line.trim();
-        if t.starts_with("[[package]]") {
-            pending = None;
-        } else if let Some(rest) = t.strip_prefix("name = ") {
-            pending = Some(unquote(rest).to_string());
-        } else if let Some(rest) = t.strip_prefix("version = ") {
-            if let Some(name) = pending.take() {
-                let v = unquote(rest);
-                if is_concrete_version(v) {
-                    out.push((name, v.to_string()));
-                }
-            }
-        }
-    }
-    out
-}
-
 /// `Gemfile.lock`: `    name (1.2.3)` spec lines (bare version only).
 fn parse_gemfile_lock(added: &[&str]) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -466,11 +504,20 @@ fn parse_gemfile_lock(added: &[&str]) -> Vec<(String, String)> {
 }
 
 /// `composer.lock`: paired `"name": "vendor/pkg"` / `"version": "1.2.3"`.
-fn parse_composer_lock(added: &[&str]) -> Vec<(String, String)> {
+/// Reads the whole hunk so a bump — which rewrites only the version line — is
+/// scanned; emission is gated on the version line being added.
+fn parse_composer_lock(hunk: &[&str]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut pending: Option<String> = None;
-    for line in added {
-        let t = line.trim();
+    for &line in hunk {
+        if line.starts_with("@@") {
+            pending = None;
+            continue;
+        }
+        let Some((added, text)) = hunk_line(line) else {
+            continue;
+        };
+        let t = text.trim();
         if let Some(rest) = t.strip_prefix("\"name\":") {
             let name = unquote(rest.trim_end_matches(','));
             // Packagist names are `vendor/package`.
@@ -478,12 +525,14 @@ fn parse_composer_lock(added: &[&str]) -> Vec<(String, String)> {
                 pending = Some(name.to_string());
             }
         } else if let Some(rest) = t.strip_prefix("\"version\":") {
-            if let Some(name) = pending.take() {
-                let mut v = unquote(rest.trim_end_matches(','));
-                // Composer tags are often `v1.2.3`.
-                v = v.strip_prefix('v').unwrap_or(v);
-                if is_concrete_version(v) {
-                    out.push((name, v.to_string()));
+            if added {
+                if let Some(name) = pending.take() {
+                    let mut v = unquote(rest.trim_end_matches(','));
+                    // Composer tags are often `v1.2.3`.
+                    v = v.strip_prefix('v').unwrap_or(v);
+                    if is_concrete_version(v) {
+                        out.push((name, v.to_string()));
+                    }
                 }
             }
         }
@@ -966,17 +1015,11 @@ mod tests {
         assert_eq!(pkgs[0].version, "8.1.7");
     }
 
-    /// Documents a *pre-existing* module-wide limit, not a Python-specific one:
-    /// the scan reads added lines only, so a version bump — which adds the
-    /// `version` line but leaves `name` above it as context — has no name to bind
-    /// to and is skipped. `Cargo.lock`, `package-lock.json` and `composer.lock`
-    /// behave identically. Change this test when that changes.
+    /// The bump case: `name` stays as unchanged context and only `version` is
+    /// added. Resolving the name from context is the whole point of reading the
+    /// hunk rather than the added lines alone.
     #[test]
-    fn python_toml_lock_version_bump_is_not_scanned() {
-        // Built with `concat!` and explicit `\n`, not a line-continued literal:
-        // rustfmt collapses the latter and bakes the source indentation into the
-        // string, which silently empties the added-line set and makes the
-        // assertion below pass for the wrong reason.
+    fn a_version_bump_is_scanned() {
         let bump = concat!(
             "diff --git a/poetry.lock b/poetry.lock\n",
             "+++ b/poetry.lock\n",
@@ -986,23 +1029,189 @@ mod tests {
             "-version = \"2.11.2\"\n",
             "+version = \"2.11.3\"\n",
         );
-        assert!(changed_packages(bump).is_empty());
-
-        // Positive control on the same fixture shape. Without it the assertion
-        // above would also hold for a malformed diff that parses to no added
-        // lines at all, pinning nothing.
-        let whole_block_added = concat!(
-            "diff --git a/poetry.lock b/poetry.lock\n",
-            "+++ b/poetry.lock\n",
-            "@@ -0,0 +1,3 @@\n",
-            "+[[package]]\n",
-            "+name = \"jinja2\"\n",
-            "+version = \"2.11.3\"\n",
-        );
-        let pkgs = changed_packages(whole_block_added);
+        let pkgs = changed_packages(bump);
         assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].ecosystem, "PyPI");
         assert_eq!(pkgs[0].name, "jinja2");
         assert_eq!(pkgs[0].version, "2.11.3");
+    }
+
+    /// The same shape for the three long-shipped block formats, which gain the
+    /// behaviour at the same time.
+    #[test]
+    fn a_version_bump_is_scanned_for_cargo_npm_and_composer() {
+        let cargo = concat!(
+            "diff --git a/Cargo.lock b/Cargo.lock\n",
+            "+++ b/Cargo.lock\n",
+            "@@ -1,3 +1,3 @@\n",
+            " [[package]]\n",
+            " name = \"time\"\n",
+            "-version = \"0.1.43\"\n",
+            "+version = \"0.1.44\"\n",
+        );
+        let p = changed_packages(cargo);
+        assert_eq!(p.len(), 1, "cargo: {p:?}");
+        assert_eq!(
+            (p[0].ecosystem.as_str(), p[0].name.as_str()),
+            ("crates.io", "time")
+        );
+        assert_eq!(p[0].version, "0.1.44");
+
+        let npm = concat!(
+            "diff --git a/package-lock.json b/package-lock.json\n",
+            "+++ b/package-lock.json\n",
+            "@@ -1,3 +1,3 @@\n",
+            "     \"node_modules/lodash\": {\n",
+            "-      \"version\": \"4.17.20\",\n",
+            "+      \"version\": \"4.17.21\",\n",
+        );
+        let p = changed_packages(npm);
+        assert_eq!(p.len(), 1, "npm: {p:?}");
+        assert_eq!(
+            (p[0].ecosystem.as_str(), p[0].name.as_str()),
+            ("npm", "lodash")
+        );
+        assert_eq!(p[0].version, "4.17.21");
+
+        let composer = concat!(
+            "diff --git a/composer.lock b/composer.lock\n",
+            "+++ b/composer.lock\n",
+            "@@ -1,3 +1,3 @@\n",
+            "     \"name\": \"monolog/monolog\",\n",
+            "-    \"version\": \"2.0.0\",\n",
+            "+    \"version\": \"2.0.1\",\n",
+        );
+        let p = changed_packages(composer);
+        assert_eq!(p.len(), 1, "composer: {p:?}");
+        assert_eq!(
+            (p[0].ecosystem.as_str(), p[0].name.as_str()),
+            ("Packagist", "monolog/monolog")
+        );
+        assert_eq!(p[0].version, "2.0.1");
+    }
+
+    /// A removed name belongs to the pre-image. It must never bind to a version
+    /// added further down, or deleting one package and bumping the next would
+    /// report a pin that never existed.
+    #[test]
+    fn a_removed_name_does_not_bind_to_a_later_added_version() {
+        let d = concat!(
+            "diff --git a/poetry.lock b/poetry.lock\n",
+            "+++ b/poetry.lock\n",
+            "@@ -1,8 +1,6 @@\n",
+            "-[[package]]\n",
+            "-name = \"deleted-pkg\"\n",
+            "-version = \"1.0.0\"\n",
+            " [[package]]\n",
+            " name = \"kept-pkg\"\n",
+            "-version = \"2.0.0\"\n",
+            "+version = \"2.0.1\"\n",
+        );
+        let pkgs = changed_packages(d);
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        assert_eq!(pkgs[0].name, "kept-pkg");
+        assert_eq!(pkgs[0].version, "2.0.1");
+    }
+
+    /// Hunks are not contiguous in the file, so a name from one must not carry
+    /// into the next.
+    #[test]
+    fn a_name_does_not_leak_across_hunks() {
+        let d = concat!(
+            "diff --git a/poetry.lock b/poetry.lock\n",
+            "+++ b/poetry.lock\n",
+            "@@ -1,2 +1,2 @@\n",
+            " [[package]]\n",
+            " name = \"first\"\n",
+            "@@ -90,2 +90,2 @@\n",
+            "-version = \"9.0.0\"\n",
+            "+version = \"9.0.1\"\n",
+        );
+        assert!(
+            changed_packages(d).is_empty(),
+            "name leaked across a hunk boundary"
+        );
+    }
+
+    /// `parse_package_lock` and `parse_composer_lock` implement the removed-line
+    /// and hunk-boundary guards independently of the TOML parser, so they are
+    /// asserted independently too. Without this, a guard could regress in two of
+    /// the three block parsers with every test still green.
+    #[test]
+    fn the_guards_hold_for_package_lock_and_composer_too() {
+        // A removed key must not bind to a version added further down.
+        let npm_removed = concat!(
+            "diff --git a/package-lock.json b/package-lock.json\n",
+            "+++ b/package-lock.json\n",
+            "@@ -1,6 +1,4 @@\n",
+            "-    \"node_modules/deleted\": {\n",
+            "-      \"version\": \"1.0.0\",\n",
+            "     \"node_modules/kept\": {\n",
+            "-      \"version\": \"2.0.0\",\n",
+            "+      \"version\": \"2.0.1\",\n",
+        );
+        let p = changed_packages(npm_removed);
+        assert_eq!(p.len(), 1, "npm removed-name guard: {p:?}");
+        assert_eq!(p[0].name, "kept");
+        assert_eq!(p[0].version, "2.0.1");
+
+        // A name must not survive a hunk boundary.
+        let npm_hunks = concat!(
+            "diff --git a/package-lock.json b/package-lock.json\n",
+            "+++ b/package-lock.json\n",
+            "@@ -1,1 +1,1 @@\n",
+            "     \"node_modules/first\": {\n",
+            "@@ -90,1 +90,1 @@\n",
+            "-      \"version\": \"9.0.0\",\n",
+            "+      \"version\": \"9.0.1\",\n",
+        );
+        assert!(
+            changed_packages(npm_hunks).is_empty(),
+            "npm name leaked across a hunk boundary"
+        );
+
+        let composer_removed = concat!(
+            "diff --git a/composer.lock b/composer.lock\n",
+            "+++ b/composer.lock\n",
+            "@@ -1,6 +1,4 @@\n",
+            "-    \"name\": \"vendor/deleted\",\n",
+            "-    \"version\": \"1.0.0\",\n",
+            "     \"name\": \"vendor/kept\",\n",
+            "-    \"version\": \"2.0.0\",\n",
+            "+    \"version\": \"2.0.1\",\n",
+        );
+        let p = changed_packages(composer_removed);
+        assert_eq!(p.len(), 1, "composer removed-name guard: {p:?}");
+        assert_eq!(p[0].name, "vendor/kept");
+        assert_eq!(p[0].version, "2.0.1");
+
+        let composer_hunks = concat!(
+            "diff --git a/composer.lock b/composer.lock\n",
+            "+++ b/composer.lock\n",
+            "@@ -1,1 +1,1 @@\n",
+            "     \"name\": \"vendor/first\",\n",
+            "@@ -90,1 +90,1 @@\n",
+            "-    \"version\": \"9.0.0\",\n",
+            "+    \"version\": \"9.0.1\",\n",
+        );
+        assert!(
+            changed_packages(composer_hunks).is_empty(),
+            "composer name leaked across a hunk boundary"
+        );
+    }
+
+    /// A block removed outright reports nothing: no version line was added.
+    #[test]
+    fn a_removed_block_reports_nothing() {
+        let d = concat!(
+            "diff --git a/poetry.lock b/poetry.lock\n",
+            "+++ b/poetry.lock\n",
+            "@@ -1,3 +0,0 @@\n",
+            "-[[package]]\n",
+            "-name = \"gone\"\n",
+            "-version = \"1.0.0\"\n",
+        );
+        assert!(changed_packages(d).is_empty());
     }
 
     #[test]

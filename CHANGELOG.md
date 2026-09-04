@@ -19,18 +19,45 @@ binding to the *next* block's version and inventing a pin the PR never made.
 edges are both excluded. Verified against the upstream `poetry.lock` (80 packages),
 `uv.lock` (91) and `pdm.lock` (96): every pin recovered, nothing invented.
 
-**Known limit, unchanged by this release.** The scan reads *added* diff lines
-only, and in a block-structured lockfile a version bump adds the `version` line
-while leaving `name` above it as unchanged context — so the package has no name to
-bind to and the bump is not scanned. Newly *added* packages are caught in full.
-This applies equally to `Cargo.lock`, `package-lock.json` and `composer.lock`, and
-predates this change; the single-line formats (`requirements.txt`, `go.sum`,
-`Gemfile.lock`, `yarn.lock`, `pnpm-lock.yaml`) carry name and version on one added
-line and do catch bumps.
-
 No configuration change: these files were already matched by the default
 `**/*.lock` exclude glob, and the scan has always run on the raw diff ahead of
 that filter.
+
+**Version bumps are now scanned.** Previously only *newly added* packages were,
+which in real lockfile PRs is a small minority of what changes
+([#48](https://github.com/nhatvu148/pr-review-core/issues/48)).
+
+The scan read added diff lines only. In a block-structured lockfile a bump
+rewrites the `version` line and leaves `name` above it as unchanged context, so
+the version had no name to bind to and the package was dropped. Measured against
+7 real merged PRs from `python-poetry/poetry`, `pdm-project/pdm`,
+`mlflow/mlflow`, `CDCgov` and `kdeldycke/click-extra`:
+
+| | added `version` lines | scanned |
+|---|---|---|
+| before | 132 | 5 (3.8%) |
+| after | 132 | 132 (100%) |
+
+`mlflow#25549` bumped 26 packages and `CDCgov#1265` bumped 56; every one of them
+was previously invisible to the scan.
+
+Block parsers now read the whole hunk and resolve the name from context, while
+emission stays gated on the *version* line being added — so an untouched pin is
+still never re-flagged. Three guards make that safe: a removed line can never
+supply a name (it belongs to the pre-image), a `[[package]]` header clears any
+half-built pair, and a hunk boundary does too, so a name cannot leak from one
+hunk into the next.
+
+This covers `Cargo.lock`, `package-lock.json`, `composer.lock` and the Python
+TOML locks together — `parse_cargo_lock` and the Python parser were identical, so
+they are now one `parse_toml_package_blocks`. The single-line formats
+(`requirements.txt`, `go.sum`, `Gemfile.lock`, `yarn.lock`, `pnpm-lock.yaml`)
+already caught bumps and are unchanged.
+
+**Cost.** OSV is queried through one `querybatch` request regardless of package
+count: 56 packages resolve in ~600ms. `CVE_MAX_PACKAGES` (default 100) still caps
+fan-out; the largest PR measured needed 56, but a big `uv lock --upgrade` can now
+plausibly reach that cap where before it never would.
 
 ## 0.22.1
 
