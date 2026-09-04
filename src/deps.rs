@@ -10,6 +10,36 @@
 //! before the LLM ever sees them). Fully fail-open: any parse or network error
 //! yields zero advisories rather than failing the review.
 
+//! # Verifying a change here
+//!
+//! The unit tests below cover the parsers, and the `#[ignore]`d ones hit live
+//! OSV. Neither proves the scan still works *through a deployed bot*, which is
+//! where the interesting failures live: a stale build, a diff the provider
+//! could not fetch, a lockfile excluded before the scan ever saw it.
+//!
+//! A fixture PR is the cheapest end-to-end check. Two rules make one useful:
+//!
+//! 1. **Shape the bump correctly.** Change *only* the `version` line and leave
+//!    `name` above it as unchanged context. That is the case this module got
+//!    wrong until 0.23.0, and a fixture that adds a whole `[[package]]` block
+//!    will pass without exercising it.
+//! 2. **Include a control that must NOT appear** — a pin that is already
+//!    patched and untouched by the diff. Emission is gated on the version line
+//!    being added, and that guarantee is easy to break while making the parser
+//!    read context.
+//!
+//! Pick pins that OSV actually flags, and confirm before opening the PR:
+//!
+//! ```sh
+//! curl -s https://api.osv.dev/v1/query \
+//!   -d '{"package":{"name":"time","ecosystem":"crates.io"},"version":"0.1.44"}'
+//! ```
+//!
+//! A private fixture exercising all four block formats and both paths lives at
+//! `nhatvu148/prbot-lockfile-smoke` (kept private: it pins knowingly vulnerable
+//! versions, which a public dependency graph would advertise). The recipe above
+//! is what it contains, so it can be rebuilt anywhere.
+
 use std::collections::BTreeSet;
 
 use reqwest::Client;
