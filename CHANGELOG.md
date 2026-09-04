@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.23.0
+## Unreleased
 
 **The dependency scan now reads `poetry.lock`, `uv.lock` and `pdm.lock`**
 ([#40](https://github.com/nhatvu148/pr-review-core/issues/40)).
