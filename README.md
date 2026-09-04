@@ -60,7 +60,8 @@ prompt through [`Config`].
 - **Dependency vulnerability scan**: added lockfile entries (Cargo/npm/yarn/pnpm/
   Go/PyPI/RubyGems/Composer) are checked against [OSV.dev](https://osv.dev) and
   known CVEs are surfaced in the summary with severity + fix version — no local
-  resolver, HTTP-only.
+  resolver, HTTP-only. Python coverage reads `requirements.txt` (`==` pins only),
+  `poetry.lock`, `uv.lock` and `pdm.lock`.
 - **PR commands**: `/ask <question>` answers questions about the PR from its diff;
   `/describe` (re)generates the PR description idempotently, preserving human edits;
   `/review-file <path>` deep-reviews an entire file at the PR head, beyond just the diff.

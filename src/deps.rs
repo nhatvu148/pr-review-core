@@ -163,8 +163,8 @@ pub fn render_advisories(advisories: &[DepAdvisory]) -> String {
 /// header) are considered, so an unchanged pin is never re-flagged.
 ///
 /// Recognized files: `Cargo.lock`, `package-lock.json`, `yarn.lock`,
-/// `pnpm-lock.yaml`, `go.sum`, `requirements.txt`, `Gemfile.lock`,
-/// `composer.lock`.
+/// `pnpm-lock.yaml`, `go.sum`, `requirements.txt`, `poetry.lock`, `uv.lock`,
+/// `pdm.lock`, `Gemfile.lock`, `composer.lock`.
 ///
 /// # Examples
 /// ```
@@ -200,6 +200,7 @@ pub fn changed_packages(diff: &str) -> Vec<PackageQuery> {
             "pnpm-lock.yaml" => parse_pnpm_lock(&added),
             "go.sum" => parse_go_sum(&added),
             "requirements.txt" => parse_requirements_txt(&added),
+            "poetry.lock" | "uv.lock" | "pdm.lock" => parse_python_toml_lock(&added),
             "gemfile.lock" => parse_gemfile_lock(&added),
             "composer.lock" => parse_composer_lock(&added),
             _ => continue,
@@ -225,7 +226,7 @@ fn ecosystem_for(base: &str) -> &'static str {
         "cargo.lock" => "crates.io",
         "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" => "npm",
         "go.sum" => "Go",
-        "requirements.txt" => "PyPI",
+        "requirements.txt" | "poetry.lock" | "uv.lock" | "pdm.lock" => "PyPI",
         "gemfile.lock" => "RubyGems",
         "composer.lock" => "Packagist",
         _ => "",
@@ -404,6 +405,38 @@ fn parse_requirements_txt(added: &[&str]) -> Vec<(String, String)> {
             .trim();
         if !name.is_empty() && is_concrete_version(version) {
             out.push((name.to_string(), version.to_string()));
+        }
+    }
+    out
+}
+
+/// `poetry.lock` / `uv.lock` / `pdm.lock`: TOML `[[package]]` blocks holding
+/// paired `name = "x"` / `version = "y"` keys.
+///
+/// A `[[package]]` header clears any half-built pair, so a block whose `name`
+/// is added but whose `version` line is unchanged context cannot bind to the
+/// *next* block's version and invent a package that was never pinned.
+///
+/// `uv.lock` writes its dependency edges as inline tables (`{ name = "idna" }`)
+/// and its lock-format header as `version = 1`; neither survives the pairing —
+/// the former never matches the bare `name = ` prefix, and the latter precedes
+/// every `[[package]]`.
+fn parse_python_toml_lock(added: &[&str]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut pending: Option<String> = None;
+    for line in added {
+        let t = line.trim();
+        if t.starts_with("[[package]]") {
+            pending = None;
+        } else if let Some(rest) = t.strip_prefix("name = ") {
+            pending = Some(unquote(rest).to_string());
+        } else if let Some(rest) = t.strip_prefix("version = ") {
+            if let Some(name) = pending.take() {
+                let v = unquote(rest);
+                if is_concrete_version(v) {
+                    out.push((name, v.to_string()));
+                }
+            }
         }
     }
     out
@@ -829,6 +862,119 @@ mod tests {
         }));
         // `requests>=2.0` is not an exact pin.
         assert!(!pkgs.iter().any(|p| p.name == "requests"));
+    }
+
+    #[test]
+    fn poetry_lock_pairs_name_and_version() {
+        let d = section(
+            "poetry.lock",
+            &[
+                "[[package]]",
+                "name = \"jinja2\"",
+                "version = \"2.11.2\"",
+                "description = \"A very fast and expressive template engine.\"",
+                "optional = false",
+                "python-versions = \">=3.6\"",
+            ],
+        );
+        let pkgs = changed_packages(&d);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].ecosystem, "PyPI");
+        assert_eq!(pkgs[0].name, "jinja2");
+        assert_eq!(pkgs[0].version, "2.11.2");
+    }
+
+    /// The `[metadata]` trailer's `lock-version` / `python-versions` keys must not
+    /// be mistaken for a package version.
+    #[test]
+    fn poetry_lock_ignores_metadata_trailer() {
+        let d = section(
+            "poetry.lock",
+            &[
+                "[metadata]",
+                "lock-version = \"2.0\"",
+                "python-versions = \"^3.9\"",
+                "content-hash = \"abc123\"",
+            ],
+        );
+        assert!(changed_packages(&d).is_empty());
+    }
+
+    /// `uv.lock` carries a bare `version = 1` format header and writes dependency
+    /// edges as inline `{ name = ... }` tables; neither may yield a query.
+    #[test]
+    fn uv_lock_skips_format_header_and_inline_deps() {
+        let d = section(
+            "uv.lock",
+            &[
+                "version = 1",
+                "requires-python = \">=3.11\"",
+                "",
+                "[[package]]",
+                "name = \"anyio\"",
+                "version = \"4.3.0\"",
+                "source = { registry = \"https://pypi.org/simple\" }",
+                "dependencies = [",
+                "    { name = \"idna\" },",
+                "    { name = \"sniffio\" },",
+                "]",
+            ],
+        );
+        let pkgs = changed_packages(&d);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].ecosystem, "PyPI");
+        assert_eq!(pkgs[0].name, "anyio");
+        assert_eq!(pkgs[0].version, "4.3.0");
+    }
+
+    #[test]
+    fn pdm_lock_pairs_name_and_version() {
+        let d = section(
+            "pdm.lock",
+            &[
+                "[[package]]",
+                "name = \"urllib3\"",
+                "version = \"1.26.4\"",
+                "requires_python = \">=3.6\"",
+                "summary = \"HTTP library with thread-safe connection pooling.\"",
+            ],
+        );
+        let pkgs = changed_packages(&d);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].ecosystem, "PyPI");
+        assert_eq!(pkgs[0].name, "urllib3");
+        assert_eq!(pkgs[0].version, "1.26.4");
+    }
+
+    /// A block whose `name` is added while its `version` stays as unchanged
+    /// context must not bind to the *following* block's version.
+    #[test]
+    fn python_toml_lock_does_not_pair_across_package_blocks() {
+        let d = section(
+            "poetry.lock",
+            &[
+                "[[package]]",
+                "name = \"orphan\"",
+                "[[package]]",
+                "name = \"click\"",
+                "version = \"8.1.7\"",
+            ],
+        );
+        let pkgs = changed_packages(&d);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "click");
+        assert_eq!(pkgs[0].version, "8.1.7");
+    }
+
+    /// Documents a *pre-existing* module-wide limit, not a Python-specific one:
+    /// the scan reads added lines only, so a version bump — which adds the
+    /// `version` line but leaves `name` above it as context — has no name to bind
+    /// to and is skipped. `Cargo.lock`, `package-lock.json` and `composer.lock`
+    /// behave identically. Change this test when that changes.
+    #[test]
+    fn python_toml_lock_version_bump_is_not_scanned() {
+        let d = "diff --git a/poetry.lock b/poetry.lock\n                 +++ b/poetry.lock\n                 @@ -1,4 +1,4 @@\n                 \x20[[package]]\n                 \x20name = \"jinja2\"\n                 -version = \"2.11.2\"\n                 +version = \"2.11.3\"\n";
+        assert!(changed_packages(d).is_empty());
     }
 
     #[test]
