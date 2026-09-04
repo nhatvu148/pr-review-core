@@ -158,9 +158,15 @@ pub fn render_advisories(advisories: &[DepAdvisory]) -> String {
     s
 }
 
-/// Extract the `(name, version)` coordinates *added* by the diff from every
-/// changed lockfile it recognizes. Only added lines (`+`, excluding the `+++`
-/// header) are considered, so an unchanged pin is never re-flagged.
+/// Extract the `(name, version)` coordinates a diff *pins* in every changed
+/// lockfile it recognizes.
+///
+/// Emission is gated on the line carrying the **version** being added, so an
+/// unchanged pin is never re-flagged. The name may come from an unchanged
+/// context line: in a block format a version bump rewrites only the `version`
+/// line, and reading the surrounding hunk is what lets that bump be seen at
+/// all. Single-line formats carry both on one added line and read added lines
+/// only.
 ///
 /// Recognized files: `Cargo.lock`, `package-lock.json`, `yarn.lock`,
 /// `pnpm-lock.yaml`, `go.sum`, `requirements.txt`, `poetry.lock`, `uv.lock`,
@@ -1124,6 +1130,73 @@ mod tests {
         assert!(
             changed_packages(d).is_empty(),
             "name leaked across a hunk boundary"
+        );
+    }
+
+    /// `parse_package_lock` and `parse_composer_lock` implement the removed-line
+    /// and hunk-boundary guards independently of the TOML parser, so they are
+    /// asserted independently too. Without this, a guard could regress in two of
+    /// the three block parsers with every test still green.
+    #[test]
+    fn the_guards_hold_for_package_lock_and_composer_too() {
+        // A removed key must not bind to a version added further down.
+        let npm_removed = concat!(
+            "diff --git a/package-lock.json b/package-lock.json\n",
+            "+++ b/package-lock.json\n",
+            "@@ -1,6 +1,4 @@\n",
+            "-    \"node_modules/deleted\": {\n",
+            "-      \"version\": \"1.0.0\",\n",
+            "     \"node_modules/kept\": {\n",
+            "-      \"version\": \"2.0.0\",\n",
+            "+      \"version\": \"2.0.1\",\n",
+        );
+        let p = changed_packages(npm_removed);
+        assert_eq!(p.len(), 1, "npm removed-name guard: {p:?}");
+        assert_eq!(p[0].name, "kept");
+        assert_eq!(p[0].version, "2.0.1");
+
+        // A name must not survive a hunk boundary.
+        let npm_hunks = concat!(
+            "diff --git a/package-lock.json b/package-lock.json\n",
+            "+++ b/package-lock.json\n",
+            "@@ -1,1 +1,1 @@\n",
+            "     \"node_modules/first\": {\n",
+            "@@ -90,1 +90,1 @@\n",
+            "-      \"version\": \"9.0.0\",\n",
+            "+      \"version\": \"9.0.1\",\n",
+        );
+        assert!(
+            changed_packages(npm_hunks).is_empty(),
+            "npm name leaked across a hunk boundary"
+        );
+
+        let composer_removed = concat!(
+            "diff --git a/composer.lock b/composer.lock\n",
+            "+++ b/composer.lock\n",
+            "@@ -1,6 +1,4 @@\n",
+            "-    \"name\": \"vendor/deleted\",\n",
+            "-    \"version\": \"1.0.0\",\n",
+            "     \"name\": \"vendor/kept\",\n",
+            "-    \"version\": \"2.0.0\",\n",
+            "+    \"version\": \"2.0.1\",\n",
+        );
+        let p = changed_packages(composer_removed);
+        assert_eq!(p.len(), 1, "composer removed-name guard: {p:?}");
+        assert_eq!(p[0].name, "vendor/kept");
+        assert_eq!(p[0].version, "2.0.1");
+
+        let composer_hunks = concat!(
+            "diff --git a/composer.lock b/composer.lock\n",
+            "+++ b/composer.lock\n",
+            "@@ -1,1 +1,1 @@\n",
+            "     \"name\": \"vendor/first\",\n",
+            "@@ -90,1 +90,1 @@\n",
+            "-    \"version\": \"9.0.0\",\n",
+            "+    \"version\": \"9.0.1\",\n",
+        );
+        assert!(
+            changed_packages(composer_hunks).is_empty(),
+            "composer name leaked across a hunk boundary"
         );
     }
 
