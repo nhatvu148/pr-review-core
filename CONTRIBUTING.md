@@ -43,18 +43,20 @@ Match the file you are editing rather than any general style guide.
 
 ## The CHANGELOG
 
-Any user-visible change gets an entry in [CHANGELOG.md](CHANGELOG.md). Write why
-the old behaviour was wrong, not only what changed — the existing entries are the
+Any user-visible change gets an entry in [CHANGELOG.md](CHANGELOG.md) under a
+`## Unreleased` heading — add the heading if it is not currently there. Write why
+the old behaviour was wrong, not only what changed. The existing entries are the
 model.
 
-Entries are filed directly under a version heading (`## 0.23.0`). There is no
-`Unreleased` section, and the version in `Cargo.toml` is bumped in the same commit
-as the change it describes.
+`## Unreleased` is promoted to a version number at release time, along with the
+`Cargo.toml` bump — see [Releasing](README.md#releasing). That is a maintainer
+step, so **do not choose a version number or bump `Cargo.toml` in a
+contribution**: releasing here requires compiling private downstream consumers
+that CI cannot reach, and that check gates the version.
 
-**If you are contributing from outside, do not pick the version number.** Write
-the entry body and leave the heading to a maintainer — which version a change
-lands under is a release decision, and releasing here requires compiling private
-downstream consumers that CI cannot see.
+This is also why you will not find an `Unreleased` section sitting in the
+CHANGELOG most of the time. It is always promoted before a release lands, so its
+absence means the last change was released — not that the convention is unused.
 
 If the change has a known limit or leaves a gap, say so in the entry. An
 overclaim discovered later costs more than the gap ever did.
