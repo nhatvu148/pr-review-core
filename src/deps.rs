@@ -973,8 +973,36 @@ mod tests {
     /// behave identically. Change this test when that changes.
     #[test]
     fn python_toml_lock_version_bump_is_not_scanned() {
-        let d = "diff --git a/poetry.lock b/poetry.lock\n                 +++ b/poetry.lock\n                 @@ -1,4 +1,4 @@\n                 \x20[[package]]\n                 \x20name = \"jinja2\"\n                 -version = \"2.11.2\"\n                 +version = \"2.11.3\"\n";
-        assert!(changed_packages(d).is_empty());
+        // Built with `concat!` and explicit `\n`, not a line-continued literal:
+        // rustfmt collapses the latter and bakes the source indentation into the
+        // string, which silently empties the added-line set and makes the
+        // assertion below pass for the wrong reason.
+        let bump = concat!(
+            "diff --git a/poetry.lock b/poetry.lock\n",
+            "+++ b/poetry.lock\n",
+            "@@ -1,4 +1,4 @@\n",
+            " [[package]]\n",
+            " name = \"jinja2\"\n",
+            "-version = \"2.11.2\"\n",
+            "+version = \"2.11.3\"\n",
+        );
+        assert!(changed_packages(bump).is_empty());
+
+        // Positive control on the same fixture shape. Without it the assertion
+        // above would also hold for a malformed diff that parses to no added
+        // lines at all, pinning nothing.
+        let whole_block_added = concat!(
+            "diff --git a/poetry.lock b/poetry.lock\n",
+            "+++ b/poetry.lock\n",
+            "@@ -0,0 +1,3 @@\n",
+            "+[[package]]\n",
+            "+name = \"jinja2\"\n",
+            "+version = \"2.11.3\"\n",
+        );
+        let pkgs = changed_packages(whole_block_added);
+        assert_eq!(pkgs.len(), 1);
+        assert_eq!(pkgs[0].name, "jinja2");
+        assert_eq!(pkgs[0].version, "2.11.3");
     }
 
     #[test]
