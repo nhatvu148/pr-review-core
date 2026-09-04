@@ -30,6 +30,7 @@ pub mod repo_config;
 pub mod review;
 pub mod runlog;
 pub mod structure;
+pub mod suggest;
 pub mod webhook;
 
 /// Clip a string to at most `n` characters (char-safe — never splits a UTF-8

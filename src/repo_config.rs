@@ -39,6 +39,8 @@ pub struct RepoConfig {
     /// Toggle re-anchoring a finding that drifted just off a diff line to the
     /// nearest matching diff line (else it folds to the summary), for this repo.
     pub reanchor_findings: Option<bool>,
+    /// Toggle committable suggestion blocks on findings, for this repo.
+    pub suggestions: Option<bool>,
     /// Pass this repo's PR descriptions to the reviewer as a statement of intent
     /// to check the diff against. Off suppresses it for this repo only.
     pub pr_body: Option<bool>,
