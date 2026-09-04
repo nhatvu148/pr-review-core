@@ -41,6 +41,19 @@ Match the file you are editing rather than any general style guide.
 - **Enrichment fails open.** The scan and context paths never block a review when
   a service is down or a parse fails.
 
+## Changing the dependency scan
+
+`src/deps.rs` has a failure mode its unit tests cannot see: the parsers can be
+right while the scan still produces nothing in production, because a build is
+stale, a provider could not fetch the diff, or a lockfile was filtered out before
+the scan ran.
+
+If you change that module, verify it end to end with a fixture PR as well as the
+tests. The module docs at the top of `src/deps.rs` give the recipe, including the
+two rules that make a fixture actually test something: shape the bump so only the
+`version` line changes, and include an already-patched pin that must *not* be
+reported.
+
 ## The CHANGELOG
 
 Any user-visible change gets an entry in [CHANGELOG.md](CHANGELOG.md) under a
