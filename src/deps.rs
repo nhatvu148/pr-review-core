@@ -1048,6 +1048,27 @@ mod tests {
     }
 
     /// Live end-to-end scan against the real OSV.dev API. Ignored by default
+    /// Live end-to-end check for the PyPI TOML lockfiles: a poetry.lock pin must
+    /// reach OSV as `PyPI` and come back with a real advisory (needs network).
+    #[tokio::test]
+    #[ignore = "hits the live OSV.dev API"]
+    async fn osv_scan_flags_known_vulnerable_poetry_pin() {
+        let diff = section(
+            "poetry.lock",
+            &["[[package]]", "name = \"jinja2\"", "version = \"2.11.2\""],
+        );
+        let cfg = crate::config::Config::from_env();
+        let client = reqwest::Client::new();
+        let advisories = scan(&client, &cfg, &diff).await;
+        let a = advisories
+            .iter()
+            .find(|a| a.package == "jinja2")
+            .expect(&format!("expected a jinja2 advisory, got: {advisories:?}"));
+        assert_eq!(a.ecosystem, "PyPI");
+        assert!(a.fixed.is_some(), "should report a fixed version");
+        println!("{}", render_advisories(&advisories));
+    }
+
     /// (needs network); run with `cargo test --lib deps -- --ignored --nocapture`.
     #[tokio::test]
     #[ignore = "hits the live OSV.dev API"]
