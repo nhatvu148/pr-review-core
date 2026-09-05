@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.24.1
 
 **A finding no longer posts on a blank line.** Being *in* the diff was treated as
 enough to anchor a comment, and in a newly added file every line is in the diff —
