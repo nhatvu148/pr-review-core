@@ -51,27 +51,24 @@ problem, but replacement text does not — applied, it overwrites a line the fin
 never looked at. Since both features default to on, this is the rule that makes
 the pair safe, and it is covered by a test.
 
-**Verified on both hosts, to different depths.** On GitHub the whole path was run
-end to end on a throwaway PR: the model populated `suggestion`, validation accepted
-it, and GitHub rendered a suggested change with a working *Apply suggestion* button.
-On GitLab the fence and the position payload were confirmed by posting the block
-this engine emits (`suggestion:-0+0`, a note anchored with base/start/head SHAs) to
-a real merge request — GitLab rendered it as a *Suggested change* with an *Apply
-suggestion* button. What has not been exercised on GitLab is the bot driving it:
-the review, anchoring and posting path is shared code, but nobody has watched a
-GitLab review produce one by itself.
+**Verified on all three hosts, on live pull requests.** Each was confirmed by
+posting this crate's own output and watching the host render an *Apply* button —
+not read off a documentation page. GitHub additionally ran the full pipeline end to
+end: the model populated `suggestion`, validation accepted it, the comment posted,
+and applying it committed the fix. GitLab and Bitbucket had the fence and the
+comment payload confirmed; nobody has yet watched a review on either host produce
+one unaided, though the review, anchoring and posting path is shared code.
 
-Bitbucket Cloud does have code suggestions, but nothing is emitted there yet: its
-documented paths are all UI (a toolbar button, `/suggestcode`) and no raw-markdown
-form is published, so what an API client must post to produce one is unknown. A
-guess that renders as an ordinary code block labelled `suggestion`, with no way to
-apply it, would be worse than the prose it replaced. Nothing is emitted there — and neither
-does the **local** review path, for a different reason: `run_review_local` returns
-`summary_markdown` and `findings_detail`, never the rendered inline bodies, so a
-block built for it would be discarded unread. A local consumer that wants to show
-the fix as code has the raw `Finding::suggestion` and can run it through the now-
-public `suggest::sanitize` / `suggest::render` itself. `/review-file` findings post
-to the summary, where no block would render, so its prompt is unchanged.
+Bitbucket was nearly excluded on a false premise. Atlassian documents only a UI
+path for suggestions — a toolbar button, `/suggestcode` — and publishes no
+raw-markdown form, which reads like the feature is out of reach for an API client.
+It is not: an ordinary ```` ```suggestion ```` fence in a comment's `content.raw`
+renders as a *Suggested change* with an *Apply suggestion* button, the same as on
+GitHub. Absent documentation was not absent capability, and one posted comment
+settled what no amount of reading could.
+
+`/review-file` findings post to the summary, where no block would render, so its
+prompt is unchanged.
 
 `PRBOT_RUN_LOG` records `funnel.suggested` — of the anchored findings, how many
 carried a block. The gap between that and `funnel.anchored` is how the feature

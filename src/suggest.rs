@@ -16,18 +16,17 @@
 
 /// Whether a provider renders a committable suggestion block natively.
 ///
-/// GitHub and GitLab do, with different fence syntax (see [`fence_info`]), and
-/// both were confirmed by posting this crate's own output to a live PR/MR.
+/// All three do, and each was confirmed by posting this crate's own output to a
+/// live pull request and watching the host render an *Apply* button — not read off
+/// a documentation page. Only the fence differs (see [`fence_info`]).
 ///
-/// Bitbucket Cloud **has** a code-suggestions feature, but it is excluded until
-/// someone establishes what an API client must post to produce one. Every
-/// Atlassian doc describes a UI path — a toolbar button, `/suggestcode` — and
-/// none gives a raw-markdown form, which is consistent with suggestions being
-/// stored structurally rather than as a fence. Emitting a speculative
-/// ```` ```suggestion ```` there would, if wrong, render as an ordinary code
-/// block labelled `suggestion` with no way to apply it: worse than the prose it
-/// replaced. Withholding costs a feature; guessing costs trust in every comment
-/// beside it.
+/// Bitbucket was nearly excluded on a false premise. Atlassian's docs describe
+/// only a UI path for suggestions — a toolbar button, `/suggestcode` — and publish
+/// no raw-markdown form, which reads like the feature is unavailable to an API
+/// client. It is not: an ordinary ```` ```suggestion ```` fence in a comment's
+/// `content.raw` renders as a *Suggested change* with an *Apply suggestion*
+/// button, exactly as on GitHub. Absent documentation was not absent capability,
+/// and one posted comment settled what no amount of reading could.
 ///
 /// `local` is included again. It was dropped when a local review's rendered
 /// bodies died inside `finish_review` and a block built for it would have been
@@ -40,7 +39,7 @@
 pub fn supports_suggestions(provider: &str) -> bool {
     matches!(
         provider,
-        "github" | "gitlab" | crate::review::LOCAL_PROVIDER
+        "github" | "gitlab" | "bitbucket" | crate::review::LOCAL_PROVIDER
     )
 }
 
@@ -48,9 +47,10 @@ pub fn supports_suggestions(provider: &str) -> bool {
 ///
 /// GitLab requires an explicit line range on the info string: `-0+0` means
 /// "replace zero lines above and zero lines below the anchored line", i.e. that
-/// line alone. GitHub infers the same range from the comment's own anchor.
-/// Emitting GitHub's bare `suggestion` on GitLab renders an inert code block,
-/// which is the failure this function exists to prevent.
+/// line alone. GitHub and Bitbucket both infer the same range from the comment's
+/// own anchor and take the bare `suggestion`. Emitting that bare form on GitLab
+/// renders an inert code block, which is the failure this function exists to
+/// prevent.
 fn fence_info(provider: &str) -> &'static str {
     match provider {
         "gitlab" => "suggestion:-0+0",
@@ -359,22 +359,19 @@ mod tests {
     fn gitlab_needs_an_explicit_range_on_the_fence() {
         assert_eq!(fence_info("gitlab"), "suggestion:-0+0");
         assert_eq!(fence_info("github"), "suggestion");
+        assert_eq!(fence_info("bitbucket"), "suggestion");
     }
 
-    /// Only the two hosts that both render the block *and* receive a rendered
-    /// comment body from this crate.
-    ///
-    /// `local` is the trap: it renders markdown fine, but `run_review_local`
-    /// returns `summary_markdown` and `findings_detail` — never the inline
-    /// bodies — so a block built for it is discarded unread, and claiming
-    /// support would put a number in `funnel.suggested` for output nobody gets.
+    /// Every host this crate posts to renders a suggestion; all three were
+    /// verified on a live pull request rather than from documentation.
     #[test]
-    fn only_hosts_that_receive_a_rendered_body_get_suggestions() {
+    fn every_host_gets_suggestions() {
         assert!(supports_suggestions("github"));
         assert!(supports_suggestions("gitlab"));
-        assert!(!supports_suggestions("bitbucket"));
+        assert!(supports_suggestions("bitbucket"));
         // Local reads its blocks out of `inline_detail` — see the doc comment.
         assert!(supports_suggestions(crate::review::LOCAL_PROVIDER));
+        assert!(!supports_suggestions("nonesuch"));
     }
 
     #[test]
