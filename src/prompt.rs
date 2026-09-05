@@ -116,9 +116,17 @@ findings about how it is written.
 
 ## One claim, one finding
 
-If the same observation applies to many files, raise it ONCE, name the pattern, and say how many files it covers. Do not emit one finding per file.
+If the same observation applies to many files, raise it ONCE, name the pattern, and say how many files it covers. Do not emit one finding per file."#;
 
-## Suggestions
+/// The committable-suggestion contract, appended only when `SUGGESTIONS` is on.
+///
+/// Split out of [`REVIEW_RULES`] because it is the one block that is *conditional*
+/// on a config flag. Shipped unconditionally it spends its tokens on every review
+/// that cannot use them — a repo with the feature off, and every Bitbucket review,
+/// where no provider renders the block — and worse, it steers the model toward
+/// writing replacement text that `inline_body_for` then discards unread. A rule
+/// the reader cannot act on is not a cheap rule.
+const SUGGESTION_RULES: &str = r#"## Suggestions
 
 `suggestion` is OPTIONAL and defaults to null. When you set it, it is committed to the author's branch by a single click, replacing `line` outright — so it is not a snippet, an excerpt, or a patch. It is the exact, complete text that should stand where `line` stands now.
 
@@ -129,7 +137,8 @@ Set it ONLY when all of these hold:
 
 It may span several lines even though it replaces one — adding a guard above a statement you keep is the normal case. Write no `+`/`-` markers, no line numbers, and no ``` fences: just the code.
 
-Everywhere else, set `suggestion` to null and put the fix in `body` as you always have. Null is the right answer for most findings; the prose is what carries the review."#;
+Everywhere else, set `suggestion` to null and put the fix in `body` as you always have. Null is the right answer for most findings; 
+the prose is what carries the review."#;
 
 /// Everything the orchestrator injects into a backend's system prompt:
 /// [`REVIEW_RULES`] followed by the consumer's `extra_system_prompt`.
@@ -143,11 +152,16 @@ Everywhere else, set `suggestion` to null and put the fix in `body` as you alway
 /// backend on [`crate::backend::ReviewContext`]; a backend that wants them has to
 /// take them from the context it was given.
 pub fn injected_rules(cfg: &Config) -> String {
-    if cfg.extra_system_prompt.is_empty() {
-        REVIEW_RULES.to_string()
-    } else {
-        format!("{REVIEW_RULES}\n{}", cfg.extra_system_prompt)
+    let mut out = REVIEW_RULES.to_string();
+    if cfg.suggestions {
+        out.push('\n');
+        out.push_str(SUGGESTION_RULES);
     }
+    if !cfg.extra_system_prompt.is_empty() {
+        out.push('\n');
+        out.push_str(&cfg.extra_system_prompt);
+    }
+    out
 }
 
 /// The `/describe` system prompt with the consumer's layout instructions applied.
@@ -614,6 +628,9 @@ mod tests {
     fn composition_is_byte_identical_to_the_per_backend_formula() {
         use super::{injected_rules, with_injected_rules, SYSTEM_PROMPT};
         let mut cfg = crate::config::Config::from_env();
+        // The formula this pins predates suggestions; the block they add is
+        // asserted separately below.
+        cfg.suggestions = false;
 
         cfg.extra_system_prompt = String::new();
         let old = format!("{SYSTEM_PROMPT}\n{REVIEW_RULES}");
@@ -627,6 +644,28 @@ mod tests {
         assert_eq!(
             with_injected_rules(SYSTEM_PROMPT, &injected_rules(&cfg)),
             old
+        );
+    }
+
+    /// The suggestion contract is the one rule block conditional on a config
+    /// flag, and the flag it follows is the one that decides whether anything
+    /// downstream can use what the block asks for. Shipped to a review that
+    /// discards the answer, it is spent tokens steering the model at nothing.
+    #[test]
+    fn the_suggestion_rules_follow_their_flag() {
+        use super::injected_rules;
+        let mut cfg = crate::config::Config::from_env();
+        cfg.extra_system_prompt = String::new();
+
+        cfg.suggestions = false;
+        assert!(!injected_rules(&cfg).contains("## Suggestions"));
+
+        cfg.suggestions = true;
+        let on = injected_rules(&cfg);
+        assert!(on.contains("## Suggestions"));
+        assert!(
+            on.starts_with(REVIEW_RULES),
+            "the shared rules still lead, unchanged"
         );
     }
 

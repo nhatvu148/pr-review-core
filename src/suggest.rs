@@ -20,17 +20,19 @@
 /// Bitbucket Cloud has no equivalent: the block would render as an ordinary
 /// code fence with a misleading `suggestion` label and no way to apply it.
 ///
-/// `local` is excluded for a different reason — not that it cannot render one,
-/// but that nothing in its output contract carries one. A local review returns
-/// `summary_markdown` (built from the *unanchored* findings) and
-/// `findings_detail`; the rendered inline bodies never leave `finish_review`, so
-/// a block built here would be discarded unread. A local consumer that wants to
-/// display the fix as code has [`Finding::suggestion`] in `findings_detail`, and
-/// can run it through [`sanitize`] and [`render`] itself.
+/// `local` is included again. It was dropped when a local review's rendered
+/// bodies died inside `finish_review` and a block built for it would have been
+/// discarded unread — a true statement about the output contract, not about the
+/// renderer. `RunReviewOutput::inline_detail` now carries them on every path, so
+/// the block reaches the caller, and the local path is where you *want* it: it is
+/// the one place a suggestion can be read before any of it touches a PR.
 ///
-/// [`Finding::suggestion`]: crate::llm::Finding::suggestion
+/// [`RunReviewOutput::inline_detail`]: crate::review::RunReviewOutput::inline_detail
 pub fn supports_suggestions(provider: &str) -> bool {
-    matches!(provider, "github" | "gitlab")
+    matches!(
+        provider,
+        "github" | "gitlab" | crate::review::LOCAL_PROVIDER
+    )
 }
 
 /// The fence info string that makes a block committable on `provider`.
@@ -70,7 +72,15 @@ pub fn render(provider: &str, body: &str, suggestion: &str) -> String {
 /// The suggestion may span several lines even though it replaces one: adding a
 /// guard above a kept statement is the common case, and the host expands the
 /// single anchored line into all of them.
-pub fn sanitize(suggestion: &str, current: &str) -> Option<String> {
+/// `prev` and `next` are the new-side texts of the lines immediately above and
+/// below the anchor, when the diff shows them. They are not context for judging
+/// the fix — they are how an echoed line is caught; see the check below.
+pub fn sanitize(
+    suggestion: &str,
+    current: &str,
+    prev: Option<&str>,
+    next: Option<&str>,
+) -> Option<String> {
     let s = unwrap_fence(suggestion);
     // Trailing blank lines are invisible in the model's output and would commit
     // as real ones. Leading blank lines are load-bearing far less often than
@@ -114,6 +124,22 @@ pub fn sanitize(suggestion: &str, current: &str) -> Option<String> {
     // express the fix, which is exactly when the prose matters most.
     if s == current.trim_end() {
         return None;
+    }
+
+    // An echoed neighbour. A multi-line suggestion replaces the anchored line
+    // ALONE, so a model that helpfully includes the line above or below — a very
+    // common habit, since that is how one writes a code sample — produces a block
+    // that commits a duplicate of a line already in the file. Nothing downstream
+    // catches it: the result parses, compiles in many languages, and reads as
+    // correct in the review. This is the one-click failure the module exists to
+    // prevent, and it is invisible in the rendered block unless the reader has
+    // the surrounding file in mind.
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() > 1 {
+        let echoes = |a: &str, b: Option<&str>| b.is_some_and(|t| a.trim() == t.trim());
+        if echoes(lines[0], prev) || echoes(lines[lines.len() - 1], next) {
+            return None;
+        }
     }
 
     Some(s)
@@ -177,15 +203,21 @@ fn reindent(s: &str, current: &str) -> String {
 mod tests {
     use super::*;
 
+    /// `sanitize` for a line with no diff neighbours — the shape most rules are
+    /// about. The neighbour rule has its own tests below.
+    fn sanitize_alone(suggestion: &str, current: &str) -> Option<String> {
+        sanitize(suggestion, current, None, None)
+    }
+
     #[test]
     fn keeps_a_clean_single_line_replacement() {
-        let got = sanitize("    return null;", "    return x;");
+        let got = sanitize_alone("    return null;", "    return x;");
         assert_eq!(got.as_deref(), Some("    return null;"));
     }
 
     #[test]
     fn one_line_may_expand_into_several() {
-        let got = sanitize(
+        let got = sanitize_alone(
             "    if (p.expiresAt <= Date.now()) return null;\n    return issue(p.id);",
             "    return issue(p.id);",
         );
@@ -197,13 +229,13 @@ mod tests {
 
     #[test]
     fn supplies_the_indent_the_model_omitted() {
-        let got = sanitize("return null;", "        return x;");
+        let got = sanitize_alone("return null;", "        return x;");
         assert_eq!(got.as_deref(), Some("        return null;"));
     }
 
     #[test]
     fn reindents_every_line_of_a_flush_left_block() {
-        let got = sanitize("if (a) return;\nreturn b;", "    return b;");
+        let got = sanitize_alone("if (a) return;\nreturn b;", "    return b;");
         assert_eq!(got.as_deref(), Some("    if (a) return;\n    return b;"));
     }
 
@@ -211,50 +243,107 @@ mod tests {
     fn declines_a_differently_indented_first_line() {
         // The model tracked indentation (line 2 has some) but got line 1 wrong.
         assert_eq!(
-            sanitize("  if (a) return;\n    return b;", "    return b;"),
+            sanitize_alone("  if (a) return;\n    return b;", "    return b;"),
             None
         );
     }
 
     #[test]
     fn declines_a_no_op() {
-        assert_eq!(sanitize("    return x;", "    return x;"), None);
+        assert_eq!(sanitize_alone("    return x;", "    return x;"), None);
         // Trailing whitespace on the original must not manufacture a difference.
-        assert_eq!(sanitize("    return x;", "    return x;  "), None);
+        assert_eq!(sanitize_alone("    return x;", "    return x;  "), None);
     }
 
     #[test]
     fn declines_a_patch() {
         assert_eq!(
-            sanitize("@@ -1,2 +1,3 @@\n     return x;", "    return x;"),
+            sanitize_alone("@@ -1,2 +1,3 @@\n     return x;", "    return x;"),
             None
         );
-        assert_eq!(sanitize("--- a/x.ts\n+++ b/x.ts", "    return x;"), None);
+        assert_eq!(
+            sanitize_alone("--- a/x.ts\n+++ b/x.ts", "    return x;"),
+            None
+        );
     }
 
     #[test]
     fn declines_an_inner_fence() {
-        assert_eq!(sanitize("    x();\n```\nnote", "    y();"), None);
+        assert_eq!(sanitize_alone("    x();\n```\nnote", "    y();"), None);
     }
 
     #[test]
     fn declines_empty() {
-        assert_eq!(sanitize("", "    return x;"), None);
-        assert_eq!(sanitize("\n  \n", "    return x;"), None);
+        assert_eq!(sanitize_alone("", "    return x;"), None);
+        assert_eq!(sanitize_alone("\n  \n", "    return x;"), None);
     }
 
     #[test]
     fn unwraps_a_fence_the_model_added() {
-        let got = sanitize("```ts\n    return null;\n```", "    return x;");
+        let got = sanitize_alone("```ts\n    return null;\n```", "    return x;");
         assert_eq!(got.as_deref(), Some("    return null;"));
-        let got = sanitize("```suggestion\n    return null;\n```", "    return x;");
+        let got = sanitize_alone("```suggestion\n    return null;\n```", "    return x;");
         assert_eq!(got.as_deref(), Some("    return null;"));
     }
 
     #[test]
     fn a_yaml_list_item_is_not_a_diff_marker() {
-        let got = sanitize("  - name: build", "  - name: biuld");
+        let got = sanitize_alone("  - name: build", "  - name: biuld");
         assert_eq!(got.as_deref(), Some("  - name: build"));
+    }
+
+    /// A multi-line suggestion that echoes the line below the anchor would
+    /// commit a duplicate of it — the failure is silent, since the result parses
+    /// and reads as correct in the rendered block.
+    #[test]
+    fn declines_a_suggestion_that_echoes_the_next_line() {
+        assert_eq!(
+            sanitize(
+                "    let t = compute();\n    return t;",
+                "    let t = old();",
+                None,
+                Some("    return t;"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn declines_a_suggestion_that_echoes_the_previous_line() {
+        assert_eq!(
+            sanitize(
+                "    let t = compute();\n    return t;",
+                "    return old();",
+                Some("    let t = compute();"),
+                None,
+            ),
+            None
+        );
+    }
+
+    /// The rule is about *echoed* neighbours, not about multi-line suggestions.
+    #[test]
+    fn a_multi_line_suggestion_with_no_echo_is_kept() {
+        let got = sanitize(
+            "    if (!t) return;\n    return t;",
+            "    return t;",
+            Some("    let t = compute();"),
+            Some("}"),
+        );
+        assert_eq!(got.as_deref(), Some("    if (!t) return;\n    return t;"));
+    }
+
+    /// A single-line suggestion equal to a neighbour is a legitimate fix — moving
+    /// a line, or making this line match the one above it.
+    #[test]
+    fn a_one_line_suggestion_may_equal_a_neighbour() {
+        let got = sanitize(
+            "    return t;",
+            "    return old();",
+            None,
+            Some("    return t;"),
+        );
+        assert_eq!(got.as_deref(), Some("    return t;"));
     }
 
     #[test]
@@ -275,7 +364,8 @@ mod tests {
         assert!(supports_suggestions("github"));
         assert!(supports_suggestions("gitlab"));
         assert!(!supports_suggestions("bitbucket"));
-        assert!(!supports_suggestions(crate::review::LOCAL_PROVIDER));
+        // Local reads its blocks out of `inline_detail` — see the doc comment.
+        assert!(supports_suggestions(crate::review::LOCAL_PROVIDER));
     }
 
     #[test]

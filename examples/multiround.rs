@@ -615,6 +615,7 @@ mod tests {
             line,
             body: "x".to_string(),
             confidence: Some(50),
+            suggestion: None,
         }
     }
 

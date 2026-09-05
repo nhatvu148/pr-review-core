@@ -396,7 +396,8 @@ fn inline_body_for(
     cfg: &Config,
     provider: &str,
     f: &Finding,
-    current: Option<&str>,
+    lines: Option<&std::collections::HashMap<u64, String>>,
+    line: u64,
     exact_anchor: bool,
 ) -> (String, bool) {
     let body = inline_body(f);
@@ -406,7 +407,13 @@ fn inline_body_for(
     let Some(raw) = f.suggestion.as_deref() else {
         return (body, false);
     };
-    match current.and_then(|c| crate::suggest::sanitize(raw, c)) {
+    // The anchored line and its two diff neighbours: the first is what the block
+    // replaces, the other two are how an echoed line is caught.
+    let at = |n: u64| lines.and_then(|t| t.get(&n)).map(String::as_str);
+    let Some(current) = at(line) else {
+        return (body, false);
+    };
+    match crate::suggest::sanitize(raw, current, at(line - 1), at(line + 1)) {
         Some(s) => (crate::suggest::render(provider, &body, &s), true),
         None => (body, false),
     }
@@ -1109,9 +1116,14 @@ async fn finish_review(
         anchors.push(anchor);
         match anchor {
             Some(line) => {
-                let current = line_texts.get(&f.file).and_then(|t| t.get(&line));
-                let (body, suggested) =
-                    inline_body_for(cfg, provider, f, current.map(String::as_str), exact_anchor);
+                let (body, suggested) = inline_body_for(
+                    cfg,
+                    provider,
+                    f,
+                    line_texts.get(&f.file),
+                    line,
+                    exact_anchor,
+                );
                 if suggested {
                     funnel.suggested += 1;
                 }
