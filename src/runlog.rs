@@ -58,6 +58,12 @@ use crate::llm::{Finding, Usage};
 /// Record format version. Bump when a field changes meaning or is removed, so a
 /// reader over a log spanning several releases can tell the shapes apart. Adding
 /// a field is not a bump — every consumer of JSONL must tolerate new keys.
+///
+/// The reader tolerates *missing* keys too: every field but the identity
+/// (`schema`, `ts_unix`, `provider`, `repo`, `pr`) is `#[serde(default)]`, so a
+/// record from a release with a different field set loses a column rather than
+/// failing to parse. A record that fails to parse is a review that happened and a
+/// PR missing from [`crate::queue`] — much worse than an empty cell.
 pub const SCHEMA: u32 = 1;
 
 /// Marks a line as one of ours, under the `_kind` key.
@@ -177,30 +183,40 @@ pub struct RunLog {
     pub ts_unix: u64,
     /// The `pr-review-core` version that produced this record — the reason a run
     /// log is comparable across releases at all.
+    #[serde(default)]
     pub core_version: String,
     pub provider: String,
     pub repo: String,
     pub pr: u64,
+    #[serde(default)]
     pub head_sha: Option<String>,
+    #[serde(default)]
     pub base_branch: Option<String>,
     /// Model as *reported by the run*, not as configured — an agent-CLI backend
     /// may not use the configured OpenRouter model at all.
+    #[serde(default)]
     pub model: String,
     /// True when the review never posted (`--dry-run`, or a bench run).
+    #[serde(default)]
     pub dry_run: bool,
+    #[serde(default)]
     pub posted: bool,
     /// Whether the provider reported CI results for the reviewed commit. The text
     /// itself is not logged — it is another service's output, and only its
     /// presence changes how findings are demoted.
+    #[serde(default)]
     pub ci_status_known: bool,
     /// Bytes of diff actually sent to the backend, after glob filtering and
     /// packing. The single best predictor of cost, and the thing a "why was this
     /// review shallow?" question starts from.
+    #[serde(default)]
     pub diff_bytes: usize,
     /// True when whole files were packed out to fit the size budget — i.e. part
     /// of the change was never reviewed.
+    #[serde(default)]
     pub diff_truncated: bool,
     /// Dependency advisories from the CVE scan.
+    #[serde(default)]
     pub advisories: usize,
     /// True when the review was salvaged from a response the model cut off
     /// mid-output, so findings after the cut are missing.
@@ -209,13 +225,19 @@ pub struct RunLog {
     /// JSON repair (malformed but complete) is not visible here: it is reported
     /// only to the tracing log, and surfacing it would change the signature of
     /// the public `parse_review_with_repair`, which downstream backends call.
+    #[serde(default)]
     pub truncated_salvage: bool,
+    #[serde(default)]
     pub recommendation: String,
+    #[serde(default)]
     pub funnel: Funnel,
+    #[serde(default)]
     pub findings: Vec<LoggedFinding>,
+    #[serde(default)]
     pub usage: Option<Usage>,
     /// Wall-clock milliseconds for the whole run, including the provider fetches
     /// and the post.
+    #[serde(default)]
     pub duration_ms: u64,
 }
 

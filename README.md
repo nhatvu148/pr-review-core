@@ -297,7 +297,11 @@ on, so one nobody reviewed is absent. It is **not a quality measure**: `Priority
 ranks the reviewer's verdict, and no record knows whether that verdict was right.
 And staleness is partial — a record names the commit it read, but only the
 provider knows the PR's head today; what the fold can see is two records
-disagreeing on the SHA, reported as `superseded`.
+disagreeing on the SHA, reported as `superseded` and rendered as *re-reviewed*.
+That detection needs the provider to record a commit id, so it is GitHub/GitLab
+only: Bitbucket deliberately leaves `head_sha` unset (its inline comments need no
+commit), and on a Bitbucket-only log the column is always empty — absent, not
+evidence that nothing moved.
 
 ## PR commands
 

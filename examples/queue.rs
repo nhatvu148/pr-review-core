@@ -35,8 +35,8 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let records = parse_jsonl(&text);
-    if records.is_empty() {
+    let log = parse_jsonl(&text);
+    if log.records.is_empty() && log.unreadable == 0 {
         eprintln!(
             "No run-log records found. Records carry `\"_kind\":\"{}\"`; set PRBOT_RUN_LOG to produce them.",
             pr_review_core::runlog::KIND
@@ -44,24 +44,30 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let rows = rank(&records);
+    let rows = rank(&log.records);
     println!("{}\n", render_queue(&rows, RunLog::now_unix()));
 
     let count = |p: Priority| rows.iter().filter(|r| r.priority == p).count();
     println!(
         "{} PR(s) from {} record(s) — P0 {}, P1 {}, P2 {}",
         rows.len(),
-        records.len(),
+        log.records.len(),
         count(Priority::P0),
         count(Priority::P1),
         count(Priority::P2),
     );
 
-    // Said out loud because a queue invites being read as complete, and this one
-    // structurally is not.
-    let skipped = records.len() - records.iter().filter(|r| !r.dry_run).count();
+    // Every omission is said out loud: a queue invites being read as complete,
+    // and nothing in the table distinguishes "not listed" from "never reviewed".
+    let skipped = log.records.iter().filter(|r| r.dry_run).count();
     if skipped > 0 {
         println!("({skipped} dry run(s) excluded — they post nothing to act on.)");
+    }
+    if log.unreadable > 0 {
+        println!(
+            "({} record(s) could not be read — those PRs are MISSING from this table.)",
+            log.unreadable
+        );
     }
     println!("Only PRs this reviewer has run on appear here.");
     Ok(())

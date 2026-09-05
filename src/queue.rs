@@ -82,6 +82,11 @@ pub struct PrStatus {
     /// True when an *older* record for this PR names a different commit — the PR
     /// moved and was reviewed again. It does **not** mean the current review is
     /// stale; only the provider knows the PR's head today.
+    ///
+    /// **Provider-dependent.** It can only ever be true where records carry a
+    /// commit id, and Bitbucket's deliberately do not (`head_sha` stays `None`
+    /// there because its inline comments need no commit). So on a Bitbucket log
+    /// this is always false — absent, not evidence of a PR that never moved.
     pub superseded: bool,
 }
 
@@ -106,7 +111,11 @@ pub fn rank(records: &[RunLog]) -> Vec<PrStatus> {
         newest
             .entry(key)
             .and_modify(|cur| {
-                if r.ts_unix >= cur.ts_unix {
+                // Ordered on `(ts, sha)`, not `ts` alone. Timestamps are whole
+                // seconds, so two records for one PR can tie — and `>=` on the
+                // tie makes the winner whichever arrived later, which is exactly
+                // the arrival-order dependence this fold claims not to have.
+                if (r.ts_unix, r.head_sha.as_deref()) > (cur.ts_unix, cur.head_sha.as_deref()) {
                     *cur = r;
                 }
             })
@@ -130,10 +139,15 @@ pub fn rank(records: &[RunLog]) -> Vec<PrStatus> {
                 blocking,
                 high,
                 total_findings: r.findings.len(),
-                superseded: shas
-                    .iter()
-                    .filter(|s| s.is_some())
-                    .any(|s| *s != r.head_sha),
+                // Only a record that names a commit can witness a different
+                // one. Without this guard a newest record with no SHA compares
+                // `Some(older) != None` and reports a PR as re-reviewed on no
+                // evidence at all — which every Bitbucket log would do.
+                superseded: r.head_sha.is_some()
+                    && shas
+                        .iter()
+                        .filter(|s| s.is_some())
+                        .any(|s| *s != r.head_sha),
             }
         })
         .collect();
@@ -180,6 +194,19 @@ fn priority_of(recommendation: &str, blocking: usize, high: usize) -> Priority {
     }
 }
 
+/// What a run log yielded: the records, and how many were unreadable.
+#[derive(Debug, Default)]
+pub struct ParsedLog {
+    pub records: Vec<RunLog>,
+    /// Lines carrying the `_kind` marker that failed to deserialize.
+    ///
+    /// Reported rather than swallowed. Each one is a review that happened and a
+    /// PR that will be missing from the queue — and a queue that quietly omits
+    /// rows is worse than one that admits it cannot read them, because nothing
+    /// in the output distinguishes "not in the queue" from "never reviewed".
+    pub unreadable: usize,
+}
+
 /// Parse a JSONL run log, skipping anything that is not one of our records.
 ///
 /// The stdout sink shares a stream with tracing output, so a log can legitimately
@@ -187,13 +214,17 @@ fn priority_of(recommendation: &str, blocking: usize, high: usize) -> Priority {
 /// [`crate::runlog`] documents as the way to find records; "is this line JSON" is
 /// not, and stops working the moment anything else emits structured output.
 ///
-/// A record that matches `_kind` but fails to parse is skipped too — a schema
-/// change across releases must not make an old log unreadable.
-pub fn parse_jsonl(text: &str) -> Vec<RunLog> {
-    text.lines()
-        .filter(|l| l.contains(crate::runlog::KIND))
-        .filter_map(|l| serde_json::from_str::<RunLog>(l).ok())
-        .collect()
+/// A line that matches `_kind` but fails to parse is counted in
+/// [`ParsedLog::unreadable`] rather than dropped in silence.
+pub fn parse_jsonl(text: &str) -> ParsedLog {
+    let mut out = ParsedLog::default();
+    for line in text.lines().filter(|l| l.contains(crate::runlog::KIND)) {
+        match serde_json::from_str::<RunLog>(line) {
+            Ok(r) => out.records.push(r),
+            Err(_) => out.unreadable += 1,
+        }
+    }
+    out
 }
 
 /// Render a ranked queue as a markdown table.
@@ -332,6 +363,40 @@ mod tests {
         assert_eq!(a[0].priority, b[0].priority);
     }
 
+    /// Equal timestamps must not let arrival order decide the winner — the fold
+    /// documents order-independence and whole-second stamps make ties real.
+    #[test]
+    fn a_timestamp_tie_folds_the_same_either_way() {
+        let mut a1 = rec(1, 100, "BLOCK", &["BLOCKING"]);
+        a1.head_sha = Some("aaa".into());
+        let mut a2 = rec(1, 100, "APPROVE", &[]);
+        a2.head_sha = Some("bbb".into());
+
+        let fwd = rank(&[a1.clone(), a2.clone()]);
+        let rev = rank(&[a2, a1]);
+        assert_eq!(fwd[0].recommendation, rev[0].recommendation);
+        assert_eq!(fwd[0].priority, rev[0].priority);
+        assert_eq!(
+            fwd[0].head_sha.as_deref(),
+            Some("bbb"),
+            "the stable tie-break"
+        );
+    }
+
+    /// `superseded` claims the PR moved. A record with no commit id witnesses
+    /// nothing — and Bitbucket records never carry one, so without this guard
+    /// every Bitbucket PR would read as re-reviewed.
+    #[test]
+    fn a_newest_record_with_no_sha_never_claims_superseded() {
+        let mut old = rec(1, 100, "BLOCK", &[]);
+        old.head_sha = Some("aaa".into());
+        let mut newest = rec(1, 200, "APPROVE", &[]);
+        newest.head_sha = None;
+
+        let rows = rank(&[old, newest]);
+        assert!(!rows[0].superseded, "no commit id, no claim");
+    }
+
     #[test]
     fn a_pr_reviewed_at_two_shas_is_marked_superseded() {
         let rows = rank(&[rec(1, 100, "BLOCK", &[]), rec(1, 200, "APPROVE", &[])]);
@@ -366,8 +431,29 @@ mod tests {
             "INFO some tracing line\n{{\"hello\":\"world\"}}\n{good}\n{{\"_kind\":\"prbot_run_log\",\"broken\":\n"
         );
         let got = parse_jsonl(&text);
-        assert_eq!(got.len(), 1, "only the one real record");
-        assert_eq!(got[0].pr, 1);
+        assert_eq!(got.records.len(), 1, "only the one real record");
+        assert_eq!(got.records[0].pr, 1);
+        assert_eq!(
+            got.unreadable, 1,
+            "the broken marker line is counted, not lost"
+        );
+    }
+
+    /// A record that fails to parse is a review that happened and a PR missing
+    /// from the queue. Losing it silently is worse than any empty column.
+    #[test]
+    fn a_record_from_a_different_field_set_still_parses() {
+        // Only the identity fields; everything else absent, as an older release
+        // or a trimmed export would leave it.
+        let minimal = r#"{"_kind":"prbot_run_log","schema":1,"ts_unix":100,"provider":"github","repo":"o/r","pr":5}"#;
+        let got = parse_jsonl(minimal);
+        assert_eq!(
+            got.unreadable, 0,
+            "a missing column must not lose the record"
+        );
+        assert_eq!(got.records.len(), 1);
+        assert_eq!(got.records[0].pr, 5);
+        assert!(rank(&got.records).len() == 1, "and it reaches the queue");
     }
 
     #[test]

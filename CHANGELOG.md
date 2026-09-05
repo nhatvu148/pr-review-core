@@ -26,9 +26,12 @@ What it deliberately does **not** claim:
 - **It is not a quality measure.** `Priority` ranks the reviewer's *verdict*, and
   nothing in a record knows whether that verdict was right. P0 means the reviewer
   said BLOCK, not that the PR is broken.
-- **Staleness is partial.** A record names the commit it read; whether that is
-  still the PR's head needs a provider call. What the fold *can* see is two
-  records disagreeing on the SHA — reported as `superseded`.
+- **Staleness is partial, and provider-dependent.** A record names the commit it
+  read; whether that is still the PR's head needs a provider call. What the fold
+  *can* see is two records disagreeing on the SHA — reported as `superseded`. That
+  needs the provider to record a commit id at all, so it is GitHub/GitLab only:
+  Bitbucket leaves `head_sha` unset by design, and on such a log the column is
+  always empty — absent, not evidence that nothing moved.
 
 Dry runs are excluded: they post nothing, so no human can act on them.
 
