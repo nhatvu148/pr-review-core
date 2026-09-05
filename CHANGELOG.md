@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**`RunReviewOutput` exposes the inline comments it built** (`inline_detail`), so a
+dry run can show what would post. `inline_posted` is a count, and a count cannot be
+reviewed — the rendered bodies existed only inside `finish_review` and were dropped
+on the way out, which is why committable suggestions shipped with no way to read a
+one-click commit before it reached someone's PR. Populated on every run, posted or
+not. `providers::InlineComment` now derives `Serialize` to carry it.
+
 **Committable suggestions.** A finding whose fix is an exact rewrite of the line
 it sits on now posts with a ```` ```suggestion ```` block, which GitHub and GitLab
 render with an *Apply* button: the author commits the fix without leaving the PR.

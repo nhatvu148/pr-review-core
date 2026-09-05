@@ -41,6 +41,19 @@ pub struct RunReviewOutput {
     #[serde(default)]
     pub findings_detail: Vec<Finding>,
     pub inline_posted: usize,
+    /// The inline comments exactly as they were built — path, line, and the
+    /// rendered body, committable suggestion block and all.
+    ///
+    /// Exposed because `inline_posted` is a count, and a count cannot be reviewed.
+    /// Everything a reader needs to judge an inline comment *before* it reaches
+    /// someone's PR — the suggestion block above all, which is applied on one
+    /// click — existed only inside `finish_review` and was dropped on the way out.
+    /// That left `--dry-run` unable to show what it was a dry run of, and it is
+    /// why suggestions shipped with no way to preview them.
+    ///
+    /// Populated on every run, posted or not.
+    #[serde(default)]
+    pub inline_detail: Vec<InlineComment>,
     pub posted: bool,
     pub comment_url: Option<String>,
     pub summary_markdown: String,
@@ -831,6 +844,7 @@ async fn post_advisory_only(
         findings: hygiene.len(),
         findings_detail: hygiene,
         inline_posted: 0,
+        inline_detail: Vec::new(),
         posted: false,
         comment_url: None,
         summary_markdown: summary,
@@ -1365,6 +1379,7 @@ pub async fn run_review_with(
         findings: findings.len(),
         findings_detail: findings,
         inline_posted: inline_count,
+        inline_detail: post.inline.clone(),
         posted: false,
         comment_url: None,
         summary_markdown: summary,
@@ -1475,6 +1490,7 @@ pub async fn run_review_local(
                 findings: prepared.hygiene.len(),
                 findings_detail: prepared.hygiene,
                 inline_posted: 0,
+                inline_detail: Vec::new(),
                 posted: false,
                 comment_url: None,
                 summary_markdown: summary,
@@ -1551,6 +1567,7 @@ pub async fn run_review_local(
         findings: finished.findings.len(),
         findings_detail: finished.findings,
         inline_posted: finished.inline.len(),
+        inline_detail: finished.inline.clone(),
         posted: false,
         comment_url: None,
         summary_markdown: finished.summary,
@@ -2372,6 +2389,38 @@ mod orchestrator_tests {
         assert_eq!(
             v["funnel"]["suggested"], 0,
             "but with no button, because the comment moved"
+        );
+    }
+
+    /// The rendered block reaches the caller, so a dry run can show what would
+    /// post.
+    ///
+    /// `inline_posted` is a count and a count cannot be reviewed: the first cut of
+    /// suggestions shipped with the rendered bodies discarded inside
+    /// `finish_review`, which left no way to read a one-click commit before it
+    /// reached someone's PR.
+    #[tokio::test]
+    async fn the_caller_can_read_the_comment_that_would_post() {
+        let srv = github_stub_with(DRIFT_DIFF).await;
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.suggestions = true;
+
+        let out = run_review_with(&cfg, input(), &SuggestBackend { line: 3 })
+            .await
+            .expect("the review runs");
+
+        assert_eq!(out.inline_detail.len(), 1, "the comment is exposed");
+        let c = &out.inline_detail[0];
+        assert_eq!((c.path.as_str(), c.line), ("src/order.ts", 3));
+        assert!(c.body.contains("region arg"), "the prose is there");
+        assert!(
+            c.body.contains(
+                "```suggestion
+return calcTotal(order, tax, region);
+```"
+            ),
+            "and so is the block, rendered exactly as it posts: {}",
+            c.body
         );
     }
 

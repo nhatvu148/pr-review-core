@@ -2,6 +2,8 @@
 //! Bitbucket. Each provider knows how to fetch a PR's diff + metadata and post a
 //! review (a summary comment + inline comments).
 
+use serde::Serialize;
+
 pub type ProviderName = &'static str;
 
 /// Minimal PR context passed into the prompt and the providers.
@@ -32,7 +34,7 @@ pub struct PrMeta {
 }
 
 /// One inline comment anchored to a file + line on the new side of the diff.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InlineComment {
     pub path: String,
     pub line: u64,
