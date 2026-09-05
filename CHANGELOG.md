@@ -51,11 +51,15 @@ problem, but replacement text does not — applied, it overwrites a line the fin
 never looked at. Since both features default to on, this is the rule that makes
 the pair safe, and it is covered by a test.
 
-**Verified on GitHub only.** A block posted from this engine renders as a
-suggested change with a working *Apply suggestion* button, confirmed end to end on
-a throwaway PR. GitLab's fence takes an explicit range (`suggestion:-0+0`) and that
-syntax comes from GitLab's documentation — it has not been seen render. Treat the
-GitLab path as untested until someone runs it.
+**Verified on both hosts, to different depths.** On GitHub the whole path was run
+end to end on a throwaway PR: the model populated `suggestion`, validation accepted
+it, and GitHub rendered a suggested change with a working *Apply suggestion* button.
+On GitLab the fence and the position payload were confirmed by posting the block
+this engine emits (`suggestion:-0+0`, a note anchored with base/start/head SHAs) to
+a real merge request — GitLab rendered it as a *Suggested change* with an *Apply
+suggestion* button. What has not been exercised on GitLab is the bot driving it:
+the review, anchoring and posting path is shared code, but nobody has watched a
+GitLab review produce one by itself.
 
 Bitbucket has no equivalent feature, so nothing is emitted there — and neither
 does the **local** review path, for a different reason: `run_review_local` returns
