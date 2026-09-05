@@ -110,7 +110,13 @@ impl RunLogSink {
 /// stage runs, so the drop at any stage is the difference from the previous one.
 /// `hygiene_added` is the exception: deterministic findings are merged in, so it
 /// is an addition, and `after_collapse` includes them.
+/// `serde(default)` at the container: the next field added here must not make
+/// every older record fail to deserialize. A per-field annotation only covers the
+/// fields that exist today, and the failure it misses is total — a record whose
+/// nested `funnel` cannot be read takes the whole record with it, and the PR
+/// vanishes from [`crate::queue`] rather than losing a column.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Funnel {
     /// Findings the backend returned, before any post-processing.
     pub model_raw: usize,
@@ -140,7 +146,10 @@ pub struct Funnel {
 }
 
 /// One finding as logged: its metadata, where it was posted, and its text.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `Default` + container `serde(default)` for the same reason as [`Funnel`]: a
+/// field added later must cost a column, never the record.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoggedFinding {
     pub severity: String,
     pub file: String,

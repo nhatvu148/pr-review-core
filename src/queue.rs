@@ -111,11 +111,7 @@ pub fn rank(records: &[RunLog]) -> Vec<PrStatus> {
         newest
             .entry(key)
             .and_modify(|cur| {
-                // Ordered on `(ts, sha)`, not `ts` alone. Timestamps are whole
-                // seconds, so two records for one PR can tie — and `>=` on the
-                // tie makes the winner whichever arrived later, which is exactly
-                // the arrival-order dependence this fold claims not to have.
-                if (r.ts_unix, r.head_sha.as_deref()) > (cur.ts_unix, cur.head_sha.as_deref()) {
+                if fold_key(r) > fold_key(cur) {
                     *cur = r;
                 }
             })
@@ -163,8 +159,36 @@ pub fn rank(records: &[RunLog]) -> Vec<PrStatus> {
             .then(b.ts_unix.cmp(&a.ts_unix))
             .then(a.repo.cmp(&b.repo))
             .then(a.pr.cmp(&b.pr))
+            // The fold keys on provider, so a repo mirrored to two hosts yields
+            // two rows. Without this they order by HashMap iteration — randomized
+            // per process, which is the opposite of the stability claimed above.
+            .then(a.provider.cmp(&b.provider))
     });
     out
+}
+
+/// The total order that decides which record for a PR wins.
+///
+/// Timestamps are whole seconds, so two records for one PR tie readily — a retry
+/// within the same second, or the concurrent-instance interleaving the module docs
+/// cite. Comparing `ts` alone (or `(ts, sha)`, which only separates records that
+/// reviewed *different* commits) leaves the winner as whichever the slice happened
+/// to yield first, and the fold's promise of order-independence held only almost
+/// always.
+///
+/// Every field the rendered row is derived from is in the key, so when two records
+/// tie on all of them the choice between them cannot change the output — which is
+/// what makes this a total order *for this purpose* without needing to compare
+/// records byte for byte.
+fn fold_key(r: &RunLog) -> (u64, Option<&str>, &str, usize, usize, usize) {
+    (
+        r.ts_unix,
+        r.head_sha.as_deref(),
+        r.recommendation.as_str(),
+        count_severity(r, "BLOCKING"),
+        count_severity(r, "HIGH"),
+        r.findings.len(),
+    )
 }
 
 /// Count posted findings of one severity, case-insensitively.
@@ -184,10 +208,13 @@ fn count_severity(r: &RunLog, sev: &str) -> usize {
 /// Taking the more urgent of the two keeps an old log readable without
 /// understating it.
 fn priority_of(recommendation: &str, blocking: usize, high: usize) -> Priority {
-    let rec = recommendation.to_ascii_uppercase();
-    if blocking > 0 || rec.contains("BLOCK") {
+    // Classification comes from `review::recommendation_rank`, not a second copy
+    // of the same string matching: two encodings of the same vocabulary drift the
+    // moment it changes, and nothing would fail when they did.
+    let rank = crate::review::recommendation_rank(recommendation);
+    if blocking > 0 || rank >= 2 {
         Priority::P0
-    } else if high > 0 || rec.contains("CHANGES") {
+    } else if high > 0 || rank >= 1 {
         Priority::P1
     } else {
         Priority::P2
@@ -246,9 +273,13 @@ pub fn render_queue(rows: &[PrStatus], now_unix: u64) -> String {
         };
         let age = age_label(now_unix.saturating_sub(r.ts_unix));
         let moved = if r.superseded { " · re-reviewed" } else { "" };
+        // The provider is part of the row's identity, not decoration: the same
+        // `repo#pr` on two hosts is two different PRs, and printing them
+        // identically makes the table ambiguous exactly where it matters.
         s.push_str(&format!(
-            "| **{}** | `{}`#{} | {} | {} | {age}{moved} |\n",
+            "| **{}** | {}:`{}`#{} | {} | {} | {age}{moved} |\n",
             r.priority.label(),
+            r.provider,
             r.repo,
             r.pr,
             r.recommendation,
@@ -424,6 +455,70 @@ mod tests {
         assert_eq!(a, vec![4, 9], "lower PR number first");
     }
 
+    /// A field added to a nested struct later must cost a column, never the
+    /// record. Without container-level `serde(default)` on `Funnel` and
+    /// `LoggedFinding`, the next field either gains makes every older record with
+    /// a populated `funnel`/`findings` fail wholesale — and the PR disappears from
+    /// the queue rather than losing a cell.
+    #[test]
+    fn a_record_whose_nested_structs_predate_a_field_still_parses() {
+        let line = r#"{"_kind":"prbot_run_log","schema":1,"ts_unix":100,"provider":"github",
+            "repo":"o/r","pr":5,"recommendation":"BLOCK",
+            "funnel":{"model_raw":2},
+            "findings":[{"severity":"HIGH","file":"a.rs"}]}"#;
+        let got = parse_jsonl(&line.replace('\n', ""));
+        assert_eq!(
+            got.unreadable, 0,
+            "a partial nested struct must not lose it"
+        );
+        assert_eq!(got.records.len(), 1);
+
+        let rows = rank(&got.records);
+        assert_eq!(rows[0].priority, Priority::P0, "and it still ranks");
+        assert_eq!(rows[0].high, 1, "from the finding it could read");
+    }
+
+    /// Two records identical in `(ts, sha)` must still fold deterministically —
+    /// `(ts, sha)` alone separates only records that reviewed different commits.
+    #[test]
+    fn a_tie_on_timestamp_and_sha_still_folds_deterministically() {
+        let mut a = rec(1, 100, "BLOCK", &["BLOCKING"]);
+        a.head_sha = Some("same".into());
+        let mut b = rec(1, 100, "APPROVE", &[]);
+        b.head_sha = Some("same".into());
+
+        let fwd = rank(&[a.clone(), b.clone()]);
+        let rev = rank(&[b, a]);
+        assert_eq!(fwd[0].recommendation, rev[0].recommendation);
+        assert_eq!(fwd[0].priority, rev[0].priority);
+        assert_eq!(fwd[0].blocking, rev[0].blocking);
+    }
+
+    /// The same `repo#pr` on two hosts is two different PRs. They must order
+    /// stably and must not render identically.
+    #[test]
+    fn two_providers_sharing_a_repo_and_number_stay_distinct() {
+        let a = rec(1, 100, "APPROVE", &[]);
+        let mut b = rec(1, 100, "APPROVE", &[]);
+        b.provider = "gitlab".into();
+
+        let rows = rank(&[a.clone(), b.clone()]);
+        assert_eq!(rows.len(), 2, "one row per (provider, repo, pr)");
+        let order: Vec<_> = rows.iter().map(|r| r.provider.as_str()).collect();
+        assert_eq!(order, vec!["github", "gitlab"], "stable, not HashMap order");
+        assert_eq!(
+            rank(&[b, a])
+                .iter()
+                .map(|r| r.provider.clone())
+                .collect::<Vec<_>>(),
+            order
+        );
+
+        let out = render_queue(&rows, 100);
+        assert!(out.contains("github:`o/r`#1"), "{out}");
+        assert!(out.contains("gitlab:`o/r`#1"), "{out}");
+    }
+
     #[test]
     fn parse_skips_foreign_and_broken_lines() {
         let good = serde_json::to_string(&rec(1, 100, "APPROVE", &[])).expect("serializes");
@@ -471,7 +566,7 @@ mod tests {
         let rows = rank(&[rec(1, 100, "BLOCK", &["BLOCKING", "HIGH"])]);
         let out = render_queue(&rows, 100 + 7200);
         assert!(out.contains("**P0**"), "{out}");
-        assert!(out.contains("`o/r`#1"), "{out}");
+        assert!(out.contains("github:`o/r`#1"), "{out}");
         assert!(out.contains("2 (1 blocking, 1 high)"), "{out}");
         assert!(out.contains("2h"), "{out}");
     }

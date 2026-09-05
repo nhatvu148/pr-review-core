@@ -35,6 +35,17 @@ What it deliberately does **not** claim:
 
 Dry runs are excluded: they post nothing, so no human can act on them.
 
+`Funnel` and `LoggedFinding` carry `#[serde(default)]` at the **container**, not
+per field: the next field either gains would otherwise make every older record
+holding a populated `funnel`/`findings` fail wholesale, and a record that fails to
+parse is a PR missing from the queue rather than a column missing from a row. The
+fold's tie-break covers every field the rendered row derives from, so two records
+that tie on all of them cannot change the output whichever wins. `provider` is part
+of a row's identity — the same `repo#pr` on two hosts is two PRs — so it reaches
+both the sort key and the rendered cell. And `queue` classifies a recommendation
+through `review::recommendation_rank` rather than a second copy of the same string
+matching.
+
 `runlog::RunLog`, `Funnel` and `LoggedFinding` now derive `Deserialize`, which is
 what made the log readable at all. A record that fails to parse is skipped rather
 than fatal, so a log spanning several releases stays usable.

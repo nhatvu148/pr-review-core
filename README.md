@@ -283,9 +283,9 @@ Two things it is not:
 $ cargo run --example queue -- ~/.local/share/pr-review/runs.jsonl
 | | PR | Verdict | Findings | Reviewed |
 | --- | --- | --- | --- | --- |
-| **P0** | `o/app`#12 | BLOCK | 2 (1 blocking, 1 high) | 2h · re-reviewed |
-| **P1** | `o/app`#13 | APPROVE WITH CHANGES | 1 (1 high) | 1h |
-| **P2** | `o/lib`#4 | APPROVE | 0 | 1d |
+| **P0** | github:`o/app`#12 | BLOCK | 2 (1 blocking, 1 high) | 2h · re-reviewed |
+| **P1** | github:`o/app`#13 | APPROVE WITH CHANGES | 1 (1 high) | 1h |
+| **P2** | github:`o/lib`#4 | APPROVE | 0 | 1d |
 ```
 
 One row per PR, newest review winning, bucketed from the reviewer's own verdict
