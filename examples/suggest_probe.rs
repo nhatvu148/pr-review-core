@@ -105,8 +105,14 @@ async fn main() -> anyhow::Result<()> {
             println!("   suggestion: PROPOSED but the finding does not anchor — withheld\n");
             continue;
         };
-        let current = texts.get(&f.file).and_then(|t| t.get(&line));
-        match current.and_then(|c| suggest::sanitize(raw, c)) {
+        let at = |n: u64| {
+            texts
+                .get(&f.file)
+                .and_then(|t| t.get(&n))
+                .map(String::as_str)
+        };
+        let current = at(line);
+        match current.and_then(|c| suggest::sanitize(raw, c, at(line - 1), at(line + 1))) {
             Some(s) => {
                 accepted += 1;
                 println!("   suggestion: ACCEPTED — this is what posts:\n");

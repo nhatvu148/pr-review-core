@@ -9,6 +9,27 @@ on the way out, which is why committable suggestions shipped with no way to read
 one-click commit before it reached someone's PR. Populated on every run, posted or
 not. `providers::InlineComment` now derives `Serialize` to carry it.
 
+**Hardened after the first live run** (four findings from the bot's own review of
+the feature, all confirmed):
+
+- A multi-line suggestion that **echoes a neighbouring line** is now rejected.
+  The block replaces the anchored line *alone*, so a model that helpfully includes
+  the line above or below — how one naturally writes a code sample — produced a
+  one-click commit of a duplicate. Nothing downstream caught it: the result parses,
+  compiles in many languages, and reads as correct in the rendered block.
+- `Finding::suggestion` deserializes **leniently**. Strict parsing failed the whole
+  element, and `findings_from_values` drops a failed element — so a model answering
+  `"suggestion": ["line one", "line two"]` lost the finding's prose, severity and
+  anchor along with the block. An array of strings now joins; anything else becomes
+  `None`. The optional part of a finding must never take the mandatory part with it.
+- The `## Suggestions` contract is appended **only when `SUGGESTIONS` is on**,
+  instead of shipping to every Bitbucket review and every repo with the feature off,
+  where it steered the model toward text that was then discarded unread.
+- `supports_suggestions` covers `local` again. It was dropped because a local
+  review's rendered bodies died inside `finish_review`; `inline_detail` now carries
+  them, and local is where a suggestion *should* be read — before any of it reaches
+  a PR.
+
 **Committable suggestions.** A finding whose fix is an exact rewrite of the line
 it sits on now posts with a ```` ```suggestion ```` block, which GitHub and GitLab
 render with an *Apply* button: the author commits the fix without leaving the PR.

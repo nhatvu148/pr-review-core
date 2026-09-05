@@ -69,8 +69,40 @@ pub struct Finding {
     /// suggestion is dropped outright if it fails [`crate::suggest::sanitize`].
     /// Absent on older responses and on every backend that does not know to
     /// produce it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "lenient_suggestion",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub suggestion: Option<String>,
+}
+
+/// Accept a suggestion in whatever shape the model sent it, and drop it rather
+/// than the finding when it makes no sense.
+///
+/// `Option<String>` deserialized strictly would fail the *element*, and
+/// [`findings_from_values`] drops an element that fails — so a model answering
+/// `"suggestion": ["line one", "line two"]`, a plausible reading of a request for
+/// multi-line replacement text, would cost the whole finding: prose, severity,
+/// anchor and all. The block is the optional part of a finding; it must never be
+/// able to take the mandatory part with it.
+///
+/// An array of strings is the one malformed shape with an obvious meaning, so it
+/// joins with newlines and goes on to `suggest::sanitize` like any other. Anything
+/// else becomes `None` and the finding posts as prose.
+fn lenient_suggestion<'de, D>(d: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Array(a) => {
+            let lines: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+            (!lines.is_empty()).then(|| lines.join("\n"))
+        }
+        _ => None,
+    })
 }
 
 /// Parse a findings array element-by-element, dropping (with a warning) any element
