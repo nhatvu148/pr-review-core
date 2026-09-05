@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.24.0
 
 **`RunReviewOutput` exposes the inline comments it built** (`inline_detail`), so a
 dry run can show what would post. `inline_posted` is a count, and a count cannot be
@@ -51,6 +51,12 @@ problem, but replacement text does not — applied, it overwrites a line the fin
 never looked at. Since both features default to on, this is the rule that makes
 the pair safe, and it is covered by a test.
 
+**Verified on GitHub only.** A block posted from this engine renders as a
+suggested change with a working *Apply suggestion* button, confirmed end to end on
+a throwaway PR. GitLab's fence takes an explicit range (`suggestion:-0+0`) and that
+syntax comes from GitLab's documentation — it has not been seen render. Treat the
+GitLab path as untested until someone runs it.
+
 Bitbucket has no equivalent feature, so nothing is emitted there — and neither
 does the **local** review path, for a different reason: `run_review_local` returns
 `summary_markdown` and `findings_detail`, never the rendered inline bodies, so a
@@ -70,6 +76,15 @@ selective enough to be trusted with a commit button.
   `#[serde(default)]`, so no stored or model-produced JSON breaks — but any
   consumer constructing a `Finding` with a struct literal must add
   `suggestion: None`. `runlog::Funnel` gains `suggested: usize` on the same terms.
+- **`review::RunReviewOutput` gains `inline_detail: Vec<InlineComment>`.** A
+  consumer constructing one with a struct literal must add
+  `inline_detail: Vec::new()`. This broke `pr-review-bot` (a test helper in
+  `telegram.rs`) and was caught only by compiling a consumer against the release
+  candidate — every test here passed. That is the same shape of break as 0.11.0's
+  `PrMeta` field, and the reason that step is in the release checklist.
+- `suggest::sanitize` takes two more arguments — the anchored line's diff
+  neighbours — and is public, though it is new in this release, so nothing
+  depends on the old signature yet.
 
 ## 0.23.0
 
