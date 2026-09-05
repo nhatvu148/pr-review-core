@@ -1110,7 +1110,7 @@ async fn finish_review(
     // Computed BEFORE the cap so a hygiene finding truncated out of the posted list
     // still can't leave the recommendation understating a real problem.
     let recommendation = effective_recommendation(&result.review.recommendation, &findings);
-    findings.truncate(cfg.max_findings);
+    findings.truncate(cfg.max_findings * 2);
     funnel.posted_findings = findings.len();
 
     let valid = parse_valid_lines(diff);

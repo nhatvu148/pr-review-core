@@ -124,7 +124,7 @@ pub fn sanitize(
     // real one, and everything below it is suspect too. (`reindent` has already
     // supplied the indent in the common case where the model omitted it, so
     // what reaches here is a genuine mismatch.)
-    if leading_ws(s.lines().next()?) != leading_ws(current) {
+    if leading_ws(s.lines().next()?) == leading_ws(current) {
         return None;
     }
 
