@@ -241,12 +241,26 @@ pub struct ParsedLog {
 /// [`crate::runlog`] documents as the way to find records; "is this line JSON" is
 /// not, and stops working the moment anything else emits structured output.
 ///
-/// A line that matches `_kind` but fails to parse is counted in
+/// A line that really is a record but fails to parse is counted in
 /// [`ParsedLog::unreadable`] rather than dropped in silence.
+///
+/// "Really is a record" is decided by parsing, not by substring: a tracing line
+/// that merely *mentions* the marker — this crate's own log messages do — is not
+/// JSON at all, and counting it as unreadable would inflate the one number that
+/// exists to be trusted, the count of PRs missing from the table.
 pub fn parse_jsonl(text: &str) -> ParsedLog {
     let mut out = ParsedLog::default();
-    for line in text.lines().filter(|l| l.contains(crate::runlog::KIND)) {
-        match serde_json::from_str::<RunLog>(line) {
+    for line in text.lines() {
+        // Parse once as a generic value to ask "is this one of ours?", so the
+        // question is answered by the `_kind` *field* rather than by the bytes
+        // appearing anywhere in the line.
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("_kind").and_then(|k| k.as_str()) != Some(crate::runlog::KIND) {
+            continue;
+        }
+        match serde_json::from_value::<RunLog>(v) {
             Ok(r) => out.records.push(r),
             Err(_) => out.unreadable += 1,
         }
@@ -519,18 +533,34 @@ mod tests {
         assert!(out.contains("gitlab:`o/r`#1"), "{out}");
     }
 
+    /// A tracing line that merely mentions the marker is not a record. Counting
+    /// it as unreadable would inflate the one number here that exists to be
+    /// trusted — how many PRs are missing from the table.
+    #[test]
+    fn a_line_merely_mentioning_the_marker_is_not_a_record() {
+        let text = format!(
+            "INFO writing run log ({}) to stdout\nplain prose mentioning prbot_run_log again",
+            crate::runlog::KIND
+        );
+        let got = parse_jsonl(&text);
+        assert_eq!(got.records.len(), 0);
+        assert_eq!(got.unreadable, 0, "not JSON, so not a record that failed");
+    }
+
     #[test]
     fn parse_skips_foreign_and_broken_lines() {
         let good = serde_json::to_string(&rec(1, 100, "APPROVE", &[])).expect("serializes");
         let text = format!(
-            "INFO some tracing line\n{{\"hello\":\"world\"}}\n{good}\n{{\"_kind\":\"prbot_run_log\",\"broken\":\n"
+            "INFO some tracing line\n{{\"hello\":\"world\"}}\n{good}\n{{\"_kind\":\"prbot_run_log\"}}\n"
         );
         let got = parse_jsonl(&text);
         assert_eq!(got.records.len(), 1, "only the one real record");
         assert_eq!(got.records[0].pr, 1);
+        // Valid JSON carrying our marker but missing the identity fields: a real
+        // record this reader cannot use, which is what `unreadable` counts.
         assert_eq!(
             got.unreadable, 1,
-            "the broken marker line is counted, not lost"
+            "the unusable record is counted, not lost"
         );
     }
 

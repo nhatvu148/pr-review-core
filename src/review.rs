@@ -83,10 +83,12 @@ pub(crate) fn severity_emoji(sev: &str) -> &'static str {
 
 /// Rank a recommendation so two can be compared (higher = blocks more).
 ///
-/// Public because [`crate::queue`] buckets PRs by the same verdict strings, and a
-/// second copy of the `BLOCK`/`CHANGES` matching is a copy that drifts the moment
-/// the vocabulary changes.
-pub fn recommendation_rank(rec: &str) -> u8 {
+/// `pub(crate)` because [`crate::queue`] buckets PRs by the same verdict strings,
+/// and a second copy of the `BLOCK`/`CHANGES` matching is a copy that drifts the
+/// moment the vocabulary changes. Crate-visible rather than public: no consumer
+/// asked for it, and a `pub fn` in a published library is a promise that narrowing
+/// it later would break.
+pub(crate) fn recommendation_rank(rec: &str) -> u8 {
     let r = rec.to_uppercase();
     if r.contains("BLOCK") {
         2
