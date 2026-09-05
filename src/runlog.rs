@@ -51,7 +51,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::llm::{Finding, Usage};
 
@@ -104,7 +104,7 @@ impl RunLogSink {
 /// stage runs, so the drop at any stage is the difference from the previous one.
 /// `hygiene_added` is the exception: deterministic findings are merged in, so it
 /// is an addition, and `after_collapse` includes them.
-#[derive(Debug, Default, Clone, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Funnel {
     /// Findings the backend returned, before any post-processing.
     pub model_raw: usize,
@@ -134,7 +134,7 @@ pub struct Funnel {
 }
 
 /// One finding as logged: its metadata, where it was posted, and its text.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggedFinding {
     pub severity: String,
     pub file: String,
@@ -163,11 +163,11 @@ pub struct LoggedFinding {
 /// `jq` and pandas, not by the bot's API consumers.
 ///
 /// [`RunReviewOutput`]: crate::review::RunReviewOutput
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunLog {
     /// Always [`KIND`]. First key in the record so a reader — or a human tailing
     /// a mixed stdout stream — can identify the line without parsing it all.
-    #[serde(rename = "_kind")]
+    #[serde(rename = "_kind", skip_deserializing, default = "default_kind")]
     pub kind: &'static str,
     pub schema: u32,
     /// Seconds since the Unix epoch. Deliberately not a formatted timestamp: this
@@ -217,6 +217,12 @@ pub struct RunLog {
     /// Wall-clock milliseconds for the whole run, including the provider fetches
     /// and the post.
     pub duration_ms: u64,
+}
+
+/// [`KIND`] as a deserialization default: the field is a constant, and
+/// `&'static str` cannot borrow from an owned JSON document.
+fn default_kind() -> &'static str {
+    KIND
 }
 
 impl RunLog {
