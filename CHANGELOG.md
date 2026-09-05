@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.24.0
 
 **`RunReviewOutput` exposes the inline comments it built** (`inline_detail`), so a
 dry run can show what would post. `inline_posted` is a count, and a count cannot be
@@ -51,13 +51,24 @@ problem, but replacement text does not — applied, it overwrites a line the fin
 never looked at. Since both features default to on, this is the rule that makes
 the pair safe, and it is covered by a test.
 
-Bitbucket has no equivalent feature, so nothing is emitted there — and neither
-does the **local** review path, for a different reason: `run_review_local` returns
-`summary_markdown` and `findings_detail`, never the rendered inline bodies, so a
-block built for it would be discarded unread. A local consumer that wants to show
-the fix as code has the raw `Finding::suggestion` and can run it through the now-
-public `suggest::sanitize` / `suggest::render` itself. `/review-file` findings post
-to the summary, where no block would render, so its prompt is unchanged.
+**Verified on all three hosts, on live pull requests.** Each was confirmed by
+posting this crate's own output and watching the host render an *Apply* button —
+not read off a documentation page. GitHub additionally ran the full pipeline end to
+end: the model populated `suggestion`, validation accepted it, the comment posted,
+and applying it committed the fix. GitLab and Bitbucket had the fence and the
+comment payload confirmed; nobody has yet watched a review on either host produce
+one unaided, though the review, anchoring and posting path is shared code.
+
+Bitbucket was nearly excluded on a false premise. Atlassian documents only a UI
+path for suggestions — a toolbar button, `/suggestcode` — and publishes no
+raw-markdown form, which reads like the feature is out of reach for an API client.
+It is not: an ordinary ```` ```suggestion ```` fence in a comment's `content.raw`
+renders as a *Suggested change* with an *Apply suggestion* button, the same as on
+GitHub. Absent documentation was not absent capability, and one posted comment
+settled what no amount of reading could.
+
+`/review-file` findings post to the summary, where no block would render, so its
+prompt is unchanged.
 
 `PRBOT_RUN_LOG` records `funnel.suggested` — of the anchored findings, how many
 carried a block. The gap between that and `funnel.anchored` is how the feature
@@ -70,6 +81,15 @@ selective enough to be trusted with a commit button.
   `#[serde(default)]`, so no stored or model-produced JSON breaks — but any
   consumer constructing a `Finding` with a struct literal must add
   `suggestion: None`. `runlog::Funnel` gains `suggested: usize` on the same terms.
+- **`review::RunReviewOutput` gains `inline_detail: Vec<InlineComment>`.** A
+  consumer constructing one with a struct literal must add
+  `inline_detail: Vec::new()`. This broke `pr-review-bot` (a test helper in
+  `telegram.rs`) and was caught only by compiling a consumer against the release
+  candidate — every test here passed. That is the same shape of break as 0.11.0's
+  `PrMeta` field, and the reason that step is in the release checklist.
+- `suggest::sanitize` takes two more arguments — the anchored line's diff
+  neighbours — and is public, though it is new in this release, so nothing
+  depends on the old signature yet.
 
 ## 0.23.0
 
