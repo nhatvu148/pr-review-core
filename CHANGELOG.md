@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.25.0
 
 **A PR queue: the layer above one review** (`queue`). A review ended when its
 comment posted, and so did the reviewer's memory of it — every record needed to
@@ -34,6 +34,14 @@ What it deliberately does **not** claim:
   always empty — absent, not evidence that nothing moved.
 
 Dry runs are excluded: they post nothing, so no human can act on them.
+
+**Measured on its first real run**, over 76 records from five days of production
+reviews: 68 PRs, P0 3 / P1 24 / P2 41, spanning repos the operator was not
+thinking about. It also demonstrated the documented limit in the sharpest possible
+way — all three P0s were PRs that had since been **closed**. A run log knows what
+was reviewed, not what is open, and reconciling that needs a provider token this
+crate does not have. Read the top of the queue with that in mind until a consumer
+supplies the PR's current state.
 
 `Funnel` and `LoggedFinding` carry `#[serde(default)]` at the **container**, not
 per field: the next field either gains would otherwise make every older record
