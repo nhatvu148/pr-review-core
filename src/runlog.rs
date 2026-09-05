@@ -123,6 +123,14 @@ pub struct Funnel {
     pub anchored: usize,
     /// The rest, folded into the summary because no diff line would take them.
     pub unanchored: usize,
+    /// Of the anchored ones, how many carried a committable suggestion block.
+    ///
+    /// The gap between this and `anchored` is the question the feature is judged
+    /// on: a reviewer that never offers a one-click fix has not closed the gap,
+    /// and one that offers it on everything is not being selective enough to be
+    /// trusted with a commit button.
+    #[serde(default)]
+    pub suggested: usize,
 }
 
 /// One finding as logged: its metadata, where it was posted, and its text.
@@ -355,6 +363,7 @@ mod tests {
                 posted_findings: 4,
                 anchored: 3,
                 unanchored: 1,
+                suggested: 0,
             },
             findings: vec![LoggedFinding {
                 severity: "HIGH".into(),
@@ -410,6 +419,7 @@ mod tests {
             line,
             body: "a body".into(),
             confidence: None,
+            suggestion: None,
         }
     }
 

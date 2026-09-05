@@ -61,6 +61,16 @@ pub struct Finding {
     /// reviewer would flag. Absent on older responses; treated as full confidence.
     #[serde(default)]
     pub confidence: Option<u8>,
+    /// Replacement text for the anchored line, ready to render as a committable
+    /// suggestion — or `None` whenever the fix is not expressible as an exact
+    /// line replacement, which is most of the time.
+    ///
+    /// Never load-bearing: `body` states the fix in prose either way, and the
+    /// suggestion is dropped outright if it fails [`crate::suggest::sanitize`].
+    /// Absent on older responses and on every backend that does not know to
+    /// produce it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestion: Option<String>,
 }
 
 /// Parse a findings array element-by-element, dropping (with a warning) any element

@@ -75,6 +75,18 @@ pub struct Config {
     /// folding into the summary. Conservative + fail-open.
     pub reanchor_findings: bool,
 
+    /// Attach a committable suggestion block to a finding whose fix the model
+    /// expressed as exact replacement text for the anchored line.
+    ///
+    /// On by default, because a parity feature that is off by default closes no
+    /// gap. The risk it carries — a one-click commit of the wrong text — is
+    /// bounded elsewhere: every suggestion is validated against the line it
+    /// would replace, a re-anchored finding never gets one, and anything that
+    /// fails falls back to exactly today's prose comment. Turn it off for a
+    /// repo where an *Apply* button next to an advisory review would be read as
+    /// an endorsement.
+    pub suggestions: bool,
+
     /// Pass the PR's own description to the reviewer as a *statement of intent to
     /// verify the diff against* (coverage spec class B). The body is already
     /// fetched by every provider for `/describe`; this is what lets the review
@@ -303,6 +315,7 @@ impl Config {
             min_confidence: env_or("MIN_CONFIDENCE", "0").parse().unwrap_or(0),
             max_findings: env_or("MAX_FINDINGS", "20").parse().unwrap_or(20),
             reanchor_findings: env_or("REANCHOR_FINDINGS", "true").parse().unwrap_or(true),
+            suggestions: env_or("SUGGESTIONS", "true").parse().unwrap_or(true),
 
             agentic: env_or("AGENTIC", "false").parse().unwrap_or(false),
             max_turns: env_or("MAX_TURNS", "6").parse().unwrap_or(6),
@@ -432,6 +445,9 @@ impl Config {
         }
         if let Some(v) = rc.reanchor_findings {
             cfg.reanchor_findings = v;
+        }
+        if let Some(v) = rc.suggestions {
+            cfg.suggestions = v;
         }
         if let Some(v) = &rc.instructions {
             let extra = v.trim();

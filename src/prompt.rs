@@ -25,7 +25,8 @@ Return ONLY a JSON object — no markdown fences, no prose around it — with ex
       "file": "<path EXACTLY as it appears in the diff, new side>",
       "line": <integer line number in the NEW version of the file, or null if not line-specific>,
       "body": "<one sentence describing the problem, then ' Fix: ' and a concrete fix>",
-      "confidence": <integer 0-100 — your confidence a senior reviewer would flag this>
+      "confidence": <integer 0-100 — your confidence a senior reviewer would flag this>,
+      "suggestion": "<replacement text for `line`, or null — see the suggestion rules>"
     }
   ]
 }
@@ -115,7 +116,20 @@ findings about how it is written.
 
 ## One claim, one finding
 
-If the same observation applies to many files, raise it ONCE, name the pattern, and say how many files it covers. Do not emit one finding per file."#;
+If the same observation applies to many files, raise it ONCE, name the pattern, and say how many files it covers. Do not emit one finding per file.
+
+## Suggestions
+
+`suggestion` is OPTIONAL and defaults to null. When you set it, it is committed to the author's branch by a single click, replacing `line` outright — so it is not a snippet, an excerpt, or a patch. It is the exact, complete text that should stand where `line` stands now.
+
+Set it ONLY when all of these hold:
+- The whole fix is a rewrite of `line` itself. A fix that also needs an import, a change in another function, or a new file is prose, not a suggestion.
+- You can write the replacement in full, with the same indentation `line` already has. No `...`, no "// rest unchanged", no placeholder names.
+- You are confident in the exact text. A suggestion that has to be corrected after clicking is worse than no suggestion, because it has already been committed.
+
+It may span several lines even though it replaces one — adding a guard above a statement you keep is the normal case. Write no `+`/`-` markers, no line numbers, and no ``` fences: just the code.
+
+Everywhere else, set `suggestion` to null and put the fix in `body` as you always have. Null is the right answer for most findings; the prose is what carries the review."#;
 
 /// Everything the orchestrator injects into a backend's system prompt:
 /// [`REVIEW_RULES`] followed by the consumer's `extra_system_prompt`.
@@ -193,7 +207,7 @@ pub fn review_system_prompt(cfg: &Config) -> String {
 /// System prompt for the optional second-pass self-critique. Given the diff and a
 /// JSON array of proposed findings, the model prunes noise and re-scores what it
 /// keeps, returning ONLY a JSON array of the surviving findings.
-pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence}. If all should be dropped, return []."#;
+pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence, suggestion}. Carry `suggestion` through UNCHANGED on a finding you keep — it is replacement code that was checked against the diff, and silently dropping or rewriting it here loses work the review already did. Set it to null only if the suggestion itself is what makes the finding wrong. If all should be dropped, return []."#;
 
 /// System prompt for the `/ask` command: answer a free-form question about the
 /// PR, grounded strictly in its diff.

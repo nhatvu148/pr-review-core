@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+**Committable suggestions.** A finding whose fix is an exact rewrite of the line
+it sits on now posts with a ```` ```suggestion ```` block, which GitHub and GitLab
+render with an *Apply* button: the author commits the fix without leaving the PR.
+On by default (`SUGGESTIONS`, or `suggestions` in `.prbot.toml`).
+
+The reason this is gated rather than simply asked for: a suggestion is not a
+snippet. Its content **replaces the anchored line outright** on one click, so a
+block that reads fine as prose commits code that was never checked against the
+file. Every proposal is therefore validated against the exact new-side text of the
+line it would replace (`suggest::sanitize`), and a failure withholds the block
+while keeping the finding — the prose fix is what it has always been. Dropped:
+diff furniture (`@@`, `+++`/`---`), nested fences, no-ops, and text indented
+differently from the line it replaces. Indentation the model omitted entirely is
+supplied rather than rejected, which is what makes the feature fire at all.
+
+**A re-anchored finding never gets one.** `REANCHOR_FINDINGS` moves a drifted
+finding onto a nearby line; prose survives that move because it describes a
+problem, but replacement text does not — applied, it overwrites a line the finding
+never looked at. Since both features default to on, this is the rule that makes
+the pair safe, and it is covered by a test.
+
+Bitbucket has no equivalent feature, so nothing is emitted there — and neither
+does the **local** review path, for a different reason: `run_review_local` returns
+`summary_markdown` and `findings_detail`, never the rendered inline bodies, so a
+block built for it would be discarded unread. A local consumer that wants to show
+the fix as code has the raw `Finding::suggestion` and can run it through the now-
+public `suggest::sanitize` / `suggest::render` itself. `/review-file` findings post
+to the summary, where no block would render, so its prompt is unchanged.
+
+`PRBOT_RUN_LOG` records `funnel.suggested` — of the anchored findings, how many
+carried a block. The gap between that and `funnel.anchored` is how the feature
+should be judged: never offering is no gap closed, always offering is not
+selective enough to be trusted with a commit button.
+
+### Breaking
+
+- `llm::Finding` gains a `suggestion: Option<String>` field. It is
+  `#[serde(default)]`, so no stored or model-produced JSON breaks — but any
+  consumer constructing a `Finding` with a struct literal must add
+  `suggestion: None`. `runlog::Funnel` gains `suggested: usize` on the same terms.
+
 ## 0.23.0
 
 **The dependency scan now reads `poetry.lock`, `uv.lock` and `pdm.lock`**

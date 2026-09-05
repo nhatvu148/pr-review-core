@@ -370,6 +370,35 @@ fn inline_body(f: &Finding) -> String {
     )
 }
 
+/// The inline comment for `f`, and whether a committable suggestion block was
+/// appended to it — which happens when the model proposed one and it survives
+/// validation against `current`, the exact new-side text of the anchored line.
+///
+/// `exact_anchor` is false for a re-anchored finding, and that alone withholds
+/// the block. The replacement text was written for the line the model named; the
+/// comment is going somewhere else. Prose survives being moved a few rows — it
+/// describes a problem — but replacement text moved onto a different line is a
+/// one-click commit that deletes code the finding never looked at.
+fn inline_body_for(
+    cfg: &Config,
+    provider: &str,
+    f: &Finding,
+    current: Option<&str>,
+    exact_anchor: bool,
+) -> (String, bool) {
+    let body = inline_body(f);
+    if !cfg.suggestions || !exact_anchor || !crate::suggest::supports_suggestions(provider) {
+        return (body, false);
+    }
+    let Some(raw) = f.suggestion.as_deref() else {
+        return (body, false);
+    };
+    match current.and_then(|c| crate::suggest::sanitize(raw, c)) {
+        Some(s) => (crate::suggest::render(provider, &body, &s), true),
+        None => (body, false),
+    }
+}
+
 /// A finding may miss a real diff line by this many rows and still be re-anchored.
 const REANCHOR_WINDOW: i64 = 3;
 
@@ -910,6 +939,7 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
             line: None,
             body: h.body,
             confidence: Some(100),
+            suggestion: None,
         })
         .collect();
 
@@ -979,6 +1009,7 @@ struct FinishedReview {
 async fn finish_review(
     cfg: &Config,
     backend: &dyn ReviewBackend,
+    provider: &str,
     meta: &PrMeta,
     diff: &str,
     result: &ReviewResult,
@@ -1031,8 +1062,10 @@ async fn finish_review(
     funnel.posted_findings = findings.len();
 
     let valid = parse_valid_lines(diff);
-    // Line texts are only needed to confirm a re-anchor (content match).
-    let line_texts = if cfg.reanchor_findings {
+    // Line texts confirm a re-anchor (content match) and validate a suggestion
+    // against the line it would replace. Either feature alone needs them; with
+    // both off the parse is skipped.
+    let line_texts = if cfg.reanchor_findings || cfg.suggestions {
         crate::diff::diff_line_texts(diff)
     } else {
         std::collections::HashMap::new()
@@ -1049,6 +1082,9 @@ async fn finish_review(
         let mut anchor = f
             .line
             .filter(|l| valid.get(&f.file).is_some_and(|s| s.contains(l)));
+        // Whether the comment is going to the line the model named. A suggestion
+        // is only valid against that line — see `inline_body_for`.
+        let exact_anchor = anchor.is_some();
         if anchor.is_none() && cfg.reanchor_findings {
             if let (Some(l), Some(v), Some(t)) =
                 (f.line, valid.get(&f.file), line_texts.get(&f.file))
@@ -1058,11 +1094,19 @@ async fn finish_review(
         }
         anchors.push(anchor);
         match anchor {
-            Some(line) => inline.push(InlineComment {
-                path: f.file.clone(),
-                line,
-                body: inline_body(f),
-            }),
+            Some(line) => {
+                let current = line_texts.get(&f.file).and_then(|t| t.get(&line));
+                let (body, suggested) =
+                    inline_body_for(cfg, provider, f, current.map(String::as_str), exact_anchor);
+                if suggested {
+                    funnel.suggested += 1;
+                }
+                inline.push(InlineComment {
+                    path: f.file.clone(),
+                    line,
+                    body,
+                })
+            }
             None => unanchored.push(f),
         }
     }
@@ -1270,7 +1314,16 @@ pub async fn run_review_with(
     };
     let result = backend.review(&ctx).await?;
     let truncated = result.review.summary.contains(crate::llm::TRUNCATED_NOTE);
-    let mut finished = finish_review(cfg, backend, &meta, &diff, &result, hygiene).await;
+    let mut finished = finish_review(
+        cfg,
+        backend,
+        &input.provider,
+        &meta,
+        &diff,
+        &result,
+        hygiene,
+    )
+    .await;
     if !advisories.is_empty() {
         finished.summary.push_str("\n\n");
         finished
@@ -1476,7 +1529,8 @@ pub async fn run_review_local(
         injected_rules: &injected_rules,
     };
     let result = backend.review(&ctx).await?;
-    let mut finished = finish_review(cfg, backend, &meta, &diff, &result, hygiene).await;
+    let mut finished =
+        finish_review(cfg, backend, LOCAL_PROVIDER, &meta, &diff, &result, hygiene).await;
     // Same feature on this path: a local review's deliverable *is* its
     // `summary_markdown`, so leaving it unwired made WALKTHROUGH/DIAGRAM silently
     // a no-op for every caller of this entry point.
@@ -1570,6 +1624,7 @@ mod local_review_tests {
                         line: Some(3),
                         body: "`t` can overflow on a long list. Fix: use checked_add.".to_string(),
                         confidence: Some(90),
+                        suggestion: None,
                     }],
                 },
                 model: "spy".to_string(),
@@ -1650,6 +1705,7 @@ mod local_review_tests {
                             line: Some(900),
                             body: "something far away entirely".to_string(),
                             confidence: Some(50),
+                            suggestion: None,
                         }],
                     },
                     model: "spy".to_string(),
@@ -2084,6 +2140,7 @@ mod orchestrator_tests {
                     line,
                     body: body.to_string(),
                     confidence: Some(conf),
+                    suggestion: None,
                 }
             };
             Ok(ReviewResult {
@@ -2189,6 +2246,7 @@ mod orchestrator_tests {
                         line: Some(5),
                         body: "`calcTotal` now needs a tax arg.".to_string(),
                         confidence: Some(90),
+                        suggestion: None,
                     }],
                 },
                 model: "spy".to_string(),
@@ -2235,6 +2293,100 @@ mod orchestrator_tests {
         assert_eq!(f["anchored_line"], 3, "onto the line naming calcTotal");
     }
 
+    /// Proposes one finding carrying a suggestion, at a caller-chosen line.
+    struct SuggestBackend {
+        line: u64,
+    }
+
+    #[async_trait]
+    impl ReviewBackend for SuggestBackend {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "one finding with a fix".to_string(),
+                    recommendation: "APPROVE WITH CHANGES".to_string(),
+                    findings: vec![crate::llm::Finding {
+                        severity: "HIGH".to_string(),
+                        file: "src/order.ts".to_string(),
+                        line: Some(self.line),
+                        body: "`calcTotal` now needs a region arg.".to_string(),
+                        confidence: Some(90),
+                        suggestion: Some("return calcTotal(order, tax, region);".to_string()),
+                    }],
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    /// Runs a review over [`DRIFT_DIFF`] with `cfg` and returns its run-log record.
+    async fn record_for(cfg: &mut Config, backend: &dyn ReviewBackend) -> serde_json::Value {
+        let srv = github_stub_with(DRIFT_DIFF).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+        cfg.github_api_base = srv.uri();
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
+
+        run_review_with(cfg, input(), backend)
+            .await
+            .expect("the review runs");
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        serde_json::from_str(text.trim()).expect("one parseable JSON line")
+    }
+
+    /// A finding anchored to the line the model named gets its suggestion.
+    #[tokio::test]
+    async fn an_exactly_anchored_finding_carries_its_suggestion() {
+        let mut cfg = cfg_for("http://replaced");
+        cfg.suggestions = true;
+
+        // Line 3 of DRIFT_DIFF is `return calcTotal(order, tax);` — a real diff
+        // line, so no re-anchoring is involved.
+        let v = record_for(&mut cfg, &SuggestBackend { line: 3 }).await;
+
+        assert_eq!(v["funnel"]["anchored"], 1);
+        assert_eq!(v["funnel"]["suggested"], 1, "the block was attached");
+    }
+
+    /// A **re-anchored** finding must never carry one.
+    ///
+    /// The replacement text was written for the line the model named; the comment
+    /// is going to a different line. Prose survives that move — it describes a
+    /// problem — but replacement text does not: applied, it overwrites a line the
+    /// finding never looked at, and it does so on one click. This is the single
+    /// rule that makes suggestions safe to default on alongside
+    /// `REANCHOR_FINDINGS`, which is itself on by default.
+    #[tokio::test]
+    async fn a_reanchored_finding_never_carries_a_suggestion() {
+        let mut cfg = cfg_for("http://replaced");
+        cfg.suggestions = true;
+        cfg.reanchor_findings = true;
+
+        // Line 5 is off the diff; the body names `calcTotal`, so it re-anchors
+        // onto line 3 — the same path the test above exercises for logging.
+        let v = record_for(&mut cfg, &SuggestBackend { line: 5 }).await;
+
+        assert_eq!(v["funnel"]["anchored"], 1, "it still posts inline");
+        assert_eq!(
+            v["funnel"]["suggested"], 0,
+            "but with no button, because the comment moved"
+        );
+    }
+
+    /// Off by config means off, even on a finding that would have qualified.
+    #[tokio::test]
+    async fn suggestions_off_withholds_the_block() {
+        let mut cfg = cfg_for("http://replaced");
+        cfg.suggestions = false;
+
+        let v = record_for(&mut cfg, &SuggestBackend { line: 3 }).await;
+
+        assert_eq!(v["funnel"]["anchored"], 1);
+        assert_eq!(v["funnel"]["suggested"], 0);
+    }
+
     /// The privacy default. A record carries review commentary on someone's
     /// source, so an operator who never asked for a log must not get one — and
     /// the check is a config field being unset, not a path that happens to fail.
@@ -2270,6 +2422,7 @@ mod orchestrator_tests {
             line: None,
             body: body.to_string(),
             confidence: Some(80),
+            suggestion: None,
         }
     }
 
@@ -2440,6 +2593,7 @@ mod tests {
             line: None,
             body: body.to_string(),
             confidence: Some(100),
+            suggestion: None,
         }
     }
 
@@ -2655,6 +2809,7 @@ mod tests {
             line: None,
             body: "A binary file `assets/ime.zip` was added. Fix: drop it.".to_string(),
             confidence: Some(100),
+            suggestion: None,
         }
     }
 
@@ -2884,6 +3039,7 @@ mod change_map_tests {
             line: Some(1),
             body: "x".into(),
             confidence: None,
+            suggestion: None,
         }];
         let mut s = String::new();
         append_change_map(&conf(true, false), "github", &map(), &findings, &mut s);
