@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+**A finding no longer posts on a blank line.** Being *in* the diff was treated as
+enough to anchor a comment, and in a newly added file every line is in the diff —
+blank ones included. A model that drifted a few rows landed on one, and because the
+anchor looked valid, the re-anchor step that exists for exactly that drift never
+ran.
+
+Three failures followed, and the third is the one that matters: the comment floated
+detached from the code it described; re-anchoring was skipped; and a **committable
+suggestion became impossible**, because replacing a blank line inserts code rather
+than fixing any. That last one is silent — the finding posts, and the missing
+button reads as the model declining to suggest rather than as a bad anchor.
+
+Observed on this repo's own PR #64, where a finding about `if r.ts_unix >= …` on
+line 109 posted on line 115, six rows below it, on nothing.
+
+A blank anchor now falls through to `reanchor`, and failing that to the summary.
+Neither recovers the *right* line when the drift is wider than `REANCHOR_WINDOW` —
+no anchoring rule can, and the real cause there is the drift — but both beat a
+comment on nothing.
+
+`parse_valid_lines` is deliberately unchanged: it answers "is this line in the
+diff", which `blast` and `structure` depend on, and "is this a good place for a
+comment" is a different question with its own predicate now.
+
 ## 0.24.0
 
 **`RunReviewOutput` exposes the inline comments it built** (`inline_detail`), so a

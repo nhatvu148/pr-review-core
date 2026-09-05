@@ -419,6 +419,37 @@ fn inline_body_for(
     }
 }
 
+/// Whether a finding's stated line is somewhere a comment should actually go.
+///
+/// Being *in* the diff is necessary but not sufficient. A **blank** line is in the
+/// diff — in a newly added file every line is, blank ones included — and a model
+/// that drifts a few rows lands on one readily. Accepting it does three bad
+/// things: the comment floats detached from the code it describes, the re-anchor
+/// step that exists for exactly this drift is skipped because the anchor looked
+/// valid, and a committable suggestion becomes impossible, since replacing a blank
+/// line with code inserts rather than fixes. The third is the worst, because it is
+/// invisible: the finding posts, and the missing button reads as the model
+/// declining to suggest rather than as a bad anchor.
+///
+/// Observed on pr-review-core#64, where a finding about `if r.ts_unix >= …` (line
+/// 109) posted on line 115, a blank line six rows below it.
+///
+/// Rejecting it here sends the finding to [`reanchor`], and failing that to the
+/// summary. Neither recovers the *right* line when the drift is wider than
+/// [`REANCHOR_WINDOW`] — no anchoring rule can — but both beat a comment on
+/// nothing.
+fn anchorable(
+    line: u64,
+    valid: Option<&std::collections::HashSet<u64>>,
+    text: Option<&str>,
+) -> bool {
+    // An unknown text is not evidence against the line: `diff_line_texts` and
+    // `parse_valid_lines` walk the same hunks, so a line present in one is present
+    // in the other, and treating a lookup miss as "blank" would silently unanchor
+    // findings if that ever stopped being true.
+    valid.is_some_and(|s| s.contains(&line)) && text.is_none_or(|t| !t.trim().is_empty())
+}
+
 /// A finding may miss a real diff line by this many rows and still be re-anchored.
 const REANCHOR_WINDOW: i64 = 3;
 
@@ -1083,14 +1114,10 @@ async fn finish_review(
     funnel.posted_findings = findings.len();
 
     let valid = parse_valid_lines(diff);
-    // Line texts confirm a re-anchor (content match) and validate a suggestion
-    // against the line it would replace. Either feature alone needs them; with
-    // both off the parse is skipped.
-    let line_texts = if cfg.reanchor_findings || cfg.suggestions {
-        crate::diff::diff_line_texts(diff)
-    } else {
-        std::collections::HashMap::new()
-    };
+    // Always parsed now, not just when re-anchoring or suggestions are on: every
+    // anchor is checked against the text of the line it would land on (see
+    // `anchorable`), so there is no configuration in which these are unused.
+    let line_texts = crate::diff::diff_line_texts(diff);
 
     // Anchor findings whose (file, line) is actually in the diff. A finding that
     // just missed (model off-by-a-few / drift) is re-anchored to a nearby diff line
@@ -1100,9 +1127,16 @@ async fn finish_review(
     let mut unanchored: Vec<&Finding> = Vec::new();
     let mut anchors: Vec<Option<u64>> = Vec::with_capacity(findings.len());
     for f in &findings {
-        let mut anchor = f
-            .line
-            .filter(|l| valid.get(&f.file).is_some_and(|s| s.contains(l)));
+        let mut anchor = f.line.filter(|l| {
+            anchorable(
+                *l,
+                valid.get(&f.file),
+                line_texts
+                    .get(&f.file)
+                    .and_then(|t| t.get(l))
+                    .map(String::as_str),
+            )
+        });
         // Whether the comment is going to the line the model named. A suggestion
         // is only valid against that line — see `inline_body_for`.
         let exact_anchor = anchor.is_some();
@@ -2322,6 +2356,70 @@ mod orchestrator_tests {
         assert_eq!(f["anchored_line"], 3, "onto the line naming calcTotal");
     }
 
+    /// A new file: every line is an added line, blank ones included. New-side 2
+    /// is blank; `calcTotal` is on 3.
+    const BLANK_LINE_DIFF: &str = "diff --git a/src/order.ts b/src/order.ts\n--- /dev/null\n+++ b/src/order.ts\n@@ -0,0 +1,4 @@\n+function f() {\n+\n+  return calcTotal(order, tax);\n+}\n";
+
+    /// Proposes one finding on the blank line, naming a symbol that is on the
+    /// code line below it.
+    struct BlankAnchorBackend;
+
+    #[async_trait]
+    impl ReviewBackend for BlankAnchorBackend {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "drifted onto a blank line".to_string(),
+                    recommendation: "APPROVE WITH CHANGES".to_string(),
+                    findings: vec![crate::llm::Finding {
+                        severity: "HIGH".to_string(),
+                        file: "src/order.ts".to_string(),
+                        line: Some(2),
+                        body: "`calcTotal` now needs a region arg.".to_string(),
+                        confidence: Some(90),
+                        suggestion: None,
+                    }],
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    /// A finding that drifts onto a blank line must not post there.
+    ///
+    /// The blank line *is* in the diff, so the anchor looked valid and the
+    /// re-anchor step — which exists for exactly this drift — was skipped. The
+    /// comment then floated detached from the code, and a committable suggestion
+    /// was impossible, because replacing a blank line inserts rather than fixes.
+    /// Observed on pr-review-core#64.
+    #[tokio::test]
+    async fn a_finding_drifting_onto_a_blank_line_moves_to_the_code() {
+        let srv = github_stub_with(BLANK_LINE_DIFF).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.reanchor_findings = true;
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
+
+        run_review_with(&cfg, input(), &BlankAnchorBackend)
+            .await
+            .expect("the review runs");
+
+        let v: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&log).expect("a record").trim())
+                .expect("one JSON line");
+
+        let f = &v["findings"][0];
+        assert_eq!(f["line"], 2, "the line the model named is preserved");
+        assert_ne!(f["anchored_line"], 2, "but the comment did not go there");
+        assert_eq!(
+            f["anchored_line"], 3,
+            "it re-anchored onto the line naming calcTotal"
+        );
+    }
+
     /// Proposes one finding carrying a suggestion, at a caller-chosen line.
     struct SuggestBackend {
         line: u64,
@@ -2641,8 +2739,8 @@ return calcTotal(order, tax, region);
 #[cfg(test)]
 mod tests {
     use super::{
-        burst_key, collapse_bursts, demote_falsified_build_claims, effective_recommendation,
-        idents, line_symbols, reanchor, render_no_review_summary,
+        anchorable, burst_key, collapse_bursts, demote_falsified_build_claims,
+        effective_recommendation, idents, line_symbols, reanchor, render_no_review_summary,
     };
     use crate::llm::Finding;
     use std::collections::{HashMap, HashSet};
@@ -2922,6 +3020,33 @@ mod tests {
         assert!(!s
             .iter()
             .any(|w| w == "export" || w == "function" || w == "o"));
+    }
+
+    /// A blank line is in the diff — in a new file every line is — but it is not
+    /// somewhere a finding belongs. Accepting one skips re-anchoring and makes a
+    /// suggestion impossible, and both failures are silent.
+    #[test]
+    fn a_blank_line_is_not_anchorable() {
+        let valid: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(anchorable(2, Some(&valid), Some("    let x = 1;")));
+        assert!(!anchorable(2, Some(&valid), Some("")), "empty");
+        assert!(
+            !anchorable(2, Some(&valid), Some("    ")),
+            "whitespace only"
+        );
+        assert!(
+            !anchorable(9, Some(&valid), Some("code")),
+            "not in the diff"
+        );
+    }
+
+    /// A lookup miss must not unanchor a finding: the two parses walk the same
+    /// hunks, and treating "unknown" as "blank" would fail closed on the wrong
+    /// side if that ever changed.
+    #[test]
+    fn an_unknown_line_text_does_not_block_a_valid_anchor() {
+        let valid: std::collections::HashSet<u64> = [1].into_iter().collect();
+        assert!(anchorable(1, Some(&valid), None));
     }
 
     #[test]
