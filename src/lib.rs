@@ -25,6 +25,7 @@ pub mod diff;
 pub mod llm;
 pub mod prompt;
 pub mod providers;
+pub mod queue;
 pub mod repo;
 pub mod repo_config;
 pub mod review;

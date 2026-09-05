@@ -275,6 +275,34 @@ Two things it is not:
   the local path you name, and nothing in this crate uploads it. Point it
   somewhere private — and if that is inside a repo, gitignore it.
 
+## PR queue (the layer above one review)
+
+`PRBOT_RUN_LOG` records every run; `queue` reads them back:
+
+```console
+$ cargo run --example queue -- ~/.local/share/pr-review/runs.jsonl
+| | PR | Verdict | Findings | Reviewed |
+| --- | --- | --- | --- | --- |
+| **P0** | github:`o/app`#12 | BLOCK | 2 (1 blocking, 1 high) | 2h · re-reviewed |
+| **P1** | github:`o/app`#13 | APPROVE WITH CHANGES | 1 (1 high) | 1h |
+| **P2** | github:`o/lib`#4 | APPROVE | 0 | 1d |
+```
+
+One row per PR, newest review winning, bucketed from the reviewer's own verdict
+and severity counts. No key, no token, no network — a pure fold over records you
+already have, which is what makes it safe to trust.
+
+It is **not a list of open PRs**: a run log knows only about PRs the reviewer ran
+on, so one nobody reviewed is absent. It is **not a quality measure**: `Priority`
+ranks the reviewer's verdict, and no record knows whether that verdict was right.
+And staleness is partial — a record names the commit it read, but only the
+provider knows the PR's head today; what the fold can see is two records
+disagreeing on the SHA, reported as `superseded` and rendered as *re-reviewed*.
+That detection needs the provider to record a commit id, so it is GitHub/GitLab
+only: Bitbucket deliberately leaves `head_sha` unset (its inline comments need no
+commit), and on a Bitbucket-only log the column is always empty — absent, not
+evidence that nothing moved.
+
 ## PR commands
 
 Wire a comment webhook (see the bot binaries) and the reviewer answers these

@@ -51,13 +51,19 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::llm::{Finding, Usage};
 
 /// Record format version. Bump when a field changes meaning or is removed, so a
 /// reader over a log spanning several releases can tell the shapes apart. Adding
 /// a field is not a bump — every consumer of JSONL must tolerate new keys.
+///
+/// The reader tolerates *missing* keys too: every field but the identity
+/// (`schema`, `ts_unix`, `provider`, `repo`, `pr`) is `#[serde(default)]`, so a
+/// record from a release with a different field set loses a column rather than
+/// failing to parse. A record that fails to parse is a review that happened and a
+/// PR missing from [`crate::queue`] — much worse than an empty cell.
 pub const SCHEMA: u32 = 1;
 
 /// Marks a line as one of ours, under the `_kind` key.
@@ -104,7 +110,13 @@ impl RunLogSink {
 /// stage runs, so the drop at any stage is the difference from the previous one.
 /// `hygiene_added` is the exception: deterministic findings are merged in, so it
 /// is an addition, and `after_collapse` includes them.
-#[derive(Debug, Default, Clone, Serialize)]
+/// `serde(default)` at the container: the next field added here must not make
+/// every older record fail to deserialize. A per-field annotation only covers the
+/// fields that exist today, and the failure it misses is total — a record whose
+/// nested `funnel` cannot be read takes the whole record with it, and the PR
+/// vanishes from [`crate::queue`] rather than losing a column.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Funnel {
     /// Findings the backend returned, before any post-processing.
     pub model_raw: usize,
@@ -134,7 +146,10 @@ pub struct Funnel {
 }
 
 /// One finding as logged: its metadata, where it was posted, and its text.
-#[derive(Debug, Clone, Serialize)]
+/// `Default` + container `serde(default)` for the same reason as [`Funnel`]: a
+/// field added later must cost a column, never the record.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoggedFinding {
     pub severity: String,
     pub file: String,
@@ -163,11 +178,11 @@ pub struct LoggedFinding {
 /// `jq` and pandas, not by the bot's API consumers.
 ///
 /// [`RunReviewOutput`]: crate::review::RunReviewOutput
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunLog {
     /// Always [`KIND`]. First key in the record so a reader — or a human tailing
     /// a mixed stdout stream — can identify the line without parsing it all.
-    #[serde(rename = "_kind")]
+    #[serde(rename = "_kind", skip_deserializing, default = "default_kind")]
     pub kind: &'static str,
     pub schema: u32,
     /// Seconds since the Unix epoch. Deliberately not a formatted timestamp: this
@@ -177,30 +192,40 @@ pub struct RunLog {
     pub ts_unix: u64,
     /// The `pr-review-core` version that produced this record — the reason a run
     /// log is comparable across releases at all.
+    #[serde(default)]
     pub core_version: String,
     pub provider: String,
     pub repo: String,
     pub pr: u64,
+    #[serde(default)]
     pub head_sha: Option<String>,
+    #[serde(default)]
     pub base_branch: Option<String>,
     /// Model as *reported by the run*, not as configured — an agent-CLI backend
     /// may not use the configured OpenRouter model at all.
+    #[serde(default)]
     pub model: String,
     /// True when the review never posted (`--dry-run`, or a bench run).
+    #[serde(default)]
     pub dry_run: bool,
+    #[serde(default)]
     pub posted: bool,
     /// Whether the provider reported CI results for the reviewed commit. The text
     /// itself is not logged — it is another service's output, and only its
     /// presence changes how findings are demoted.
+    #[serde(default)]
     pub ci_status_known: bool,
     /// Bytes of diff actually sent to the backend, after glob filtering and
     /// packing. The single best predictor of cost, and the thing a "why was this
     /// review shallow?" question starts from.
+    #[serde(default)]
     pub diff_bytes: usize,
     /// True when whole files were packed out to fit the size budget — i.e. part
     /// of the change was never reviewed.
+    #[serde(default)]
     pub diff_truncated: bool,
     /// Dependency advisories from the CVE scan.
+    #[serde(default)]
     pub advisories: usize,
     /// True when the review was salvaged from a response the model cut off
     /// mid-output, so findings after the cut are missing.
@@ -209,14 +234,26 @@ pub struct RunLog {
     /// JSON repair (malformed but complete) is not visible here: it is reported
     /// only to the tracing log, and surfacing it would change the signature of
     /// the public `parse_review_with_repair`, which downstream backends call.
+    #[serde(default)]
     pub truncated_salvage: bool,
+    #[serde(default)]
     pub recommendation: String,
+    #[serde(default)]
     pub funnel: Funnel,
+    #[serde(default)]
     pub findings: Vec<LoggedFinding>,
+    #[serde(default)]
     pub usage: Option<Usage>,
     /// Wall-clock milliseconds for the whole run, including the provider fetches
     /// and the post.
+    #[serde(default)]
     pub duration_ms: u64,
+}
+
+/// [`KIND`] as a deserialization default: the field is a constant, and
+/// `&'static str` cannot borrow from an owned JSON document.
+fn default_kind() -> &'static str {
+    KIND
 }
 
 impl RunLog {

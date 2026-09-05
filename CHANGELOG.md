@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+**A PR queue: the layer above one review** (`queue`). A review ended when its
+comment posted, and so did the reviewer's memory of it — every record needed to
+answer *"which of our PRs most needs a human right now?"* was already being
+written by `PRBOT_RUN_LOG` and then never read.
+
+`queue::rank` folds run-log records into one row per PR, newest review winning,
+bucketed P0/P1/P2 from the reviewer's own verdict and severity counts.
+`queue::render_queue` prints it as a table. `cargo run --example queue -- runs.jsonl`
+runs the whole thing — no key, no token, no network, because it is a pure fold
+over records you already have.
+
+Three buckets rather than a score, on purpose: the inputs are a model's severity
+label and its self-reported confidence, and neither is precise enough to order a
+list finely. A score invites comparing two PRs that differ by a point, which is
+noise.
+
+What it deliberately does **not** claim:
+
+- **It is not a list of open PRs.** A run log knows only about PRs the reviewer
+  ran on; one nobody reviewed is invisible, and so is one whose review died before
+  logging. Reconciling against the provider needs a token, which is a bot's job.
+- **It is not a quality measure.** `Priority` ranks the reviewer's *verdict*, and
+  nothing in a record knows whether that verdict was right. P0 means the reviewer
+  said BLOCK, not that the PR is broken.
+- **Staleness is partial, and provider-dependent.** A record names the commit it
+  read; whether that is still the PR's head needs a provider call. What the fold
+  *can* see is two records disagreeing on the SHA — reported as `superseded`. That
+  needs the provider to record a commit id at all, so it is GitHub/GitLab only:
+  Bitbucket leaves `head_sha` unset by design, and on such a log the column is
+  always empty — absent, not evidence that nothing moved.
+
+Dry runs are excluded: they post nothing, so no human can act on them.
+
+`Funnel` and `LoggedFinding` carry `#[serde(default)]` at the **container**, not
+per field: the next field either gains would otherwise make every older record
+holding a populated `funnel`/`findings` fail wholesale, and a record that fails to
+parse is a PR missing from the queue rather than a column missing from a row. The
+fold's tie-break covers every field the rendered row derives from, so two records
+that tie on all of them cannot change the output whichever wins. `provider` is part
+of a row's identity — the same `repo#pr` on two hosts is two PRs — so it reaches
+both the sort key and the rendered cell. And `queue` classifies a recommendation
+through `review::recommendation_rank` rather than a second copy of the same string
+matching.
+
+`runlog::RunLog`, `Funnel` and `LoggedFinding` now derive `Deserialize`, which is
+what made the log readable at all. A record that fails to parse is skipped rather
+than fatal, so a log spanning several releases stays usable.
 ## 0.24.1
 
 **A finding no longer posts on a blank line.** Being *in* the diff was treated as
