@@ -61,7 +61,11 @@ suggestion* button. What has not been exercised on GitLab is the bot driving it:
 the review, anchoring and posting path is shared code, but nobody has watched a
 GitLab review produce one by itself.
 
-Bitbucket has no equivalent feature, so nothing is emitted there — and neither
+Bitbucket Cloud does have code suggestions, but nothing is emitted there yet: its
+documented paths are all UI (a toolbar button, `/suggestcode`) and no raw-markdown
+form is published, so what an API client must post to produce one is unknown. A
+guess that renders as an ordinary code block labelled `suggestion`, with no way to
+apply it, would be worse than the prose it replaced. Nothing is emitted there — and neither
 does the **local** review path, for a different reason: `run_review_local` returns
 `summary_markdown` and `findings_detail`, never the rendered inline bodies, so a
 block built for it would be discarded unread. A local consumer that wants to show

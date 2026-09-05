@@ -16,9 +16,18 @@
 
 /// Whether a provider renders a committable suggestion block natively.
 ///
-/// GitHub and GitLab do, with different fence syntax (see [`fence_info`]).
-/// Bitbucket Cloud has no equivalent: the block would render as an ordinary
-/// code fence with a misleading `suggestion` label and no way to apply it.
+/// GitHub and GitLab do, with different fence syntax (see [`fence_info`]), and
+/// both were confirmed by posting this crate's own output to a live PR/MR.
+///
+/// Bitbucket Cloud **has** a code-suggestions feature, but it is excluded until
+/// someone establishes what an API client must post to produce one. Every
+/// Atlassian doc describes a UI path — a toolbar button, `/suggestcode` — and
+/// none gives a raw-markdown form, which is consistent with suggestions being
+/// stored structurally rather than as a fence. Emitting a speculative
+/// ```` ```suggestion ```` there would, if wrong, render as an ordinary code
+/// block labelled `suggestion` with no way to apply it: worse than the prose it
+/// replaced. Withholding costs a feature; guessing costs trust in every comment
+/// beside it.
 ///
 /// `local` is included again. It was dropped when a local review's rendered
 /// bodies died inside `finish_review` and a block built for it would have been
