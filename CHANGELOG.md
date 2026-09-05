@@ -23,9 +23,13 @@ problem, but replacement text does not — applied, it overwrites a line the fin
 never looked at. Since both features default to on, this is the rule that makes
 the pair safe, and it is covered by a test.
 
-Bitbucket has no equivalent feature, so nothing is emitted there.
-`/review-file` findings post to the summary, where no block would render, so its
-prompt is unchanged.
+Bitbucket has no equivalent feature, so nothing is emitted there — and neither
+does the **local** review path, for a different reason: `run_review_local` returns
+`summary_markdown` and `findings_detail`, never the rendered inline bodies, so a
+block built for it would be discarded unread. A local consumer that wants to show
+the fix as code has the raw `Finding::suggestion` and can run it through the now-
+public `suggest::sanitize` / `suggest::render` itself. `/review-file` findings post
+to the summary, where no block would render, so its prompt is unchanged.
 
 `PRBOT_RUN_LOG` records `funnel.suggested` — of the anchored findings, how many
 carried a block. The gap between that and `funnel.anchored` is how the feature

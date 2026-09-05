@@ -20,14 +20,17 @@
 /// Bitbucket Cloud has no equivalent: the block would render as an ordinary
 /// code fence with a misleading `suggestion` label and no way to apply it.
 ///
-/// `local` is not a host at all — a local review posts nowhere and hands its
-/// markdown back to the caller — so it gets the GitHub form, which is what a
-/// reader pasting it into a PR would want.
+/// `local` is excluded for a different reason — not that it cannot render one,
+/// but that nothing in its output contract carries one. A local review returns
+/// `summary_markdown` (built from the *unanchored* findings) and
+/// `findings_detail`; the rendered inline bodies never leave `finish_review`, so
+/// a block built here would be discarded unread. A local consumer that wants to
+/// display the fix as code has [`Finding::suggestion`] in `findings_detail`, and
+/// can run it through [`sanitize`] and [`render`] itself.
+///
+/// [`Finding::suggestion`]: crate::llm::Finding::suggestion
 pub fn supports_suggestions(provider: &str) -> bool {
-    matches!(
-        provider,
-        "github" | "gitlab" | crate::review::LOCAL_PROVIDER
-    )
+    matches!(provider, "github" | "gitlab")
 }
 
 /// The fence info string that makes a block committable on `provider`.
@@ -49,7 +52,7 @@ fn fence_info(provider: &str) -> &'static str {
 /// `body` is the finding's prose, which is kept above the block: the button
 /// answers *what to write*, never *why*, and a suggestion with no reasoning
 /// above it is a diff with no review attached.
-pub(crate) fn render(provider: &str, body: &str, suggestion: &str) -> String {
+pub fn render(provider: &str, body: &str, suggestion: &str) -> String {
     format!(
         "{}\n\n```{}\n{}\n```",
         body.trim_end(),
@@ -67,7 +70,7 @@ pub(crate) fn render(provider: &str, body: &str, suggestion: &str) -> String {
 /// The suggestion may span several lines even though it replaces one: adding a
 /// guard above a kept statement is the common case, and the host expands the
 /// single anchored line into all of them.
-pub(crate) fn sanitize(suggestion: &str, current: &str) -> Option<String> {
+pub fn sanitize(suggestion: &str, current: &str) -> Option<String> {
     let s = unwrap_fence(suggestion);
     // Trailing blank lines are invisible in the model's output and would commit
     // as real ones. Leading blank lines are load-bearing far less often than
@@ -260,12 +263,19 @@ mod tests {
         assert_eq!(fence_info("github"), "suggestion");
     }
 
+    /// Only the two hosts that both render the block *and* receive a rendered
+    /// comment body from this crate.
+    ///
+    /// `local` is the trap: it renders markdown fine, but `run_review_local`
+    /// returns `summary_markdown` and `findings_detail` — never the inline
+    /// bodies — so a block built for it is discarded unread, and claiming
+    /// support would put a number in `funnel.suggested` for output nobody gets.
     #[test]
-    fn bitbucket_gets_no_suggestions() {
+    fn only_hosts_that_receive_a_rendered_body_get_suggestions() {
         assert!(supports_suggestions("github"));
         assert!(supports_suggestions("gitlab"));
-        assert!(supports_suggestions(crate::review::LOCAL_PROVIDER));
         assert!(!supports_suggestions("bitbucket"));
+        assert!(!supports_suggestions(crate::review::LOCAL_PROVIDER));
     }
 
     #[test]
