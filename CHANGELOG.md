@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+**The engine, usable without Rust** — a `kaniscope` binary, and prebuilt packages on npm and PyPI.
+
+A bot consuming this crate had to be a Rust program. That was never a property of the engine: `run_review` takes five scalars, reads everything else from the environment, and returns one `Serialize` struct that `RunReviewOutput` has always documented as *"the HTTP/CLI response"*. This makes it literally one.
+
+- **`[[bin]] kaniscope`**, behind the new `cli` feature. `--json` puts the whole `RunReviewOutput` on stdout and nothing else; `--local` reviews a diff with no PR; `--schema` prints the JSON Schema of the output. Non-default so the three Rust library consumers do not link clap: build it with `--features cli`.
+- **`kaniscope` on npm and PyPI** (`packaging/`), each a thin client over the bundled binary — `review()` in TypeScript, `review()` / `review_async()` in Python. Per-platform npm packages selected by `os`/`cpu`, and `py3-none-<platform>` wheels that carry a binary rather than an extension module, so a wheel is independent of the Python version it installs under.
+- **`Finding`, `InlineComment`, `Usage` and `RunReviewOutput` now derive `JsonSchema`**, and both clients' types are generated from `kaniscope --schema` and committed. CI regenerates and fails on a diff.
+
+Why not pyo3/napi bindings: the boundary carries five scalars in and one JSON document out, on a call that takes minutes and is network- and clone-bound. FFI there would buy nothing a pipe does not, and would cost an ABI-pinned matrix per Python ABI and per Node release, a tokio bridge into two foreign runtimes, and a second hand-written declaration of every wire type — the exact drift the generated types exist to prevent. The one case bindings would genuinely serve is a non-Rust consumer supplying its own `ReviewBackend` or `Provider`, which needs callbacks into the host language; nothing else a consumer does requires them.
+
+No API breaks. `packaging/` is excluded from the published crate.
+
 ## 0.25.0
 
 **A PR queue: the layer above one review** (`queue`). A review ended when its

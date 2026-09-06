@@ -34,7 +34,7 @@ pub struct PrMeta {
 }
 
 /// One inline comment anchored to a file + line on the new side of the diff.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct InlineComment {
     pub path: String,
     pub line: u64,

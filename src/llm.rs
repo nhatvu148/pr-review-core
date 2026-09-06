@@ -27,7 +27,7 @@ struct ChatReq {
 }
 
 /// Token accounting echoed back by OpenRouter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Usage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
@@ -48,7 +48,7 @@ fn default_severity() -> String {
 /// demanded because a model that drops one field must not cost the whole review:
 /// an unlabelled severity becomes MEDIUM, and an empty `file` simply fails to
 /// anchor and folds into the summary.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Finding {
     #[serde(default = "default_severity")]
     pub severity: String,

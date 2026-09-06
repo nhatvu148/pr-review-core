@@ -5,3 +5,10 @@
 # (nhatvu148/pr-review-docs) and contains client-confidential material, so a new
 # file added there must never reach this public repo by default.
 docs/
+
+# Distribution build outputs (packaging/). The platform packages hold the actual
+# binaries — hundreds of MB — and are rebuilt from CI artifacts on every release.
+packaging/npm/platforms/
+packaging/pypi/wheels/
+packaging/**/node_modules/
+__pycache__/
