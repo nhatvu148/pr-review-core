@@ -103,6 +103,25 @@ def test_timeout_reaps_the_child() -> None:
         os.unlink(binary)
 
 
+def test_sync_timeout_raises_kaniscope_error() -> None:
+    """Both APIs must fail the same way on a timeout.
+
+    The sync path let a raw `subprocess.TimeoutExpired` escape while the async
+    path raised `KaniscopeError`, so a caller following the documented
+    `except KaniscopeError` would have caught one and not the other.
+    """
+    binary = fake_binary("sleep 30")
+    try:
+        kaniscope.review(binary=binary, timeout=0.5)
+        check("a sync timeout raises KaniscopeError", False, "no error raised")
+    except kaniscope.KaniscopeError:
+        check("a sync timeout raises KaniscopeError", True)
+    except BaseException as err:  # noqa: BLE001 - the point is which type escapes
+        check("a sync timeout raises KaniscopeError", False, type(err).__name__)
+    finally:
+        os.unlink(binary)
+
+
 def test_large_single_line_stdout() -> None:
     """`--json` emits the whole review as ONE line, of unbounded length.
 
@@ -155,6 +174,7 @@ if __name__ == "__main__":
     test_unknown_kwarg_is_rejected()
     test_cancellation_reaps_the_child()
     test_timeout_reaps_the_child()
+    test_sync_timeout_raises_kaniscope_error()
     test_large_single_line_stdout()
     test_nonzero_exit_carries_the_reason()
     print()

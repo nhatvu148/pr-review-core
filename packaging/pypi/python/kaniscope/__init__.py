@@ -173,13 +173,31 @@ def review(
     would review a repository named after a provider rather than fail.
     """
     options = locals()
-    result = subprocess.run(
-        [binary or binary_path(), *_build_args(options)],
-        capture_output=True,
-        text=True,
-        env=_environment(env, inherit_env),
-        timeout=timeout,
-    )
+    try:
+        result = subprocess.run(
+            [binary or binary_path(), *_build_args(options)],
+            capture_output=True,
+            text=True,
+            env=_environment(env, inherit_env),
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # Re-raised as KaniscopeError so both APIs fail the same way. A caller
+        # that wraps this in `except KaniscopeError` — which the README and these
+        # docstrings both tell them to — would otherwise have a raw
+        # `subprocess.TimeoutExpired` escape from the sync path only, and find out
+        # in production that the two functions disagree about their own contract.
+        #
+        # `subprocess.run` has already killed and reaped the child by the time it
+        # raises, so unlike the async path there is nothing to clean up here; what
+        # is wrong is only the exception type. Partial output is preserved,
+        # because a review that ran for the full timeout usually printed the
+        # reason it was stuck.
+        stderr = exc.stderr or b""
+        raise KaniscopeError(
+            f"kaniscope timed out after {timeout}s",
+            stderr=stderr.decode(errors="replace") if isinstance(stderr, bytes) else stderr,
+        ) from None
     return _parse(result.stdout, result.stderr, result.returncode)
 
 
