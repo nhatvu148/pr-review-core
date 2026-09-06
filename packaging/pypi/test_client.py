@@ -154,6 +154,60 @@ def test_large_single_line_stdout() -> None:
         os.unlink(binary)
 
 
+def test_env_none_unsets() -> None:
+    """``None`` in ``env`` must UNSET, matching the Node client.
+
+    Node drops an ``undefined`` env value, so the same gesture unset the variable
+    there and silently left the inherited one in place here. Verified against
+    both runtimes before choosing which way to converge.
+    """
+    os.environ["KANISCOPE_TEST_VAR"] = "inherited"
+    unset = kaniscope._environment({"KANISCOPE_TEST_VAR": None}, True)
+    kept = kaniscope._environment({"KANISCOPE_TEST_VAR": "override"}, True)
+    check(
+        "env None unsets an inherited variable",
+        "KANISCOPE_TEST_VAR" not in unset and kept["KANISCOPE_TEST_VAR"] == "override",
+    )
+    del os.environ["KANISCOPE_TEST_VAR"]
+
+
+def test_diff_reaches_stdin() -> None:
+    """``local=True`` with no ``base`` reads the diff from stdin.
+
+    Unreachable through this API until ``diff`` existed, and stdin must not be
+    inherited either: a webhook server has no diff on its stdin, so the child
+    would block on a read that never returns.
+    """
+    # A heredoc, not a quoted printf: inside an unquoted heredoc a `"` is
+    # literal, so the JSON survives the shell intact. One binary echoes what it
+    # read; the other only counts it, because the big-diff case must not embed
+    # raw newlines in a JSON string field.
+    body = (
+        '{"model":"m","findings":0,"inlinePosted":0,"posted":false,"pr":0,'
+        '"provider":"p","recommendation":"%s","repo":"r","summaryMarkdown":""}'
+    )
+    echoes = fake_binary("D=$(cat)\ncat <<EOF\n" + (body % "[$D]") + "\nEOF")
+    counts = fake_binary("N=$(wc -c | tr -d ' ')\ncat <<EOF\n" + (body % "$N") + "\nEOF")
+    try:
+        sync = kaniscope.review(binary=echoes, local=True, diff="THE DIFF")
+        closed = kaniscope.review(binary=echoes, local=True)
+        check("sync diff reaches stdin", sync["recommendation"] == "[THE DIFF]", sync["recommendation"])
+        check("no diff means a closed stdin", closed["recommendation"] == "[]", closed["recommendation"])
+
+        # Past the OS pipe buffer (64 KiB on Linux, 8-64 KiB on macOS), which is
+        # where a write-then-read implementation deadlocks instead of finishing.
+        big = "diff --git a/x b/x\n" + ("+line\n" * 40000)
+        got = asyncio.run(kaniscope.review_async(binary=counts, local=True, diff=big))
+        check(
+            "a diff past the pipe buffer does not deadlock",
+            got["recommendation"] == str(len(big.encode())),
+            f"{len(big) // 1024} KiB delivered, child counted {got['recommendation']}",
+        )
+    finally:
+        os.unlink(echoes)
+        os.unlink(counts)
+
+
 def test_nonzero_exit_carries_the_reason() -> None:
     """A failed review must surface its exit code and stderr, not just fail."""
     binary = fake_binary("echo 'the cause' >&2\nexit 3")
@@ -176,6 +230,8 @@ if __name__ == "__main__":
     test_timeout_reaps_the_child()
     test_sync_timeout_raises_kaniscope_error()
     test_large_single_line_stdout()
+    test_env_none_unsets()
+    test_diff_reaches_stdin()
     test_nonzero_exit_carries_the_reason()
     print()
     if FAILURES:

@@ -67,6 +67,13 @@ kaniscope --local --base main            # the working tree against a ref
 git diff --staged | kaniscope --local    # any diff, from anywhere
 ```
 
+Through the API, `base` picks the ref and `diff` is the stdin form:
+
+```python
+review(local=True, base="main")
+review(local=True, diff=pathlib.Path("change.patch").read_text())
+```
+
 Same reviewer, same prompts, same anchoring — it just has nowhere to post.
 
 ## Why a binary and not a pyo3 extension

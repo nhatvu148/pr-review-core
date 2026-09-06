@@ -57,6 +57,13 @@ kaniscope --local --base main          # the working tree against a ref
 git diff --staged | kaniscope --local  # any diff, from anywhere
 ```
 
+Through the API, `base` picks the ref and `diff` is the stdin form:
+
+```ts
+await review({ local: true, base: "main" });
+await review({ local: true, diff: await readFile("change.patch", "utf8") });
+```
+
 Same reviewer, same prompts, same anchoring — it just has nowhere to post.
 
 ## Why a subprocess and not native bindings

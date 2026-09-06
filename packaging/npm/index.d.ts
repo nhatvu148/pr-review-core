@@ -40,6 +40,16 @@ export interface ReviewOptions extends SpawnOptions {
   label?: string;
   /** Also write the result as JSON to this path, atomically. */
   jsonOut?: string;
+  /**
+   * A unified diff to feed the engine on stdin — the way to use
+   * `{ local: true }` without a {@link base}, matching
+   * `git diff --staged | kaniscope --local`.
+   *
+   * Without it the child's stdin is closed rather than inherited: a server has
+   * no diff on its own stdin, so inheriting would block on a read that never
+   * returns.
+   */
+  diff?: string;
 }
 
 /**

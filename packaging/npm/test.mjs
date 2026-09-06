@@ -109,6 +109,63 @@ await client
     );
 }
 
+// `onLog` is documented as firing once per LINE, but a `data` event is a chunk
+// of a byte stream. A log line straddling two events was delivered as two
+// fragments — half a message each — so this asserts on the exact sequence.
+{
+  const json =
+    '{"model":"m","findings":0,"inlinePosted":0,"posted":false,"pr":0,' +
+    '"provider":"p","recommendation":"r","repo":"r","summaryMarkdown":""}';
+  const binary = fakeBinary(
+    [
+      "printf 'first hal' >&2",
+      "sleep 0.2",                       // force a second data event mid-line
+      "printf 'f-of-line\\n' >&2",
+      "printf 'whole line\\n' >&2",
+      "printf 'tail with no newline' >&2",
+      `cat <<EOF
+${json}
+EOF`,
+    ].join("\n")
+  );
+  const seen = [];
+  await client.review({ binary, onLog: (l) => seen.push(l) });
+  check(
+    "onLog fires once per complete line",
+    seen.length === 3 &&
+      seen[0] === "first half-of-line" &&
+      seen[1] === "whole line" &&
+      seen[2] === "tail with no newline",
+    JSON.stringify(seen)
+  );
+}
+
+// `local` with no `base` reads the diff from stdin. Unreachable through this API
+// while stdin was hard-wired to "ignore"; inheriting the parent's would be worse
+// still, since a server has no diff there.
+{
+  const body = (rec) =>
+    `{"model":"m","findings":0,"inlinePosted":0,"posted":false,"pr":0,` +
+    `"provider":"p","recommendation":"${rec}","repo":"r","summaryMarkdown":""}`;
+  const echoes = fakeBinary(`D=$(cat)\ncat <<EOF\n${body("[$D]")}\nEOF`);
+  const counts = fakeBinary(`N=$(wc -c | tr -d ' ')\ncat <<EOF\n${body("$N")}\nEOF`);
+
+  const sent = await client.review({ binary: echoes, local: true, diff: "THE DIFF" });
+  check("a diff reaches stdin", sent.recommendation === "[THE DIFF]", sent.recommendation);
+
+  const none = await client.review({ binary: echoes, local: true });
+  check("no diff means a closed stdin", none.recommendation === "[]", none.recommendation);
+
+  // Past the OS pipe buffer, where a write-then-read implementation deadlocks.
+  const big = "diff --git a/x b/x\n" + "+line\n".repeat(40000);
+  const got = await client.review({ binary: counts, local: true, diff: big });
+  check(
+    "a diff past the pipe buffer does not deadlock",
+    got.recommendation === String(Buffer.byteLength(big)),
+    `${Math.round(big.length / 1024)} KiB sent, child counted ${got.recommendation}`
+  );
+}
+
 // The override is the documented escape hatch for an unsupported platform, so it
 // has to be read BEFORE the supported-platform check that names it.
 {

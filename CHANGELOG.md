@@ -14,6 +14,8 @@ Why not pyo3/napi bindings: the boundary carries five scalars in and one JSON do
 
 **Release archives + `install.sh`** for everything npm and PyPI do not reach — a Go or Ruby bot, a plain CI job, an air-gapped box. The `Distribute` workflow now archives each platform binary, publishes a `SHA256SUMS` beside them, and attaches both to the GitHub Release; `packaging/install.sh` downloads the right archive, **verifies it against that checksum file before unpacking**, and refuses to install on a mismatch. Deliberately no Go/Ruby/Java client: npm and PyPI were worth building because each is both a distribution channel *and* a client library, and elsewhere the first does not exist (`go install` compiles Go source) while the second is a dozen lines of `exec` plus a JSON decode.
 
+Both clients take a `diff` (TS) / `diff=` (Python) option that feeds the engine on stdin, which is how `local` review works without a `base` — previously unreachable through either API. Neither client inherits the caller's stdin any more: a server has none, so inheriting meant blocking on a read that never returns.
+
 No API breaks. `packaging/` is excluded from the published crate.
 
 ## 0.25.0

@@ -116,9 +116,21 @@ def _build_args(options: Mapping[str, Any]) -> list:
 
 
 def _environment(env: Optional[Mapping[str, str]], inherit_env: bool) -> Dict[str, str]:
+    """Merge ``env`` over the inherited environment. ``None`` means **unset**.
+
+    Skipping a ``None`` instead of removing the key made the two clients
+    disagree about the same gesture: Node drops an ``undefined`` env value, so
+    ``env={"FOO": undefined}`` unsets ``FOO`` there, while here the inherited
+    value silently survived. Verified against both runtimes before choosing which
+    way to converge — unsetting is the useful reading, since "inherit everything
+    except this one secret" has no other spelling.
+    """
     base = dict(os.environ) if inherit_env else {}
-    if env:
-        base.update({k: str(v) for k, v in env.items() if v is not None})
+    for key, value in (env or {}).items():
+        if value is None:
+            base.pop(key, None)
+        else:
+            base[key] = str(value)
     return base
 
 
@@ -156,6 +168,7 @@ def review(
     repo_root: Optional[str] = None,
     label: Optional[str] = None,
     json_out: Optional[str] = None,
+    diff: Optional[str] = None,
     env: Optional[Mapping[str, str]] = None,
     inherit_env: bool = True,
     timeout: Optional[float] = None,
@@ -180,6 +193,14 @@ def review(
             text=True,
             env=_environment(env, inherit_env),
             timeout=timeout,
+            # Explicit, never inherited. `local=True` without `base` reads the
+            # diff from stdin, and leaving stdin to default meant a caller got
+            # whatever the parent had — in a webhook server, nothing, so the
+            # process would block on a read that never returns. `diff` feeds that
+            # mode properly; its absence closes the door rather than leaving it
+            # ajar. The Node client does the same thing for the same reason.
+            input=diff,
+            stdin=None if diff is not None else subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as exc:
         # Re-raised as KaniscopeError so both APIs fail the same way. A caller
@@ -212,6 +233,7 @@ async def review_async(
     repo_root: Optional[str] = None,
     label: Optional[str] = None,
     json_out: Optional[str] = None,
+    diff: Optional[str] = None,
     env: Optional[Mapping[str, str]] = None,
     inherit_env: bool = True,
     timeout: Optional[float] = None,
@@ -240,6 +262,10 @@ async def review_async(
         *_build_args(options),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # Explicit, never inherited — see the note in `review`. A server has no
+        # diff on its stdin, so inheriting means blocking on a read that never
+        # returns; `diff` opens the door deliberately and DEVNULL keeps it shut.
+        stdin=asyncio.subprocess.PIPE if diff is not None else asyncio.subprocess.DEVNULL,
         env=_environment(env, inherit_env),
     )
 
@@ -274,12 +300,35 @@ async def review_async(
             if on_log and line.strip():
                 on_log(line.rstrip("\n"))
 
+    async def feed_stdin() -> None:
+        """Write the diff and close, concurrently with draining the outputs.
+
+        Concurrently, not before: a diff larger than the pipe buffer would block
+        this write until the child consumes it, while the child can block writing
+        its output until we consume that — a deadlock that only shows up on big
+        diffs, which is the worst possible size at which to discover it.
+        """
+        if diff is None or proc.stdin is None:
+            return
+        try:
+            proc.stdin.write(diff.encode())
+            await proc.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            # The child exited before reading it all — its own exit code and
+            # stderr say why, and that is the more useful error of the two.
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
     err_lines: list = []
     gather = asyncio.gather(
-        read_all(proc.stdout), read_lines(proc.stderr, err_lines), proc.wait()
+        read_all(proc.stdout), read_lines(proc.stderr, err_lines), feed_stdin(), proc.wait()
     )
     try:
-        stdout, _, _ = await asyncio.wait_for(gather, timeout=timeout)
+        stdout, _, _, _ = await asyncio.wait_for(gather, timeout=timeout)
     except asyncio.TimeoutError:
         await _terminate(proc)
         raise KaniscopeError(

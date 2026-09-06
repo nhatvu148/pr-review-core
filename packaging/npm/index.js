@@ -12,6 +12,7 @@
 // `--schema`, so they cannot.
 
 const { spawn } = require("node:child_process");
+const { StringDecoder } = require("node:string_decoder");
 const { binaryPath } = require("./binary.js");
 
 /** Flags that take a value, mapped from the camelCase option name. */
@@ -40,7 +41,7 @@ const BOOL_FLAGS = {
  * one mistake in this API with consequences that cannot be undone.
  */
 function buildArgs(options) {
-  const known = new Set([...Object.keys(VALUE_FLAGS), ...Object.keys(BOOL_FLAGS), "env", "inheritEnv", "timeoutMs", "onLog", "binary"]);
+  const known = new Set([...Object.keys(VALUE_FLAGS), ...Object.keys(BOOL_FLAGS), "env", "inheritEnv", "timeoutMs", "onLog", "binary", "diff"]);
   for (const key of Object.keys(options)) {
     if (!known.has(key)) {
       throw new TypeError(`kaniscope: unknown option ${JSON.stringify(key)}`);
@@ -69,25 +70,61 @@ function buildArgs(options) {
  */
 function run(bin, args, options) {
   return new Promise((resolve, reject) => {
+    // stdin is `pipe` only when a diff was supplied. The CLI's most general door
+    // is `git diff | kaniscope --local`, and with stdin hard-wired to "ignore"
+    // that mode was unreachable through this API: the child saw EOF immediately
+    // and bailed with "empty diff". Inheriting the parent's stdin instead — what
+    // the Python client used to do by omission — is worse, because a server has
+    // no diff on stdin and would block or read junk. Explicit both ways.
+    const wantsStdin = options.diff !== undefined && options.diff !== null;
     const child = spawn(bin, args, {
       env: options.inheritEnv === false ? { ...options.env } : { ...process.env, ...options.env },
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [wantsStdin ? "pipe" : "ignore", "pipe", "pipe"],
     });
+
+    if (wantsStdin) {
+      // A child that exits before reading it all (bad flags, missing key) makes
+      // this write fail with EPIPE. That is the child's error to report, not a
+      // crash in the parent, so swallow it and let the exit code speak.
+      child.stdin.on("error", () => {});
+      child.stdin.end(options.diff);
+    }
 
     const stdout = [];
     const stderr = [];
     child.stdout.on("data", (c) => stdout.push(c));
+
+    // The engine logs progress here (tool calls, warnings). A caller that wants
+    // to surface them live gets them line by line; otherwise they are still
+    // kept, because they are what makes a failure diagnosable.
+    //
+    // `carry` holds the incomplete tail of the last chunk. A `data` event is a
+    // chunk of a byte stream, NOT a line: a log line straddling two events was
+    // being delivered as two fragments, which breaks the "called once per line"
+    // contract in index.d.ts and, worse, hands a caller half a message to log.
+    // The StringDecoder is the same bug one level down — it holds a partial
+    // UTF-8 sequence split across chunks instead of turning it into U+FFFD.
+    const decoder = new StringDecoder("utf8");
+    let carry = "";
+    const emitLines = (text, flush) => {
+      if (!options.onLog) return;
+      carry += text;
+      const lines = carry.split("\n");
+      carry = lines.pop(); // the incomplete tail; more bytes may still be coming
+      for (const line of lines) if (line.trim()) options.onLog(line);
+      // At EOF nothing more is coming, so the tail is a whole line after all —
+      // which is the common case, since the last log line has no trailing \n.
+      if (flush && carry.trim()) {
+        options.onLog(carry);
+        carry = "";
+      }
+    };
+
     child.stderr.on("data", (c) => {
       stderr.push(c);
-      // The engine logs progress here (tool calls, warnings). A caller that wants
-      // to surface them live gets them line by line; otherwise they are still
-      // kept, because they are what makes a failure diagnosable.
-      if (options.onLog) {
-        for (const line of c.toString().split("\n")) {
-          if (line.trim()) options.onLog(line);
-        }
-      }
+      emitLines(decoder.write(c), false);
     });
+    child.stderr.on("end", () => emitLines(decoder.end(), true));
 
     let timer;
     if (options.timeoutMs) {
