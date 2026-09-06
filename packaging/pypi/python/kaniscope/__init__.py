@@ -185,8 +185,20 @@ def review(
 
 async def review_async(
     *,
+    provider: Optional[str] = None,
+    repo: Optional[str] = None,
+    pr: Optional[int] = None,
+    dry_run: bool = False,
+    local: bool = False,
+    base: Optional[str] = None,
+    repo_root: Optional[str] = None,
+    label: Optional[str] = None,
+    json_out: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
     on_log: Optional[Callable[[str], None]] = None,
-    **kwargs: Any,
 ) -> RunReviewOutput:
     """:func:`review`, without blocking the event loop.
 
@@ -194,43 +206,89 @@ async def review_async(
     webhook handler — which is the shape most Python bots have. ``on_log`` is
     called per stderr line as it arrives, so a handler can report progress rather
     than going silent for the whole run.
+
+    The signature is spelled out rather than taken as ``**kwargs`` so that an
+    unknown argument is a :class:`TypeError` here, at the call, instead of being
+    dropped on the way to the binary. Silently ignoring ``dryRun=True`` — the
+    natural typo when porting from the TypeScript client, where that IS the
+    spelling — would post a live review to someone's PR while the caller believed
+    they had asked for a dry run. That is the one mistake in this API whose
+    consequences cannot be undone.
     """
-    binary = kwargs.pop("binary", None)
-    env = kwargs.pop("env", None)
-    inherit_env = kwargs.pop("inherit_env", True)
-    timeout = kwargs.pop("timeout", None)
+    options = locals()
 
     proc = await asyncio.create_subprocess_exec(
         binary or binary_path(),
-        *_build_args(kwargs),
+        *_build_args(options),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         env=_environment(env, inherit_env),
     )
 
-    async def drain(stream: Any, sink: list) -> None:
-        async for raw in stream:
+    async def read_all(stream: Any) -> str:
+        """Drain a stream to EOF in bounded chunks.
+
+        Deliberately NOT line-oriented. ``--json`` emits the whole review as ONE
+        line, and asyncio's stream reader raises ``ValueError`` on any line past
+        its 64 KiB limit — so iterating by line fails on exactly the large PRs
+        whose reviews were most expensive to produce, after all the work is done.
+        """
+        chunks = []
+        while True:
+            chunk = await stream.read(65536)
+            if not chunk:
+                return b"".join(chunks).decode(errors="replace")
+            chunks.append(chunk)
+
+    async def read_lines(stream: Any, sink: list) -> None:
+        """Drain stderr by line, reporting each to ``on_log`` as it arrives.
+
+        Line-oriented is right here and wrong for stdout: these are log lines,
+        they are short, and their value is in arriving during the run rather than
+        after it.
+        """
+        while True:
+            raw = await stream.readline()
+            if not raw:
+                return
             line = raw.decode(errors="replace")
             sink.append(line)
             if on_log and line.strip():
                 on_log(line.rstrip("\n"))
 
-    out_lines: list = []
     err_lines: list = []
+    gather = asyncio.gather(
+        read_all(proc.stdout), read_lines(proc.stderr, err_lines), proc.wait()
+    )
     try:
-        await asyncio.wait_for(
-            asyncio.gather(
-                drain(proc.stdout, out_lines), drain(proc.stderr, err_lines), proc.wait()
-            ),
-            timeout=timeout,
-        )
+        stdout, _, _ = await asyncio.wait_for(gather, timeout=timeout)
     except asyncio.TimeoutError:
-        # Kill it rather than leaving an orphan holding a clone and an API key.
-        proc.kill()
-        await proc.wait()
-        raise KaniscopeError(f"kaniscope timed out after {timeout}s", stderr="".join(err_lines))
+        await _terminate(proc)
+        raise KaniscopeError(
+            f"kaniscope timed out after {timeout}s", stderr="".join(err_lines)
+        ) from None
+    except asyncio.CancelledError:
+        # The caller's task was cancelled — a client disconnect, a shutdown, an
+        # `asyncio.timeout` block outside this call. Without this the review keeps
+        # running unsupervised: it holds a clone, spends the API quota, and can
+        # still POST to the pull request minutes after whoever asked for it went
+        # away. Reap it, then let the cancellation continue.
+        await _terminate(proc)
+        raise
 
-    return _parse("".join(out_lines), "".join(err_lines), proc.returncode or 0)
+    return _parse(stdout, "".join(err_lines), proc.returncode or 0)
+
+
+async def _terminate(proc: Any) -> None:
+    """Kill a review subprocess and wait for it, so no orphan is left behind."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        # It exited between the check and the kill; nothing to reap.
+        return
+    await proc.wait()
 
 
 def schema(*, binary: Optional[str] = None) -> Dict[str, Any]:

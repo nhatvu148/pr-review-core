@@ -3,7 +3,7 @@
 
 /** Result of one review run (serialized as the HTTP/CLI response). */
 export interface RunReviewOutput {
-  commentUrl?: string;
+  commentUrl?: string | null;
   findings: number;
   /** The post-processed findings that were posted (after self-critique, confidence floor, sort, and cap). */
   findingsDetail?: Finding[];
@@ -17,19 +17,19 @@ export interface RunReviewOutput {
   recommendation: string;
   repo: string;
   summaryMarkdown: string;
-  usage?: Usage;
+  usage?: Usage | null;
 }
 
 /** One review finding from the model. */
 export interface Finding {
   body: string;
   /** Model's confidence (0–100) that this is a real, actionable issue a senior reviewer would flag. */
-  confidence?: number;
+  confidence?: number | null;
   file?: string;
-  line?: number;
+  line?: number | null;
   severity?: string;
   /** Replacement text for the anchored line, ready to render as a committable suggestion — or `None` whenever the fix is not expressible as an exact line replacement, which is most of the time. */
-  suggestion?: string;
+  suggestion?: string | null;
 }
 
 /** One inline comment anchored to a file + line on the new side of the diff. */
@@ -41,8 +41,8 @@ export interface InlineComment {
 
 /** Token accounting echoed back by OpenRouter. */
 export interface Usage {
-  completion_tokens?: number;
-  prompt_tokens?: number;
-  total_tokens?: number;
+  completion_tokens?: number | null;
+  prompt_tokens?: number | null;
+  total_tokens?: number | null;
 }
 

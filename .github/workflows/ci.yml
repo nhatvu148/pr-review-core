@@ -128,7 +128,16 @@ jobs:
       - name: npm package version matches the crate
         run: node packaging/npm/build-platform-packages.mjs --check
 
-      - name: The wrappers can drive the binary
+      - name: Client regression tests
+        run: |
+          set -euo pipefail
+          # Every case in these two files is a bug one of the clients actually
+          # shipped. They run against a fake binary, so they need no API key and
+          # no network — the real binary is exercised separately below.
+          node packaging/npm/test.mjs
+          (cd packaging/pypi && python3 test_client.py)
+
+      - name: The wrappers can drive the real binary
         env:
           KANISCOPE_BINARY_PATH: ${{ github.workspace }}/target/debug/kaniscope
         run: |

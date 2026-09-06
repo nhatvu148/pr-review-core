@@ -34,6 +34,15 @@ const SUPPORTED = new Set([
  * and unusable, and "ENOENT: kaniscope" points at nothing.
  */
 function binaryPath() {
+  // An explicit override wins, always, and is therefore checked FIRST — before
+  // the supported-platform test below. The unsupported-platform error tells you
+  // to build from source and set this variable, so reading it only after that
+  // check makes the advertised escape hatch unreachable on precisely the
+  // platforms it exists for. It is also how you point at a locally built binary
+  // or an air-gapped vendored copy without editing inside node_modules.
+  const override = process.env.KANISCOPE_BINARY_PATH;
+  if (override) return override;
+
   const key = platformKey();
   if (!SUPPORTED.has(key)) {
     throw new Error(
@@ -42,12 +51,6 @@ function binaryPath() {
         `KANISCOPE_BINARY_PATH to the result.`
     );
   }
-
-  // An explicit override wins, always. It is how you test a locally built binary
-  // against the real wrapper, and how an air-gapped install points at a vendored
-  // copy — both of which otherwise require editing inside node_modules.
-  const override = process.env.KANISCOPE_BINARY_PATH;
-  if (override) return override;
 
   const pkg = `kaniscope-${key}`;
   const exe = process.platform === "win32" ? "kaniscope.exe" : "kaniscope";

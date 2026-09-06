@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import List, TypedDict
+from typing import List, Optional, TypedDict
 
 class _RunReviewOutputRequired(TypedDict):
     findings: int
@@ -20,10 +20,10 @@ class _RunReviewOutputRequired(TypedDict):
 class RunReviewOutput(_RunReviewOutputRequired, total=False):
     """Result of one review run (serialized as the HTTP/CLI response)."""
 
-    commentUrl: str
+    commentUrl: Optional[str]
     findingsDetail: List[Finding]
     inlineDetail: List[InlineComment]
-    usage: Usage
+    usage: Optional[Usage]
 
 
 class _FindingRequired(TypedDict):
@@ -33,11 +33,11 @@ class _FindingRequired(TypedDict):
 class Finding(_FindingRequired, total=False):
     """One review finding from the model."""
 
-    confidence: int
+    confidence: Optional[int]
     file: str
-    line: int
+    line: Optional[int]
     severity: str
-    suggestion: str
+    suggestion: Optional[str]
 
 
 class InlineComment(TypedDict):
@@ -55,6 +55,6 @@ class _UsageRequired(TypedDict):
 class Usage(_UsageRequired, total=False):
     """Token accounting echoed back by OpenRouter."""
 
-    completion_tokens: int
-    prompt_tokens: int
-    total_tokens: int
+    completion_tokens: Optional[int]
+    prompt_tokens: Optional[int]
+    total_tokens: Optional[int]

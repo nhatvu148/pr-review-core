@@ -41,25 +41,48 @@ function loadSchema() {
 }
 
 /**
- * Split a schemars property into `{ types, optional }`.
+ * Split a schemars property into `{ types, nullable }`.
  *
- * schemars renders an `Option<T>` as `anyOf: [T, {type: "null"}]` and a plain `T`
- * as a bare type, so optionality lives in two different places and both have to
- * be read. A property treated as required when it is optional produces a client
- * whose types promise a value that is routinely absent.
+ * Nullable and optional are DIFFERENT things and this only answers the first.
+ * `Option<String>` with no `skip_serializing_if` serializes as an explicit
+ * `"commentUrl": null` — the key is present and its value is null — so a client
+ * typed `commentUrl?: string` is simply wrong about what arrives on the wire.
+ * Optionality (is the key there at all?) comes from the schema's `required`
+ * list instead, in [`objects`].
+ *
+ * Both shapes have to be read, because schemars emits nullability two ways: an
+ * `anyOf: [T, {type: "null"}]`, and a bare `type: ["string", "null"]`. Reading
+ * only the first dropped null from every field in this schema, which is exactly
+ * how a generated client ends up confidently wrong.
  */
 function variants(node) {
   const branches = node.anyOf || node.oneOf || [node];
-  const types = branches.filter((b) => b.type !== "null");
-  const optional = branches.length !== types.length;
-  return { types, optional };
+  let nullable = branches.length !== branches.filter((b) => b.type !== "null").length;
+
+  const types = branches
+    .filter((b) => b.type !== "null")
+    .map((b) => {
+      if (!Array.isArray(b.type)) return b;
+      if (b.type.includes("null")) nullable = true;
+      return { ...b, type: b.type.find((x) => x !== "null") };
+    });
+
+  return { types, nullable };
+}
+
+/** Wrap a rendered type so it also admits null. */
+function nullableOf(inner, lang) {
+  return lang === "ts" ? `${inner} | null` : `Optional[${inner}]`;
 }
 
 /** Map one non-null schema node to a language type via `prims` + `ref`/`array`. */
 function render(node, lang) {
   if (node.$ref) return node.$ref.replace("#/$defs/", "");
   if (node.type === "array") {
-    const inner = render(variants(node.items).types[0], lang);
+    const item = variants(node.items);
+    const inner = item.nullable
+      ? nullableOf(render(item.types[0], lang), lang)
+      : render(item.types[0], lang);
     return lang === "ts" ? `${inner}[]` : `List[${inner}]`;
   }
   const prims =
@@ -100,19 +123,22 @@ function objects(schema) {
     if (!node.properties) throw new Error(`${name} is not an object schema`);
     const required = new Set(node.required || []);
     const fields = Object.entries(node.properties).map(([key, prop]) => {
-      const { types, optional } = variants(prop);
+      const { types, nullable } = variants(prop);
       if (types.length !== 1) {
         throw new Error(`${name}.${key}: expected one non-null variant, got ${types.length}`);
       }
+      const ts = render(types[0], "ts");
+      const py = render(types[0], "py");
       return {
         key,
         doc: summarize(prop.description),
-        // Optional if schemars said so *or* if it is simply not required — a
-        // `#[serde(default)]` field is neither nullable nor required, and reading
-        // only one of the two signals mislabels it.
-        optional: optional || !required.has(key),
-        ts: render(types[0], "ts"),
-        py: render(types[0], "py"),
+        // Whether the KEY can be absent. Distinct from whether its VALUE can be
+        // null: a `#[serde(default)]` field is optional and not nullable, an
+        // `Option<T>` that serializes is nullable and not optional, and a field
+        // can be both. Collapsing the two mislabels every one of those cases.
+        optional: !required.has(key),
+        ts: nullable ? nullableOf(ts, "ts") : ts,
+        py: nullable ? nullableOf(py, "py") : py,
       };
     });
     return { name, doc: summarize(node.description), fields };
@@ -139,7 +165,7 @@ function emitTs(defs) {
 function emitPy(defs) {
   let out =
     BANNER("node packaging/generate-types.mjs").replaceAll("//", "#") +
-    "\nfrom __future__ import annotations\n\nfrom typing import List, TypedDict\n\n";
+    "\nfrom __future__ import annotations\n\nfrom typing import List, Optional, TypedDict\n\n";
   for (const def of defs) {
     // `total=False` on a second class, not `NotRequired` inline: this has to
     // import on the oldest Python the wheel claims, and `NotRequired` is 3.11+
