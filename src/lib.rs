@@ -20,6 +20,7 @@ pub mod changemap;
 pub mod command;
 pub mod complexity;
 pub mod config;
+pub mod config_spec;
 pub mod deps;
 pub mod diff;
 pub mod llm;

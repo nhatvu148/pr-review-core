@@ -122,6 +122,9 @@ jobs:
       - name: Build the CLI
         run: cargo build --features cli --bin kaniscope
 
+      - name: README config table matches the engine's spec
+        run: node scripts/sync-config-docs.mjs --check
+
       - name: Generated types match the engine's schema
         run: node packaging/generate-types.mjs --check
 

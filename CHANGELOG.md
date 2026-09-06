@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**The configuration surface, as data** (`config_spec`). Every knob `Config::from_env` reads was a string literal inside a 130-line constructor, so the surface existed but could not be *enumerated* — nothing could type it, document it, or check it. The README's hand-maintained table had drifted to **41 of the 61 names in use**, and there was no way to tell which 20 were missing.
+
+`config_spec::SPEC` is that enumeration: canonical name, aliases, kind, default and a one-line doc for all 61 (59 entries, two of them aliased — `LLM_API_KEY` and `OPENROUTER_BASE_URL`). `markdown_table()` renders it, `kaniscope --config-docs` prints it, and the README's complete table is generated from it and checked in CI.
+
+What makes it stay true is `spec_matches_config_rs`: it re-reads `config.rs` and fails the build if a variable is read with no entry, or an entry names a variable nothing reads. Mutation-tested in both directions, including the multi-line call form — a naive single-line pattern finds 59 of 61 and looks correct, which is the one failure mode this test must not have.
+
+Secrets are marked as such and their defaults never render, so the generated table cannot leak a key into the README the day one stops being empty.
+
+Groundwork, not the payoff: the npm and PyPI clients still take these as raw `env` strings. A typed `config` option generated from this spec is the intended next step.
+
+
 **The engine, usable without Rust** — a `kaniscope` binary, and prebuilt packages on npm and PyPI.
 
 A bot consuming this crate had to be a Rust program. That was never a property of the engine: `run_review` takes five scalars, reads everything else from the environment, and returns one `Serialize` struct that `RunReviewOutput` has always documented as *"the HTTP/CLI response"*. This makes it literally one.
