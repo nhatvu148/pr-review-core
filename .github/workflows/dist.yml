@@ -93,6 +93,74 @@ jobs:
           path: dist/${{ matrix.target }}
           if-no-files-found: error
 
+  assets:
+    # Attach the binaries to the GitHub Release, which is the ONLY channel for
+    # every ecosystem without a binary registry of its own.
+    #
+    # npm and PyPI each do two jobs — they are how those ecosystems install a
+    # binary at all, and they carry a client library. Go has neither: `go install`
+    # compiles Go source, so a Rust binary cannot travel that way, and a Go caller
+    # only ever wanted `os/exec` plus `json.Unmarshal`. Same for Ruby, Java, .NET,
+    # and for a plain CI job or an air-gapped install. What all of them want is a
+    # URL to a binary and a checksum to verify it, and until this job existed the
+    # workflow built exactly that and then left it in a CI artifact that expires.
+    name: release assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins
+
+      - name: Archive each platform
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for dir in bins/bin-*; do
+            target="${dir#bins/bin-}"
+            chmod +x "$dir"/kaniscope 2>/dev/null || true
+            case "$target" in
+              # zip for Windows, tar.gz everywhere else: a .tar.gz is not
+              # something a stock Windows shell can open, and an installer that
+              # needs a second tool to unpack is one people skip.
+              *windows*) (cd "$dir" && zip -q -r "$GITHUB_WORKSPACE/out/kaniscope-$target.zip" .) ;;
+              *)         tar -czf "out/kaniscope-$target.tar.gz" -C "$dir" . ;;
+            esac
+          done
+          # One checksum file over all archives, with BARE names in it, so
+          # `sha256sum -c SHA256SUMS` works from the directory a user downloaded
+          # into rather than only from this runner's layout.
+          (cd out && sha256sum kaniscope-* > SHA256SUMS)
+          cat out/SHA256SUMS
+
+      # Uploaded whether or not this run publishes, so a dry run still lets you
+      # download and try the exact archives a real run would attach.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: out
+          if-no-files-found: error
+
+      - name: Attach to the Release
+        if: ${{ github.event.inputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # `--clobber` so re-running after a partial failure replaces assets
+          # instead of erroring on the ones that already landed. The Release
+          # itself is created by release.yml on the tag push; this only adds to it.
+          gh release upload "$TAG" out/* --clobber
+          echo "::notice::attached $(ls out | wc -l | tr -d ' ') asset(s) to $TAG"
+
   npm:
     name: npm
     needs: build

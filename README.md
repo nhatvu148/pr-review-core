@@ -119,6 +119,17 @@ npm install kaniscope     # or: npx kaniscope --help
 pip install kaniscope     # or: uv tool install kaniscope
 ```
 
+For everything those two do not reach — a Go or Ruby bot, a plain CI job, an air-gapped box — every release also carries platform archives with a `SHA256SUMS` beside them:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nhatvu148/pr-review-core/main/packaging/install.sh | sh
+# pin a version, choose a directory, or point at an internal mirror:
+#   ... | sh -s -- --version v0.26.0 --dir /usr/local/bin
+#   KANISCOPE_BASE_URL=https://mirror.internal/kaniscope ... | sh
+```
+
+The installer verifies the archive against the release's `SHA256SUMS` before unpacking, and refuses to install on a mismatch. Or just download the archive for your platform from [Releases](https://github.com/nhatvu148/pr-review-core/releases) and put the binary on `PATH` — that is all any non-Rust consumer needs, since the contract is a process and a JSON document.
+
 Both packages carry a thin client over the binary, so a bot reads as a library call:
 
 ```python
@@ -139,6 +150,8 @@ console.log(out.recommendation, out.findings);
 **Why a binary and not pyo3/napi bindings.** The boundary carries five scalars in and one JSON document out, on a call that takes minutes and is network- and clone-bound — the worst possible ratio for FFI. Bindings would cost an ABI-pinned build matrix per Python ABI and per Node release, a tokio bridge into two foreign runtimes, and a second declaration of every wire type. A pipe costs one process spawn. `uv` and `ruff` reach these ecosystems the same way, and the PyPI wheel is `py3-none-<platform>` for the same reason: it carries a binary, not an extension, so it is independent of the Python version it installs under.
 
 `Finding` and `RunReviewOutput` are **generated** for both clients from the binary's own `--schema` and committed (`packaging/generate-types.mjs`); CI regenerates and fails on a diff. That is what stops a field added here from shipping dark in a client, which a missing JSON key otherwise does silently. Sources live in `packaging/`.
+
+There is deliberately no Go, Ruby or Java client. npm and PyPI were worth building because each does *two* jobs — it is how that ecosystem installs a binary at all, **and** it carries a client library. Elsewhere the first job does not exist (`go install` compiles Go source; a Rust binary cannot travel that way) and the second collapses into a dozen lines of `exec` plus a JSON decode. Those ecosystems want a URL and a checksum, which is what the Releases above are.
 
 The one thing this arrangement cannot do is let a non-Rust bot supply its own `ReviewBackend` or `Provider` — that needs real callbacks into the host language. Nothing else a consumer does requires them.
 

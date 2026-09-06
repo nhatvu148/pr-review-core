@@ -93,7 +93,18 @@ function run(bin, args, options) {
     if (options.timeoutMs) {
       timer = setTimeout(() => {
         child.kill("SIGKILL");
-        reject(new Error(`kaniscope: timed out after ${options.timeoutMs}ms`));
+        // Carry the same diagnostics as every other rejection from this file.
+        // A review that ran the full timeout usually printed the reason it was
+        // stuck, and dropping stderr here threw away the only evidence of it —
+        // on the one failure path where there is no exit code to look at either.
+        // `timedOut` because "was it killed by the timeout, or did it die on its
+        // own?" is otherwise only answerable by matching on the message string.
+        const err = new Error(`kaniscope: timed out after ${options.timeoutMs}ms`);
+        err.timedOut = true;
+        err.exitCode = null;
+        err.signal = "SIGKILL";
+        err.stderr = Buffer.concat(stderr).toString();
+        reject(err);
       }, options.timeoutMs);
     }
 

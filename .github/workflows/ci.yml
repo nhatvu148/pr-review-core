@@ -128,6 +128,19 @@ jobs:
       - name: npm package version matches the crate
         run: node packaging/npm/build-platform-packages.mjs --check
 
+      - name: The installer parses as POSIX sh
+        run: |
+          set -euo pipefail
+          # This script is piped into whatever /bin/sh a machine has, and on
+          # Debian/Ubuntu and Alpine that is dash — where bashisms are syntax
+          # errors, not warnings. Checking it under dash is the whole test: a
+          # `curl | sh` installer that fails to parse fails after the user has
+          # already piped it to a shell.
+          sh -n packaging/install.sh
+          sudo apt-get install -y dash >/dev/null 2>&1 || true
+          command -v dash >/dev/null && dash -n packaging/install.sh
+          echo "installer parses under sh and dash"
+
       - name: Client regression tests
         run: |
           set -euo pipefail

@@ -89,6 +89,26 @@ await client
     );
 }
 
+// A timeout must carry the same diagnostics as any other failure. It is the one
+// path with no exit code to inspect, so stderr is the only evidence of why the
+// review was stuck — and it was the only rejection in this file that dropped it.
+{
+  const binary = fakeBinary("echo 'why it was stuck' >&2\nsleep 30");
+  const started = Date.now();
+  await client
+    .review({ binary, timeoutMs: 700 })
+    .then(() => check("a timeout rejects with stderr and a flag", false, "no error"))
+    .catch((err) =>
+      check(
+        "a timeout rejects with stderr and a flag",
+        err.timedOut === true &&
+          err.signal === "SIGKILL" &&
+          err.stderr.includes("why it was stuck"),
+        `timedOut=${err.timedOut} after ${Date.now() - started}ms`
+      )
+    );
+}
+
 // The override is the documented escape hatch for an unsupported platform, so it
 // has to be read BEFORE the supported-platform check that names it.
 {

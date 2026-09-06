@@ -12,6 +12,8 @@ A bot consuming this crate had to be a Rust program. That was never a property o
 
 Why not pyo3/napi bindings: the boundary carries five scalars in and one JSON document out, on a call that takes minutes and is network- and clone-bound. FFI there would buy nothing a pipe does not, and would cost an ABI-pinned matrix per Python ABI and per Node release, a tokio bridge into two foreign runtimes, and a second hand-written declaration of every wire type — the exact drift the generated types exist to prevent. The one case bindings would genuinely serve is a non-Rust consumer supplying its own `ReviewBackend` or `Provider`, which needs callbacks into the host language; nothing else a consumer does requires them.
 
+**Release archives + `install.sh`** for everything npm and PyPI do not reach — a Go or Ruby bot, a plain CI job, an air-gapped box. The `Distribute` workflow now archives each platform binary, publishes a `SHA256SUMS` beside them, and attaches both to the GitHub Release; `packaging/install.sh` downloads the right archive, **verifies it against that checksum file before unpacking**, and refuses to install on a mismatch. Deliberately no Go/Ruby/Java client: npm and PyPI were worth building because each is both a distribution channel *and* a client library, and elsewhere the first does not exist (`go install` compiles Go source) while the second is a dozen lines of `exec` plus a JSON decode.
+
 No API breaks. `packaging/` is excluded from the published crate.
 
 ## 0.25.0
