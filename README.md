@@ -19,7 +19,8 @@ prompt through [`Config`].
 
 ## Used by
 
-- **🦀 Kaniscope** — built entirely on this crate:
+- **🦀 Kaniscope** — built entirely on this crate, and distributed as a binary on
+  [npm](https://www.npmjs.com/package/kaniscope) and [PyPI](https://pypi.org/project/kaniscope/):
   - a hosted **[playground](https://kaniscope.nvnv.app)** (paste a diff or a GitHub PR URL → get a review), and
   - a **[GitHub Action](https://github.com/marketplace/actions/kaniscope-ai-code-review)** on the Marketplace (`uses: nhatvu148/kaniscope-action@v1`).
 
@@ -98,6 +99,61 @@ prompt through [`Config`].
   Together / Groq / a local server via `LLM_BASE_URL` + `LLM_API_KEY`.
 - Webhook signature verification and payload parsing helpers.
 - Dedupe: the bot updates its own prior comments on re-review instead of stacking.
+
+## Using it without Rust — CLI, Python, TypeScript
+
+The engine is a Rust library, but a bot that consumes it does not have to be a Rust program. `run_review` takes five scalars, reads the rest of its configuration from the environment, and returns one JSON document — a wire contract in everything but name. The `kaniscope` binary makes it one.
+
+```sh
+cargo install pr-review-core --features cli     # or use a prebuilt binary below
+kaniscope --provider github --repo me/app --pr 12 --dry-run
+kaniscope --provider github --repo me/app --pr 12 --json | jq .findingsDetail
+kaniscope --local --base main                   # review a diff that has no PR yet
+kaniscope --schema                              # the JSON Schema of --json output
+```
+
+Prebuilt binaries ship through the registries the bots live in, so there is no toolchain to install:
+
+```sh
+npm install kaniscope     # or: npx kaniscope --help
+pip install kaniscope     # or: uv tool install kaniscope
+```
+
+For everything those two do not reach — a Go or Ruby bot, a plain CI job, an air-gapped box — every release also carries platform archives with a `SHA256SUMS` beside them:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nhatvu148/pr-review-core/main/packaging/install.sh | sh
+# pin a version, choose a directory, or point at an internal mirror:
+#   ... | sh -s -- --version v0.26.0 --dir /usr/local/bin
+#   KANISCOPE_BASE_URL=https://mirror.internal/kaniscope ... | sh
+```
+
+The installer verifies the archive against the release's `SHA256SUMS` before unpacking, and refuses to install on a mismatch. Or just download the archive for your platform from [Releases](https://github.com/nhatvu148/pr-review-core/releases) and put the binary on `PATH` — that is all any non-Rust consumer needs, since the contract is a process and a JSON document.
+
+Both packages carry a thin client over the binary, so a bot reads as a library call:
+
+```python
+from kaniscope import review_async
+
+out = await review_async(provider="github", repo="me/app", pr=12)
+for f in out.get("findingsDetail", []):
+    print(f["severity"], f["file"], f["body"])
+```
+
+```ts
+import { review } from "kaniscope";
+
+const out = await review({ provider: "github", repo: "me/app", pr: 12 });
+console.log(out.recommendation, out.findings);
+```
+
+**Why a binary and not pyo3/napi bindings.** The boundary carries five scalars in and one JSON document out, on a call that takes minutes and is network- and clone-bound — the worst possible ratio for FFI. Bindings would cost an ABI-pinned build matrix per Python ABI and per Node release, a tokio bridge into two foreign runtimes, and a second declaration of every wire type. A pipe costs one process spawn. `uv` and `ruff` reach these ecosystems the same way, and the PyPI wheel is `py3-none-<platform>` for the same reason: it carries a binary, not an extension, so it is independent of the Python version it installs under.
+
+`Finding` and `RunReviewOutput` are **generated** for both clients from the binary's own `--schema` and committed (`packaging/generate-types.mjs`); CI regenerates and fails on a diff. That is what stops a field added here from shipping dark in a client, which a missing JSON key otherwise does silently. Sources live in `packaging/`.
+
+There is deliberately no Go, Ruby or Java client. npm and PyPI were worth building because each does *two* jobs — it is how that ecosystem installs a binary at all, **and** it carries a client library. Elsewhere the first job does not exist (`go install` compiles Go source; a Rust binary cannot travel that way) and the second collapses into a dozen lines of `exec` plus a JSON decode. Those ecosystems want a URL and a checksum, which is what the Releases above are.
+
+The one thing this arrangement cannot do is let a non-Rust bot supply its own `ReviewBackend` or `Provider` — that needs real callbacks into the host language. Nothing else a consumer does requires them.
 
 ## Injecting identity and prompt
 
@@ -386,6 +442,12 @@ Then:
    compile, but moved what runs at review time.
 4. `cargo publish --dry-run`, then publish, then tag `vX.Y.Z`.
 5. Bump each consumer's dep to the published version and commit.
+6. **Ship the binaries.** Run the `Distribute` workflow with the new tag and
+   `publish: true` — it builds `kaniscope` for five platforms natively, verifies
+   each one starts, then publishes to npm and PyPI. Leaving `publish` false builds
+   and verifies without shipping, which is the way to check a matrix change.
+   Deliberately not chained to the tag push: a typo'd tag would otherwise burn a
+   version number on three registries at once, and none of them let you reuse it.
 
 ## License
 

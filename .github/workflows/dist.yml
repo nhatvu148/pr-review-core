@@ -1,0 +1,273 @@
+name: Distribute
+
+# Build the `kaniscope` binary for every supported platform and publish it to npm
+# and PyPI, so a bot that is not written in Rust can use this engine.
+#
+# Deliberately NOT triggered by the version tag. `release.yml` already fires on
+# `v*.*.*`, and the crate is published to crates.io by hand — chaining a
+# multi-registry publish onto a tag push would mean a typo'd tag burns three
+# version numbers instead of one, across registries where a version cannot be
+# reused after it is yanked. This is `workflow_dispatch` with an explicit tag and
+# an explicit `publish` switch, so the default run builds and verifies the
+# artifacts without shipping them.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build from (e.g. v0.26.0). Defaults to the current ref."
+        required: false
+      publish:
+        description: "Publish to npm and PyPI. Leave false to build and verify only."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One platform failing must not cancel the others: a partial matrix is
+      # still worth inspecting, and re-running one leg is cheaper than five.
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-apple-darwin
+            runner: macos-14
+          # 22.04, not latest: the glibc a binary is LINKED against is the oldest
+          # it can run on, so building on the newest runner silently narrows who
+          # can install this. The npm/PyPI audience is not on the newest distro.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install Rust
+        run: rustup update stable && rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --features cli --bin kaniscope --target ${{ matrix.target }}
+
+      # A binary that will not start is the worst thing this workflow can
+      # publish, and it is caught by running it once. Cross-built legs are not
+      # runnable here, which is exactly why the matrix uses a native runner per
+      # target rather than cross-compiling from one.
+      - name: Verify it runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/kaniscope"
+          [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ] && BIN="$BIN.exe"
+          "$BIN" --version
+          # `--schema` exercises the serialization path the wrapper packages parse,
+          # without needing a key or the network.
+          "$BIN" --schema | python3 -c "import json,sys; sys.exit(0 if json.load(sys.stdin)['title']=='RunReviewOutput' else 1)"
+
+      - name: Stage the artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${{ matrix.target }}"
+          cp target/${{ matrix.target }}/release/kaniscope* "dist/${{ matrix.target }}/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/${{ matrix.target }}
+          if-no-files-found: error
+
+  assets:
+    # Attach the binaries to the GitHub Release, which is the ONLY channel for
+    # every ecosystem without a binary registry of its own.
+    #
+    # npm and PyPI each do two jobs — they are how those ecosystems install a
+    # binary at all, and they carry a client library. Go has neither: `go install`
+    # compiles Go source, so a Rust binary cannot travel that way, and a Go caller
+    # only ever wanted `os/exec` plus `json.Unmarshal`. Same for Ruby, Java, .NET,
+    # and for a plain CI job or an air-gapped install. What all of them want is a
+    # URL to a binary and a checksum to verify it, and until this job existed the
+    # workflow built exactly that and then left it in a CI artifact that expires.
+    name: release assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins
+
+      - name: Archive each platform
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for dir in bins/bin-*; do
+            target="${dir#bins/bin-}"
+            chmod +x "$dir"/kaniscope 2>/dev/null || true
+            case "$target" in
+              # zip for Windows, tar.gz everywhere else: a .tar.gz is not
+              # something a stock Windows shell can open, and an installer that
+              # needs a second tool to unpack is one people skip.
+              *windows*) (cd "$dir" && zip -q -r "$GITHUB_WORKSPACE/out/kaniscope-$target.zip" .) ;;
+              *)         tar -czf "out/kaniscope-$target.tar.gz" -C "$dir" . ;;
+            esac
+          done
+          # One checksum file over all archives, with BARE names in it, so
+          # `sha256sum -c SHA256SUMS` works from the directory a user downloaded
+          # into rather than only from this runner's layout.
+          (cd out && sha256sum kaniscope-* > SHA256SUMS)
+          cat out/SHA256SUMS
+
+      # Uploaded whether or not this run publishes, so a dry run still lets you
+      # download and try the exact archives a real run would attach.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: out
+          if-no-files-found: error
+
+      - name: Attach to the Release
+        if: ${{ github.event.inputs.publish == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # `--clobber` so re-running after a partial failure replaces assets
+          # instead of erroring on the ones that already landed. The Release
+          # itself is created by release.yml on the tag push; this only adds to it.
+          gh release upload "$TAG" out/* --clobber
+          echo "::notice::attached $(ls out | wc -l | tr -d ' ') asset(s) to $TAG"
+
+  npm:
+    name: npm
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins
+          # Strip the `bin-` prefix so the directories are bare target triples,
+          # which is the layout build-platform-packages.mjs expects.
+          merge-multiple: false
+
+      - name: Normalize artifact layout
+        run: |
+          set -euo pipefail
+          mkdir -p staged
+          for d in bins/bin-*; do mv "$d" "staged/$(basename "$d" | sed 's/^bin-//')"; done
+          ls -R staged
+
+      - name: Build the packages
+        run: |
+          chmod +x staged/*/kaniscope || true
+          node packaging/npm/build-platform-packages.mjs --bins staged
+
+      - name: Publish
+        if: ${{ github.event.inputs.publish == 'true' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Platform packages FIRST. The wrapper pins them as exact-version
+          # optional dependencies, and npm treats a missing optional dependency as
+          # a successful install — so publishing the wrapper first opens a window
+          # where `npm i kaniscope` succeeds and installs no binary at all. This
+          # repo has already shipped a floating tag pointing at a stale image by
+          # getting a publish order wrong; same class of mistake, quieter symptom.
+          for dir in packaging/npm/platforms/*/; do
+            npm publish "$dir" --access public --provenance
+          done
+          npm publish packaging/npm --access public --provenance
+
+  pypi:
+    name: wheel ${{ matrix.target }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin, runner: macos-14 }
+          - { target: x86_64-apple-darwin, runner: macos-14 }
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+          - { target: x86_64-pc-windows-msvc, runner: windows-latest }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      # One wheel per platform, each built natively — a wheel is per-platform but
+      # NOT per-Python-version, because this distribution carries a binary rather
+      # than an extension module. That is the whole reason the matrix is five
+      # entries instead of five times the supported interpreters.
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --out wheels
+          working-directory: packaging/pypi
+          target: ${{ matrix.target }}
+          # Linux wheels must carry a manylinux tag or PyPI rejects them; `auto`
+          # builds inside the manylinux container that produces one.
+          manylinux: auto
+          sccache: true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: packaging/pypi/wheels
+          if-no-files-found: error
+
+  publish-pypi:
+    name: PyPI publish
+    needs: pypi
+    runs-on: ubuntu-latest
+    # Gate the upload on the switch, not on the build: a default run still
+    # produces every wheel as an artifact you can install and try by hand.
+    if: ${{ github.event.inputs.publish == 'true' }}
+    permissions:
+      # Trusted publishing, so no long-lived PyPI token lives in this repo.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: wheels
+          merge-multiple: true
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: wheels

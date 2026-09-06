@@ -1,0 +1,185 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunReviewOutput",
+  "description": "Result of one review run (serialized as the HTTP/CLI response).",
+  "type": "object",
+  "properties": {
+    "commentUrl": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "findings": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "findingsDetail": {
+      "description": "The post-processed findings that were posted (after self-critique,\nconfidence floor, sort, and cap). Exposed for tooling/benchmarks that need\nthe structured findings, not just the count. Empty on an advisory-only run.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Finding"
+      }
+    },
+    "inlineDetail": {
+      "description": "The inline comments exactly as they were built — path, line, and the\nrendered body, committable suggestion block and all.\n\nExposed because `inline_posted` is a count, and a count cannot be reviewed.\nEverything a reader needs to judge an inline comment *before* it reaches\nsomeone's PR — the suggestion block above all, which is applied on one\nclick — existed only inside `finish_review` and was dropped on the way out.\nThat left `--dry-run` unable to show what it was a dry run of, and it is\nwhy suggestions shipped with no way to preview them.\n\nPopulated on every run, posted or not.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/InlineComment"
+      }
+    },
+    "inlinePosted": {
+      "type": "integer",
+      "format": "uint",
+      "minimum": 0
+    },
+    "model": {
+      "type": "string"
+    },
+    "posted": {
+      "type": "boolean"
+    },
+    "pr": {
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    },
+    "provider": {
+      "type": "string"
+    },
+    "recommendation": {
+      "type": "string"
+    },
+    "repo": {
+      "type": "string"
+    },
+    "summaryMarkdown": {
+      "type": "string"
+    },
+    "usage": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Usage"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "provider",
+    "repo",
+    "pr",
+    "model",
+    "recommendation",
+    "findings",
+    "inlinePosted",
+    "posted",
+    "summaryMarkdown"
+  ],
+  "$defs": {
+    "Finding": {
+      "description": "One review finding from the model.\n\nOnly `body` is required. `severity` and `file` are defaulted rather than\ndemanded because a model that drops one field must not cost the whole review:\nan unlabelled severity becomes MEDIUM, and an empty `file` simply fails to\nanchor and folds into the summary.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "confidence": {
+          "description": "Model's confidence (0–100) that this is a real, actionable issue a senior\nreviewer would flag. Absent on older responses; treated as full confidence.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "default": null,
+          "maximum": 255,
+          "minimum": 0
+        },
+        "file": {
+          "type": "string",
+          "default": ""
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "severity": {
+          "type": "string",
+          "default": "MEDIUM"
+        },
+        "suggestion": {
+          "description": "Replacement text for the anchored line, ready to render as a committable\nsuggestion — or `None` whenever the fix is not expressible as an exact\nline replacement, which is most of the time.\n\nNever load-bearing: `body` states the fix in prose either way, and the\nsuggestion is dropped outright if it fails [`crate::suggest::sanitize`].\nAbsent on older responses and on every backend that does not know to\nproduce it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "body"
+      ]
+    },
+    "InlineComment": {
+      "description": "One inline comment anchored to a file + line on the new side of the diff.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "line": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "line",
+        "body"
+      ]
+    },
+    "Usage": {
+      "description": "Token accounting echoed back by OpenRouter.",
+      "type": "object",
+      "properties": {
+        "completion_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "prompt_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "total_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

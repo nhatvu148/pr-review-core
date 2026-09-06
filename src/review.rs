@@ -26,8 +26,9 @@ pub struct RunReviewInput {
 }
 
 /// Result of one review run (serialized as the HTTP/CLI response).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+#[schemars(rename_all = "camelCase")]
 pub struct RunReviewOutput {
     pub provider: String,
     pub repo: String,

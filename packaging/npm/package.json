@@ -1,0 +1,41 @@
+{
+  "name": "kaniscope",
+  "version": "0.25.0",
+  "description": "AI pull-request reviewer — line-anchored inline comments plus a summary, for GitHub, GitLab and Bitbucket. Ships a native binary; no Rust toolchain required.",
+  "keywords": [
+    "code-review",
+    "pull-request",
+    "ai",
+    "github",
+    "gitlab",
+    "bitbucket"
+  ],
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nhatvu148/pr-review-core.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "index.js",
+  "types": "index.d.ts",
+  "bin": {
+    "kaniscope": "bin/kaniscope.js"
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "types.d.ts",
+    "binary.js",
+    "bin/kaniscope.js",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "kaniscope-darwin-arm64": "0.25.0",
+    "kaniscope-darwin-x64": "0.25.0",
+    "kaniscope-linux-arm64": "0.25.0",
+    "kaniscope-linux-x64": "0.25.0",
+    "kaniscope-win32-x64": "0.25.0"
+  }
+}

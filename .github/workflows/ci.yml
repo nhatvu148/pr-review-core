@@ -101,3 +101,74 @@ jobs:
           sed -i 's|^pr-review-core = .*|pr-review-core = { path = "../core" }|' Cargo.toml
           grep -n '^pr-review-core' Cargo.toml
           cargo check --all-targets --features claude-code
+
+  packaging:
+    # The npm and PyPI wrappers restate this crate's wire shape in two more
+    # languages, and the failure that costs the most is the quiet one: a field
+    # added to `Finding` in Rust and missed in a client ships the feature dark,
+    # because a missing key in JSON is just `undefined`. Nothing here is
+    # hand-written — the types are generated from the binary's own `--schema` and
+    # committed — so this job's whole job is to prove the committed copies still
+    # match the engine.
+    name: wrapper packages in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+
+      - name: Build the CLI
+        run: cargo build --features cli --bin kaniscope
+
+      - name: Generated types match the engine's schema
+        run: node packaging/generate-types.mjs --check
+
+      - name: npm package version matches the crate
+        run: node packaging/npm/build-platform-packages.mjs --check
+
+      - name: The installer parses as POSIX sh
+        run: |
+          set -euo pipefail
+          # This script is piped into whatever /bin/sh a machine has, and on
+          # Debian/Ubuntu and Alpine that is dash — where bashisms are syntax
+          # errors, not warnings. Checking it under dash is the whole test: a
+          # `curl | sh` installer that fails to parse fails after the user has
+          # already piped it to a shell.
+          sh -n packaging/install.sh
+          sudo apt-get install -y dash >/dev/null 2>&1 || true
+          command -v dash >/dev/null && dash -n packaging/install.sh
+          echo "installer parses under sh and dash"
+
+      - name: Client regression tests
+        run: |
+          set -euo pipefail
+          # Every case in these two files is a bug one of the clients actually
+          # shipped. They run against a fake binary, so they need no API key and
+          # no network — the real binary is exercised separately below.
+          node packaging/npm/test.mjs
+          (cd packaging/pypi && python3 test_client.py)
+
+      - name: The wrappers can drive the real binary
+        env:
+          KANISCOPE_BINARY_PATH: ${{ github.workspace }}/target/debug/kaniscope
+        run: |
+          set -euo pipefail
+          # A smoke test, not a review: `--schema` and `--version` need no API key
+          # and no network, and they exercise the exact spawn-and-parse path both
+          # clients use. A wrapper that cannot parse its own binary's output is
+          # the one bug neither language's type checker can catch.
+          node -e '
+            const k = require("./packaging/npm/index.js");
+            k.schema().then((s) => {
+              if (s.title !== "RunReviewOutput") throw new Error("unexpected schema: " + s.title);
+              console.log("node client OK");
+            });
+          '
+          PYTHONPATH=packaging/pypi/python python3 -c '
+          import kaniscope
+          assert kaniscope.schema()["title"] == "RunReviewOutput"
+          assert kaniscope.version()
+          print("python client OK")
+          '

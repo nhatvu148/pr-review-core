@@ -8,10 +8,33 @@ repository = "https://github.com/nhatvu148/pr-review-core"
 readme = "README.md"
 keywords = ["pr-review", "code-review", "openrouter", "github", "bitbucket"]
 categories = ["development-tools"]
+# The npm/PyPI wrapper sources are not part of the crate a Rust consumer
+# installs, and `platforms/` holds hundreds of MB of built binaries at release
+# time. Keeping them out of the .crate keeps `cargo package` honest about what
+# the library actually is.
+exclude = ["packaging/"]
 
 [lib]
 name = "pr_review_core"
 path = "src/lib.rs"
+
+# The distributable CLI. This is the door for every consumer that is not itself a
+# Rust program: a bot written in Python or TypeScript sets env vars, spawns this,
+# and reads one JSON object back — see `packaging/`. `RunReviewOutput` was always
+# documented as "the HTTP/CLI response"; this makes that literally true.
+[[bin]]
+name = "kaniscope"
+path = "src/bin/kaniscope.rs"
+# Not built by default. Three library consumers (kaniscope-action, pr-review-bot,
+# vexar) link this crate and none of them want clap in their tree; a bin that is
+# always built would put it there. The distribution artifacts are built with
+# `--features cli`, so no end user ever types this.
+required-features = ["cli"]
+
+[features]
+default = []
+# Everything the `kaniscope` binary needs and the library does not.
+cli = ["dep:clap", "dep:dotenvy", "dep:tracing-subscriber"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
@@ -51,6 +74,11 @@ tree-sitter-typescript = "0.23"
 tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
 tree-sitter-go = "0.23"
+
+# --- CLI-only (feature `cli`); optional so the library keeps its small tree. ---
+clap = { version = "4", features = ["derive"], optional = true }
+dotenvy = { version = "0.15", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
 
 [dev-dependencies]
 # Mock OpenRouter endpoint. `Config::openrouter_base_url` is already injectable,

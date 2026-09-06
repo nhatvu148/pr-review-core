@@ -1,0 +1,54 @@
+# The PyPI distribution: a wheel that carries the native `kaniscope` binary plus
+# a thin Python client, and NO extension module.
+#
+# `bindings = "bin"` is what makes that true, and it is the whole reason this is
+# cheap to maintain. A pyo3 extension would need a wheel per interpreter ABI, and
+# would tie the release to CPython's own schedule. A binary wheel is
+# Python-version-independent: one artifact per platform, built once, valid for
+# every Python that can install it. Same arrangement as `uv` and `ruff`.
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "kaniscope"
+description = "AI pull-request reviewer — line-anchored inline comments plus a summary, for GitHub, GitLab and Bitbucket. Ships a native binary; no Rust toolchain required."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.9"
+keywords = ["code-review", "pull-request", "ai", "github", "gitlab", "bitbucket"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+  "Topic :: Software Development :: Quality Assurance",
+]
+# No runtime dependencies, deliberately. This package is spawn + json.loads; a
+# bot that installs it should not thereby acquire an HTTP client or a validation
+# library it did not ask for.
+dependencies = []
+# `version` comes from Cargo.toml, so the wheel and the engine can never disagree
+# about which release this is.
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/nhatvu148/pr-review-core"
+Changelog = "https://github.com/nhatvu148/pr-review-core/blob/main/CHANGELOG.md"
+
+[tool.maturin]
+bindings = "bin"
+manifest-path = "../../Cargo.toml"
+# The binary is behind this feature so that the three Rust library consumers do
+# not link clap. Every distribution build has to switch it on.
+features = ["cli"]
+# The pure-Python client lives beside the binary in the same wheel, so
+# `pip install kaniscope` gives both `kaniscope` on PATH and `import kaniscope`.
+python-source = "python"
+# maturin derives the module name from the CRATE name (`pr_review_core`) unless
+# told otherwise, and then looks for a Python package by that name — which is not
+# what this distribution is called. Without this the build fails outright, which
+# is the good failure; the bad one would be a wheel that installs a module nobody
+# imports.
+module-name = "kaniscope"
+strip = true
