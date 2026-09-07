@@ -30,7 +30,7 @@ Three things, and they are yours because they are where bots differ:
 npm test
 ```
 
-Nine checks, no API key, no GitHub token, no pull request. `KANISCOPE_BINARY_PATH` points the client at a fake engine that records how it was called and answers with a valid `RunReviewOutput`, so the whole path runs for real:
+12 checks, no API key, no GitHub token, no pull request. `KANISCOPE_BINARY_PATH` points the client at a fake engine that records how it was called and answers with a valid `RunReviewOutput`, so the whole path runs for real:
 
 ```
 ok   a bad signature is rejected
