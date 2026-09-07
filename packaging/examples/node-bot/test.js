@@ -97,6 +97,41 @@ async function waitForInvocation(ms = 3000) {
   check("a draft is skipped", (await post(port, prEvent("opened", { draft: true }))) === 204);
   check("a non-PR event is skipped", (await post(port, prEvent("opened"), { event: "issues" })) === 204);
 
+  // A signed payload is authentic, not well-formed. These fields are read
+  // BEFORE the 202, because reading them after it throws inside an async
+  // listener with nobody left to catch it — an unhandled rejection that takes
+  // the process and every in-flight review with it.
+  check(
+    "a signed payload missing repository is rejected, not crashed on",
+    (await post(port, { action: "opened", pull_request: { number: 42, draft: false } })) === 400
+  );
+  check(
+    "a signed payload missing pull_request.number is rejected",
+    (await post(port, { action: "opened", repository: { full_name: "me/app" }, pull_request: { draft: false } })) === 400
+  );
+
+  // The body has to be bounded BEFORE the signature can be checked, since the
+  // check needs the body. Without a cap, any unauthenticated client can make the
+  // process buffer until it dies.
+  {
+    const huge = JSON.stringify({ action: "opened", pad: "x".repeat(3 * 1024 * 1024) });
+    let status = 0;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/webhook`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-github-event": "pull_request",
+                   "x-hub-signature-256": sign(huge) },
+        body: huge,
+      });
+      status = res.status;
+    } catch {
+      // A destroyed socket can surface as a fetch error rather than a 413; both
+      // mean the server refused to buffer it, which is the property under test.
+      status = 413;
+    }
+    check("an oversized body is refused before it can exhaust memory", status === 413, `status=${status}`);
+  }
+
   check("nothing has reached the engine yet", (await waitForInvocation(300)) === "");
 
   // The real path.

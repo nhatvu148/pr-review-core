@@ -37,10 +37,13 @@ ok   a bad signature is rejected
 ok   a missing signature is rejected
 ok   a push (synchronize) is skipped
 ok   a draft is skipped
-ok   nothing has reached the engine yet
+ok   a signed payload missing repository is rejected, not crashed on
+ok   an oversized body is refused before it can exhaust memory
 ok   a real PR is accepted immediately
 ok   the engine was called with the payload's repo and PR
 ```
+
+Two of those exist because the engine's own reviewer found the bugs in this file. It flagged that the body was buffered without a limit *before* the signature could be checked — an unauthenticated memory-exhaustion path — and that a signed-but-malformed payload was dereferenced **after** the 202 was sent, where a throw becomes an unhandled rejection that kills the process. Both are the kind of thing a copied example propagates, so both are fixed and tested here.
 
 That override is worth knowing about generally — it makes the engine substitutable in one environment variable, which is what lets a bot's own tests stay fast and offline.
 

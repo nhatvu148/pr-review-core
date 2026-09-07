@@ -58,9 +58,32 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Bound the body BEFORE the signature is checked, because the check cannot
+  // happen until the body has been read — so until this limit exists, any
+  // unauthenticated client can make the process buffer until it dies, taking
+  // every in-flight review with it. GitHub caps webhook payloads at 25 MB and a
+  // `pull_request` event is orders of magnitude smaller; 2 MB is generous.
+  const MAX_BODY = 2 * 1024 * 1024;
   const chunks = [];
-  req.on("data", (c) => chunks.push(c));
+  let size = 0;
+  let aborted = false;
+
+  req.on("data", (c) => {
+    if (aborted) return;
+    size += c.length;
+    if (size > MAX_BODY) {
+      aborted = true;
+      res.writeHead(413).end("payload too large");
+      req.destroy();
+      return;
+    }
+    chunks.push(c);
+  });
+
   req.on("end", async () => {
+    // `destroy()` can still be followed by `end`; without this the handler runs
+    // on a truncated body and answers a request already answered with 413.
+    if (aborted) return;
     // The RAW bytes, not a re-serialized object: the signature is over exactly
     // what GitHub sent, and `JSON.stringify(JSON.parse(body))` is not that.
     const raw = Buffer.concat(chunks);
@@ -84,13 +107,24 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // Read the fields BEFORE acknowledging, and reject rather than assume them.
+    // A signed payload is authentic, not well-formed. Reaching for
+    // `payload.repository.full_name` after the 202 has been sent throws inside
+    // an async listener with no caller left to catch it — an unhandled
+    // rejection that kills the process and every other in-flight review. The
+    // catch below cannot help: it starts one line too late.
+    const repo = payload.repository?.full_name;
+    const pr = payload.pull_request?.number;
+    if (typeof repo !== "string" || typeof pr !== "number") {
+      res.writeHead(400).end("missing repository.full_name or pull_request.number");
+      return;
+    }
+
     // Acknowledge BEFORE reviewing. A review takes minutes and GitHub gives a
     // webhook ten seconds; holding the connection open earns a delivery failure
     // and a redelivery, which reviews the same PR twice.
     res.writeHead(202).end("reviewing");
 
-    const repo = payload.repository.full_name;
-    const pr = payload.pull_request.number;
     try {
       const out = await review({
         provider: "github",
