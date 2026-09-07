@@ -52,7 +52,9 @@ function binaryPath() {
     );
   }
 
-  const pkg = `kaniscope-${key}`;
+  // Scoped, matching what the generator publishes — see the note there on npm's
+  // spam detection. The wrapper itself stays unscoped.
+  const pkg = `@nhatvu148/kaniscope-${key}`;
   const exe = process.platform === "win32" ? "kaniscope.exe" : "kaniscope";
 
   // Resolve the package's manifest, not the binary: `bin/` is not an export, and

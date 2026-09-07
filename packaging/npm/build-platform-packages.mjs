@@ -23,6 +23,25 @@ const NPM_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.dirname(path.dirname(NPM_DIR));
 const OUT_DIR = path.join(NPM_DIR, "platforms");
 
+/** The npm scope the per-platform packages live under.
+ *
+ * Scoped, because unscoped ones do not survive contact with npm. Publishing five
+ * near-identical new names into the global namespace tripped npm's spam
+ * detection on the fifth:
+ *
+ *   403 Forbidden - PUT /kaniscope-win32-x64
+ *   Package name triggered spam detection
+ *
+ * Name-based, not rate-based — an identical retry got the identical error, with
+ * the four earlier names already published. A scope sidesteps it because these
+ * names no longer compete for the global namespace at all, which is why esbuild
+ * and every other project shipping per-platform binaries is scoped too.
+ *
+ * The WRAPPER stays unscoped: `npm i kaniscope` is the name a user types, and it
+ * was never the one npm objected to.
+ */
+const SCOPE = "@nhatvu148";
+
 /** Rust target triple -> the npm `os`/`cpu` pair that must match it. */
 const TARGETS = {
   "aarch64-apple-darwin": { os: "darwin", cpu: "arm64" },
@@ -57,7 +76,7 @@ const expected = {
   ...wrapper,
   version,
   optionalDependencies: Object.fromEntries(
-    Object.values(TARGETS).map(({ os, cpu }) => [`kaniscope-${os}-${cpu}`, version])
+    Object.values(TARGETS).map(({ os, cpu }) => [`${SCOPE}/kaniscope-${os}-${cpu}`, version])
   ),
 };
 const serialized = JSON.stringify(expected, null, 2) + "\n";
@@ -98,6 +117,8 @@ for (const [triple, { os, cpu }] of Object.entries(TARGETS)) {
     process.exit(1);
   }
 
+  // Directory name stays flat — a `@scope/name` path would nest, and the
+  // publish loop globs one level.
   const dir = path.join(OUT_DIR, `kaniscope-${os}-${cpu}`);
   fs.mkdirSync(path.join(dir, "bin"), { recursive: true });
   fs.copyFileSync(source, path.join(dir, "bin", exe));
@@ -111,7 +132,7 @@ for (const [triple, { os, cpu }] of Object.entries(TARGETS)) {
     path.join(dir, "package.json"),
     JSON.stringify(
       {
-        name: `kaniscope-${os}-${cpu}`,
+        name: `${SCOPE}/kaniscope-${os}-${cpu}`,
         version,
         description: `The kaniscope binary for ${os}-${cpu}. Installed automatically by the \`kaniscope\` package.`,
         license: wrapper.license,
@@ -129,7 +150,7 @@ for (const [triple, { os, cpu }] of Object.entries(TARGETS)) {
     ) + "\n"
   );
   const size = (fs.statSync(source).size / 1024 / 1024).toFixed(1);
-  console.log(`kaniscope-${os}-${cpu}@${version} (${size} MiB)`);
+  console.log(`${SCOPE}/kaniscope-${os}-${cpu}@${version} (${size} MiB)`);
 }
 
 // A published binary that will not start is the worst artifact here, and the one
