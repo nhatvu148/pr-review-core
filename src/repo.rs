@@ -30,6 +30,7 @@ impl Workspace {
     pub fn clone(clone_url: &str, head_sha: Option<&str>) -> Result<Self> {
         let tmp = tempfile::tempdir().context("create temp dir for clone")?;
         let root = tmp.path().to_path_buf();
+        create_private_dir(&root).context("restrict permissions on the clone dir")?;
 
         clone_with_retry(clone_url, &root)?;
 
@@ -292,10 +293,14 @@ fn clone_with_retry(clone_url: &str, root: &Path) -> Result<()> {
         // A previous attempt may have left a partial tree behind; `git clone`
         // refuses a non-empty destination, so a retry into it would fail for a
         // reason that has nothing to do with the network.
+        // Errors here are propagated rather than swallowed. A real filesystem
+        // failure — permissions, ENOSPC — used to fall through to a confusing
+        // git error *and* burn the remaining attempts on sleeps first, which
+        // reports a network fault for a full disk.
         if root.exists() {
-            let _ = std::fs::remove_dir_all(root);
+            std::fs::remove_dir_all(root).context("clear the previous clone attempt")?;
         }
-        let _ = std::fs::create_dir_all(root);
+        create_private_dir(root).context("recreate the clone dir")?;
 
         match run_git_bounded(
             &[
@@ -331,6 +336,38 @@ fn clone_with_retry(clone_url: &str, root: &Path) -> Result<()> {
         "git clone failed after {CLONE_ATTEMPTS} attempts: {}",
         last.unwrap_or_else(|| "unknown error".into())
     )
+}
+
+/// Create `path` as a directory only this user can enter.
+///
+/// The clone writes the token-bearing remote URL into `.git/config`, so the
+/// directory holding it must not be readable by other local users. A review flagged
+/// the retry path for recreating it with `create_dir_all`, which is subject to the
+/// umask — and measuring it showed the problem is wider than that: on this platform
+/// `tempfile::tempdir()` itself yields **0755**, not the 0700 its documentation
+/// describes. So the exposure predates the retry, and setting the mode explicitly
+/// fixes both paths rather than restoring a property that was never there.
+///
+/// Not `#[cfg(unix)]`-only at the call sites: on other platforms this is a plain
+/// `create_dir_all`, so callers do not have to branch.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        // `recursive(true)` does not re-apply the mode to a directory that
+        // already existed, which is exactly the tempdir case above.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::PermissionsExt;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
 }
 
 /// Replace the credentials in any `scheme://user:secret@host` with `***`.
@@ -688,6 +725,31 @@ mod clone_timeout_tests {
             redact("[\"https://u:p@a.com/x\", \"https://u:p@b.com/y\"]"),
             "[\"https://***@a.com/x\", \"https://***@b.com/y\"]"
         );
+    }
+
+    /// The clone directory must not be readable by other local users: the clone
+    /// writes the token-bearing remote URL into `.git/config`.
+    ///
+    /// Measured, not assumed — `tempfile::tempdir()` returned 0755 on the machine
+    /// this was written on, despite documenting 0700, which is why the mode is set
+    /// explicitly instead of relied upon.
+    #[cfg(unix)]
+    #[test]
+    fn the_clone_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("clone");
+        create_private_dir(&root).expect("create");
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "fresh dir is {mode:04o}, not private");
+
+        // And again over a directory that already exists with a loose mode —
+        // the retry path, and the tempdir itself.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&root).expect("recreate over an existing dir");
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "existing dir left at {mode:04o}");
     }
 
     /// Output larger than a pipe buffer must not deadlock. Before stdout was
