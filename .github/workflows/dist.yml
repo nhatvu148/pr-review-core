@@ -240,13 +240,21 @@ jobs:
           # publish ORDER below exists to prevent.
           publish_if_new() {
             local dir="$1" name version
-            name=$(node -p "require('./$dir/package.json').name")
-            version=$(node -p "require('./$dir/package.json').version")
+            # `./` is load-bearing. npm parses an `owner/repo` shaped argument as
+            # GitHub shorthand, so `npm publish packaging/npm` does not publish
+            # the directory — it tries to clone
+            # `ssh://git@github.com/packaging/npm.git` and dies with
+            # "Permission denied (publickey)". The platform directories have
+            # four path segments and escaped that reading by luck; the wrapper
+            # has exactly two and did not.
+            local path="./${dir#./}"
+            name=$(node -p "require('$path/package.json').name")
+            version=$(node -p "require('$path/package.json').version")
             if npm view "$name@$version" version >/dev/null 2>&1; then
               echo "::notice::$name@$version already published — skipping"
               return 0
             fi
-            npm publish "$dir" --access public --provenance
+            npm publish "$path" --access public --provenance
           }
 
           # Platform packages FIRST. The wrapper pins them as exact-version
