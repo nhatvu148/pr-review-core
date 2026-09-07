@@ -85,7 +85,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "dist/${{ matrix.target }}"
-          cp target/${{ matrix.target }}/release/kaniscope* "dist/${{ matrix.target }}/"
+          # Name the file, do not glob it. `kaniscope*` also matches
+          # `kaniscope.d` — cargo's dep-info — which then rode into the release
+          # archive and onto the GitHub Release, where artifacts are permanent.
+          # Caught by extracting a dry-run archive and looking inside it, which
+          # is the only place it was ever visible: nothing failed, because the
+          # installer extracts `kaniscope` by name and never noticed the litter.
+          #
+          # `case`, not `[ x = y ] && VAR=...`: under `set -e` that idiom is
+          # safe only while another command follows it, and fails the whole step
+          # the day someone deletes the trailing line. Verified both ways rather
+          # than assumed.
+          case "${{ matrix.target }}" in
+            *windows*) BIN="target/${{ matrix.target }}/release/kaniscope.exe" ;;
+            *)         BIN="target/${{ matrix.target }}/release/kaniscope" ;;
+          esac
+          cp "$BIN" "dist/${{ matrix.target }}/"
+          ls -l "dist/${{ matrix.target }}/"
 
       - uses: actions/upload-artifact@v4
         with:
