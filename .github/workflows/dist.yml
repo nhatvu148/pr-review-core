@@ -165,6 +165,14 @@ jobs:
     name: npm
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # `npm publish --provenance` signs the package against this workflow run,
+      # and it gets the claim from an OIDC token it cannot mint without this.
+      # The job inherits `contents: read` from the top of the file otherwise, so
+      # every publish step below would fail — at the END of a ~15 minute matrix,
+      # after five platform builds, on the one run that was meant to ship.
+      id-token: write
     steps:
       - uses: actions/checkout@v4
         with:
