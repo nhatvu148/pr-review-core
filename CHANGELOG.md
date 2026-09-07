@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.26.0
 
 **The configuration surface, as data** (`config_spec`). Every knob `Config::from_env` reads was a string literal inside a 130-line constructor, so the surface existed but could not be *enumerated* — nothing could type it, document it, or check it. The README's hand-maintained table had drifted to **41 of the 61 names in use**, and there was no way to tell which 20 were missing.
 
