@@ -42,6 +42,10 @@ for (const f of out.findingsDetail ?? []) {
 
 `review()` runs the binary and parses its JSON. It rejects when the engine exits non-zero, with `exitCode`, `signal` and the full `stderr` on the error.
 
+## A complete bot
+
+[`packaging/examples/node-bot`](https://github.com/nhatvu148/pr-review-core/tree/main/packaging/examples/node-bot) is a working GitHub review bot on this package — an HTTP server, webhook signature verification, and one `review()` call. It ships with tests that run against a fake engine, so they need no API key and no pull request.
+
 ## Configuration
 
 Everything beyond the flags above — the model, the API key, provider tokens, file globs, confidence floors, bot identity — is read from the environment, exactly as it is for the Rust library. Pass overrides in `env` (merged over `process.env`, unless `inheritEnv: false`).

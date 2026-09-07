@@ -1,0 +1,16 @@
+{
+  "name": "kaniscope-node-bot-example",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A minimal GitHub review bot built on the kaniscope npm package.",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "kaniscope": "^0.26.0"
+  }
+}

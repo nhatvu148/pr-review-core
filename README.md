@@ -149,6 +149,8 @@ const out = await review({ provider: "github", repo: "me/app", pr: 12 });
 console.log(out.recommendation, out.findings);
 ```
 
+A complete worked example — HTTP server, webhook signature verification, one `review()` call, and tests that run against a fake engine with no key — is in [`packaging/examples/node-bot`](packaging/examples/node-bot).
+
 **Why a binary and not pyo3/napi bindings.** The boundary carries five scalars in and one JSON document out, on a call that takes minutes and is network- and clone-bound — the worst possible ratio for FFI. Bindings would cost an ABI-pinned build matrix per Python ABI and per Node release, a tokio bridge into two foreign runtimes, and a second declaration of every wire type. A pipe costs one process spawn. `uv` and `ruff` reach these ecosystems the same way, and the PyPI wheel is `py3-none-<platform>` for the same reason: it carries a binary, not an extension, so it is independent of the Python version it installs under.
 
 `Finding` and `RunReviewOutput` are **generated** for both clients from the binary's own `--schema` and committed (`packaging/generate-types.mjs`); CI regenerates and fails on a diff. That is what stops a field added here from shipping dark in a client, which a missing JSON key otherwise does silently. Sources live in `packaging/`.
