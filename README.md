@@ -177,6 +177,76 @@ Nothing about the bot's identity is hardcoded. `Config::from_env()` reads:
 Other operational settings (OpenRouter key/models, provider tokens, agentic mode,
 size caps) are also read from the environment — see `src/config.rs`.
 
+### Every variable
+
+The tables in this section and the next cover the knobs worth a paragraph. This one is the complete surface, generated from `config_spec::SPEC` and checked in CI — a hand-maintained version of it had drifted to 41 of 61 entries, with no way to tell which were missing.
+
+`kaniscope --config-docs` prints it. The npm and PyPI clients still take these as raw `env` strings — a typed `config` option generated from this same spec is the intended next step, not something that exists today.
+
+<!-- BEGIN GENERATED CONFIG TABLE -->
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `AGENTIC` | `false` | Clone the repo and let the model investigate cross-file context (grep / read_file / list_dir) before writing findings. |
+| `BB_API_TOKEN` | *(unset)* | Atlassian API token for Bitbucket. |
+| `BB_EMAIL` | *(unset)* | Atlassian account email, paired with BB_API_TOKEN for Bitbucket basic auth. |
+| `BITBUCKET_WEBHOOK_SECRET` | *(unset)* | HMAC secret for Bitbucket webhook deliveries. |
+| `BLAST_MAX_REFS` | `8` | References reported per symbol by the blast-radius scan. |
+| `BLAST_MAX_SYMBOLS` | `12` | Changed symbols the blast-radius scan will follow. |
+| `BLAST_RADIUS` | `true` | Precompute callers, tests and type uses of changed symbols and seed the agentic reviewer with them. Measured no recall gain on well-named repos; may help on large monorepos. |
+| `CI_STATUS` | `true` | Fetch the head commit's CI results so the reviewer cannot assert a broken build CI already decided. One extra API call per review. |
+| `COMMENT_MARKER` | `🤖 ai-pr-review` | Signature appended to every comment, and the dedupe key for finding the bot's own comments on re-review. |
+| `COMPLEXITY_METRICS` | `true` | Report cyclomatic and cognitive complexity (A-F) for touched functions. Deterministic; no model call. |
+| `COMPLEXITY_MIN_CYCLOMATIC` | `8` | Only surface functions at or above this cyclomatic complexity. |
+| `CVE_MAX_PACKAGES` | `100` | Distinct packages queried against OSV per review. |
+| `CVE_SCAN` | `true` | Check added lockfile entries against OSV.dev for known vulnerabilities. |
+| `DESCRIBE_INSTRUCTIONS` | *(unset)* | Free-form instructions shaping /describe output. Outranks the built-in layout. |
+| `DIAGRAM` | `false` | Append the mermaid change diagram. Skipped on Bitbucket, and whenever there are no edges to draw. |
+| `DIAGRAM_MAX_NODES` | `12` | Symbols considered for edge linking, and so the diagram's node budget. |
+| `EXCLUDE_GLOBS` | *(unset)* | Globs skipped before the model call. Setting this REPLACES the lockfile/generated/vendored/minified defaults. |
+| `EXTRA_SYSTEM_PROMPT` | *(unset)* | Appended to the built-in system prompts. Your conventions, in plain language. Set but empty is the same as unset: EXTRA_SYSTEM_PROMPT_FILE is consulted either way. |
+| `EXTRA_SYSTEM_PROMPT_FILE` | *(unset)* | Path whose contents are used when EXTRA_SYSTEM_PROMPT is unset OR empty. For baking a large conventions block into an image. |
+| `FILE_BUNDLING` | `true` | Keep related files (a source and its test, i18n siblings) adjacent when packing, so the model reviews them together. |
+| `GH_API_BASE` | `https://api.github.com` | GitHub API base. Point at a GitHub Enterprise host. |
+| `GH_TOKEN` | *(unset)* | GitHub token used to read the PR and post comments. |
+| `GITHUB_WEBHOOK_SECRET` | *(unset)* | HMAC secret GitHub signs webhook deliveries with. |
+| `GITLAB_API_BASE` | `https://gitlab.com/api/v4` | GitLab API base. Point at a self-hosted instance. |
+| `GITLAB_TOKEN` | *(unset)* | GitLab token used to read the MR and post notes. |
+| `GITLAB_WEBHOOK_SECRET` | *(unset)* | Token GitLab sends as X-Gitlab-Token on webhook deliveries. |
+| `GREP_CONTEXT` | `true` | Let the agentic reviewer's grep request 1-8 lines of context per match, so it can judge a second site without a read_file round trip. |
+| `INCLUDE_GLOBS` | *(unset)* | If set, ONLY files matching these globs are reviewed. |
+| `LLM_BASE_URL` / `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 for Ollama. |
+| `MAX_DIFF_CHARS` | `200000` | Size budget for the packed diff. Beyond it, whole files are ranked and dropped rather than truncated mid-hunk. |
+| `MAX_FINDINGS` | `20` | Cap findings per PR, ranked by severity then confidence. |
+| `MAX_HISTORY_CHARS` | `45000` | Cap on the agentic conversation carried between turns. |
+| `MAX_TURNS` | `6` | Tool-call turns the agentic reviewer may take before it must conclude. |
+| `MIN_CONFIDENCE` | `0` | Drop findings below this confidence (0-100). |
+| `OPENROUTER_API_KEY` / `LLM_API_KEY` | *(unset)* | API key for the OpenAI-compatible endpoint. Required for every review. |
+| `OPENROUTER_HTTP_REFERER` | `https://github.com/nhatvu148/pr-review-core` | HTTP-Referer sent to OpenRouter, for its dashboard attribution. |
+| `OPENROUTER_MAX_RETRIES` | `3` | Retries on a failed or rate-limited model call. |
+| `OPENROUTER_MAX_TOKENS` | `4000` | Cap on completion tokens per model call. |
+| `OPENROUTER_MODEL` | `anthropic/claude-sonnet-4.5` | Model that writes the review, and the synthesis half of the agentic split. |
+| `OPENROUTER_MODEL_EXPLORE` | `moonshotai/kimi-k2-0905` | Cheaper model for the agentic explore turns, before synthesis. |
+| `OPENROUTER_TEMPERATURE` | `0.2` | Sampling temperature. Low on purpose: a review should be reproducible. |
+| `OPENROUTER_TIMEOUT_SECS` | `120` | Per-request timeout for a model call. |
+| `OPENROUTER_X_TITLE` | `pr-review` | X-Title sent to OpenRouter, for its dashboard attribution. |
+| `OSV_API_BASE` | `https://api.osv.dev` | OSV API base. Override for a mirror or a test double. |
+| `PORT` | `8088` | HTTP port for a bot serving webhooks. 8088 locally to dodge the usual Docker Desktop clash on 8080. |
+| `PRBOT_RUN_LOG` | *(unset)* | Path to append one JSON record per review to. `-` means stdout; empty means off, so a line in an env file can disable it without being deleted. |
+| `PR_BODY` | `true` | Give the reviewer the PR's own description as a statement of intent to check the diff against. Rendered inside an untrusted fence, so it can never direct the review. |
+| `PR_BODY_MAX_CHARS` | `12000` | Cap on the description handed to the reviewer. A clipped one is marked truncated, so absence is not read as out-of-scope. |
+| `REANCHOR_FINDINGS` | `true` | Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. |
+| `REVIEW_ON_UPDATE` | `false` | Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. |
+| `SELF_CRITIQUE` | `true` | Second skeptical pass that removes false positives and low-value nits. |
+| `STRUCTURAL_CONTEXT` | `true` | Name the enclosing function or symbol of each changed line, via tree-sitter, with no clone. |
+| `STRUCTURAL_MAX_FILES` | `15` | Files fetched for structural context before it stops. |
+| `SUGGESTIONS` | `true` | Attach a committable suggestion block when the model proposed replacement text that validates against the anchored line. Never on a re-anchored finding. |
+| `USER_AGENT` | `pr-review-core` | User-Agent sent to provider APIs. |
+| `VENDORED_GLOBS` | *(unset)* | Globs marking third-party source: hygiene findings are suppressed inside them and the reviewer is told not to edit there. Setting this REPLACES the defaults. |
+| `WALKTHROUGH` | `false` | Append the per-file walkthrough table to the summary comment. |
+| `WALKTHROUGH_MAX_SYMBOLS` | `4` | Symbols listed per file before the cell collapses to (+N more). |
+| `WORKER_TOKEN` | *(unset)* | Shared secret authenticating a bot's own async worker callback. |
+<!-- END GENERATED CONFIG TABLE -->
+
 ## Review quality & cost controls
 
 | Env var | Default | Effect |

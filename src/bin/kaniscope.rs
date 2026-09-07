@@ -89,6 +89,13 @@ struct Args {
     /// re-deriving the same findings.
     #[arg(long = "json-out", value_name = "PATH")]
     json_out: Option<PathBuf>,
+    /// Print the engine's full environment-variable surface as a markdown table
+    /// and exit. Needs no key, no token and no network.
+    ///
+    /// The README's table is generated from this, and CI fails if the committed
+    /// copy drifts — the previous hand-written one documented 41 of 61 names.
+    #[arg(long = "config-docs", default_value_t = false)]
+    config_docs: bool,
     /// Print the JSON Schema of the `--json` output and exit. Needs no key, no
     /// token and no network.
     ///
@@ -118,6 +125,11 @@ async fn main() -> anyhow::Result<()> {
     // Before any config read or network call: a schema dump is a pure function of
     // the binary, and demanding a key for it would make the typed-client
     // generation step need production credentials.
+    if args.config_docs {
+        print!("{}", pr_review_core::config_spec::markdown_table());
+        return Ok(());
+    }
+
     if args.schema {
         println!(
             "{}",
