@@ -164,8 +164,16 @@ jobs:
           path: out
           if-no-files-found: error
 
+      # Only when a tag was actually named. Publishing a PACKAGING fix for an
+      # already-released version means running from `main` with no tag — the
+      # engine source is identical, but `packaging/` is checked out by ref, so
+      # the tag would supply the old packaging. In that mode `github.ref_name`
+      # is `main`, and `gh release upload main` fails against a release that
+      # does not exist. The assets belong to the tag; if there is no tag there
+      # is nothing to attach them to, and the archives are still uploaded as
+      # artifacts by the step above either way.
       - name: Attach to the Release
-        if: ${{ github.event.inputs.publish == 'true' }}
+        if: ${{ github.event.inputs.publish == 'true' && github.event.inputs.tag != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
