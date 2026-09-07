@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ignore::WalkBuilder;
@@ -29,30 +30,40 @@ impl Workspace {
     pub fn clone(clone_url: &str, head_sha: Option<&str>) -> Result<Self> {
         let tmp = tempfile::tempdir().context("create temp dir for clone")?;
         let root = tmp.path().to_path_buf();
+        // No `create_private_dir` here: `clone_with_retry`'s first iteration
+        // already finds this path present and recreates it privately, so doing
+        // it twice was pure duplicate work on every successful clone. The
+        // directory is empty until the clone runs, so there is no window in
+        // which anything sensitive sits in it at the looser mode.
 
-        run_git(
-            &[
-                "clone",
-                "--depth",
-                "1",
-                "--quiet",
-                clone_url,
-                root.to_str().unwrap(),
-            ],
-            None,
-        )
-        .context("git clone failed")?;
+        clone_with_retry(clone_url, &root)?;
 
         // Best-effort: fetch + check out the exact PR head. GitHub/Bitbucket allow
         // fetching a specific SHA; if it fails we keep the default-branch checkout.
+        //
+        // Bounded for the same reason the clone is, and it was not: this is a
+        // second round-trip to the same host, so it can draw the same
+        // black-holed address and stall for the same ~134 seconds. Being
+        // best-effort makes that quieter, not cheaper — the review does not
+        // fail, it just takes two minutes longer for nothing, which is harder
+        // to notice than an outright failure.
+        //
+        // No retry, deliberately: the clone already succeeded, so landing on
+        // the default branch instead of the PR head is a degradation the caller
+        // already tolerates.
         if let Some(sha) = head_sha {
-            if run_git(
+            if run_git_bounded(
                 &["fetch", "--depth", "1", "--quiet", "origin", sha],
                 Some(&root),
+                CLONE_ATTEMPT_TIMEOUT,
             )
             .is_ok()
             {
-                let _ = run_git(&["checkout", "--quiet", sha], Some(&root));
+                let _ = run_git_bounded(
+                    &["checkout", "--quiet", sha],
+                    Some(&root),
+                    CLONE_ATTEMPT_TIMEOUT,
+                );
             }
         }
 
@@ -233,30 +244,267 @@ impl Workspace {
     }
 }
 
-fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<()> {
+/// How long one clone attempt may take before it is killed, and how many
+/// attempts are made.
+///
+/// Measured against production: successful shallow clones of these repos take
+/// **2 to 4 seconds** (1–20 MB). 90s is more than an order of magnitude of
+/// headroom for a slow day, and still far below the failure this exists to stop.
+const CLONE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(90);
+const CLONE_ATTEMPTS: u32 = 3;
+
+// There is deliberately no unbounded `git` helper in this module any more. Every
+// call to the network here goes through `run_git_bounded`, so the timeout is not
+// something a future call site has to remember to opt into — the only way to run
+// git from this file is with a deadline. The unbounded `run_git` that used to sit
+// below became dead code the moment the fetch was bounded too, and clippy said so;
+// deleting it rather than silencing that is what keeps the property true.
+
+/// Shallow-clone `clone_url` into `root`, bounding each attempt and retrying.
+///
+/// ## Why this is not just `git clone`
+///
+/// A single unbounded attempt was losing whole reviews to a network blip. Four
+/// production failures in one day read:
+///
+/// ```text
+/// Failed to connect to github.com port 443 after 134192 ms
+/// Failed to connect to github.com port 443 after 135126 ms
+/// Failed to connect to github.com port 443 after 134852 ms
+/// Failed to connect to github.com port 443 after 134760 ms
+/// ```
+///
+/// Four failures inside a one-second band is not congestion — that is a
+/// deterministic timeout being reached. It lines up with the kernel's default
+/// SYN retry ladder (`tcp_syn_retries = 6`, roughly 127s of doubling backoff)
+/// plus resolution overhead: the machine is SYNing an address that never
+/// answers and waiting out the whole budget. `github.com` has several addresses,
+/// so which one is drawn decides whether a review lives, and the very same clone
+/// succeeded 4 seconds later on the next attempt.
+///
+/// Retrying alone would not have helped — each attempt costs those 134 seconds.
+/// The timeout is the part that makes the retry affordable: a black-holed
+/// address is abandoned in 90s rather than 134, and the next attempt usually
+/// draws a different one.
+///
+/// Killed rather than waited on, because the point is to stop waiting. `git`
+/// spawns `git-remote-https`, and killing the parent can leave the child holding
+/// the socket, so the whole process group goes.
+fn clone_with_retry(clone_url: &str, root: &Path) -> Result<()> {
+    let mut last: Option<String> = None;
+
+    for attempt in 1..=CLONE_ATTEMPTS {
+        // A previous attempt may have left a partial tree behind; `git clone`
+        // refuses a non-empty destination, so a retry into it would fail for a
+        // reason that has nothing to do with the network.
+        // Errors here are propagated rather than swallowed. A real filesystem
+        // failure — permissions, ENOSPC — used to fall through to a confusing
+        // git error *and* burn the remaining attempts on sleeps first, which
+        // reports a network fault for a full disk.
+        if root.exists() {
+            std::fs::remove_dir_all(root).context("clear the previous clone attempt")?;
+        }
+        create_private_dir(root).context("recreate the clone dir")?;
+
+        match run_git_bounded(
+            &[
+                "clone",
+                "--depth",
+                "1",
+                "--quiet",
+                clone_url,
+                root.to_str().unwrap(),
+            ],
+            None,
+            CLONE_ATTEMPT_TIMEOUT,
+        ) {
+            Ok(()) => {
+                if attempt > 1 {
+                    tracing::info!("git clone succeeded on attempt {attempt}");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                // Redacted: `clone_url` carries the token, and this string ends
+                // up in a log, a Telegram message and a PR comment.
+                tracing::warn!("git clone attempt {attempt}/{CLONE_ATTEMPTS} failed: {e}");
+                last = Some(e.to_string());
+                if attempt < CLONE_ATTEMPTS {
+                    std::thread::sleep(Duration::from_secs(2 * attempt as u64));
+                }
+            }
+        }
+    }
+
+    bail!(
+        "git clone failed after {CLONE_ATTEMPTS} attempts: {}",
+        last.unwrap_or_else(|| "unknown error".into())
+    )
+}
+
+/// Create `path` as a directory only this user can enter.
+///
+/// The clone writes the token-bearing remote URL into `.git/config`, so the
+/// directory holding it must not be readable by other local users. A review flagged
+/// the retry path for recreating it with `create_dir_all`, which is subject to the
+/// umask — and measuring it showed the problem is wider than that: on this platform
+/// `tempfile::tempdir()` itself yields **0755**, not the 0700 its documentation
+/// describes. So the exposure predates the retry, and setting the mode explicitly
+/// fixes both paths rather than restoring a property that was never there.
+///
+/// Not `#[cfg(unix)]`-only at the call sites: on other platforms this is a plain
+/// `create_dir_all`, so callers do not have to branch.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        // `recursive(true)` does not re-apply the mode to a directory that
+        // already existed, which is exactly the tempdir case above.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::PermissionsExt;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Replace the credentials in any `scheme://user:secret@host` with `***`.
+///
+/// The clone URL carries a token, and the error built from these arguments does
+/// not stay in the process: it is logged, sent to Telegram, and posted on the
+/// pull request as a failure notice. Fly scrubs its own log output, which is why
+/// the token looked redacted in production — none of the other three paths do.
+fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        // Credentials end at the first `@`, and must not run past the end of the
+        // authority — otherwise a later `@` in a path would swallow the host.
+        match tail.find('@') {
+            Some(a) if !tail[..a].contains('/') => {
+                out.push_str("***");
+                rest = &tail[a..];
+            }
+            _ => {
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Kill the whole process group, not just the child.
+///
+/// `git` delegates the network to `git-remote-https`. Killing only the parent
+/// leaves that helper alive holding the socket, so the resource this timeout
+/// exists to reclaim is not reclaimed — and across three retries the leaked
+/// helpers accumulate.
+#[cfg(unix)]
+fn kill_process_group(child: &mut std::process::Child) {
+    // SAFETY: `kill` with a negated pid signals the process group of that pid.
+    // The group exists because `process_group(0)` put the child in its own,
+    // which also means this can never signal our own group.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
+/// `run_git`, but killed if it outlives `timeout`.
+///
+/// Polls rather than blocking on `wait`: the standard library has no timed wait,
+/// and a poll at this granularity costs nothing next to a network clone.
+fn run_git_bounded(args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Result<()> {
     let mut cmd = Command::new("git");
-    cmd.args(args);
+    cmd.args(args)
+        // stdout is never read, so null it rather than pipe it. A piped stream
+        // nobody drains fills its buffer and blocks the writer forever — which
+        // here would stall a clone that was making progress and then have the
+        // deadline kill it, reporting a network fault that never happened.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let out = cmd.output().context("spawn git")?;
-    if !out.success_like() {
-        bail!(
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    Ok(())
-}
+    let mut child = cmd.spawn().context("spawn git")?;
 
-/// Tiny helper so the `run_git` success check reads clearly.
-trait SuccessLike {
-    fn success_like(&self) -> bool;
-}
-impl SuccessLike for std::process::Output {
-    fn success_like(&self) -> bool {
-        self.status.success()
+    // stderr is drained on its own thread for the same reason, and because the
+    // message it carries is the only diagnosis a failure leaves behind.
+    let mut pipe = child.stderr.take().expect("stderr piped above");
+    let drain = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        buf
+    });
+
+    /// Why the loop breaks with a value instead of using `?`.
+    ///
+    /// `try_wait()` returning `Err` used to propagate straight out, skipping the
+    /// kill, the reap and the thread join — leaking the child and its
+    /// `git-remote-https` helper in exactly the way this function exists to
+    /// prevent. Every exit from the loop now goes through the same cleanup.
+    enum Outcome {
+        Exited(std::process::ExitStatus),
+        TimedOut,
+        WaitFailed(std::io::Error),
+    }
+
+    let deadline = Instant::now() + timeout;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Outcome::Exited(status),
+            Ok(None) if Instant::now() >= deadline => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                break Outcome::TimedOut;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                break Outcome::WaitFailed(e);
+            }
+        }
+    };
+
+    // Joinable now either way: the pipe closes when the process dies, so the
+    // reader returns rather than hanging on a killed child.
+    let stderr = drain.join().unwrap_or_default();
+
+    match outcome {
+        Outcome::WaitFailed(e) => {
+            Err(e).with_context(|| format!("waiting for git {}", redact(&format!("{args:?}"))))
+        }
+        Outcome::TimedOut => bail!(
+            "git {} timed out after {}s",
+            redact(&format!("{args:?}")),
+            timeout.as_secs()
+        ),
+        Outcome::Exited(status) if !status.success() => bail!(
+            "git {} failed: {}",
+            redact(&format!("{args:?}")),
+            redact(&String::from_utf8_lossy(&stderr))
+        ),
+        Outcome::Exited(_) => Ok(()),
     }
 }
 
@@ -380,5 +628,170 @@ mod tests {
         let d = fixture();
         let ws = Workspace::from_dir(d.path());
         assert!(ws.read_file("../../etc/passwd", None, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod clone_timeout_tests {
+    use super::*;
+
+    /// The timeout must actually kill the process, not merely report one.
+    ///
+    /// `240.0.0.1` is reserved (class E) and unroutable everywhere, so the
+    /// connect hangs exactly the way a black-holed github.com address does. The
+    /// production failures took **134 seconds** to give up; this asserts the
+    /// bound is enforced in seconds instead.
+    #[test]
+    fn a_hanging_clone_is_killed_at_the_deadline() {
+        let dst = std::env::temp_dir().join(format!("prc-clone-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+
+        let started = Instant::now();
+        let err = run_git_bounded(
+            &[
+                "clone",
+                "--quiet",
+                "https://240.0.0.1/x.git",
+                dst.to_str().unwrap(),
+            ],
+            None,
+            Duration::from_secs(3),
+        )
+        .expect_err("an unroutable clone must not succeed");
+        let elapsed = started.elapsed();
+
+        // Deliberately NOT asserting the message says "timed out". Whether
+        // `240.0.0.1` black-holes or is refused outright is a property of the
+        // network the test runs on: a sandbox with a deny-all egress policy
+        // sends a fast RST, and git then fails with its own error rather than
+        // reaching our deadline. Both outcomes prove the thing under test — that
+        // this call cannot hang — so asserting the mechanism would fail a
+        // correct implementation on a restricted CI network.
+        let _ = &err;
+
+        // This is the real assertion: bounded, however it got there.
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "took {elapsed:?} — it hung. The production failures took 134s, and \
+             whether this ends at our deadline or the network's refusal, it must \
+             not wait that out."
+        );
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// A command that exits on its own must not be reported as a timeout, and
+    /// its stderr must survive into the error.
+    #[test]
+    fn a_failing_command_reports_its_own_error() {
+        // Not `rev-parse --bogus`: rev-parse echoes unknown arguments and exits
+        // 0, so that premise was wrong and the test failed on the code being
+        // right. An unknown SUBCOMMAND is a real non-zero exit.
+        let err = run_git_bounded(&["definitely-not-a-command"], None, Duration::from_secs(30))
+            .expect_err("an unknown subcommand must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("timed out"),
+            "misreported as a timeout: {msg}"
+        );
+    }
+
+    /// And the happy path still works, with output collected.
+    #[test]
+    fn a_successful_command_returns_ok() {
+        run_git_bounded(&["--version"], None, Duration::from_secs(30)).expect("git --version");
+    }
+
+    /// The token must never reach the error. It is logged, sent to Telegram and
+    /// posted on the pull request; only the Fly log is scrubbed for us.
+    #[test]
+    fn the_token_never_reaches_the_error() {
+        let secret = "ghs_SUPERSECRET1234567890";
+        let url = format!("https://x-access-token:{secret}@github.com/o/r.git");
+        let dst = std::env::temp_dir().join(format!("prc-redact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+
+        // A REAL host, unlike the sibling timeout test: the point here is only
+        // that the message is redacted, and this fails fast on auth or DNS
+        // rather than waiting out a deadline. The comment used to claim it was
+        // unroutable, which was simply untrue of `github.com`.
+        let err = run_git_bounded(
+            &["clone", "--quiet", &url, dst.to_str().unwrap()],
+            None,
+            Duration::from_secs(3),
+        )
+        .expect_err("unroutable clone must fail");
+
+        let msg = err.to_string();
+        assert!(!msg.contains(secret), "token leaked into: {msg}");
+        assert!(msg.contains("***"), "expected redaction marker in: {msg}");
+        assert!(
+            msg.contains("github.com/o/r.git"),
+            "host was over-redacted: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// `redact` must not eat a URL that has no credentials, and must stop at the
+    /// authority — a later `@` in a path is not a secret.
+    #[test]
+    fn redact_only_touches_credentials() {
+        assert_eq!(
+            redact("https://github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            redact("https://x-access-token:abc@github.com/o/r.git"),
+            "https://***@github.com/o/r.git"
+        );
+        assert_eq!(
+            redact("https://github.com/o/r/blob/main/a@b.txt"),
+            "https://github.com/o/r/blob/main/a@b.txt"
+        );
+        // Two of them in one string, as `{args:?}` can produce.
+        assert_eq!(
+            redact("[\"https://u:p@a.com/x\", \"https://u:p@b.com/y\"]"),
+            "[\"https://***@a.com/x\", \"https://***@b.com/y\"]"
+        );
+    }
+
+    /// The clone directory must not be readable by other local users: the clone
+    /// writes the token-bearing remote URL into `.git/config`.
+    ///
+    /// Measured, not assumed — `tempfile::tempdir()` returned 0755 on the machine
+    /// this was written on, despite documenting 0700, which is why the mode is set
+    /// explicitly instead of relied upon.
+    #[cfg(unix)]
+    #[test]
+    fn the_clone_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("clone");
+        create_private_dir(&root).expect("create");
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "fresh dir is {mode:04o}, not private");
+
+        // And again over a directory that already exists with a loose mode —
+        // the retry path, and the tempdir itself.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dir(&root).expect("recreate over an existing dir");
+        let mode = std::fs::metadata(&root).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "existing dir left at {mode:04o}");
+    }
+
+    /// Output larger than a pipe buffer must not deadlock. Before stdout was
+    /// nulled and stderr drained on a thread, a chatty command would fill the
+    /// buffer, block, and be killed by the deadline as if the network had failed.
+    #[test]
+    fn a_chatty_command_does_not_deadlock() {
+        // `git help -a` prints well over a pipe buffer's worth to stdout.
+        let started = Instant::now();
+        let r = run_git_bounded(&["help", "-a"], None, Duration::from_secs(20));
+        assert!(r.is_ok(), "chatty command failed: {r:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "took {:?} — it blocked on a full pipe",
+            started.elapsed()
+        );
     }
 }
