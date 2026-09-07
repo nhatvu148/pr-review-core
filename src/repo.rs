@@ -30,7 +30,11 @@ impl Workspace {
     pub fn clone(clone_url: &str, head_sha: Option<&str>) -> Result<Self> {
         let tmp = tempfile::tempdir().context("create temp dir for clone")?;
         let root = tmp.path().to_path_buf();
-        create_private_dir(&root).context("restrict permissions on the clone dir")?;
+        // No `create_private_dir` here: `clone_with_retry`'s first iteration
+        // already finds this path present and recreates it privately, so doing
+        // it twice was pure duplicate work on every successful clone. The
+        // directory is empty until the clone runs, so there is no window in
+        // which anything sensitive sits in it at the looser mode.
 
         clone_with_retry(clone_url, &root)?;
 
@@ -452,16 +456,33 @@ fn run_git_bounded(args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Resu
         buf
     });
 
+    /// Why the loop breaks with a value instead of using `?`.
+    ///
+    /// `try_wait()` returning `Err` used to propagate straight out, skipping the
+    /// kill, the reap and the thread join — leaking the child and its
+    /// `git-remote-https` helper in exactly the way this function exists to
+    /// prevent. Every exit from the loop now goes through the same cleanup.
+    enum Outcome {
+        Exited(std::process::ExitStatus),
+        TimedOut,
+        WaitFailed(std::io::Error),
+    }
+
     let deadline = Instant::now() + timeout;
-    let result = loop {
-        match child.try_wait().context("wait for git")? {
-            Some(status) => break Ok(status),
-            None if Instant::now() >= deadline => {
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Outcome::Exited(status),
+            Ok(None) if Instant::now() >= deadline => {
                 kill_process_group(&mut child);
                 let _ = child.wait();
-                break Err(());
+                break Outcome::TimedOut;
             }
-            None => std::thread::sleep(Duration::from_millis(100)),
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                break Outcome::WaitFailed(e);
+            }
         }
     };
 
@@ -469,18 +490,21 @@ fn run_git_bounded(args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Resu
     // reader returns rather than hanging on a killed child.
     let stderr = drain.join().unwrap_or_default();
 
-    match result {
-        Err(()) => bail!(
+    match outcome {
+        Outcome::WaitFailed(e) => {
+            Err(e).with_context(|| format!("waiting for git {}", redact(&format!("{args:?}"))))
+        }
+        Outcome::TimedOut => bail!(
             "git {} timed out after {}s",
             redact(&format!("{args:?}")),
             timeout.as_secs()
         ),
-        Ok(status) if !status.success() => bail!(
+        Outcome::Exited(status) if !status.success() => bail!(
             "git {} failed: {}",
             redact(&format!("{args:?}")),
             redact(&String::from_utf8_lossy(&stderr))
         ),
-        Ok(_) => Ok(()),
+        Outcome::Exited(_) => Ok(()),
     }
 }
 
@@ -686,7 +710,10 @@ mod clone_timeout_tests {
         let dst = std::env::temp_dir().join(format!("prc-redact-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dst);
 
-        // Unroutable, so this reliably times out rather than reaching a network.
+        // A REAL host, unlike the sibling timeout test: the point here is only
+        // that the message is redacted, and this fails fast on auth or DNS
+        // rather than waiting out a deadline. The comment used to claim it was
+        // unroutable, which was simply untrue of `github.com`.
         let err = run_git_bounded(
             &["clone", "--quiet", &url, dst.to_str().unwrap()],
             None,
