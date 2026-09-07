@@ -200,14 +200,14 @@ pub const SPEC: &[ConfigVar] = &[
         aliases: &[],
         kind: ConfigKind::Str,
         default: None,
-        doc: "Appended to the built-in system prompts. Your conventions, in plain language.",
+        doc: "Appended to the built-in system prompts. Your conventions, in plain language. Set but empty is the same as unset: EXTRA_SYSTEM_PROMPT_FILE is consulted either way.",
     },
     ConfigVar {
         env: "EXTRA_SYSTEM_PROMPT_FILE",
         aliases: &[],
         kind: ConfigKind::Path,
         default: None,
-        doc: "Path read into EXTRA_SYSTEM_PROMPT when that is unset. For baking a large conventions block into an image.",
+        doc: "Path whose contents are used when EXTRA_SYSTEM_PROMPT is unset OR empty. For baking a large conventions block into an image.",
     },
     ConfigVar {
         env: "FILE_BUNDLING",
