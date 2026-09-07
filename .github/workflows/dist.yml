@@ -224,16 +224,34 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          # Platform packages FIRST. The wrapper pins them as exact-version
-          # optional dependencies, and npm treats a missing optional dependency as
-          # a successful install — so publishing the wrapper first opens a window
-          # where `npm i kaniscope` succeeds and installs no binary at all. This
-          # repo has already shipped a floating tag pointing at a stale image by
-          # getting a publish order wrong; same class of mistake, quieter symptom.
-          for dir in packaging/npm/platforms/*/; do
+          # Skip what is already published, for the same reason PyPI does:
+          # a re-run after a partial failure must be able to finish the job
+          # rather than die on the first package that succeeded last time.
+          # `npm publish` on an existing version fails with EPUBLISHCONFLICT,
+          # which would strand the wrapper — the exact half-published state the
+          # publish ORDER below exists to prevent.
+          publish_if_new() {
+            local dir="$1" name version
+            name=$(node -p "require('./$dir/package.json').name")
+            version=$(node -p "require('./$dir/package.json').version")
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "::notice::$name@$version already published — skipping"
+              return 0
+            fi
             npm publish "$dir" --access public --provenance
+          }
+
+          # Platform packages FIRST. The wrapper pins them as exact-version
+          # optional dependencies, and npm treats a missing optional dependency
+          # as a successful install — so publishing the wrapper first opens a
+          # window where `npm i kaniscope` succeeds and installs no binary at
+          # all. This repo has already shipped a floating tag pointing at a
+          # stale image by getting a publish order wrong; same class of mistake,
+          # quieter symptom.
+          for dir in packaging/npm/platforms/*/; do
+            publish_if_new "${dir%/}"
           done
-          npm publish packaging/npm --access public --provenance
+          publish_if_new packaging/npm
 
   pypi:
     name: wheel ${{ matrix.target }}
@@ -295,3 +313,11 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: wheels
+          # Re-running a publish is normal — the npm half can fail on its own
+          # (a token type, an expiry) and the fix is to run the whole workflow
+          # again. Without this, PyPI answers the second attempt with
+          # `400 File already exists` and fails the job, so a green npm publish
+          # would sit behind a red run and nobody could tell which half was
+          # broken. A version already on PyPI is the desired end state, not an
+          # error.
+          skip-existing: true
