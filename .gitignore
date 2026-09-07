@@ -12,3 +12,11 @@ packaging/npm/platforms/
 packaging/pypi/wheels/
 packaging/**/node_modules/
 __pycache__/
+
+# npm artifacts at the REPO ROOT. This is not a Node project, but
+# `npm install kaniscope` gets run here while testing the published package —
+# and once did, leaving a 15 MB binary and a node_modules/ that a `git add -A`
+# then committed. The packaging/ rule above matches nested paths, not the root.
+/node_modules/
+/package.json
+/package-lock.json
