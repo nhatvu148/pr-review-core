@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.26.1
 
 **A clone no longer loses a review to one network blip.** `Workspace::clone` made a single unbounded `git clone` attempt, so a transient egress failure killed the whole review. Four production failures in one day, and their durations are the finding:
 
