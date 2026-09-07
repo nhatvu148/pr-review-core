@@ -5,9 +5,18 @@ AI pull-request reviewer: fetches a PR's diff, reviews it, and posts line-anchor
 This package ships a native binary — there is no Rust toolchain to install, no compile step, and no postinstall download. The binary lives in a small per-platform package that npm picks by `os`/`cpu`, so you download one, not five.
 
 ```bash
-npm install kaniscope
+npm install -g kaniscope                 # want the `kaniscope` command on PATH
+kaniscope --provider github --repo me/app --pr 12 --dry-run
+```
+
+```bash
+npm install kaniscope                    # building a bot? this is the one you want
 npx kaniscope --provider github --repo me/app --pr 12 --dry-run
 ```
+
+A plain `npm install kaniscope` is a **local** install, so it does not put `kaniscope` on your `PATH` — running it bare gives `command not found`. That is ordinary npm behaviour, not a broken install: reach it with `npx kaniscope`, or `./node_modules/.bin/kaniscope`, or install with `-g`.
+
+For a bot, the local install is the right one anyway — `require("kaniscope")` works from it immediately and never touches `PATH`.
 
 ## As a library
 

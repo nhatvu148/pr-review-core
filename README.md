@@ -115,9 +115,11 @@ kaniscope --schema                              # the JSON Schema of --json outp
 Prebuilt binaries ship through the registries the bots live in, so there is no toolchain to install:
 
 ```sh
-npm install kaniscope     # or: npx kaniscope --help
+npm install -g kaniscope  # `kaniscope` on PATH; drop -g for a project-local install
 pip install kaniscope     # or: uv tool install kaniscope
 ```
+
+A project-local `npm install kaniscope` does not put the command on `PATH` — use `npx kaniscope`, or `require("kaniscope")`, which is what a bot wants regardless.
 
 For everything those two do not reach — a Go or Ruby bot, a plain CI job, an air-gapped box — every release also carries platform archives with a `SHA256SUMS` beside them:
 
