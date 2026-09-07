@@ -310,43 +310,117 @@ fn clone_with_retry(clone_url: &str, root: &Path) -> Result<()> {
     )
 }
 
+/// Replace the credentials in any `scheme://user:secret@host` with `***`.
+///
+/// The clone URL carries a token, and the error built from these arguments does
+/// not stay in the process: it is logged, sent to Telegram, and posted on the
+/// pull request as a failure notice. Fly scrubs its own log output, which is why
+/// the token looked redacted in production — none of the other three paths do.
+fn redact(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        // Credentials end at the first `@`, and must not run past the end of the
+        // authority — otherwise a later `@` in a path would swallow the host.
+        match tail.find('@') {
+            Some(a) if !tail[..a].contains('/') => {
+                out.push_str("***");
+                rest = &tail[a..];
+            }
+            _ => {
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Kill the whole process group, not just the child.
+///
+/// `git` delegates the network to `git-remote-https`. Killing only the parent
+/// leaves that helper alive holding the socket, so the resource this timeout
+/// exists to reclaim is not reclaimed — and across three retries the leaked
+/// helpers accumulate.
+#[cfg(unix)]
+fn kill_process_group(child: &mut std::process::Child) {
+    // SAFETY: `kill` with a negated pid signals the process group of that pid.
+    // The group exists because `process_group(0)` put the child in its own,
+    // which also means this can never signal our own group.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(child: &mut std::process::Child) {
+    let _ = child.kill();
+}
+
 /// `run_git`, but killed if it outlives `timeout`.
 ///
 /// Polls rather than blocking on `wait`: the standard library has no timed wait,
-/// and a poll loop at this granularity costs nothing next to a network clone.
+/// and a poll at this granularity costs nothing next to a network clone.
 fn run_git_bounded(args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.args(args)
-        .stdout(std::process::Stdio::piped())
+        // stdout is never read, so null it rather than pipe it. A piped stream
+        // nobody drains fills its buffer and blocks the writer forever — which
+        // here would stall a clone that was making progress and then have the
+        // deadline kill it, reporting a network fault that never happened.
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
     let mut child = cmd.spawn().context("spawn git")?;
 
+    // stderr is drained on its own thread for the same reason, and because the
+    // message it carries is the only diagnosis a failure leaves behind.
+    let mut pipe = child.stderr.take().expect("stderr piped above");
+    let drain = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+        buf
+    });
+
     let deadline = Instant::now() + timeout;
-    loop {
+    let result = loop {
         match child.try_wait().context("wait for git")? {
-            Some(status) => {
-                let out = child.wait_with_output().context("collect git output")?;
-                if !status.success() {
-                    bail!(
-                        "git {:?} failed: {}",
-                        args,
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                }
-                return Ok(());
+            Some(status) => break Ok(status),
+            None if Instant::now() >= deadline => {
+                kill_process_group(&mut child);
+                let _ = child.wait();
+                break Err(());
             }
-            None => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    bail!("git {:?} timed out after {}s", args, timeout.as_secs());
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            None => std::thread::sleep(Duration::from_millis(100)),
         }
+    };
+
+    // Joinable now either way: the pipe closes when the process dies, so the
+    // reader returns rather than hanging on a killed child.
+    let stderr = drain.join().unwrap_or_default();
+
+    match result {
+        Err(()) => bail!(
+            "git {} timed out after {}s",
+            redact(&format!("{args:?}")),
+            timeout.as_secs()
+        ),
+        Ok(status) if !status.success() => bail!(
+            "git {} failed: {}",
+            redact(&format!("{args:?}")),
+            redact(&String::from_utf8_lossy(&stderr))
+        ),
+        Ok(_) => Ok(()),
     }
 }
 
@@ -562,5 +636,71 @@ mod clone_timeout_tests {
     #[test]
     fn a_successful_command_returns_ok() {
         run_git_bounded(&["--version"], None, Duration::from_secs(30)).expect("git --version");
+    }
+
+    /// The token must never reach the error. It is logged, sent to Telegram and
+    /// posted on the pull request; only the Fly log is scrubbed for us.
+    #[test]
+    fn the_token_never_reaches_the_error() {
+        let secret = "ghs_SUPERSECRET1234567890";
+        let url = format!("https://x-access-token:{secret}@github.com/o/r.git");
+        let dst = std::env::temp_dir().join(format!("prc-redact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+
+        // Unroutable, so this reliably times out rather than reaching a network.
+        let err = run_git_bounded(
+            &["clone", "--quiet", &url, dst.to_str().unwrap()],
+            None,
+            Duration::from_secs(3),
+        )
+        .expect_err("unroutable clone must fail");
+
+        let msg = err.to_string();
+        assert!(!msg.contains(secret), "token leaked into: {msg}");
+        assert!(msg.contains("***"), "expected redaction marker in: {msg}");
+        assert!(
+            msg.contains("github.com/o/r.git"),
+            "host was over-redacted: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// `redact` must not eat a URL that has no credentials, and must stop at the
+    /// authority — a later `@` in a path is not a secret.
+    #[test]
+    fn redact_only_touches_credentials() {
+        assert_eq!(
+            redact("https://github.com/o/r.git"),
+            "https://github.com/o/r.git"
+        );
+        assert_eq!(
+            redact("https://x-access-token:abc@github.com/o/r.git"),
+            "https://***@github.com/o/r.git"
+        );
+        assert_eq!(
+            redact("https://github.com/o/r/blob/main/a@b.txt"),
+            "https://github.com/o/r/blob/main/a@b.txt"
+        );
+        // Two of them in one string, as `{args:?}` can produce.
+        assert_eq!(
+            redact("[\"https://u:p@a.com/x\", \"https://u:p@b.com/y\"]"),
+            "[\"https://***@a.com/x\", \"https://***@b.com/y\"]"
+        );
+    }
+
+    /// Output larger than a pipe buffer must not deadlock. Before stdout was
+    /// nulled and stderr drained on a thread, a chatty command would fill the
+    /// buffer, block, and be killed by the deadline as if the network had failed.
+    #[test]
+    fn a_chatty_command_does_not_deadlock() {
+        // `git help -a` prints well over a pipe buffer's worth to stdout.
+        let started = Instant::now();
+        let r = run_git_bounded(&["help", "-a"], None, Duration::from_secs(20));
+        assert!(r.is_ok(), "chatty command failed: {r:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "took {:?} — it blocked on a full pipe",
+            started.elapsed()
+        );
     }
 }

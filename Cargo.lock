@@ -953,6 +953,7 @@ dependencies = [
  "hex",
  "hmac",
  "ignore",
+ "libc",
  "regex",
  "reqwest",
  "schemars",

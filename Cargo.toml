@@ -80,6 +80,12 @@ clap = { version = "4", features = ["derive"], optional = true }
 dotenvy = { version = "0.15", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 
+# Only to kill a whole process group when a git clone has to be abandoned.
+# `Child::kill` signals the direct child, and `git` delegates the network to
+# `git-remote-https`, which then survives holding the socket.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Mock OpenRouter endpoint. `Config::openrouter_base_url` is already injectable,
 # so the agent loop can be characterised end-to-end over real HTTP without

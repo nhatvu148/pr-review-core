@@ -13,7 +13,13 @@ Failed to connect to github.com port 443 after 134760 ms
 
 Four failures inside a one-second band is not congestion — it is a deterministic timeout, matching the kernel's default SYN retry ladder (`tcp_syn_retries = 6`, ~127s of doubling backoff) plus resolution. `github.com` has several addresses; the machine drew one that never answered and waited out the whole budget. The identical clone succeeded four seconds later.
 
-Each attempt is now bounded at 90s (successful clones of these repos take 2–4s) and retried up to three times with backoff. The bound is what makes the retry affordable — retrying alone would have cost 134 seconds a go. The child is killed rather than waited on, and a partial checkout is cleared before each retry, since `git clone` refuses a non-empty destination.
+Each attempt is now bounded at 90s (successful clones of these repos take 2–4s) and retried up to three times with backoff. The bound is what makes the retry affordable — retrying alone would have cost 134 seconds a go. A partial checkout is cleared before each retry, since `git clone` refuses a non-empty destination.
+
+Three things the first version of this got wrong, all caught in review:
+
+- **The clone URL carries a token, and the error built from it does not stay in the process** — it is logged, sent to Telegram, and posted on the PR as a failure notice. Fly scrubs its own log output, which is why the token looked redacted in production; none of the other three paths do. Credentials in any `scheme://user:secret@host` are now replaced before the message is built.
+- **`Child::kill` signals only the direct child.** `git` delegates the network to `git-remote-https`, which survived holding the socket — so the resource the timeout exists to reclaim was not reclaimed, and across three retries the helpers accumulated. The child now gets its own process group and the group is signalled.
+- **Both pipes were drained only after exit**, so output past a pipe buffer would block git forever and the deadline would then kill a clone that was making progress, reporting a network fault that never happened. stdout is nulled (it is never read) and stderr is drained on its own thread.
 
 ## 0.26.0
 
