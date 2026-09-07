@@ -32,10 +32,10 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "kaniscope-darwin-arm64": "0.26.0",
-    "kaniscope-darwin-x64": "0.26.0",
-    "kaniscope-linux-arm64": "0.26.0",
-    "kaniscope-linux-x64": "0.26.0",
-    "kaniscope-win32-x64": "0.26.0"
+    "@nhatvu148/kaniscope-darwin-arm64": "0.26.0",
+    "@nhatvu148/kaniscope-darwin-x64": "0.26.0",
+    "@nhatvu148/kaniscope-linux-arm64": "0.26.0",
+    "@nhatvu148/kaniscope-linux-x64": "0.26.0",
+    "@nhatvu148/kaniscope-win32-x64": "0.26.0"
   }
 }
