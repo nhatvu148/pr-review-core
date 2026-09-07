@@ -105,7 +105,7 @@ prompt through [`Config`].
 The engine is a Rust library, but a bot that consumes it does not have to be a Rust program. `run_review` takes five scalars, reads the rest of its configuration from the environment, and returns one JSON document — a wire contract in everything but name. The `kaniscope` binary makes it one.
 
 ```sh
-cargo install pr-review-core --features cli     # or use a prebuilt binary below
+cargo install pr-review-core --features cli     # the crate is pr-review-core; the binary is kaniscope
 kaniscope --provider github --repo me/app --pr 12 --dry-run
 kaniscope --provider github --repo me/app --pr 12 --json | jq .findingsDetail
 kaniscope --local --base main                   # review a diff that has no PR yet
