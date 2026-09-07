@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use ignore::WalkBuilder;
@@ -30,18 +31,7 @@ impl Workspace {
         let tmp = tempfile::tempdir().context("create temp dir for clone")?;
         let root = tmp.path().to_path_buf();
 
-        run_git(
-            &[
-                "clone",
-                "--depth",
-                "1",
-                "--quiet",
-                clone_url,
-                root.to_str().unwrap(),
-            ],
-            None,
-        )
-        .context("git clone failed")?;
+        clone_with_retry(clone_url, &root)?;
 
         // Best-effort: fetch + check out the exact PR head. GitHub/Bitbucket allow
         // fetching a specific SHA; if it fails we keep the default-branch checkout.
@@ -233,6 +223,133 @@ impl Workspace {
     }
 }
 
+/// How long one clone attempt may take before it is killed, and how many
+/// attempts are made.
+///
+/// Measured against production: successful shallow clones of these repos take
+/// **2 to 4 seconds** (1–20 MB). 90s is more than an order of magnitude of
+/// headroom for a slow day, and still far below the failure this exists to stop.
+const CLONE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(90);
+const CLONE_ATTEMPTS: u32 = 3;
+
+/// Shallow-clone `clone_url` into `root`, bounding each attempt and retrying.
+///
+/// ## Why this is not just `git clone`
+///
+/// A single unbounded attempt was losing whole reviews to a network blip. Four
+/// production failures in one day read:
+///
+/// ```text
+/// Failed to connect to github.com port 443 after 134192 ms
+/// Failed to connect to github.com port 443 after 135126 ms
+/// Failed to connect to github.com port 443 after 134852 ms
+/// Failed to connect to github.com port 443 after 134760 ms
+/// ```
+///
+/// Four failures inside a one-second band is not congestion — that is a
+/// deterministic timeout being reached. It lines up with the kernel's default
+/// SYN retry ladder (`tcp_syn_retries = 6`, roughly 127s of doubling backoff)
+/// plus resolution overhead: the machine is SYNing an address that never
+/// answers and waiting out the whole budget. `github.com` has several addresses,
+/// so which one is drawn decides whether a review lives, and the very same clone
+/// succeeded 4 seconds later on the next attempt.
+///
+/// Retrying alone would not have helped — each attempt costs those 134 seconds.
+/// The timeout is the part that makes the retry affordable: a black-holed
+/// address is abandoned in 90s rather than 134, and the next attempt usually
+/// draws a different one.
+///
+/// Killed rather than waited on, because the point is to stop waiting. `git`
+/// spawns `git-remote-https`, and killing the parent can leave the child holding
+/// the socket, so the whole process group goes.
+fn clone_with_retry(clone_url: &str, root: &Path) -> Result<()> {
+    let mut last: Option<String> = None;
+
+    for attempt in 1..=CLONE_ATTEMPTS {
+        // A previous attempt may have left a partial tree behind; `git clone`
+        // refuses a non-empty destination, so a retry into it would fail for a
+        // reason that has nothing to do with the network.
+        if root.exists() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+        let _ = std::fs::create_dir_all(root);
+
+        match run_git_bounded(
+            &[
+                "clone",
+                "--depth",
+                "1",
+                "--quiet",
+                clone_url,
+                root.to_str().unwrap(),
+            ],
+            None,
+            CLONE_ATTEMPT_TIMEOUT,
+        ) {
+            Ok(()) => {
+                if attempt > 1 {
+                    tracing::info!("git clone succeeded on attempt {attempt}");
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                // Redacted: `clone_url` carries the token, and this string ends
+                // up in a log, a Telegram message and a PR comment.
+                tracing::warn!("git clone attempt {attempt}/{CLONE_ATTEMPTS} failed: {e}");
+                last = Some(e.to_string());
+                if attempt < CLONE_ATTEMPTS {
+                    std::thread::sleep(Duration::from_secs(2 * attempt as u64));
+                }
+            }
+        }
+    }
+
+    bail!(
+        "git clone failed after {CLONE_ATTEMPTS} attempts: {}",
+        last.unwrap_or_else(|| "unknown error".into())
+    )
+}
+
+/// `run_git`, but killed if it outlives `timeout`.
+///
+/// Polls rather than blocking on `wait`: the standard library has no timed wait,
+/// and a poll loop at this granularity costs nothing next to a network clone.
+fn run_git_bounded(args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd.spawn().context("spawn git")?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().context("wait for git")? {
+            Some(status) => {
+                let out = child.wait_with_output().context("collect git output")?;
+                if !status.success() {
+                    bail!(
+                        "git {:?} failed: {}",
+                        args,
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
+                return Ok(());
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("git {:?} timed out after {}s", args, timeout.as_secs());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+}
+
 fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<()> {
     let mut cmd = Command::new("git");
     cmd.args(args);
@@ -380,5 +497,70 @@ mod tests {
         let d = fixture();
         let ws = Workspace::from_dir(d.path());
         assert!(ws.read_file("../../etc/passwd", None, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod clone_timeout_tests {
+    use super::*;
+
+    /// The timeout must actually kill the process, not merely report one.
+    ///
+    /// `240.0.0.1` is reserved (class E) and unroutable everywhere, so the
+    /// connect hangs exactly the way a black-holed github.com address does. The
+    /// production failures took **134 seconds** to give up; this asserts the
+    /// bound is enforced in seconds instead.
+    #[test]
+    fn a_hanging_clone_is_killed_at_the_deadline() {
+        let dst = std::env::temp_dir().join(format!("prc-clone-timeout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+
+        let started = Instant::now();
+        let err = run_git_bounded(
+            &[
+                "clone",
+                "--quiet",
+                "https://240.0.0.1/x.git",
+                dst.to_str().unwrap(),
+            ],
+            None,
+            Duration::from_secs(3),
+        )
+        .expect_err("an unroutable clone must not succeed");
+        let elapsed = started.elapsed();
+
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout, got: {err}"
+        );
+        // Generous upper bound: the point is that it is seconds, not the 134
+        // the kernel's SYN ladder would otherwise cost.
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "took {elapsed:?}, so the deadline was not enforced"
+        );
+        let _ = std::fs::remove_dir_all(&dst);
+    }
+
+    /// A command that exits on its own must not be reported as a timeout, and
+    /// its stderr must survive into the error.
+    #[test]
+    fn a_failing_command_reports_its_own_error() {
+        // Not `rev-parse --bogus`: rev-parse echoes unknown arguments and exits
+        // 0, so that premise was wrong and the test failed on the code being
+        // right. An unknown SUBCOMMAND is a real non-zero exit.
+        let err = run_git_bounded(&["definitely-not-a-command"], None, Duration::from_secs(30))
+            .expect_err("an unknown subcommand must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("timed out"),
+            "misreported as a timeout: {msg}"
+        );
+    }
+
+    /// And the happy path still works, with output collected.
+    #[test]
+    fn a_successful_command_returns_ok() {
+        run_git_bounded(&["--version"], None, Duration::from_secs(30)).expect("git --version");
     }
 }

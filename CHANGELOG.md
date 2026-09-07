@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+**A clone no longer loses a review to one network blip.** `Workspace::clone` made a single unbounded `git clone` attempt, so a transient egress failure killed the whole review. Four production failures in one day, and their durations are the finding:
+
+```
+Failed to connect to github.com port 443 after 134192 ms
+Failed to connect to github.com port 443 after 135126 ms
+Failed to connect to github.com port 443 after 134852 ms
+Failed to connect to github.com port 443 after 134760 ms
+```
+
+Four failures inside a one-second band is not congestion — it is a deterministic timeout, matching the kernel's default SYN retry ladder (`tcp_syn_retries = 6`, ~127s of doubling backoff) plus resolution. `github.com` has several addresses; the machine drew one that never answered and waited out the whole budget. The identical clone succeeded four seconds later.
+
+Each attempt is now bounded at 90s (successful clones of these repos take 2–4s) and retried up to three times with backoff. The bound is what makes the retry affordable — retrying alone would have cost 134 seconds a go. The child is killed rather than waited on, and a partial checkout is cleared before each retry, since `git clone` refuses a non-empty destination.
+
 ## 0.26.0
 
 **The configuration surface, as data** (`config_spec`). Every knob `Config::from_env` reads was a string literal inside a 130-line constructor, so the surface existed but could not be *enumerated* — nothing could type it, document it, or check it. The README's hand-maintained table had drifted to **41 of the 61 names in use**, and there was no way to tell which 20 were missing.
