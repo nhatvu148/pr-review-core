@@ -153,6 +153,25 @@ jobs:
           node packaging/npm/test.mjs
           (cd packaging/pypi && python3 test_client.py)
 
+      - name: The node-bot example installs and passes
+        run: |
+          set -euo pipefail
+          # `npm ci` rather than `npm install`: it fails when package-lock.json
+          # does not satisfy package.json, which is the drift this step exists to
+          # catch. Nothing regenerated that lockfile, so it silently fell behind
+          # every release — it was pinning 0.26.0 while 0.26.1 was already on npm,
+          # and a release PR that bumped only package.json broke `npm ci` outright.
+          #
+          # This also fixes the *order* of an example bump: the pair can only be
+          # updated together, and only once the version exists on npm. That is
+          # after publish, never inside the release PR — where `npm install` would
+          # fail with ETARGET because the version is not there yet.
+          #
+          # The example's own tests then run offline against a fake binary.
+          cd packaging/examples/node-bot
+          npm ci
+          npm test
+
       - name: The wrappers can drive the real binary
         env:
           KANISCOPE_BINARY_PATH: ${{ github.workspace }}/target/debug/kaniscope
