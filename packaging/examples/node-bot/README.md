@@ -49,16 +49,18 @@ That override is worth knowing about generally — it makes the engine substitut
 
 ## Configuration
 
-Everything beyond `provider`/`repo`/`pr` comes from the environment: the model, confidence floor, globs, agentic mode, bot identity. `kaniscope --config-docs` prints the full table, or pass overrides per call:
+Everything beyond `provider`/`repo`/`pr` is configuration: the model, confidence floor, globs, agentic mode, bot identity. Pass it typed, under `config`:
 
 ```js
 await review({
   provider: "github", repo, pr,
-  env: { MODEL: "anthropic/claude-sonnet-5", MIN_CONFIDENCE: "70", AGENTIC: "true" },
+  config: { openrouterModel: "anthropic/claude-sonnet-5", minConfidence: 70, agentic: true },
 });
 ```
 
-Those are strings today, and untyped — a typed `config` option generated from the engine's own spec is the intended next step.
+`ReviewConfig` is generated from the engine's own spec, so the field names, their types and their defaults come from the same place `kaniscope --config-docs` prints — and an unknown key raises instead of being silently dropped. That last part is not hypothetical: this section used to show `env: { MODEL: ... }`, and `MODEL` is not a variable the engine reads. It set nothing, and nothing said so.
+
+`env` is still there for the raw names, and is applied **after** `config` so it stays authoritative for anything the typed layer does not model.
 
 ## What this bot cannot do
 
