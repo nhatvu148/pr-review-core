@@ -533,6 +533,13 @@ Then:
    and verifies without shipping, which is the way to check a matrix change.
    Deliberately not chained to the tag push: a typo'd tag would otherwise burn a
    version number on three registries at once, and none of them let you reuse it.
+7. **Then, and only then, bump `packaging/examples/node-bot`.** Its `package.json`
+   and `package-lock.json` must move together, and `npm install` resolves against
+   the registry — so this cannot happen before step 6 puts the version on npm
+   (`ETARGET`), and bumping the manifest alone breaks `npm ci`. That is not
+   hypothetical: 0.27.0's release PR did exactly that, and the reviewer caught it.
+   CI now runs `npm ci` there, which fails on the mismatch rather than shipping an
+   example nobody can install.
 
 ## License
 
