@@ -491,6 +491,61 @@ pub const SPEC: &[ConfigVar] = &[
     },
 ];
 
+/// The option name a TypeScript client should expose for this variable.
+///
+/// Derived, not chosen: `MIN_CONFIDENCE` becomes `minConfidence`. Doing this in
+/// Rust rather than in the generator means both language clients get their names
+/// from one definition and cannot drift into calling the same knob two things.
+pub fn camel_case(env: &str) -> String {
+    let mut out = String::with_capacity(env.len());
+    let mut upper = false;
+    for (i, c) in env.chars().enumerate() {
+        if c == '_' {
+            upper = true;
+        } else if i == 0 {
+            out.push(c.to_ascii_lowercase());
+        } else if upper {
+            out.push(c.to_ascii_uppercase());
+            upper = false;
+        } else {
+            out.push(c.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
+/// The same for Python: `MIN_CONFIDENCE` becomes `min_confidence`.
+pub fn snake_case(env: &str) -> String {
+    env.to_ascii_lowercase()
+}
+
+/// The whole surface as JSON, for the client generators.
+///
+/// Carries the derived key names alongside the env name and the language types,
+/// so a generator transcribes rather than decides. Everything a typed `config`
+/// option needs is here; nothing about it is inferred downstream.
+pub fn as_json() -> String {
+    let vars: Vec<serde_json::Value> = SPEC
+        .iter()
+        .map(|v| {
+            serde_json::json!({
+                "env": v.env,
+                "aliases": v.aliases,
+                "camel": camel_case(v.env),
+                "snake": snake_case(v.env),
+                "kind": format!("{:?}", v.kind),
+                "ts": v.kind.ts(),
+                "py": v.kind.py(),
+                "default": v.default,
+                "secret": v.kind == ConfigKind::Secret,
+                "doc": v.doc,
+            })
+        })
+        .collect();
+    serde_json::to_string_pretty(&serde_json::json!({ "vars": vars }))
+        .expect("SPEC is plain data and always serializes")
+}
+
 /// The whole surface as a markdown table, for the README.
 ///
 /// Generated rather than hand-written because the hand-written one drifted: it
@@ -614,6 +669,49 @@ mod tests {
         }
         // One row per variable, plus a header and a separator.
         assert_eq!(table.lines().count(), SPEC.len() + 2);
+    }
+
+    /// Key names are derived, so the derivation is the thing to test.
+    #[test]
+    fn keys_are_derived_predictably() {
+        assert_eq!(camel_case("MIN_CONFIDENCE"), "minConfidence");
+        assert_eq!(
+            camel_case("OPENROUTER_MODEL_EXPLORE"),
+            "openrouterModelExplore"
+        );
+        assert_eq!(camel_case("AGENTIC"), "agentic");
+        assert_eq!(snake_case("MIN_CONFIDENCE"), "min_confidence");
+        assert_eq!(snake_case("PR_BODY_MAX_CHARS"), "pr_body_max_chars");
+    }
+
+    /// Two variables must never collapse onto one option name, in either
+    /// language — a collision would silently drop one knob from the client.
+    #[test]
+    fn derived_keys_are_unique() {
+        for (label, f) in [
+            ("camel", camel_case as fn(&str) -> String),
+            ("snake", snake_case as fn(&str) -> String),
+        ] {
+            let mut seen = BTreeSet::new();
+            for v in SPEC {
+                let k = f(v.env);
+                assert!(seen.insert(k.clone()), "{label} key {k:?} is used twice");
+            }
+        }
+    }
+
+    /// The JSON is what the generators read, so it must carry every variable
+    /// with every field they need.
+    #[test]
+    fn the_json_carries_the_whole_spec() {
+        let v: serde_json::Value = serde_json::from_str(&as_json()).expect("valid json");
+        let vars = v["vars"].as_array().expect("vars array");
+        assert_eq!(vars.len(), SPEC.len());
+        for var in vars {
+            for field in ["env", "camel", "snake", "kind", "ts", "py", "doc"] {
+                assert!(!var[field].is_null(), "{field} missing from {var:?}");
+            }
+        }
     }
 
     #[test]

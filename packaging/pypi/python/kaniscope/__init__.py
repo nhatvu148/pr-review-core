@@ -30,6 +30,7 @@ import subprocess
 import sysconfig
 from typing import Any, Callable, Dict, Mapping, Optional
 
+from ._config import CONFIG_ENV, ReviewConfig, config_to_env
 from ._types import Finding, InlineComment, RunReviewOutput, Usage
 
 __all__ = [
@@ -43,6 +44,8 @@ __all__ = [
     "InlineComment",
     "RunReviewOutput",
     "Usage",
+    "ReviewConfig",
+    "CONFIG_ENV",
 ]
 
 _EXE = "kaniscope.exe" if os.name == "nt" else "kaniscope"
@@ -115,8 +118,19 @@ def _build_args(options: Mapping[str, Any]) -> list:
     return args
 
 
-def _environment(env: Optional[Mapping[str, str]], inherit_env: bool) -> Dict[str, str]:
-    """Merge ``env`` over the inherited environment. ``None`` means **unset**.
+def _environment(
+    env: Optional[Mapping[str, str]],
+    inherit_env: bool,
+    config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, str]:
+    """Merge ``config`` then ``env`` over the inherited environment.
+
+    Order is the contract: inherited, then ``config``, then ``env``. The typed
+    layer is a convenience over the same variables, so anything it does not
+    model — or models wrongly — must stay reachable, and an escape hatch is only
+    an escape hatch if it wins.
+
+    ``None`` in ``env`` means **unset**.
 
     Skipping a ``None`` instead of removing the key made the two clients
     disagree about the same gesture: Node drops an ``undefined`` env value, so
@@ -126,6 +140,7 @@ def _environment(env: Optional[Mapping[str, str]], inherit_env: bool) -> Dict[st
     except this one secret" has no other spelling.
     """
     base = dict(os.environ) if inherit_env else {}
+    base.update(config_to_env(config))
     for key, value in (env or {}).items():
         if value is None:
             base.pop(key, None)
@@ -169,6 +184,7 @@ def review(
     label: Optional[str] = None,
     json_out: Optional[str] = None,
     diff: Optional[str] = None,
+    config: Optional[ReviewConfig] = None,
     env: Optional[Mapping[str, str]] = None,
     inherit_env: bool = True,
     timeout: Optional[float] = None,
@@ -191,7 +207,7 @@ def review(
             [binary or binary_path(), *_build_args(options)],
             capture_output=True,
             text=True,
-            env=_environment(env, inherit_env),
+            env=_environment(env, inherit_env, config),
             timeout=timeout,
             # Explicit, never inherited. `local=True` without `base` reads the
             # diff from stdin, and leaving stdin to default meant a caller got
@@ -234,6 +250,7 @@ async def review_async(
     label: Optional[str] = None,
     json_out: Optional[str] = None,
     diff: Optional[str] = None,
+    config: Optional[ReviewConfig] = None,
     env: Optional[Mapping[str, str]] = None,
     inherit_env: bool = True,
     timeout: Optional[float] = None,
@@ -266,7 +283,7 @@ async def review_async(
         # diff on its stdin, so inheriting means blocking on a read that never
         # returns; `diff` opens the door deliberately and DEVNULL keeps it shut.
         stdin=asyncio.subprocess.PIPE if diff is not None else asyncio.subprocess.DEVNULL,
-        env=_environment(env, inherit_env),
+        env=_environment(env, inherit_env, config),
     )
 
     async def read_all(stream: Any) -> str:

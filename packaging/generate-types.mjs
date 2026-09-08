@@ -27,17 +27,30 @@ const OUTPUTS = {
   schema: path.join(ROOT, "packaging", "schema.json"),
   ts: path.join(ROOT, "packaging", "npm", "types.d.ts"),
   py: path.join(ROOT, "packaging", "pypi", "python", "kaniscope", "_types.py"),
+  configTs: path.join(ROOT, "packaging", "npm", "config.d.ts"),
+  configJs: path.join(ROOT, "packaging", "npm", "config.js"),
+  configPy: path.join(ROOT, "packaging", "pypi", "python", "kaniscope", "_config.py"),
 };
 
-/** The schema, from the built binary — the only source that cannot be stale. */
-function loadSchema() {
+/** The engine's env-var surface, from the same binary. */
+function loadConfigSpec() {
+  return JSON.parse(execFileSync(binaryPath(), ["--config-json"], { encoding: "utf8", maxBuffer: 8 << 20 })).vars;
+}
+
+/** Path to the binary both loaders read from. */
+function binaryPath() {
   const bin = process.env.KANISCOPE_BINARY_PATH || path.join(ROOT, "target", "debug", "kaniscope");
   if (!existsSync(bin)) {
     throw new Error(
       `no binary at ${bin} — build it first:\n  cargo build --features cli --bin kaniscope`
     );
   }
-  return JSON.parse(execFileSync(bin, ["--schema"], { encoding: "utf8", maxBuffer: 32 << 20 }));
+  return bin;
+}
+
+/** The schema, from the built binary — the only source that cannot be stale. */
+function loadSchema() {
+  return JSON.parse(execFileSync(binaryPath(), ["--schema"], { encoding: "utf8", maxBuffer: 32 << 20 }));
 }
 
 /**
@@ -188,12 +201,140 @@ function emitPy(defs) {
   return out.trimEnd() + "\n";
 }
 
+/** One doc line, wrapped as a comment, with the env name and default appended.
+ *
+ * The env name stays visible because it is the thing every existing deployment,
+ * Dockerfile and `.prbot.toml` example is written in terms of — a typed option
+ * that hides it would make the two vocabularies impossible to line up.
+ */
+function configDoc(v, style) {
+  const dflt = v.secret ? "" : v.default ? ` Default: \`${v.default}\`.` : "";
+  const body = `${v.doc}${dflt} (\`${v.env}\`)`;
+  return style === "ts" ? `  /** ${body} */` : `    ${body}`;
+}
+
+function emitConfigTs(vars) {
+  let out =
+    BANNER("node packaging/generate-types.mjs") +
+    `
+/**
+ * Typed overrides for the engine's environment-driven configuration.
+ *
+ * Every field maps to one environment variable. Passing \`config\` is exactly
+ * equivalent to setting those variables, and \`env\` still wins over it — the raw
+ * escape hatch stays authoritative for anything not modelled here.
+ */
+export interface ReviewConfig {
+`;
+  for (const v of vars) {
+    out += configDoc(v, "ts") + "\n";
+    out += `  ${v.camel}?: ${v.ts};\n`;
+  }
+  out += "}\n";
+  return out;
+}
+
+function emitConfigJs(vars) {
+  const pairs = vars.map((v) => `  ${v.camel}: ["${v.env}", "${v.kind}"],`).join("\n");
+  return (
+    BANNER("node packaging/generate-types.mjs") +
+    `
+// Option name -> [environment variable, kind]. The kind drives coercion: the
+// engine reads strings, so a boolean has to arrive as "true", a glob list as a
+// comma-separated string, and a number as its decimal form.
+const CONFIG_ENV = {
+${pairs}
+};
+
+/** Turn a \`config\` object into the environment variables the engine reads. */
+function configToEnv(config) {
+  const env = {};
+  for (const [key, value] of Object.entries(config || {})) {
+    const entry = CONFIG_ENV[key];
+    // Unknown keys are rejected rather than dropped, for the same reason
+    // unknown review options are: a silently ignored \`dryRun\` posts a live
+    // review, and a silently ignored \`minConfidence\` ships every nit.
+    if (!entry) throw new TypeError(\`kaniscope: unknown config option \${JSON.stringify(key)}\`);
+    if (value === undefined || value === null) continue;
+    const [name, kind] = entry;
+    env[name] =
+      kind === "Bool" ? (value ? "true" : "false")
+      : kind === "Globs" ? (Array.isArray(value) ? value.join(",") : String(value))
+      : String(value);
+  }
+  return env;
+}
+
+module.exports = { CONFIG_ENV, configToEnv };
+`
+  );
+}
+
+function emitConfigPy(vars) {
+  let out =
+    BANNER("node packaging/generate-types.mjs").replaceAll("//", "#") +
+    `
+from __future__ import annotations
+
+from typing import Any, Dict, List, Mapping, Optional, TypedDict
+
+
+class ReviewConfig(TypedDict, total=False):
+    """Typed overrides for the engine's environment-driven configuration.
+
+    Every field maps to one environment variable. Passing \`config\` is exactly
+    equivalent to setting those variables, and \`env\` still wins over it.
+    """
+
+`;
+  for (const v of vars) {
+    out += configDoc(v, "py").replace(/^/gm, "#").replace(/^#    /gm, "    # ") + "\n";
+    out += `    ${v.snake}: ${v.py}\n`;
+  }
+  out += `
+
+# Option name -> (environment variable, kind). The kind drives coercion: the
+# engine reads strings, so a bool arrives as "true", a glob list as a
+# comma-separated string, and a number as its decimal form.
+CONFIG_ENV: Dict[str, tuple] = {
+${vars.map((v) => `    "${v.snake}": ("${v.env}", "${v.kind}"),`).join("\n")}
+}
+
+
+def config_to_env(config: Optional[Mapping[str, Any]]) -> Dict[str, str]:
+    """Turn a \`config\` mapping into the environment variables the engine reads."""
+    env: Dict[str, str] = {}
+    for key, value in (config or {}).items():
+        entry = CONFIG_ENV.get(key)
+        # Unknown keys raise rather than being dropped, for the same reason an
+        # unknown review kwarg does: a silently ignored dry_run posts a live
+        # review, and a silently ignored min_confidence ships every nit.
+        if entry is None:
+            raise TypeError(f"kaniscope: unknown config option {key!r}")
+        if value is None:
+            continue
+        name, kind = entry
+        if kind == "Bool":
+            env[name] = "true" if value else "false"
+        elif kind == "Globs":
+            env[name] = ",".join(value) if isinstance(value, (list, tuple)) else str(value)
+        else:
+            env[name] = str(value)
+    return env
+`;
+  return out;
+}
+
 const schema = loadSchema();
 const defs = objects(schema);
+const configVars = loadConfigSpec();
 const files = {
   [OUTPUTS.schema]: JSON.stringify(schema, null, 2) + "\n",
   [OUTPUTS.ts]: emitTs(defs),
   [OUTPUTS.py]: emitPy(defs),
+  [OUTPUTS.configTs]: emitConfigTs(configVars),
+  [OUTPUTS.configJs]: emitConfigJs(configVars),
+  [OUTPUTS.configPy]: emitConfigPy(configVars),
 };
 
 let stale = [];

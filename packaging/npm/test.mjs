@@ -166,6 +166,35 @@ EOF`,
   );
 }
 
+// `config` is a typed façade over the same variables `env` carries, and `env`
+// must still win — it cannot model everything, and can model something wrongly.
+{
+  const { configToEnv } = require("./config.js");
+  const mapped = configToEnv({ minConfidence: 70, agentic: true, excludeGlobs: ["a/**", "b/**"] });
+  check(
+    "config coerces by kind",
+    mapped.MIN_CONFIDENCE === "70" && mapped.AGENTIC === "true" && mapped.EXCLUDE_GLOBS === "a/**,b/**",
+    JSON.stringify(mapped)
+  );
+
+  let threw = false;
+  try { configToEnv({ min_confidence: 70 }); } catch { threw = true; }  // snake_case typo
+  check("an unknown config key is rejected", threw);
+
+  // End to end: the child must actually see the variable.
+  const binary = fakeBinary(
+    // UNQUOTED heredoc: a quoted one makes `$MIN_CONFIDENCE` literal, and the
+    // test then asserts against the string "$MIN_CONFIDENCE" instead of the value.
+    `cat <<EOF\n{"model":"$MIN_CONFIDENCE","findings":0,"inlinePosted":0,"posted":false,` +
+      `"pr":0,"provider":"p","recommendation":"r","repo":"r","summaryMarkdown":""}\nEOF`
+  );
+  const viaConfig = await client.review({ binary, config: { minConfidence: 70 } });
+  check("config reaches the child process", viaConfig.model === "70", viaConfig.model);
+
+  const both = await client.review({ binary, config: { minConfidence: 70 }, env: { MIN_CONFIDENCE: "99" } });
+  check("env beats config", both.model === "99", both.model);
+}
+
 // The override is the documented escape hatch for an unsupported platform, so it
 // has to be read BEFORE the supported-platform check that names it.
 {

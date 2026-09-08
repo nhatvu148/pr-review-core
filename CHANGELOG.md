@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**Typed configuration for the npm and PyPI clients.** They returned fully typed results and took configuration as 59 untyped environment-variable names — no completion, no validation, and a fifth of them undocumented until `config_spec` landed. Building a real Node bot confirmed that asymmetry is the thing that actually chafes: setting a model and a confidence floor meant knowing two string names, in the same call that hands back typed findings.
+
+`kaniscope --config-json` emits the spec, and the existing generator turns it into a `ReviewConfig` interface (TypeScript) and `TypedDict` (Python), plus the option→variable map and the coercion each kind needs — the engine reads strings, so a boolean has to arrive as `"true"` and a glob list comma-separated. Option names are derived in Rust (`camel_case`/`snake_case`) rather than in the generator, so both languages cannot end up calling one knob two things; a test asserts the derived names never collide.
+
+Both clients take `config`, applied **before** `env` so the raw escape hatch still wins — it must stay authoritative for anything the typed layer does not model, or models wrongly. An unknown `config` key raises rather than being dropped, for the same reason an unknown review option does: a silently ignored `minConfidence` ships every nit and nothing tells you.
+
 ## 0.26.1
 
 **A clone no longer loses a review to one network blip.** `Workspace::clone` made a single unbounded `git clone` attempt, so a transient egress failure killed the whole review. Four production failures in one day, and their durations are the finding:

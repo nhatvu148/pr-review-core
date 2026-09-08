@@ -208,6 +208,37 @@ def test_diff_reaches_stdin() -> None:
         os.unlink(counts)
 
 
+def test_typed_config_maps_to_env() -> None:
+    """`config` is a typed façade over the same variables `env` carries."""
+    e = kaniscope._environment(None, False, {"min_confidence": 70, "agentic": True,
+                                             "exclude_globs": ["a/**", "b/**"]})
+    check(
+        "config coerces by kind",
+        e == {"MIN_CONFIDENCE": "70", "AGENTIC": "true", "EXCLUDE_GLOBS": "a/**,b/**"},
+        str(e),
+    )
+
+
+def test_env_beats_config() -> None:
+    """The raw escape hatch has to win, or it is not an escape hatch.
+
+    `config` cannot model everything and can model something wrongly; `env` is
+    what remains when it does.
+    """
+    e = kaniscope._environment({"MIN_CONFIDENCE": "99"}, False, {"min_confidence": 70})
+    check("env overrides config", e.get("MIN_CONFIDENCE") == "99", str(e))
+
+
+def test_unknown_config_key_is_rejected() -> None:
+    """Same reasoning as an unknown kwarg: a silently dropped `min_confidence`
+    ships every nit, and nothing tells you."""
+    try:
+        kaniscope._environment(None, False, {"minConfidence": 70})  # camelCase typo
+        check("an unknown config key raises", False, "it was accepted")
+    except TypeError:
+        check("an unknown config key raises", True)
+
+
 def test_nonzero_exit_carries_the_reason() -> None:
     """A failed review must surface its exit code and stderr, not just fail."""
     binary = fake_binary("echo 'the cause' >&2\nexit 3")
@@ -231,6 +262,9 @@ if __name__ == "__main__":
     test_sync_timeout_raises_kaniscope_error()
     test_large_single_line_stdout()
     test_env_none_unsets()
+    test_typed_config_maps_to_env()
+    test_env_beats_config()
+    test_unknown_config_key_is_rejected()
     test_diff_reaches_stdin()
     test_nonzero_exit_carries_the_reason()
     print()

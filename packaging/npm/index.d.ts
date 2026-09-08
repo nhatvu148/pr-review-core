@@ -3,7 +3,18 @@ import type { RunReviewOutput } from "./types";
 export type { RunReviewOutput, Finding, InlineComment, Usage } from "./types";
 
 /** Options common to every call: how the binary is found and run. */
+export type { ReviewConfig } from "./config";
+
 export interface SpawnOptions {
+  /**
+   * Typed overrides for the engine's configuration — the same variables `env`
+   * carries, with names, types and documentation generated from the engine's
+   * own spec.
+   *
+   * `env` is applied *after* this and therefore wins, so the raw escape hatch
+   * stays authoritative for anything not modelled.
+   */
+  config?: import("./config").ReviewConfig;
   /**
    * Environment overrides, merged over `process.env` (see {@link inheritEnv}).
    * This is where the engine's configuration lives — `OPENROUTER_API_KEY`,

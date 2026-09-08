@@ -48,7 +48,18 @@ for (const f of out.findingsDetail ?? []) {
 
 ## Configuration
 
-Everything beyond the flags above — the model, the API key, provider tokens, file globs, confidence floors, bot identity — is read from the environment, exactly as it is for the Rust library. Pass overrides in `env` (merged over `process.env`, unless `inheritEnv: false`).
+Everything beyond the flags above — the model, provider tokens, file globs, confidence floors, bot identity — is engine configuration. Pass it typed:
+
+```ts
+await review({
+  provider: "github", repo, pr,
+  config: { openrouterModel: "anthropic/claude-sonnet-5", minConfidence: 70, agentic: true },
+});
+```
+
+`ReviewConfig` is **generated from the engine's own spec** — every option with its type, default and documentation — so it cannot drift from what the binary actually reads, and your editor completes them.
+
+`env` still takes raw strings and is applied *after* `config`, so it wins. That is deliberate: it stays the escape hatch for anything the typed layer does not model.
 
 The essentials: `OPENROUTER_API_KEY`, plus `GH_TOKEN` / `GITLAB_TOKEN` / Bitbucket credentials for the provider you use. See the [engine README](https://github.com/nhatvu148/pr-review-core#injecting-identity-and-prompt) for the full list, and `.prbot.toml` for per-repo settings.
 
