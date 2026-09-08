@@ -19,9 +19,9 @@ prompt through [`Config`].
 
 ## Used by
 
-- **🦀 Kaniscope** — built entirely on this crate, and distributed as a binary on
+- **🦀 [Kaniscope](https://kaniscope.nvnv.app)** — built entirely on this crate, and distributed as a binary on
   [npm](https://www.npmjs.com/package/kaniscope) and [PyPI](https://pypi.org/project/kaniscope/):
-  - a hosted **[playground](https://kaniscope.nvnv.app)** (paste a diff or a GitHub PR URL → get a review), and
+  - a hosted **[playground](https://kaniscope.nvnv.app/playground)** (paste a diff or a GitHub PR URL → get a review), and
   - a **[GitHub Action](https://github.com/marketplace/actions/kaniscope-ai-code-review)** on the Marketplace (`uses: nhatvu148/kaniscope-action@v1`).
 
 ## What's in the box
@@ -148,6 +148,17 @@ import { review } from "kaniscope";
 const out = await review({ provider: "github", repo: "me/app", pr: 12 });
 console.log(out.recommendation, out.findings);
 ```
+
+Configuration is typed from the same spec. `config` takes the knobs under their own names — completed, checked, and coerced to the strings the engine reads, so a boolean does not have to arrive as `"true"` or a glob list comma-joined by hand:
+
+```ts
+const out = await review({
+  provider: "github", repo: "me/app", pr: 12,
+  config: { openrouterModel: "anthropic/claude-sonnet-5", minConfidence: 70, agentic: true },
+});
+```
+
+`env` still takes raw variable names and is applied **after** `config`, so the escape hatch stays authoritative for anything the typed layer does not model. An unknown `config` key raises rather than being dropped — a silently ignored `minConfidence` ships every nit and nothing tells you. Python is the same call with `snake_case` keys.
 
 A complete worked example — HTTP server, webhook signature verification, one `review()` call, and tests that run against a fake engine with no key — is in [`packaging/examples/node-bot`](packaging/examples/node-bot).
 
