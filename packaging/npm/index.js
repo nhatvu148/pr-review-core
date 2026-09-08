@@ -14,6 +14,7 @@
 const { spawn } = require("node:child_process");
 const { StringDecoder } = require("node:string_decoder");
 const { binaryPath } = require("./binary.js");
+const { configToEnv } = require("./config.js");
 
 /** Flags that take a value, mapped from the camelCase option name. */
 const VALUE_FLAGS = {
@@ -41,7 +42,7 @@ const BOOL_FLAGS = {
  * one mistake in this API with consequences that cannot be undone.
  */
 function buildArgs(options) {
-  const known = new Set([...Object.keys(VALUE_FLAGS), ...Object.keys(BOOL_FLAGS), "env", "inheritEnv", "timeoutMs", "onLog", "binary", "diff"]);
+  const known = new Set([...Object.keys(VALUE_FLAGS), ...Object.keys(BOOL_FLAGS), "env", "inheritEnv", "timeoutMs", "onLog", "binary", "diff", "config"]);
   for (const key of Object.keys(options)) {
     if (!known.has(key)) {
       throw new TypeError(`kaniscope: unknown option ${JSON.stringify(key)}`);
@@ -78,7 +79,15 @@ function run(bin, args, options) {
     // no diff on stdin and would block or read junk. Explicit both ways.
     const wantsStdin = options.diff !== undefined && options.diff !== null;
     const child = spawn(bin, args, {
-      env: options.inheritEnv === false ? { ...options.env } : { ...process.env, ...options.env },
+      // Order is the contract: inherited, then `config`, then raw `env`. The
+      // typed layer is a convenience over the same variables, so anything it
+      // does not model — or models wrongly — must remain reachable, and the
+      // escape hatch is only an escape hatch if it wins.
+      env: {
+        ...(options.inheritEnv === false ? {} : process.env),
+        ...configToEnv(options.config),
+        ...options.env,
+      },
       stdio: [wantsStdin ? "pipe" : "ignore", "pipe", "pipe"],
     });
 

@@ -44,7 +44,18 @@ Both raise `KaniscopeError` when the engine exits non-zero, carrying `exit_code`
 
 ## Configuration
 
-Everything beyond these arguments — the model, the API key, provider tokens, file globs, confidence floors, bot identity — is read from the environment, exactly as it is for the Rust library. Pass overrides in `env` (merged over `os.environ`, unless `inherit_env=False`).
+Everything beyond these arguments — the model, provider tokens, file globs, confidence floors, bot identity — is engine configuration. Pass it typed:
+
+```python
+out = review(
+    provider="github", repo=repo, pr=pr,
+    config={"openrouter_model": "anthropic/claude-sonnet-5", "min_confidence": 70, "agentic": True},
+)
+```
+
+`ReviewConfig` is a `TypedDict` **generated from the engine's own spec** — every option with its type, default and documentation — so it cannot drift from what the binary actually reads.
+
+`env` still takes raw strings and is applied *after* `config`, so it wins. That is deliberate: it stays the escape hatch for anything the typed layer does not model.
 
 The essentials: `OPENROUTER_API_KEY`, plus `GH_TOKEN` / `GITLAB_TOKEN` / Bitbucket credentials for the provider you use. See the [engine README](https://github.com/nhatvu148/pr-review-core#injecting-identity-and-prompt) for the full list, and `.prbot.toml` for per-repo settings.
 

@@ -96,6 +96,14 @@ struct Args {
     /// copy drifts — the previous hand-written one documented 41 of 61 names.
     #[arg(long = "config-docs", default_value_t = false)]
     config_docs: bool,
+    /// Print the environment-variable surface as JSON and exit — the source the
+    /// npm and PyPI clients generate their typed `config` options from.
+    ///
+    /// Separate from `--config-docs`, which renders the same spec as a markdown
+    /// table for humans. One spec, two renderings, so the table a reader sees and
+    /// the types a client ships cannot disagree.
+    #[arg(long = "config-json", default_value_t = false)]
+    config_json: bool,
     /// Print the JSON Schema of the `--json` output and exit. Needs no key, no
     /// token and no network.
     ///
@@ -125,6 +133,11 @@ async fn main() -> anyhow::Result<()> {
     // Before any config read or network call: a schema dump is a pure function of
     // the binary, and demanding a key for it would make the typed-client
     // generation step need production credentials.
+    if args.config_json {
+        println!("{}", pr_review_core::config_spec::as_json());
+        return Ok(());
+    }
+
     if args.config_docs {
         print!("{}", pr_review_core::config_spec::markdown_table());
         return Ok(());

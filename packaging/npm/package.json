@@ -27,6 +27,8 @@
     "index.js",
     "index.d.ts",
     "types.d.ts",
+    "config.js",
+    "config.d.ts",
     "binary.js",
     "bin/kaniscope.js",
     "README.md"
