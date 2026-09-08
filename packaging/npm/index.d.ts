@@ -2,9 +2,9 @@ import type { RunReviewOutput } from "./types";
 
 export type { RunReviewOutput, Finding, InlineComment, Usage } from "./types";
 
-/** Options common to every call: how the binary is found and run. */
 export type { ReviewConfig } from "./config";
 
+/** Options common to every call: how the binary is found and run. */
 export interface SpawnOptions {
   /**
    * Typed overrides for the engine's configuration — the same variables `env`

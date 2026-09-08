@@ -536,7 +536,11 @@ pub fn as_json() -> String {
                 "kind": format!("{:?}", v.kind),
                 "ts": v.kind.ts(),
                 "py": v.kind.py(),
-                "default": v.default,
+                // Nulled for secrets, mirroring `markdown_table`. Every secret's
+                // default is `None` today, which is exactly why this needs a
+                // guard rather than an observation: nothing would catch the day
+                // one stopped being, and this JSON feeds two generated clients.
+                "default": if v.kind == ConfigKind::Secret { None } else { v.default },
                 "secret": v.kind == ConfigKind::Secret,
                 "doc": v.doc,
             })
@@ -696,6 +700,22 @@ mod tests {
             for v in SPEC {
                 let k = f(v.env);
                 assert!(seen.insert(k.clone()), "{label} key {k:?} is used twice");
+            }
+        }
+    }
+
+    /// The same guard the markdown table has: a secret's default must never
+    /// reach a generated client either.
+    #[test]
+    fn the_json_never_carries_a_secret_default() {
+        let v: serde_json::Value = serde_json::from_str(&as_json()).expect("valid json");
+        for var in v["vars"].as_array().unwrap() {
+            if var["secret"] == serde_json::Value::Bool(true) {
+                assert!(
+                    var["default"].is_null(),
+                    "secret {} leaked a default into the JSON",
+                    var["env"]
+                );
             }
         }
     }

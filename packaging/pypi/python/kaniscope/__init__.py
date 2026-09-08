@@ -192,10 +192,18 @@ def review(
 ) -> RunReviewOutput:
     """Review a pull request, or a local diff with ``local=True``.
 
-    Everything beyond these arguments — the API key, the model, globs, confidence
-    floors, bot identity — comes from the environment, exactly as it does for a
-    Rust consumer. Pass overrides in ``env``; they are merged over ``os.environ``
-    unless ``inherit_env=False``.
+    Everything beyond these arguments is engine configuration. Pass it typed in
+    ``config`` — a ``ReviewConfig`` generated from the engine's own spec, so its
+    names, types and defaults cannot drift from what the binary reads::
+
+        review(provider="github", repo=repo, pr=pr,
+               config={"openrouter_model": "anthropic/claude-sonnet-5",
+                       "min_confidence": 70})
+
+    ``env`` still takes raw strings and is applied **after** ``config``, so it
+    wins. That ordering is deliberate: ``config`` cannot model everything and can
+    model something wrongly, and an escape hatch is only an escape hatch if it
+    wins. Both are merged over ``os.environ`` unless ``inherit_env=False``.
 
     Keyword-only on purpose: ``provider``/``repo``/``pr`` are three adjacent
     values of which two are strings, and a positional call that swapped them
@@ -263,6 +271,9 @@ async def review_async(
     webhook handler — which is the shape most Python bots have. ``on_log`` is
     called per stderr line as it arrives, so a handler can report progress rather
     than going silent for the whole run.
+
+    Takes ``config`` and ``env`` exactly as :func:`review` does, with the same
+    precedence: ``config`` first, then ``env``, which wins.
 
     The signature is spelled out rather than taken as ``**kwargs`` so that an
     unknown argument is a :class:`TypeError` here, at the call, instead of being

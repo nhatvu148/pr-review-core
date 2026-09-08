@@ -250,11 +250,17 @@ ${pairs}
 function configToEnv(config) {
   const env = {};
   for (const [key, value] of Object.entries(config || {})) {
+    // \`hasOwnProperty\`, not a bare lookup: \`CONFIG_ENV["toString"]\` finds
+    // Object.prototype's method, which is truthy, so the unknown-key check below
+    // passes and the destructuring then fails with "entry is not iterable" —
+    // a confusing error for what is simply a typo.
+    if (!Object.prototype.hasOwnProperty.call(CONFIG_ENV, key)) {
+      // Unknown keys are rejected rather than dropped, for the same reason
+      // unknown review options are: a silently ignored \`dryRun\` posts a live
+      // review, and a silently ignored \`minConfidence\` ships every nit.
+      throw new TypeError(\`kaniscope: unknown config option \${JSON.stringify(key)}\`);
+    }
     const entry = CONFIG_ENV[key];
-    // Unknown keys are rejected rather than dropped, for the same reason
-    // unknown review options are: a silently ignored \`dryRun\` posts a live
-    // review, and a silently ignored \`minConfidence\` ships every nit.
-    if (!entry) throw new TypeError(\`kaniscope: unknown config option \${JSON.stringify(key)}\`);
     if (value === undefined || value === null) continue;
     const [name, kind] = entry;
     env[name] =

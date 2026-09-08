@@ -181,6 +181,19 @@ EOF`,
   try { configToEnv({ min_confidence: 70 }); } catch { threw = true; }  // snake_case typo
   check("an unknown config key is rejected", threw);
 
+  // A bare `CONFIG_ENV[key]` finds Object.prototype members, which are truthy,
+  // so the unknown-key check passed and the destructuring then failed with
+  // "entry is not iterable" — a baffling error for what is only a typo.
+  for (const proto of ["toString", "constructor", "valueOf"]) {
+    let msg = "";
+    try { configToEnv({ [proto]: 1 }); } catch (e) { msg = e.message; }
+    check(
+      `a prototype key (${proto}) reports as unknown, not as a crash`,
+      msg.includes("unknown config option"),
+      msg || "(no error at all)"
+    );
+  }
+
   // End to end: the child must actually see the variable.
   const binary = fakeBinary(
     // UNQUOTED heredoc: a quoted one makes `$MIN_CONFIDENCE` literal, and the
