@@ -17,7 +17,7 @@ or a reproducible diff.
 
 ## The local loop
 
-CI runs exactly these three, and they must be clean:
+CI's `check` job runs exactly these three, and they must be clean:
 
 ```sh
 cargo fmt --check
@@ -26,6 +26,8 @@ cargo test --all-features
 ```
 
 `clippy` runs with `-D warnings`, so a warning is a failure.
+
+Three further jobs gate a PR: `package`, `downstream`, and `packaging` — the last re-runs the generators with `--check` (config docs, generated client types, npm version, installer syntax, client tests). Touch config, a public type, or `packaging/` and you want that generator run locally rather than in CI. [AGENTS.md](AGENTS.md#before-you-claim-anything-works) has the detail.
 
 ## What the code should look like
 
