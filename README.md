@@ -106,7 +106,7 @@ One call, [`review::run_review`], runs the whole pipeline in this order — each
 
 **fetch** `providers` → **per-repo config** `repo_config` → **CVE scan (raw diff)** `deps` → **glob filter + hygiene + pack to budget** `diff` → **structural context** `structure` → **walkthrough & diagram** `changemap` → **prompt** `prompt` → **model, agentic or diff-only** `backend` / `agent` / `llm` → **self-critique** `llm` → **anchor & re-anchor** `diff` → **suggestions** `suggest` → **post & reconcile** `providers` → **run log** `runlog`
 
-The dependency scan runs *before* the glob filter on purpose: the filter removes lockfiles, so the added dependency lines have to be read first. `complexity` and `blast` are not pipeline stages — they are called by `changemap`, `structure` and `agent`. Around one review sit `queue` (ranking many PRs), `command` (PR comment commands) and `webhook` (signature verification).
+The dependency scan runs *before* the glob filter on purpose: the filter removes lockfiles, so the added dependency lines have to be read first. `complexity` and `blast` are not pipeline stages — `complexity` is called by `structure`, `blast` by `changemap` and `agent`. Around one review sit `queue` (ranking many PRs), `command` (PR comment commands) and `webhook` (signature verification).
 
 Contributors, human or automated, should start at [AGENTS.md](AGENTS.md): the same map with the per-stage functions, the three commands CI runs, and the rules that are easy to violate.
 

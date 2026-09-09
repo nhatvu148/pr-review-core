@@ -4,11 +4,11 @@ Orientation for an automated contributor. Everything here is also true for a hum
 
 ## What this is
 
-A **library**, not a bot. It carries no identity of its own: consumers (bot binaries) depend on it and inject branding and extra prompt through `Config`. The `kaniscope` binary in `packaging/` is a thin CLI over the same library, and its `--json` output is the wire contract every non-Rust consumer reads.
+A **library**, not a bot. It carries no identity of its own: consumers (bot binaries) depend on it and inject branding and extra prompt through `Config`. The `kaniscope` binary (`src/bin/kaniscope.rs`, behind the `cli` feature) is a thin CLI over the same library, and its `--json` output is the wire contract every non-Rust consumer reads. `packaging/` holds the npm and PyPI wrapper packages and the release tooling around that binary, not the binary itself.
 
 ## Before you claim anything works
 
-CI runs exactly these three and they must be clean. `clippy` runs with `-D warnings`, so a warning is a failure:
+CI's `check` job runs exactly these three and they must be clean. `clippy` runs with `-D warnings`, so a warning is a failure:
 
 ```sh
 cargo fmt --check
@@ -17,6 +17,8 @@ cargo test --all-features
 ```
 
 Run them. A change that has not been through all three is not finished, however obviously correct it looks.
+
+Three further jobs gate a PR, and they are the ones a docs-or-packaging change trips: `package` (`cargo package`), `downstream` (a consumer still compiles), and `packaging`, which re-runs the generators with `--check` — README config table vs the engine's spec (`scripts/sync-config-docs.mjs`), generated client types vs `--schema` (`packaging/generate-types.mjs`), npm version vs the crate, the installer parsing as POSIX sh, and the client/example tests. If you touched config, a public type, or anything under `packaging/`, run that generator locally rather than discovering it in CI.
 
 ## The review pipeline
 
@@ -40,9 +42,9 @@ One call, `review::run_review` → `run_review_with` (`src/review.rs`), runs the
 | 14 | validate and render committable suggestions | `suggest::sanitize`, `suggest::render` |
 | 15 | render dependency advisories into the summary | `deps::render_advisories` |
 | 16 | post the inline review, reconcile against prior comments | `providers::post_review` |
-| 17 | append to the run log | `runlog::append` / `write` |
+| 17 | append to the run log | `runlog::write` (via `log_run`) |
 
-Two module relationships are not visible from that list, and have surprised people: `complexity` is called by `changemap` and `structure`, not by `review`; `blast` is called by `changemap` and `agent`. Neither is a top-level pipeline stage.
+Two module relationships are not visible from that list: `complexity` is called only by `structure` (`complexity::changed_fn_complexity_in`), and its `FnComplexity` output is then *consumed* by `changemap`, which grades it with a local `grade_for` rather than calling the module; `blast` is called by `changemap` (`is_test_path`) and `agent` (`references`, `blast_seed`). Neither is a top-level pipeline stage, and neither is called from `review`.
 
 `run_review_local` (same file) is the same pipeline for a diff that is **not** a pull request — a branch, a worktree, staged changes. No host, no PR number, nothing to post to.
 
