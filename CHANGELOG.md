@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.28.0
 
 **A round's new GitHub findings post as one review instead of one comment each.** Every standalone review comment makes GitHub synthesise an empty `COMMENTED` review around it, so a four-finding round read as four reviews — in the timeline and in the API, where anything counting reviews was really counting findings.
 
