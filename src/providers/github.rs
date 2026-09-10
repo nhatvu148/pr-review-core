@@ -748,10 +748,13 @@ fn review_payload(
 /// to have created nothing.
 ///
 /// The distinction is the whole reason this is not a `Result<()>`. Reposting
-/// every pending comment is safe only when the review provably does not exist. A
-/// status code read back from GitHub proves that; a transport error does not,
-/// because the request may have been served and only the response lost — and
-/// then the fallback would duplicate the entire round.
+/// every pending comment is safe only when the review provably does not exist,
+/// and only a deterministic client refusal is that proof. A transport error is
+/// not — the request may have been served with only the response lost. Nor is a
+/// 5xx, which the edge can return after the review was applied, nor a 408/429,
+/// which say "try later" rather than "refused" and would have the fallback write
+/// N more times into a throttle. All of those propagate; only a 4xx refusal
+/// falls back.
 enum BatchOutcome {
     Created,
     /// GitHub answered and refused. Nothing was created, so a full repost is safe.
@@ -765,8 +768,9 @@ enum BatchOutcome {
 /// meant N reviews in the timeline and in the API — a four-finding round read as
 /// four reviews, and anything counting reviews was counting findings.
 ///
-/// Errors when the review was not created, and the caller falls back to posting
-/// each comment separately. That fallback is not defensive habit: GitHub rejects
+/// Returns `Rejected` when GitHub refused the review, and the caller then falls
+/// back to posting each comment separately. That fallback is not defensive
+/// habit: GitHub rejects
 /// the **whole** review if any single comment fails to anchor, while the
 /// per-comment path loses only the bad comment. Without it, one unanchorable
 /// finding would take every other finding in the round with it.
@@ -799,6 +803,19 @@ async fn post_inline_review(
         .send()
         .await?;
     let status = res.status();
+    // Not every non-2xx proves nothing was created. A 5xx can come from the edge
+    // after the review was applied, and 408/429 say "try later", not "refused" —
+    // reposting on either duplicates a round, and on 429 does it while being
+    // throttled. Only a deterministic client refusal is evidence.
+    if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        anyhow::bail!(
+            "GitHub batched review {status} (outcome unknown, not reposting): {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
     if !status.is_success() {
         return Ok(BatchOutcome::Rejected(format!(
             "{status}: {}",
