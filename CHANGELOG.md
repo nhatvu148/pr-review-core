@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.28.1
 
 **A reworded finding that drifted a line keeps its thread.** Re-reviewing an *unchanged* PR could churn every inline thread: the model rewords a finding between runs, which breaks the `sha256(path|body)` fingerprint, and anchors it a line or two away, which broke the positional fallback — because that fallback required an *exact* line match. Both keys miss, the finding looks new, and its own thread is deleted as stale.
 
