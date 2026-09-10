@@ -699,15 +699,25 @@ fn inline_body(marker: &str, c: &InlineComment, fp: &str) -> String {
 /// Pure, so the shape can be asserted without a network: every finding present
 /// exactly once, each carrying its own fingerprint.
 ///
-/// `event: "COMMENTED"` is deliberate and must stay. `APPROVE` from a GitHub App
-/// *satisfies* a required-approval branch protection rule, so an approving
-/// reviewer would begin unblocking merges it never gated; `REQUEST_CHANGES`
-/// would block a merge on a model's opinion, which contradicts this crate's own
-/// rule that a finding is a candidate rather than a verified defect. A body is
-/// required by the API for `COMMENTED`, and it is kept to one line on purpose:
-/// the real summary is an issue comment that `upsert_summary` EDITS across
-/// rounds, and a submitted review body cannot be edited, so moving the summary
-/// here would leave one stale copy per round.
+/// `event` is `"COMMENT"`, and the value matters twice over.
+///
+/// It is the submit action, not the state read back: the states are `COMMENTED`
+/// / `APPROVED` / `CHANGES_REQUESTED`, while the API accepts only `APPROVE`,
+/// `REQUEST_CHANGES` or `COMMENT`. Sending `COMMENTED` here is rejected, and
+/// because the caller falls back to per-comment posting it fails *silently* —
+/// every round would spend one doomed request and then behave exactly as before.
+/// Omitting `event` is worse still: the review is created `PENDING`, a draft
+/// nobody but its author can see.
+///
+/// And `COMMENT` is the only one of the three that is advisory. `APPROVE` from a
+/// GitHub App *satisfies* a required-approval branch protection rule, so an
+/// approving reviewer would begin unblocking merges it never gated;
+/// `REQUEST_CHANGES` would block a merge on a model's opinion, contradicting
+/// this crate's own rule that a finding is a candidate, not a verified defect.
+///
+/// The body is one line on purpose. The real summary is an issue comment that
+/// `upsert_summary` EDITS across rounds; a submitted review body cannot be
+/// edited, so moving the summary here would leave one stale copy per round.
 fn review_payload(
     marker: &str,
     commit_id: &str,
@@ -726,7 +736,7 @@ fn review_payload(
         .collect();
     serde_json::json!({
         "commit_id": commit_id,
-        "event": "COMMENTED",
+        "event": "COMMENT",
         "body": format!(
             "_{}_ — {} new finding(s) this round.",
             marker,
@@ -1152,7 +1162,7 @@ mod tests {
     fn the_review_is_advisory_and_never_approves() {
         let c = inline("src/a.rs", 1, "x");
         let payload = review_payload("🤖 mark", "deadbeef", &[(&c, "abc123".to_string())]);
-        assert_eq!(payload["event"], "COMMENTED");
+        assert_eq!(payload["event"], "COMMENT");
         assert_eq!(payload["commit_id"], "deadbeef");
         assert!(!payload["body"].as_str().unwrap().is_empty());
     }
