@@ -1006,47 +1006,57 @@ async fn bot_threads(
 /// whether to delete a thread, and a wrong answer here loses a conversation.
 const LINE_TOLERANCE: u64 = 3;
 
-/// Pair one finding to at most one existing thread, or `None` to post it anew.
+/// Pair every finding to at most one existing thread, or `None` to post it anew.
 ///
 /// Pure, so the pairing can be asserted without a network — the two keys and
 /// their interaction are the whole of reconciliation's correctness.
 ///
-/// Fingerprint first, since `sha256(path|body)` identifies a finding exactly.
-/// Position second, because the model rewords findings between runs and only
-/// position still identifies the thread when it does.
+/// **Two passes over all findings, not one pass per finding.** Pass one reserves
+/// every exact fingerprint match; pass two assigns the rest by position. The
+/// order matters and one-at-a-time gets it wrong: with threads A at line 40 and
+/// B at 42, a reworded A now at 43 is positionally closer to B, claims it, and
+/// then the unchanged B — which had an *exact* fingerprint for its own thread —
+/// finds it taken and settles for A. Both conversations end up under the wrong
+/// finding. An exact fingerprint is proof of identity and must outrank any
+/// positional guess, including one an earlier finding would have made.
 ///
-/// The positional pass takes the CLOSEST unclaimed thread rather than the first
-/// one within tolerance. With a tolerance at all, "first" is arbitrary iteration
-/// order, and two findings a couple of lines apart could claim each other's
-/// threads — swapping two live conversations, which is worse than reposting one.
-/// Closest-wins makes that impossible whenever the two are at distinct lines.
-fn claim_thread(
-    threads: &[BotThread],
-    claimed: &[bool],
-    path: &str,
-    line: u64,
-    fp: &str,
-) -> Option<usize> {
-    let available = |i: usize, t: &BotThread| !claimed[i] && t.fp.is_some();
+/// Within pass two the CLOSEST unclaimed thread wins, not the first within
+/// tolerance: with any tolerance at all "first" is arbitrary iteration order.
+fn pair_findings(threads: &[BotThread], findings: &[(String, u64, String)]) -> Vec<Option<usize>> {
+    let mut claimed = vec![false; threads.len()];
+    let mut paired: Vec<Option<usize>> = vec![None; findings.len()];
 
-    if let Some(i) = threads
-        .iter()
-        .enumerate()
-        .position(|(i, t)| available(i, t) && t.fp.as_deref() == Some(fp))
-    {
-        return Some(i);
+    for (n, (_, _, fp)) in findings.iter().enumerate() {
+        if let Some(i) = threads
+            .iter()
+            .enumerate()
+            .position(|(i, t)| !claimed[i] && t.fp.as_deref() == Some(fp.as_str()))
+        {
+            claimed[i] = true;
+            paired[n] = Some(i);
+        }
     }
 
-    threads
-        .iter()
-        .enumerate()
-        .filter(|(i, t)| available(*i, t) && t.path == path)
-        .filter_map(|(i, t)| {
-            let delta = t.line?.abs_diff(line);
-            (delta <= LINE_TOLERANCE).then_some((i, delta))
-        })
-        .min_by_key(|(_, delta)| *delta)
-        .map(|(i, _)| i)
+    for (n, (path, line, _)) in findings.iter().enumerate() {
+        if paired[n].is_some() {
+            continue;
+        }
+        let best = threads
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| !claimed[*i] && t.fp.is_some() && t.path == *path)
+            .filter_map(|(i, t)| {
+                let delta = t.line?.abs_diff(*line);
+                (delta <= LINE_TOLERANCE).then_some((i, delta))
+            })
+            .min_by_key(|(_, delta)| *delta);
+        if let Some((i, _)) = best {
+            claimed[i] = true;
+            paired[n] = Some(i);
+        }
+    }
+
+    paired
 }
 
 async fn reconcile_inline(
@@ -1069,13 +1079,24 @@ async fn reconcile_inline(
     // by (file, line) — the line key keeps a *reworded* still-present finding
     // matched, since LLM text isn't stable across runs. Legacy threads (no
     // fingerprint) never match and are cleaned up below.
+    let findings: Vec<(String, u64, String)> = inline
+        .iter()
+        .map(|c| {
+            (
+                c.path.clone(),
+                c.line,
+                finding_fingerprint(&c.path, &c.body),
+            )
+        })
+        .collect();
+    let paired = pair_findings(&threads, &findings);
+
     let mut claimed = vec![false; threads.len()];
     let mut pending: Vec<(&InlineComment, String)> = Vec::new();
-    for c in inline {
-        let fp = finding_fingerprint(&c.path, &c.body);
-        match claim_thread(&threads, &claimed, &c.path, c.line, &fp) {
-            Some(i) => claimed[i] = true, // already present → leave the thread as-is
-            None => pending.push((c, fp)),
+    for ((c, (_, _, fp)), slot) in inline.iter().zip(&findings).zip(&paired) {
+        match slot {
+            Some(i) => claimed[*i] = true, // already present → leave the thread as-is
+            None => pending.push((c, fp.clone())),
         }
     }
 
@@ -1293,7 +1314,11 @@ mod tests {
         }
     }
 
-    /// The exact-match bug this tolerance exists for.
+    fn finding(path: &str, line: u64, fp: &str) -> (String, u64, String) {
+        (path.to_string(), line, fp.to_string())
+    }
+
+    /// The exact-match bug the tolerance exists for.
     ///
     /// Re-reviewing an unchanged PR churned every thread: the model rewords a
     /// finding between runs, which breaks `sha256(path|body)`, and anchors it a
@@ -1302,10 +1327,10 @@ mod tests {
     #[test]
     fn a_reworded_finding_that_drifted_a_line_keeps_its_thread() {
         let threads = vec![thread("aaaa", "src/a.rs", Some(40))];
-        let claimed = vec![false];
+        let paired = super::pair_findings(&threads, &[finding("src/a.rs", 42, "REWORDED")]);
         assert_eq!(
-            super::claim_thread(&threads, &claimed, "src/a.rs", 42, "DIFFERENT"),
-            Some(0),
+            paired,
+            vec![Some(0)],
             "±3 drift with a broken fingerprint must still match"
         );
     }
@@ -1314,70 +1339,87 @@ mod tests {
     #[test]
     fn a_finding_beyond_tolerance_is_new() {
         let threads = vec![thread("aaaa", "src/a.rs", Some(40))];
-        let claimed = vec![false];
         assert_eq!(
-            super::claim_thread(&threads, &claimed, "src/a.rs", 50, "DIFFERENT"),
-            None
+            super::pair_findings(&threads, &[finding("src/a.rs", 50, "OTHER")]),
+            vec![None]
         );
         assert_eq!(
-            super::claim_thread(&threads, &claimed, "src/other.rs", 40, "DIFFERENT"),
-            None,
+            super::pair_findings(&threads, &[finding("src/other.rs", 40, "OTHER")]),
+            vec![None],
             "a different file is never the same thread, however close the line"
         );
     }
 
-    /// Why closest-wins rather than first-within-tolerance.
+    /// An exact fingerprint must outrank ANY positional guess — including one an
+    /// earlier finding in the same round would otherwise have made.
     ///
-    /// Two findings a couple of lines apart would otherwise claim each other's
-    /// threads on iteration order alone — swapping two live conversations, which
-    /// is worse than reposting one. Ordered so that "first match" would be wrong.
+    /// The pre-push reviewer found this in the first version of the fix, which
+    /// paired one finding at a time. Threads A@40 and B@42; a reworded A now at
+    /// 43 is positionally closer to B and claimed it, and the unchanged B — which
+    /// had an exact fingerprint for its own thread — then found it taken and
+    /// settled for A. Both conversations ended up under the wrong finding, which
+    /// is precisely the harm closest-wins was supposed to prevent.
+    ///
+    /// Ordered so that a one-pass implementation fails.
+    #[test]
+    fn an_exact_fingerprint_outranks_an_earlier_findings_positional_guess() {
+        let threads = vec![
+            thread("aaaa", "src/a.rs", Some(40)),
+            thread("bbbb", "src/a.rs", Some(42)),
+        ];
+        let paired = super::pair_findings(
+            &threads,
+            &[
+                finding("src/a.rs", 43, "REWORDED"), // was thread 0, drifted, closer to 1
+                finding("src/a.rs", 42, "bbbb"),     // exact match for thread 1
+            ],
+        );
+        assert_eq!(
+            paired,
+            vec![Some(0), Some(1)],
+            "the exact fingerprint keeps its own thread and the reworded one falls back to A"
+        );
+    }
+
+    /// Two findings a couple of lines apart keep their own threads rather than
+    /// swapping, on distance alone when neither fingerprint matches.
     #[test]
     fn two_nearby_findings_do_not_steal_each_others_threads() {
         let threads = vec![
             thread("aaaa", "src/a.rs", Some(40)),
             thread("bbbb", "src/a.rs", Some(42)),
         ];
-        let mut claimed = vec![false; 2];
-
-        let first = super::claim_thread(&threads, &claimed, "src/a.rs", 42, "X").unwrap();
-        assert_eq!(
-            first, 1,
-            "line 42 belongs to the thread at 42, not the one at 40"
+        let paired = super::pair_findings(
+            &threads,
+            &[finding("src/a.rs", 42, "X"), finding("src/a.rs", 40, "Y")],
         );
-        claimed[first] = true;
-
-        let second = super::claim_thread(&threads, &claimed, "src/a.rs", 40, "Y").unwrap();
-        assert_eq!(second, 0, "and the other keeps its own");
+        assert_eq!(paired, vec![Some(1), Some(0)]);
     }
 
-    /// The fingerprint outranks position, even when position is a nearer match.
-    #[test]
-    fn an_exact_fingerprint_wins_over_a_closer_line() {
-        let threads = vec![
-            thread("wanted", "src/a.rs", Some(90)),
-            thread("other", "src/a.rs", Some(41)),
-        ];
-        let claimed = vec![false; 2];
-        assert_eq!(
-            super::claim_thread(&threads, &claimed, "src/a.rs", 40, "wanted"),
-            Some(0)
-        );
-    }
-
-    /// An outdated thread has no line, and must not match everything on the file.
+    /// An outdated thread has no line, and must not match everything in the file.
     #[test]
     fn a_thread_with_no_line_never_matches_positionally() {
         let threads = vec![thread("aaaa", "src/a.rs", None)];
-        let claimed = vec![false];
         assert_eq!(
-            super::claim_thread(&threads, &claimed, "src/a.rs", 40, "DIFFERENT"),
-            None
+            super::pair_findings(&threads, &[finding("src/a.rs", 40, "OTHER")]),
+            vec![None]
         );
         assert_eq!(
-            super::claim_thread(&threads, &claimed, "src/a.rs", 40, "aaaa"),
-            Some(0),
+            super::pair_findings(&threads, &[finding("src/a.rs", 40, "aaaa")]),
+            vec![Some(0)],
             "but its fingerprint still identifies it"
         );
+    }
+
+    /// One thread is claimed at most once, however many findings want it.
+    #[test]
+    fn a_thread_is_claimed_by_only_one_finding() {
+        let threads = vec![thread("aaaa", "src/a.rs", Some(40))];
+        let paired = super::pair_findings(
+            &threads,
+            &[finding("src/a.rs", 40, "X"), finding("src/a.rs", 41, "Y")],
+        );
+        assert_eq!(paired, vec![Some(0), None]);
     }
 
     /// The status dispatch, pinned as a table.
