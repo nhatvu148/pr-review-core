@@ -681,6 +681,175 @@ async fn upsert_summary(
 
 // ── inline review comments (reconcile: keep, add, resolve) ──────────────────
 
+/// The body a finding's comment carries, in **both** creation paths.
+///
+/// Extracted rather than inlined twice because the fingerprint the reconciler
+/// matches on is embedded in this text. If the batched and per-comment paths
+/// ever built it differently, a finding created by one would stop matching
+/// itself on the next round — the loop would repost it forever and never
+/// converge, which is the one failure mode this file exists to prevent.
+fn inline_body(marker: &str, c: &InlineComment, fp: &str) -> String {
+    format!("{}\n\n_{}_\n{}", c.body, marker, fp_marker(fp))
+}
+
+/// The `POST /pulls/{pr}/reviews` payload for a round's new findings.
+///
+/// Pure, so the shape can be asserted without a network: every finding present
+/// exactly once, each carrying its own fingerprint.
+///
+/// `event` is `"COMMENT"`, and the value matters twice over.
+///
+/// It is the submit action, not the state read back: the states are `COMMENTED`
+/// / `APPROVED` / `CHANGES_REQUESTED`, while the API accepts only `APPROVE`,
+/// `REQUEST_CHANGES` or `COMMENT`. Sending `COMMENTED` here is rejected, and
+/// because the caller falls back to per-comment posting it fails *silently* —
+/// every round would spend one doomed request and then behave exactly as before.
+/// Omitting `event` is worse still: the review is created `PENDING`, a draft
+/// nobody but its author can see.
+///
+/// And `COMMENT` is the only one of the three that is advisory. `APPROVE` from a
+/// GitHub App *satisfies* a required-approval branch protection rule, so an
+/// approving reviewer would begin unblocking merges it never gated;
+/// `REQUEST_CHANGES` would block a merge on a model's opinion, contradicting
+/// this crate's own rule that a finding is a candidate, not a verified defect.
+///
+/// The body is one line on purpose. The real summary is an issue comment that
+/// `upsert_summary` EDITS across rounds; a submitted review body cannot be
+/// edited, so moving the summary here would leave one stale copy per round.
+fn review_payload(
+    marker: &str,
+    commit_id: &str,
+    pending: &[(&InlineComment, String)],
+) -> serde_json::Value {
+    let comments: Vec<serde_json::Value> = pending
+        .iter()
+        .map(|(c, fp)| {
+            serde_json::json!({
+                "path": c.path,
+                "line": c.line,
+                "side": "RIGHT",
+                "body": inline_body(marker, c, fp),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "commit_id": commit_id,
+        "event": "COMMENT",
+        "body": format!(
+            "_{}_ — {} new finding(s) this round.",
+            marker,
+            pending.len()
+        ),
+        "comments": comments,
+    })
+}
+
+/// What a status code from the reviews endpoint proves about the review.
+#[derive(Debug, PartialEq, Eq)]
+enum StatusVerdict {
+    /// 2xx — the review exists.
+    Created,
+    /// A deterministic client refusal. Nothing was created, so reposting is safe.
+    Refused,
+    /// Says nothing about whether the review was created.
+    Unknown,
+}
+
+/// Decide what a status licenses the caller to do.
+///
+/// Pure and separate from the request because this dispatch — not the payload —
+/// is where a mistake changes whether findings get duplicated, dropped or lost,
+/// and a table of statuses is the only cheap way to pin it.
+///
+/// Not every non-2xx is a refusal. A 5xx can come from the edge *after* the
+/// review was applied, and 408/429 say "try later" rather than "refused" —
+/// reposting on either duplicates a round, and on 429 does it while being
+/// throttled.
+fn classify_review_status(status: reqwest::StatusCode) -> StatusVerdict {
+    if status.is_success() {
+        StatusVerdict::Created
+    } else if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        StatusVerdict::Unknown
+    } else {
+        StatusVerdict::Refused
+    }
+}
+
+/// What became of a batched review — and specifically, whether GitHub is known
+/// to have created nothing.
+///
+/// The distinction is the whole reason this is not a `Result<()>`. Reposting
+/// every pending comment is safe only when the review provably does not exist,
+/// and only a deterministic client refusal is that proof. A transport error is
+/// not — the request may have been served with only the response lost. Nor is a
+/// 5xx, which the edge can return after the review was applied, nor a 408/429,
+/// which say "try later" rather than "refused" and would have the fallback write
+/// N more times into a throttle. All of those propagate; only a 4xx refusal
+/// falls back.
+enum BatchOutcome {
+    Created,
+    /// GitHub answered and refused. Nothing was created, so a full repost is safe.
+    Rejected(String),
+}
+
+/// Create a round's new findings as ONE review instead of one comment each.
+///
+/// The objects are the same either way: GitHub synthesises an empty `COMMENTED`
+/// review around every standalone review comment, so N comments have always
+/// meant N reviews in the timeline and in the API — a four-finding round read as
+/// four reviews, and anything counting reviews was counting findings.
+///
+/// Returns `Rejected` when GitHub refused the review, and the caller then falls
+/// back to posting each comment separately. That fallback is not defensive
+/// habit: GitHub rejects
+/// the **whole** review if any single comment fails to anchor, while the
+/// per-comment path loses only the bad comment. Without it, one unanchorable
+/// finding would take every other finding in the round with it.
+///
+/// The fallback reposts *every* pending comment, so it runs only on
+/// `Rejected` — a status GitHub actually returned, which means no review was
+/// created. A transport error propagates instead, because the request may have
+/// been served with only the response lost, and reposting there would duplicate
+/// the whole round.
+///
+/// That leaves one residual case: a rejection where GitHub applied some comments
+/// before erroring. Left unguarded, because reconciliation repairs it on the next
+/// round without help — each finding claims AT MOST ONE thread by fingerprint, so
+/// a duplicate is left unclaimed and gets resolved or deleted with the other
+/// stale threads.
+async fn post_inline_review(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    commit_id: &str,
+    pending: &[(&InlineComment, String)],
+) -> Result<BatchOutcome> {
+    let url = format!("{}/repos/{repo}/pulls/{pr}/reviews", cfg.github_api_base);
+    // A transport failure propagates via `?` rather than becoming a Rejected:
+    // the request may have been served and the response lost, so reposting could
+    // duplicate a whole round. Only a status we actually read proves otherwise.
+    let res = gh(client.post(url), cfg)
+        .json(&review_payload(&cfg.comment_marker, commit_id, pending))
+        .send()
+        .await?;
+    let status = res.status();
+    match classify_review_status(status) {
+        StatusVerdict::Created => Ok(BatchOutcome::Created),
+        StatusVerdict::Refused => Ok(BatchOutcome::Rejected(format!(
+            "{status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        ))),
+        StatusVerdict::Unknown => anyhow::bail!(
+            "GitHub batched review {status} (outcome unknown, not reposting): {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        ),
+    }
+}
+
 /// POST one inline review comment, embedding the finding's fingerprint as a
 /// hidden marker so a later review can match it (keep / resolve).
 async fn post_inline(
@@ -693,7 +862,7 @@ async fn post_inline(
     fp: &str,
 ) -> Result<()> {
     let url = format!("{}/repos/{repo}/pulls/{pr}/comments", cfg.github_api_base);
-    let body = format!("{}\n\n_{}_\n{}", c.body, cfg.comment_marker, fp_marker(fp));
+    let body = inline_body(&cfg.comment_marker, c, fp);
     let res = gh(client.post(url), cfg)
         .json(&serde_json::json!({
             "body": body, "commit_id": commit_id, "path": c.path, "line": c.line, "side": "RIGHT"
@@ -843,6 +1012,7 @@ async fn reconcile_inline(
     // matched, since LLM text isn't stable across runs. Legacy threads (no
     // fingerprint) never match and are cleaned up below.
     let mut claimed = vec![false; threads.len()];
+    let mut pending: Vec<(&InlineComment, String)> = Vec::new();
     for c in inline {
         let fp = finding_fingerprint(&c.path, &c.body);
         let mut hit = None;
@@ -862,7 +1032,44 @@ async fn reconcile_inline(
         }
         match hit {
             Some(i) => claimed[i] = true, // already present → leave the thread as-is
-            None => post_inline(client, cfg, &meta.repo, meta.pr, commit_id, c, &fp).await?,
+            None => pending.push((c, fp)),
+        }
+    }
+
+    // One review for the whole round, falling back to one comment each if GitHub
+    // refuses it — see `post_inline_review` for why the fallback is required
+    // rather than cautious.
+    if !pending.is_empty() {
+        // A refusal means nothing was created, so reposting each comment is safe
+        // and preserves the old per-anchor tolerance. A transport error is NOT
+        // that: it propagates, because the review may exist unseen.
+        match post_inline_review(client, cfg, &meta.repo, meta.pr, commit_id, &pending).await {
+            Ok(BatchOutcome::Created) => {}
+            Ok(BatchOutcome::Rejected(why)) => {
+                tracing::warn!(
+                    "GitHub refused the batched review for {}#{} ({why}); posting {} comment(s) individually",
+                    meta.repo,
+                    meta.pr,
+                    pending.len()
+                );
+                for (c, fp) in &pending {
+                    post_inline(client, cfg, &meta.repo, meta.pr, commit_id, c, fp).await?;
+                }
+            }
+            // Outcome unknown, so the round's new findings are dropped rather
+            // than reposted — the next review re-derives them, while a duplicate
+            // round would be visible until reconciliation caught it.
+            //
+            // Logged and swallowed rather than propagated, because `?` here would
+            // also skip the stale-thread cleanup below. Creation failing is no
+            // reason to leave fixed findings flagged: the two halves of
+            // reconciliation are independent and only the failing one should stop.
+            Err(e) => tracing::warn!(
+                "batched review outcome unknown for {}#{} ({e:#}); dropping {} new finding(s) this round rather than risking duplicates",
+                meta.repo,
+                meta.pr,
+                pending.len()
+            ),
         }
     }
 
@@ -971,7 +1178,124 @@ pub async fn post_review(
 
 #[cfg(test)]
 mod tests {
-    use super::{enc_path, render_files_diff, FileEntry};
+    use super::{enc_path, inline_body, render_files_diff, review_payload, FileEntry};
+    use crate::providers::types::InlineComment;
+
+    fn inline(path: &str, line: u64, body: &str) -> InlineComment {
+        InlineComment {
+            path: path.to_string(),
+            line,
+            body: body.to_string(),
+        }
+    }
+
+    /// The batched path must build byte-identical bodies to the per-comment one.
+    ///
+    /// The reconciler matches a finding to its existing thread by the fingerprint
+    /// embedded in the body. If the two creation paths ever diverged here, a
+    /// finding posted by one would fail to match itself next round: the loop
+    /// would repost it forever and never report convergence.
+    #[test]
+    fn batched_comment_bodies_match_the_per_comment_path() {
+        let c = inline("src/a.rs", 12, "something is wrong");
+        let payload = review_payload("🤖 mark", "deadbeef", &[(&c, "abc123".to_string())]);
+        assert_eq!(
+            payload["comments"][0]["body"].as_str().unwrap(),
+            inline_body("🤖 mark", &c, "abc123"),
+        );
+    }
+
+    /// Every pending finding appears exactly once, anchored on the new side, and
+    /// carries its OWN fingerprint — a shared or missing one would collapse
+    /// distinct findings onto one thread.
+    #[test]
+    fn every_pending_finding_is_in_the_review_once() {
+        let a = inline("src/a.rs", 12, "first");
+        let b = inline("src/b.rs", 40, "second");
+        let payload = review_payload(
+            "🤖 mark",
+            "deadbeef",
+            &[
+                (&a, "aaaaaaaaaaaa".to_string()),
+                (&b, "bbbbbbbbbbbb".to_string()),
+            ],
+        );
+        let comments = payload["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["path"], "src/a.rs");
+        assert_eq!(comments[0]["line"], 12);
+        assert_eq!(comments[1]["path"], "src/b.rs");
+        assert_eq!(comments[1]["line"], 40);
+        for c in comments {
+            assert_eq!(c["side"], "RIGHT", "findings anchor to the new side");
+        }
+        assert!(comments[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("aaaaaaaaaaaa"));
+        assert!(comments[1]["body"]
+            .as_str()
+            .unwrap()
+            .contains("bbbbbbbbbbbb"));
+    }
+
+    /// The status dispatch, pinned as a table.
+    ///
+    /// This is the branch that decides whether a round's findings are posted
+    /// once, posted twice, or not at all, and every value here was chosen for a
+    /// reason rather than to cover a line: 422 is the anchor failure the fallback
+    /// exists for, 403 is a permissions refusal, 429 is the one most likely to be
+    /// misfiled as a refusal (it is not — reposting answers a throttle with N
+    /// more writes), and 502 is the edge returning after GitHub already applied
+    /// the review.
+    #[test]
+    fn a_status_only_licenses_a_repost_when_it_proves_nothing_was_created() {
+        use super::StatusVerdict::*;
+        use reqwest::StatusCode as S;
+        for (code, want) in [
+            (S::OK, Created),
+            (S::CREATED, Created),
+            (S::UNPROCESSABLE_ENTITY, Refused),
+            (S::FORBIDDEN, Refused),
+            (S::NOT_FOUND, Refused),
+            (S::UNAUTHORIZED, Refused),
+            (S::REQUEST_TIMEOUT, Unknown),
+            (S::TOO_MANY_REQUESTS, Unknown),
+            (S::INTERNAL_SERVER_ERROR, Unknown),
+            (S::BAD_GATEWAY, Unknown),
+            (S::SERVICE_UNAVAILABLE, Unknown),
+            (S::GATEWAY_TIMEOUT, Unknown),
+        ] {
+            assert_eq!(
+                super::classify_review_status(code),
+                want,
+                "{code} should be {want:?}"
+            );
+        }
+    }
+
+    /// A regression guard with teeth, not a tautology.
+    ///
+    /// `APPROVE` from a GitHub App satisfies a required-approval branch
+    /// protection rule, so an approving reviewer starts UNBLOCKING merges it
+    /// never gated; `REQUEST_CHANGES` blocks a merge on a model's opinion. This
+    /// reviewer is advisory, and the event is the only thing enforcing that.
+    ///
+    /// The exact string is load-bearing in the other direction too: `COMMENTED`
+    /// is the state GitHub reports, not an accepted event, and sending it would
+    /// fail every batch into the per-comment fallback without a visible error.
+    ///
+    /// The body assertion is parity with `review_payload`, which always sends a
+    /// one-line label for the round — not an API requirement. The endpoint
+    /// documents `body` as optional.
+    #[test]
+    fn the_review_is_advisory_and_never_approves() {
+        let c = inline("src/a.rs", 1, "x");
+        let payload = review_payload("🤖 mark", "deadbeef", &[(&c, "abc123".to_string())]);
+        assert_eq!(payload["event"], "COMMENT");
+        assert_eq!(payload["commit_id"], "deadbeef");
+        assert!(!payload["body"].as_str().unwrap().is_empty());
+    }
 
     fn entry(filename: &str, status: &str, patch: Option<&str>) -> FileEntry {
         let (additions, deletions) = patch.map_or((0, 0), |_| (1, 0));
