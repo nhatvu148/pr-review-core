@@ -683,6 +683,94 @@ async fn upsert_summary(
 
 /// POST one inline review comment, embedding the finding's fingerprint as a
 /// hidden marker so a later review can match it (keep / resolve).
+/// The body a finding's comment carries, in **both** creation paths.
+///
+/// Extracted rather than inlined twice because the fingerprint the reconciler
+/// matches on is embedded in this text. If the batched and per-comment paths
+/// ever built it differently, a finding created by one would stop matching
+/// itself on the next round — the loop would repost it forever and never
+/// converge, which is the one failure mode this file exists to prevent.
+fn inline_body(marker: &str, c: &InlineComment, fp: &str) -> String {
+    format!("{}\n\n_{}_\n{}", c.body, marker, fp_marker(fp))
+}
+
+/// The `POST /pulls/{pr}/reviews` payload for a round's new findings.
+///
+/// Pure, so the shape can be asserted without a network: every finding present
+/// exactly once, each carrying its own fingerprint.
+///
+/// `event: "COMMENTED"` is deliberate and must stay. `APPROVE` from a GitHub App
+/// *satisfies* a required-approval branch protection rule, so an approving
+/// reviewer would begin unblocking merges it never gated; `REQUEST_CHANGES`
+/// would block a merge on a model's opinion, which contradicts this crate's own
+/// rule that a finding is a candidate rather than a verified defect. A body is
+/// required by the API for `COMMENTED`, and it is kept to one line on purpose:
+/// the real summary is an issue comment that `upsert_summary` EDITS across
+/// rounds, and a submitted review body cannot be edited, so moving the summary
+/// here would leave one stale copy per round.
+fn review_payload(
+    marker: &str,
+    commit_id: &str,
+    pending: &[(&InlineComment, String)],
+) -> serde_json::Value {
+    let comments: Vec<serde_json::Value> = pending
+        .iter()
+        .map(|(c, fp)| {
+            serde_json::json!({
+                "path": c.path,
+                "line": c.line,
+                "side": "RIGHT",
+                "body": inline_body(marker, c, fp),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "commit_id": commit_id,
+        "event": "COMMENTED",
+        "body": format!(
+            "_{}_ — {} new finding(s) this round.",
+            marker,
+            pending.len()
+        ),
+        "comments": comments,
+    })
+}
+
+/// Create a round's new findings as ONE review instead of one comment each.
+///
+/// The objects are the same either way: GitHub synthesises an empty `COMMENTED`
+/// review around every standalone review comment, so N comments have always
+/// meant N reviews in the timeline and in the API — a four-finding round read as
+/// four reviews, and anything counting reviews was counting findings.
+///
+/// Errors when the review was not created, and the caller falls back to posting
+/// each comment separately. That fallback is not defensive habit: GitHub rejects
+/// the **whole** review if any single comment fails to anchor, while the
+/// per-comment path loses only the bad comment. Without it, one unanchorable
+/// finding would take every other finding in the round with it.
+async fn post_inline_review(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    commit_id: &str,
+    pending: &[(&InlineComment, String)],
+) -> Result<()> {
+    let url = format!("{}/repos/{repo}/pulls/{pr}/reviews", cfg.github_api_base);
+    let res = gh(client.post(url), cfg)
+        .json(&review_payload(&cfg.comment_marker, commit_id, pending))
+        .send()
+        .await?;
+    let status = res.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "GitHub review {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    Ok(())
+}
+
 async fn post_inline(
     client: &Client,
     cfg: &Config,
@@ -693,7 +781,7 @@ async fn post_inline(
     fp: &str,
 ) -> Result<()> {
     let url = format!("{}/repos/{repo}/pulls/{pr}/comments", cfg.github_api_base);
-    let body = format!("{}\n\n_{}_\n{}", c.body, cfg.comment_marker, fp_marker(fp));
+    let body = inline_body(&cfg.comment_marker, c, fp);
     let res = gh(client.post(url), cfg)
         .json(&serde_json::json!({
             "body": body, "commit_id": commit_id, "path": c.path, "line": c.line, "side": "RIGHT"
@@ -843,6 +931,7 @@ async fn reconcile_inline(
     // matched, since LLM text isn't stable across runs. Legacy threads (no
     // fingerprint) never match and are cleaned up below.
     let mut claimed = vec![false; threads.len()];
+    let mut pending: Vec<(&InlineComment, String)> = Vec::new();
     for c in inline {
         let fp = finding_fingerprint(&c.path, &c.body);
         let mut hit = None;
@@ -862,7 +951,26 @@ async fn reconcile_inline(
         }
         match hit {
             Some(i) => claimed[i] = true, // already present → leave the thread as-is
-            None => post_inline(client, cfg, &meta.repo, meta.pr, commit_id, c, &fp).await?,
+            None => pending.push((c, fp)),
+        }
+    }
+
+    // One review for the whole round, falling back to one comment each if GitHub
+    // refuses it — see `post_inline_review` for why the fallback is required
+    // rather than cautious.
+    if !pending.is_empty() {
+        if let Err(e) =
+            post_inline_review(client, cfg, &meta.repo, meta.pr, commit_id, &pending).await
+        {
+            tracing::warn!(
+                "batched review failed for {}#{}: {e:#}; posting {} comment(s) individually",
+                meta.repo,
+                meta.pr,
+                pending.len()
+            );
+            for (c, fp) in &pending {
+                post_inline(client, cfg, &meta.repo, meta.pr, commit_id, c, fp).await?;
+            }
         }
     }
 
@@ -971,7 +1079,83 @@ pub async fn post_review(
 
 #[cfg(test)]
 mod tests {
-    use super::{enc_path, render_files_diff, FileEntry};
+    use super::{enc_path, inline_body, render_files_diff, review_payload, FileEntry};
+    use crate::providers::types::InlineComment;
+
+    fn inline(path: &str, line: u64, body: &str) -> InlineComment {
+        InlineComment {
+            path: path.to_string(),
+            line,
+            body: body.to_string(),
+        }
+    }
+
+    /// The batched path must build byte-identical bodies to the per-comment one.
+    ///
+    /// The reconciler matches a finding to its existing thread by the fingerprint
+    /// embedded in the body. If the two creation paths ever diverged here, a
+    /// finding posted by one would fail to match itself next round: the loop
+    /// would repost it forever and never report convergence.
+    #[test]
+    fn batched_comment_bodies_match_the_per_comment_path() {
+        let c = inline("src/a.rs", 12, "something is wrong");
+        let payload = review_payload("🤖 mark", "deadbeef", &[(&c, "abc123".to_string())]);
+        assert_eq!(
+            payload["comments"][0]["body"].as_str().unwrap(),
+            inline_body("🤖 mark", &c, "abc123"),
+        );
+    }
+
+    /// Every pending finding appears exactly once, anchored on the new side, and
+    /// carries its OWN fingerprint — a shared or missing one would collapse
+    /// distinct findings onto one thread.
+    #[test]
+    fn every_pending_finding_is_in_the_review_once() {
+        let a = inline("src/a.rs", 12, "first");
+        let b = inline("src/b.rs", 40, "second");
+        let payload = review_payload(
+            "🤖 mark",
+            "deadbeef",
+            &[
+                (&a, "aaaaaaaaaaaa".to_string()),
+                (&b, "bbbbbbbbbbbb".to_string()),
+            ],
+        );
+        let comments = payload["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0]["path"], "src/a.rs");
+        assert_eq!(comments[0]["line"], 12);
+        assert_eq!(comments[1]["path"], "src/b.rs");
+        assert_eq!(comments[1]["line"], 40);
+        for c in comments {
+            assert_eq!(c["side"], "RIGHT", "findings anchor to the new side");
+        }
+        assert!(comments[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("aaaaaaaaaaaa"));
+        assert!(comments[1]["body"]
+            .as_str()
+            .unwrap()
+            .contains("bbbbbbbbbbbb"));
+    }
+
+    /// A regression guard with teeth, not a tautology.
+    ///
+    /// `APPROVE` from a GitHub App satisfies a required-approval branch
+    /// protection rule, so an approving reviewer starts UNBLOCKING merges it
+    /// never gated; `REQUEST_CHANGES` blocks a merge on a model's opinion. This
+    /// reviewer is advisory, and the event is the only thing enforcing that.
+    /// The non-empty body is also load-bearing: the API rejects `COMMENTED`
+    /// without one.
+    #[test]
+    fn the_review_is_advisory_and_never_approves() {
+        let c = inline("src/a.rs", 1, "x");
+        let payload = review_payload("🤖 mark", "deadbeef", &[(&c, "abc123".to_string())]);
+        assert_eq!(payload["event"], "COMMENTED");
+        assert_eq!(payload["commit_id"], "deadbeef");
+        assert!(!payload["body"].as_str().unwrap().is_empty());
+    }
 
     fn entry(filename: &str, status: &str, patch: Option<&str>) -> FileEntry {
         let (additions, deletions) = patch.map_or((0, 0), |_| (1, 0));
