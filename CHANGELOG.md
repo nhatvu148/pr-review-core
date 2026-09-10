@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**A reworded finding that drifted a line keeps its thread.** Re-reviewing an *unchanged* PR could churn every inline thread: the model rewords a finding between runs, which breaks the `sha256(path|body)` fingerprint, and anchors it a line or two away, which broke the positional fallback — because that fallback required an *exact* line match. Both keys miss, the finding looks new, and its own thread is deleted as stale.
+
+That quietly falsified the property a review loop depends on: that a finding still present keeps its existing thread. Observed on a real PR, where two reviews seven minutes apart with no push between them replaced all four threads.
+
+The positional fallback now allows ±3 lines, matching `examples/bench.rs`, and takes the **closest** unclaimed thread rather than the first one within tolerance. With any tolerance at all, "first" is arbitrary iteration order, and two findings a couple of lines apart could claim each other's threads — swapping two live conversations, which is worse than reposting one.
+
 ## 0.28.0
 
 **A round's new GitHub findings post as one review instead of one comment each.** Every standalone review comment makes GitHub synthesise an empty `COMMENTED` review around it, so a four-finding round read as four reviews — in the timeline and in the API, where anything counting reviews was really counting findings.
