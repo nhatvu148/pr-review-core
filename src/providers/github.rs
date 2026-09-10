@@ -744,6 +744,40 @@ fn review_payload(
     })
 }
 
+/// What a status code from the reviews endpoint proves about the review.
+#[derive(Debug, PartialEq, Eq)]
+enum StatusVerdict {
+    /// 2xx — the review exists.
+    Created,
+    /// A deterministic client refusal. Nothing was created, so reposting is safe.
+    Refused,
+    /// Says nothing about whether the review was created.
+    Unknown,
+}
+
+/// Decide what a status licenses the caller to do.
+///
+/// Pure and separate from the request because this dispatch — not the payload —
+/// is where a mistake changes whether findings get duplicated, dropped or lost,
+/// and a table of statuses is the only cheap way to pin it.
+///
+/// Not every non-2xx is a refusal. A 5xx can come from the edge *after* the
+/// review was applied, and 408/429 say "try later" rather than "refused" —
+/// reposting on either duplicates a round, and on 429 does it while being
+/// throttled.
+fn classify_review_status(status: reqwest::StatusCode) -> StatusVerdict {
+    if status.is_success() {
+        StatusVerdict::Created
+    } else if status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        StatusVerdict::Unknown
+    } else {
+        StatusVerdict::Refused
+    }
+}
+
 /// What became of a batched review — and specifically, whether GitHub is known
 /// to have created nothing.
 ///
@@ -803,26 +837,17 @@ async fn post_inline_review(
         .send()
         .await?;
     let status = res.status();
-    // Not every non-2xx proves nothing was created. A 5xx can come from the edge
-    // after the review was applied, and 408/429 say "try later", not "refused" —
-    // reposting on either duplicates a round, and on 429 does it while being
-    // throttled. Only a deterministic client refusal is evidence.
-    if status.is_server_error()
-        || status == reqwest::StatusCode::REQUEST_TIMEOUT
-        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
-    {
-        anyhow::bail!(
-            "GitHub batched review {status} (outcome unknown, not reposting): {}",
-            clip(&res.text().await.unwrap_or_default(), 300)
-        );
-    }
-    if !status.is_success() {
-        return Ok(BatchOutcome::Rejected(format!(
+    match classify_review_status(status) {
+        StatusVerdict::Created => Ok(BatchOutcome::Created),
+        StatusVerdict::Refused => Ok(BatchOutcome::Rejected(format!(
             "{status}: {}",
             clip(&res.text().await.unwrap_or_default(), 300)
-        )));
+        ))),
+        StatusVerdict::Unknown => anyhow::bail!(
+            "GitHub batched review {status} (outcome unknown, not reposting): {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        ),
     }
-    Ok(BatchOutcome::Created)
 }
 
 /// POST one inline review comment, embedding the finding's fingerprint as a
@@ -1212,6 +1237,41 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("bbbbbbbbbbbb"));
+    }
+
+    /// The status dispatch, pinned as a table.
+    ///
+    /// This is the branch that decides whether a round's findings are posted
+    /// once, posted twice, or not at all, and every value here was chosen for a
+    /// reason rather than to cover a line: 422 is the anchor failure the fallback
+    /// exists for, 403 is a permissions refusal, 429 is the one most likely to be
+    /// misfiled as a refusal (it is not — reposting answers a throttle with N
+    /// more writes), and 502 is the edge returning after GitHub already applied
+    /// the review.
+    #[test]
+    fn a_status_only_licenses_a_repost_when_it_proves_nothing_was_created() {
+        use super::StatusVerdict::*;
+        use reqwest::StatusCode as S;
+        for (code, want) in [
+            (S::OK, Created),
+            (S::CREATED, Created),
+            (S::UNPROCESSABLE_ENTITY, Refused),
+            (S::FORBIDDEN, Refused),
+            (S::NOT_FOUND, Refused),
+            (S::UNAUTHORIZED, Refused),
+            (S::REQUEST_TIMEOUT, Unknown),
+            (S::TOO_MANY_REQUESTS, Unknown),
+            (S::INTERNAL_SERVER_ERROR, Unknown),
+            (S::BAD_GATEWAY, Unknown),
+            (S::SERVICE_UNAVAILABLE, Unknown),
+            (S::GATEWAY_TIMEOUT, Unknown),
+        ] {
+            assert_eq!(
+                super::classify_review_status(code),
+                want,
+                "{code} should be {want:?}"
+            );
+        }
     }
 
     /// A regression guard with teeth, not a tautology.
