@@ -681,8 +681,6 @@ async fn upsert_summary(
 
 // ── inline review comments (reconcile: keep, add, resolve) ──────────────────
 
-/// POST one inline review comment, embedding the finding's fingerprint as a
-/// hidden marker so a later review can match it (keep / resolve).
 /// The body a finding's comment carries, in **both** creation paths.
 ///
 /// Extracted rather than inlined twice because the fingerprint the reconciler
@@ -746,6 +744,20 @@ fn review_payload(
     })
 }
 
+/// What became of a batched review — and specifically, whether GitHub is known
+/// to have created nothing.
+///
+/// The distinction is the whole reason this is not a `Result<()>`. Reposting
+/// every pending comment is safe only when the review provably does not exist. A
+/// status code read back from GitHub proves that; a transport error does not,
+/// because the request may have been served and only the response lost — and
+/// then the fallback would duplicate the entire round.
+enum BatchOutcome {
+    Created,
+    /// GitHub answered and refused. Nothing was created, so a full repost is safe.
+    Rejected(String),
+}
+
 /// Create a round's new findings as ONE review instead of one comment each.
 ///
 /// The objects are the same either way: GitHub synthesises an empty `COMMENTED`
@@ -759,14 +771,17 @@ fn review_payload(
 /// per-comment path loses only the bad comment. Without it, one unanchorable
 /// finding would take every other finding in the round with it.
 ///
-/// The fallback reposts *every* pending comment, which duplicates any the failed
-/// call had already created if the endpoint ever applies comments before
-/// erroring. Treated as acceptable rather than guarded against, because
-/// reconciliation repairs it on the next round without help: each finding claims
-/// AT MOST ONE thread by fingerprint, so a duplicate is left unclaimed and gets
-/// resolved or deleted with the rest of the stale threads. Worth confirming
-/// against live GitHub anyway — one round of visible duplicates is a poor way to
-/// discover the endpoint is not atomic.
+/// The fallback reposts *every* pending comment, so it runs only on
+/// `Rejected` — a status GitHub actually returned, which means no review was
+/// created. A transport error propagates instead, because the request may have
+/// been served with only the response lost, and reposting there would duplicate
+/// the whole round.
+///
+/// That leaves one residual case: a rejection where GitHub applied some comments
+/// before erroring. Left unguarded, because reconciliation repairs it on the next
+/// round without help — each finding claims AT MOST ONE thread by fingerprint, so
+/// a duplicate is left unclaimed and gets resolved or deleted with the other
+/// stale threads.
 async fn post_inline_review(
     client: &Client,
     cfg: &Config,
@@ -774,22 +789,27 @@ async fn post_inline_review(
     pr: u64,
     commit_id: &str,
     pending: &[(&InlineComment, String)],
-) -> Result<()> {
+) -> Result<BatchOutcome> {
     let url = format!("{}/repos/{repo}/pulls/{pr}/reviews", cfg.github_api_base);
+    // A transport failure propagates via `?` rather than becoming a Rejected:
+    // the request may have been served and the response lost, so reposting could
+    // duplicate a whole round. Only a status we actually read proves otherwise.
     let res = gh(client.post(url), cfg)
         .json(&review_payload(&cfg.comment_marker, commit_id, pending))
         .send()
         .await?;
     let status = res.status();
     if !status.is_success() {
-        anyhow::bail!(
-            "GitHub review {status}: {}",
+        return Ok(BatchOutcome::Rejected(format!(
+            "{status}: {}",
             clip(&res.text().await.unwrap_or_default(), 300)
-        );
+        )));
     }
-    Ok(())
+    Ok(BatchOutcome::Created)
 }
 
+/// POST one inline review comment, embedding the finding's fingerprint as a
+/// hidden marker so a later review can match it (keep / resolve).
 async fn post_inline(
     client: &Client,
     cfg: &Config,
@@ -978,11 +998,14 @@ async fn reconcile_inline(
     // refuses it — see `post_inline_review` for why the fallback is required
     // rather than cautious.
     if !pending.is_empty() {
-        if let Err(e) =
-            post_inline_review(client, cfg, &meta.repo, meta.pr, commit_id, &pending).await
+        // A refusal means nothing was created, so reposting each comment is safe
+        // and preserves the old per-anchor tolerance. A transport error is NOT
+        // that: it propagates, because the review may exist unseen.
+        if let BatchOutcome::Rejected(why) =
+            post_inline_review(client, cfg, &meta.repo, meta.pr, commit_id, &pending).await?
         {
             tracing::warn!(
-                "batched review failed for {}#{}: {e:#}; posting {} comment(s) individually",
+                "GitHub refused the batched review for {}#{} ({why}); posting {} comment(s) individually",
                 meta.repo,
                 meta.pr,
                 pending.len()
