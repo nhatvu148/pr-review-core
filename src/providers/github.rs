@@ -758,6 +758,15 @@ fn review_payload(
 /// the **whole** review if any single comment fails to anchor, while the
 /// per-comment path loses only the bad comment. Without it, one unanchorable
 /// finding would take every other finding in the round with it.
+///
+/// The fallback reposts *every* pending comment, which duplicates any the failed
+/// call had already created if the endpoint ever applies comments before
+/// erroring. Treated as acceptable rather than guarded against, because
+/// reconciliation repairs it on the next round without help: each finding claims
+/// AT MOST ONE thread by fingerprint, so a duplicate is left unclaimed and gets
+/// resolved or deleted with the rest of the stale threads. Worth confirming
+/// against live GitHub anyway — one round of visible duplicates is a poor way to
+/// discover the endpoint is not atomic.
 async fn post_inline_review(
     client: &Client,
     cfg: &Config,
@@ -1156,8 +1165,14 @@ mod tests {
     /// protection rule, so an approving reviewer starts UNBLOCKING merges it
     /// never gated; `REQUEST_CHANGES` blocks a merge on a model's opinion. This
     /// reviewer is advisory, and the event is the only thing enforcing that.
-    /// The non-empty body is also load-bearing: the API rejects `COMMENTED`
-    /// without one.
+    ///
+    /// The exact string is load-bearing in the other direction too: `COMMENTED`
+    /// is the state GitHub reports, not an accepted event, and sending it would
+    /// fail every batch into the per-comment fallback without a visible error.
+    ///
+    /// The body assertion is parity with `review_payload`, which always sends a
+    /// one-line label for the round — not an API requirement. The endpoint
+    /// documents `body` as optional.
     #[test]
     fn the_review_is_advisory_and_never_approves() {
         let c = inline("src/a.rs", 1, "x");

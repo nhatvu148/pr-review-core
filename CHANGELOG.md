@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**A round's new GitHub findings post as one review instead of one comment each.** Every standalone review comment makes GitHub synthesise an empty `COMMENTED` review around it, so a four-finding round read as four reviews — in the timeline and in the API, where anything counting reviews was really counting findings.
+
+Only the *delta* is batched. `reconcile_inline` still leaves an existing thread alone and creates only what is new; batching the whole review would repost findings that already have threads and break the one signal a review loop has for knowing it has converged. The summary also stays where it was, as an issue comment that is edited across rounds — a submitted review body cannot be edited, so moving it into the review would leave one stale copy per round.
+
+The event is `COMMENT`, and nothing else. `APPROVE` from a GitHub App satisfies a required-approval branch protection rule, so an approving reviewer would begin unblocking merges it never gated, and `REQUEST_CHANGES` would block a merge on a model's opinion. This reviewer is advisory; the event is what enforces it.
+
+The per-comment path remains as the fallback, because GitHub rejects the whole review when any single comment fails to anchor while the per-comment path loses only the bad comment.
+
 ## 0.27.0
 
 **Typed configuration for the npm and PyPI clients.** They returned fully typed results and took configuration as 59 untyped environment-variable names — no completion, no validation, and a fifth of them undocumented until `config_spec` landed. Building a real Node bot confirmed that asymmetry is the thing that actually chafes: setting a model and a confidence floor meant knowing two string names, in the same call that hands back typed findings.
