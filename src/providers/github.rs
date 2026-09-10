@@ -1018,18 +1018,33 @@ async fn reconcile_inline(
         // A refusal means nothing was created, so reposting each comment is safe
         // and preserves the old per-anchor tolerance. A transport error is NOT
         // that: it propagates, because the review may exist unseen.
-        if let BatchOutcome::Rejected(why) =
-            post_inline_review(client, cfg, &meta.repo, meta.pr, commit_id, &pending).await?
-        {
-            tracing::warn!(
-                "GitHub refused the batched review for {}#{} ({why}); posting {} comment(s) individually",
+        match post_inline_review(client, cfg, &meta.repo, meta.pr, commit_id, &pending).await {
+            Ok(BatchOutcome::Created) => {}
+            Ok(BatchOutcome::Rejected(why)) => {
+                tracing::warn!(
+                    "GitHub refused the batched review for {}#{} ({why}); posting {} comment(s) individually",
+                    meta.repo,
+                    meta.pr,
+                    pending.len()
+                );
+                for (c, fp) in &pending {
+                    post_inline(client, cfg, &meta.repo, meta.pr, commit_id, c, fp).await?;
+                }
+            }
+            // Outcome unknown, so the round's new findings are dropped rather
+            // than reposted — the next review re-derives them, while a duplicate
+            // round would be visible until reconciliation caught it.
+            //
+            // Logged and swallowed rather than propagated, because `?` here would
+            // also skip the stale-thread cleanup below. Creation failing is no
+            // reason to leave fixed findings flagged: the two halves of
+            // reconciliation are independent and only the failing one should stop.
+            Err(e) => tracing::warn!(
+                "batched review outcome unknown for {}#{} ({e:#}); dropping {} new finding(s) this round rather than risking duplicates",
                 meta.repo,
                 meta.pr,
                 pending.len()
-            );
-            for (c, fp) in &pending {
-                post_inline(client, cfg, &meta.repo, meta.pr, commit_id, c, fp).await?;
-            }
+            ),
         }
     }
 
