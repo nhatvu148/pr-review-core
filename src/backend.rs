@@ -32,6 +32,7 @@ use crate::review::run_agentic;
 /// A clone created at most once and shared by every sample of one review.
 pub type SharedWorkspace = tokio::sync::OnceCell<std::sync::Arc<crate::repo::Workspace>>;
 
+/// Everything a backend needs to review one change.
 pub struct ReviewContext<'a> {
     pub client: &'a reqwest::Client,
     pub cfg: &'a Config,

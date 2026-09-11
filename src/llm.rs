@@ -143,14 +143,17 @@ pub(crate) fn findings_from_values(raw: Vec<serde_json::Value>) -> (Vec<Finding>
     let mut kept = Vec::with_capacity(raw.len());
     let mut dropped = 0usize;
     for v in raw {
-        // Describe the element before consuming it, so the warning can say what
-        // arrived rather than only what was missing.
-        let shape = describe_shape(&v);
-        match serde_json::from_value::<Finding>(v) {
+        // Deserialize from a reference so the element survives a failure and can
+        // be described. Consuming it would force describing every element up
+        // front, including the ones that parse.
+        match Finding::deserialize(&v) {
             Ok(f) => kept.push(f),
             Err(e) => {
                 dropped += 1;
-                tracing::warn!("dropping malformed finding ({e}); it had {shape}");
+                tracing::warn!(
+                    "dropping malformed finding ({e}); it had {}",
+                    describe_shape(&v)
+                );
             }
         }
     }
