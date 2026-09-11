@@ -552,14 +552,14 @@ async fn list_drafts(
 /// A draft we cannot identify counts as foreign. Guessing the other way risks
 /// deleting or publishing a person's unfinished review; guessing this way costs
 /// only a batched round.
-fn partition_drafts(cfg: &Config, drafts: &[serde_json::Value]) -> (Vec<u64>, usize) {
+fn partition_drafts(marker: &str, drafts: &[serde_json::Value]) -> (Vec<u64>, usize) {
     let mut ours = Vec::new();
     let mut foreign = 0usize;
     for d in drafts {
         let is_ours = d
             .get("note")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|b| is_bot_comment(cfg, b));
+            .is_some_and(|b| b.contains(marker));
         match (is_ours, d.get("id").and_then(serde_json::Value::as_u64)) {
             (true, Some(id)) => ours.push(id),
             _ => foreign += 1,
@@ -581,7 +581,10 @@ fn partition_drafts(cfg: &Config, drafts: &[serde_json::Value]) -> (Vec<u64>, us
 /// not be established, which is not a licence to proceed.
 async fn clear_our_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<bool> {
     let url = format!("{}/draft_notes", mr_base(cfg, repo, pr));
-    let (ours, foreign) = partition_drafts(cfg, &list_drafts(client, cfg, repo, pr).await?);
+    let (ours, foreign) = partition_drafts(
+        &cfg.comment_marker,
+        &list_drafts(client, cfg, repo, pr).await?,
+    );
     for id in ours {
         let del = gl(client.delete(format!("{url}/{id}")), cfg).send().await?;
         if !del.status().is_success() {
@@ -659,7 +662,10 @@ async fn publish_as_one_review(
     // during them. This narrows the window rather than closing it — the API
     // offers no way to publish only named drafts — but it shrinks the exposure
     // from the whole staging run to the gap before the next call.
-    let (_, foreign) = partition_drafts(cfg, &list_drafts(client, cfg, repo, pr).await?);
+    let (_, foreign) = partition_drafts(
+        &cfg.comment_marker,
+        &list_drafts(client, cfg, repo, pr).await?,
+    );
     if foreign > 0 {
         let _ = clear_our_drafts(client, cfg, repo, pr).await;
         anyhow::bail!("draft notes from another author appeared while staging");
@@ -671,7 +677,11 @@ async fn publish_as_one_review(
         // two, and it is worth asking for: returning an error here makes the
         // caller repost every finding on top of a review that already published.
         match list_drafts(client, cfg, repo, pr).await {
-            Ok(remaining) if partition_drafts(cfg, &remaining).0.is_empty() => {
+            Ok(remaining)
+                if partition_drafts(&cfg.comment_marker, &remaining)
+                    .0
+                    .is_empty() =>
+            {
                 tracing::warn!(
                     "GitLab bulk_publish for {repo}!{pr} reported an error ({e:#}) but our \
                      drafts are gone; treating the review as published"
@@ -740,6 +750,35 @@ mod tests {
             start_sha: Some("start".into()),
             head_sha: Some("head".into()),
         }
+    }
+
+    /// The classifier the whole safety guarantee rests on.
+    ///
+    /// `bulk_publish` publishes every pending draft the token owns, and the token
+    /// is usually a person's. So misfiling one draft as ours does not cost a
+    /// comment — it deletes or publishes somebody's unfinished review. Both
+    /// directions are pinned here, including the two ways a draft can be
+    /// unidentifiable.
+    #[test]
+    fn a_draft_is_ours_only_when_it_is_marked_and_addressable() {
+        let drafts = vec![
+            serde_json::json!({"id": 1, "note": "finding\n\n_🤖 mark_"}),
+            serde_json::json!({"id": 2, "note": "a colleague's half-written thought"}),
+            serde_json::json!({"note": "finding\n\n_🤖 mark_"}),
+            serde_json::json!({"id": 4}),
+        ];
+        let (ours, foreign) = super::partition_drafts("🤖 mark", &drafts);
+        assert_eq!(ours, vec![1], "only the marked draft with an id is ours");
+        assert_eq!(
+            foreign, 3,
+            "unmarked, marked-but-idless, and bodiless drafts all count as foreign"
+        );
+    }
+
+    /// No drafts at all is the ordinary case, and must read as safe to batch.
+    #[test]
+    fn an_empty_merge_request_is_safe_to_batch() {
+        assert_eq!(super::partition_drafts("🤖 mark", &[]), (vec![], 0));
     }
 
     /// The two creation paths must anchor identically.
