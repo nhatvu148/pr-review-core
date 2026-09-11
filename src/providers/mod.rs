@@ -83,6 +83,37 @@ pub(crate) fn render_resolved(resolved: &[String]) -> String {
     s
 }
 
+/// Say so when a round's inline findings may not have reached the PR.
+///
+/// The summary is composed before posting and states `N inline comment(s)
+/// below.` from the findings the model produced. Several paths can leave that
+/// sentence untrue: a creation failure that cannot be retried safely, a
+/// reconciliation pass that errored outright, or a PR whose head SHA was
+/// unavailable so nothing could be anchored at all.
+///
+/// The wording is "not confirmed" rather than "not posted", and the distinction
+/// is load-bearing. The main path this covers is a lost response, where GitHub
+/// may well have created the comments and only the acknowledgement went missing
+/// — claiming they are absent would be a fresh false statement replacing the old
+/// one. Under-claiming is the safe direction: every case this renders for is at
+/// least unconfirmed, and some are genuinely absent.
+///
+/// The count in the summary is not rewritten. Editing prose the review layer
+/// composed would couple every provider to its exact phrasing, and a correction
+/// is the more honest artifact anyway — the reader learns something went wrong,
+/// rather than seeing a smaller number and no reason.
+pub(crate) fn render_dropped(dropped: usize) -> String {
+    if dropped == 0 {
+        return String::new();
+    }
+    format!(
+        "\n\n## ⚠️ Not confirmed this round\n\n_{dropped} finding(s) above may not have \
+         reached this pull request as inline comments — the host did not confirm the write. \
+         Check the comments before relying on the count above; anything missing is \
+         re-derived on the next review._\n"
+    )
+}
+
 /// Which host the PR lives on.
 #[derive(Clone, Copy)]
 pub enum Provider {
@@ -229,7 +260,7 @@ impl Provider {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_fp, finding_fingerprint, fp_marker, render_resolved};
+    use super::{extract_fp, finding_fingerprint, fp_marker, render_dropped, render_resolved};
 
     #[test]
     fn fingerprint_is_stable_and_normalizes() {
@@ -268,5 +299,29 @@ mod tests {
         assert!(s.contains("Resolved since last review"));
         assert!(s.contains("`src/a.rs`") && s.contains("`src/b.rs`"));
         assert!(s.contains("2 previously-flagged"));
+    }
+
+    /// Silence is the failure mode this renders against.
+    ///
+    /// The summary has already said "N inline comment(s) below" by the time
+    /// posting fails, so without this the PR shows a confident count and no
+    /// comments, and only a log line says otherwise.
+    #[test]
+    fn dropped_findings_are_stated_on_the_pr_not_only_in_logs() {
+        assert_eq!(render_dropped(0), "", "nothing to correct when all posted");
+        let s = render_dropped(3);
+        assert!(s.contains("3 finding(s)"));
+        assert!(
+            s.contains("re-derived on the next review"),
+            "a reader needs to know the findings are not lost, only unconfirmed"
+        );
+        // The main case this covers is a lost response, where the comments may
+        // well exist. Saying they were not posted would replace one false
+        // statement with another.
+        assert!(
+            !s.contains("were not posted") && !s.contains("could not be posted"),
+            "the notice must not claim absence it cannot establish"
+        );
+        assert!(s.contains("did not confirm"));
     }
 }

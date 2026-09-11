@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**A round whose inline findings may not have reached the PR now says so on the PR.** The summary is composed before posting and states `N inline comment(s) below.` from what the model produced. When creation fails in a way that cannot be retried safely — a 5xx, a rate limit, a lost response, where reposting risks duplicating the round — that sentence can be untrue with only a log line to the contrary. The same holds when reconciliation fails outright, or when the head SHA is unavailable and nothing can be anchored at all.
+
+The wording is *not confirmed* rather than *not posted*, deliberately. The main case is a lost response, where the comments may well have been created and only the acknowledgement went missing — claiming absence would replace one false statement with another.
+
+A `⚠️ Not confirmed this round` section is appended instead of rewriting the count, because editing prose the review layer composed would couple every provider to its exact phrasing. It is also the more honest artifact: the reader learns that something was lost rather than simply seeing a smaller number.
+
 ## 0.29.0
 
 **A round's GitLab findings publish as one review, not N discussions.** `draft_notes` plus `draft_notes/bulk_publish` is GitLab's equivalent of the batched review added for GitHub in 0.28.0: a note is staged per finding and published in one call, so a merge request shows one review instead of N separate discussions each firing its own notification.
