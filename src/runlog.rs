@@ -118,7 +118,16 @@ impl RunLogSink {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Funnel {
-    /// Findings the backend returned, before any post-processing.
+    /// How many independent samples were taken (1 = the historical single pass).
+    #[serde(default)]
+    pub samples: usize,
+    /// Findings across all samples before merging — the sum, duplicates included.
+    /// Equal to `model_raw` when a single sample was taken.
+    #[serde(default)]
+    pub sample_total: usize,
+    /// Findings the backend returned, before any post-processing. After merging
+    /// when more than one sample was taken, so the rest of the funnel reads the
+    /// same either way.
     pub model_raw: usize,
     /// After the optional self-critique pass. Equal to `model_raw` when
     /// `self_critique` is off or the critique call failed.
@@ -392,6 +401,8 @@ mod tests {
             truncated_salvage: false,
             recommendation: "APPROVE WITH CHANGES".into(),
             funnel: Funnel {
+                samples: 1,
+                sample_total: 5,
                 model_raw: 5,
                 after_critique: 4,
                 after_confidence: 3,
