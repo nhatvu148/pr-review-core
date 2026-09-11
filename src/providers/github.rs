@@ -908,7 +908,7 @@ query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
     pullRequest(number:$pr){
       reviewThreads(first:100, after:$cursor){
         pageInfo{ hasNextPage endCursor }
-        nodes{ id isResolved path line comments(first:1){ nodes{ databaseId body } } }
+        nodes{ id isResolved path line comments(first:1){ nodes{ databaseId body originalCommit{ oid } } } }
       }
     }
   }
@@ -932,6 +932,32 @@ struct BotThread {
     /// Current line of the thread (tracked by GitHub across commits), used as a
     /// secondary match key so a reworded finding on the same line still matches.
     line: Option<u64>,
+    /// The commit this thread was first written against.
+    ///
+    /// A finding cannot have been fixed on a commit that never changed, so this
+    /// is what separates "the author fixed it" from "this round did not sample
+    /// it" — see `finding_could_have_been_fixed`.
+    original_commit: Option<String>,
+}
+
+/// Whether a missing finding could plausibly have been fixed since it was posted.
+///
+/// Reconciliation reads "not flagged this round" as "fixed" and resolves the
+/// thread. That inference is only ever as good as the assumption that the
+/// reviewer would have flagged it again — and measurement says it would not:
+/// consecutive reviews of a frozen commit shared 61–74% of their findings, and a
+/// HIGH at confidence 75/78 was missed outright by one run in three.
+///
+/// When the review is looking at the same commit the thread was written against,
+/// nothing has been edited in between, so the finding cannot have been fixed and
+/// its absence is a sampling miss by definition. Resolving there states something
+/// known to be false — `✅ Resolved — no longer flagged as of <sha>`, on the sha
+/// it was found on.
+///
+/// Unknown provenance resolves as before. A legacy thread carries no commit, and
+/// refusing to ever clean those up would leave them on the PR forever.
+fn finding_could_have_been_fixed(thread: &BotThread, reviewing: &str) -> bool {
+    thread.original_commit.as_deref() != Some(reviewing)
 }
 
 /// List the bot's prior inline-comment threads (whose first comment carries the
@@ -971,6 +997,7 @@ async fn bot_threads(
                     fp: extract_fp(body),
                     path: node["path"].as_str().unwrap_or_default().to_string(),
                     line: node["line"].as_u64(),
+                    original_commit: first["originalCommit"]["oid"].as_str().map(str::to_string),
                 });
             }
         }
@@ -1161,6 +1188,14 @@ async fn reconcile_inline(
         if claimed[i] || t.is_resolved {
             continue;
         }
+        if !finding_could_have_been_fixed(t, commit_id) {
+            tracing::debug!(
+                "{}: still on {}, so this round not flagging it is a miss, not a fix",
+                t.path,
+                short
+            );
+            continue;
+        }
         if t.fp.is_some() {
             resolved.push(format!("`{}`", t.path));
         }
@@ -1336,11 +1371,59 @@ mod tests {
             fp: Some(fp.to_string()),
             path: path.to_string(),
             line,
+            original_commit: None,
         }
     }
 
     fn finding(path: &str, line: u64, fp: &str) -> (String, u64, String) {
         (path.to_string(), line, fp.to_string())
+    }
+
+    fn thread_on(commit: Option<&str>) -> super::BotThread {
+        super::BotThread {
+            id: "t".into(),
+            comment_id: 1,
+            is_resolved: false,
+            fp: Some("aaaa".into()),
+            path: "src/a.rs".into(),
+            line: Some(40),
+            original_commit: commit.map(str::to_string),
+        }
+    }
+
+    /// The retraction this prevents, and it is not hypothetical.
+    ///
+    /// `nomnaviet/nomnaviet#91` was reviewed three times on head_sha 687cfc8 with
+    /// no push between. Round 2 did not report a HIGH that rounds 1 and 3 both
+    /// did — at confidence 75 and 78 — so reconciliation would have resolved its
+    /// thread with "no longer flagged as of 687cfc8", naming the very commit the
+    /// finding was found on. Nothing was fixed, because nothing changed.
+    #[test]
+    fn a_thread_on_the_commit_being_reviewed_is_never_resolved() {
+        assert!(
+            !super::finding_could_have_been_fixed(&thread_on(Some("687cfc8")), "687cfc8"),
+            "the code cannot have been fixed on a commit that never changed"
+        );
+    }
+
+    /// Once the code moves, a missing finding is a fix again — the guard must not
+    /// leave stale threads on the PR forever.
+    #[test]
+    fn a_thread_from_an_earlier_commit_still_resolves() {
+        assert!(super::finding_could_have_been_fixed(
+            &thread_on(Some("687cfc8")),
+            "9d20cad"
+        ));
+    }
+
+    /// A legacy thread carries no commit. Refusing to clean those would strand
+    /// them permanently, so unknown provenance behaves as it always has.
+    #[test]
+    fn a_thread_of_unknown_provenance_resolves_as_before() {
+        assert!(super::finding_could_have_been_fixed(
+            &thread_on(None),
+            "687cfc8"
+        ));
     }
 
     /// The exact-match bug the tolerance exists for.
