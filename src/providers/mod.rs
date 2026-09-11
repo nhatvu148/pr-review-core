@@ -83,6 +83,29 @@ pub(crate) fn render_resolved(resolved: &[String]) -> String {
     s
 }
 
+/// Say so when a round's findings never reached the PR.
+///
+/// The summary is rendered before posting and states `N inline comment(s)
+/// below.` from the findings the model produced. When creation fails in a way
+/// that cannot be retried safely — a 5xx or a lost response, where reposting
+/// risks duplicating the round — those comments do not exist and that sentence
+/// becomes false.
+///
+/// The count is not rewritten, because editing prose the review layer composed
+/// would couple every provider to its exact phrasing. A correction is appended
+/// instead, which is also the more honest artifact: the reader learns that
+/// something was lost, not merely a smaller number.
+pub(crate) fn render_dropped(dropped: usize) -> String {
+    if dropped == 0 {
+        return String::new();
+    }
+    format!(
+        "\n\n## ⚠️ Not posted this round\n\n_{dropped} finding(s) above could not be \
+         posted as inline comments — the host did not confirm the write, and reposting \
+         risked duplicating them. They are re-derived on the next review._\n"
+    )
+}
+
 /// Which host the PR lives on.
 #[derive(Clone, Copy)]
 pub enum Provider {
@@ -229,7 +252,7 @@ impl Provider {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_fp, finding_fingerprint, fp_marker, render_resolved};
+    use super::{extract_fp, finding_fingerprint, fp_marker, render_dropped, render_resolved};
 
     #[test]
     fn fingerprint_is_stable_and_normalizes() {
@@ -268,5 +291,21 @@ mod tests {
         assert!(s.contains("Resolved since last review"));
         assert!(s.contains("`src/a.rs`") && s.contains("`src/b.rs`"));
         assert!(s.contains("2 previously-flagged"));
+    }
+
+    /// Silence is the failure mode this renders against.
+    ///
+    /// The summary has already said "N inline comment(s) below" by the time
+    /// posting fails, so without this the PR shows a confident count and no
+    /// comments, and only a log line says otherwise.
+    #[test]
+    fn dropped_findings_are_stated_on_the_pr_not_only_in_logs() {
+        assert_eq!(render_dropped(0), "", "nothing to correct when all posted");
+        let s = render_dropped(3);
+        assert!(s.contains("3 finding(s)"));
+        assert!(
+            s.contains("re-derived on the next review"),
+            "a reader needs to know the findings are not lost, only unposted"
+        );
     }
 }

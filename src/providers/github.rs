@@ -8,8 +8,8 @@ use reqwest::Client;
 use serde::Deserialize;
 
 use super::{
-    extract_fp, finding_fingerprint, fp_marker, is_bot_comment, render_resolved, InlineComment,
-    PrMeta, ReviewPost,
+    extract_fp, finding_fingerprint, fp_marker, is_bot_comment, render_dropped, render_resolved,
+    InlineComment, PrMeta, ReviewPost,
 };
 use crate::clip;
 use crate::config::{require, Config};
@@ -1059,13 +1059,21 @@ fn pair_findings(threads: &[BotThread], findings: &[(String, u64, String)]) -> V
     paired
 }
 
+/// What a reconciliation pass did: threads it closed, and findings it could not
+/// post. Both belong in the summary — the first is good news, the second is a
+/// correction to a sentence the summary has already made.
+struct Reconciled {
+    resolved: Vec<String>,
+    dropped: usize,
+}
+
 async fn reconcile_inline(
     client: &Client,
     cfg: &Config,
     meta: &PrMeta,
     commit_id: &str,
     inline: &[InlineComment],
-) -> Result<Vec<String>> {
+) -> Result<Reconciled> {
     let (owner, name) = meta
         .repo
         .split_once('/')
@@ -1093,6 +1101,7 @@ async fn reconcile_inline(
 
     let mut claimed = vec![false; threads.len()];
     let mut pending: Vec<(&InlineComment, String)> = Vec::new();
+    let mut dropped = 0usize;
     for ((c, (_, _, fp)), slot) in inline.iter().zip(&findings).zip(&paired) {
         match slot {
             Some(i) => claimed[*i] = true, // already present → leave the thread as-is
@@ -1128,12 +1137,15 @@ async fn reconcile_inline(
             // also skip the stale-thread cleanup below. Creation failing is no
             // reason to leave fixed findings flagged: the two halves of
             // reconciliation are independent and only the failing one should stop.
-            Err(e) => tracing::warn!(
-                "batched review outcome unknown for {}#{} ({e:#}); dropping {} new finding(s) this round rather than risking duplicates",
-                meta.repo,
-                meta.pr,
-                pending.len()
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    "batched review outcome unknown for {}#{} ({e:#}); dropping {} new finding(s) this round rather than risking duplicates",
+                    meta.repo,
+                    meta.pr,
+                    pending.len()
+                );
+                dropped = pending.len();
+            }
         }
     }
 
@@ -1182,7 +1194,7 @@ async fn reconcile_inline(
             }
         }
     }
-    Ok(resolved)
+    Ok(Reconciled { resolved, dropped })
 }
 
 /// Best-effort delete of a review comment by its REST id (the fallback when the
@@ -1210,10 +1222,13 @@ pub async fn post_review(
     // findings so prior ones get resolved. Needs the head SHA to anchor new
     // comments; without it, skip inline (fail-open). Fail-soft on any hiccup so
     // the summary still posts.
-    let mut resolved = Vec::new();
+    let mut outcome = Reconciled {
+        resolved: Vec::new(),
+        dropped: 0,
+    };
     match &meta.head_sha {
         Some(sha) => {
-            resolved = reconcile_inline(client, cfg, meta, sha, &review.inline)
+            outcome = reconcile_inline(client, cfg, meta, sha, &review.inline)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!(
@@ -1221,7 +1236,10 @@ pub async fn post_review(
                         meta.repo,
                         meta.pr
                     );
-                    Vec::new()
+                    Reconciled {
+                        resolved: Vec::new(),
+                        dropped: 0,
+                    }
                 });
         }
         None if !review.inline.is_empty() => {
@@ -1236,7 +1254,8 @@ pub async fn post_review(
 
     // Append a "Resolved since last review" section to the summary, then upsert.
     let mut summary = review.summary.clone();
-    summary.push_str(&render_resolved(&resolved));
+    summary.push_str(&render_resolved(&outcome.resolved));
+    summary.push_str(&render_dropped(outcome.dropped));
     upsert_summary(client, cfg, &meta.repo, meta.pr, &summary).await
 }
 
