@@ -1236,9 +1236,12 @@ pub async fn post_review(
                         meta.repo,
                         meta.pr
                     );
+                    // The pass failed as a whole, so nothing it would have
+                    // posted is confirmed — not just the batch, but the
+                    // per-comment fallback and the thread cleanup too.
                     Reconciled {
                         resolved: Vec::new(),
-                        dropped: 0,
+                        dropped: review.inline.len(),
                     }
                 });
         }
@@ -1248,6 +1251,9 @@ pub async fn post_review(
                 meta.repo,
                 meta.pr
             );
+            // Skipped entirely, which is the same lie in the summary as a failed
+            // write: it promises comments that are not there.
+            outcome.dropped = review.inline.len();
         }
         None => {}
     }

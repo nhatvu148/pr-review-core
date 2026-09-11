@@ -83,26 +83,34 @@ pub(crate) fn render_resolved(resolved: &[String]) -> String {
     s
 }
 
-/// Say so when a round's findings never reached the PR.
+/// Say so when a round's inline findings may not have reached the PR.
 ///
-/// The summary is rendered before posting and states `N inline comment(s)
-/// below.` from the findings the model produced. When creation fails in a way
-/// that cannot be retried safely — a 5xx or a lost response, where reposting
-/// risks duplicating the round — those comments do not exist and that sentence
-/// becomes false.
+/// The summary is composed before posting and states `N inline comment(s)
+/// below.` from the findings the model produced. Several paths can leave that
+/// sentence untrue: a creation failure that cannot be retried safely, a
+/// reconciliation pass that errored outright, or a PR whose head SHA was
+/// unavailable so nothing could be anchored at all.
 ///
-/// The count is not rewritten, because editing prose the review layer composed
-/// would couple every provider to its exact phrasing. A correction is appended
-/// instead, which is also the more honest artifact: the reader learns that
-/// something was lost, not merely a smaller number.
+/// The wording is "not confirmed" rather than "not posted", and the distinction
+/// is load-bearing. The main path this covers is a lost response, where GitHub
+/// may well have created the comments and only the acknowledgement went missing
+/// — claiming they are absent would be a fresh false statement replacing the old
+/// one. Under-claiming is the safe direction: every case this renders for is at
+/// least unconfirmed, and some are genuinely absent.
+///
+/// The count in the summary is not rewritten. Editing prose the review layer
+/// composed would couple every provider to its exact phrasing, and a correction
+/// is the more honest artifact anyway — the reader learns something went wrong,
+/// rather than seeing a smaller number and no reason.
 pub(crate) fn render_dropped(dropped: usize) -> String {
     if dropped == 0 {
         return String::new();
     }
     format!(
-        "\n\n## ⚠️ Not posted this round\n\n_{dropped} finding(s) above could not be \
-         posted as inline comments — the host did not confirm the write, and reposting \
-         risked duplicating them. They are re-derived on the next review._\n"
+        "\n\n## ⚠️ Not confirmed this round\n\n_{dropped} finding(s) above may not have \
+         reached this pull request as inline comments — the host did not confirm the write. \
+         Check the comments before relying on the count above; anything missing is \
+         re-derived on the next review._\n"
     )
 }
 
@@ -305,7 +313,15 @@ mod tests {
         assert!(s.contains("3 finding(s)"));
         assert!(
             s.contains("re-derived on the next review"),
-            "a reader needs to know the findings are not lost, only unposted"
+            "a reader needs to know the findings are not lost, only unconfirmed"
         );
+        // The main case this covers is a lost response, where the comments may
+        // well exist. Saying they were not posted would replace one false
+        // statement with another.
+        assert!(
+            !s.contains("were not posted") && !s.contains("could not be posted"),
+            "the notice must not claim absence it cannot establish"
+        );
+        assert!(s.contains("did not confirm"));
     }
 }
