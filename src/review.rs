@@ -762,11 +762,22 @@ pub(crate) async fn run_agentic(
     pr_body_block: Option<&str>,
     repo: &str,
     system_prompt: &str,
+    shared: Option<&crate::backend::SharedWorkspace>,
 ) -> Result<ReviewResult> {
-    let url = provider.clone_url(cfg, repo)?;
-    let sha = meta.head_sha.clone();
-    // git clone is blocking — keep it off the async worker threads.
-    let ws = tokio::task::spawn_blocking(move || Workspace::clone(&url, sha.as_deref())).await??;
+    let clone_once = || async {
+        let url = provider.clone_url(cfg, repo)?;
+        let sha = meta.head_sha.clone();
+        // git clone is blocking — keep it off the async worker threads.
+        let ws =
+            tokio::task::spawn_blocking(move || Workspace::clone(&url, sha.as_deref())).await??;
+        Ok::<_, anyhow::Error>(std::sync::Arc::new(ws))
+    };
+    // Sharing is per review, not global: every sample of one review reads the
+    // same commit, so cloning it again per sample fetched bytes we already had.
+    let ws = match shared {
+        Some(cell) => cell.get_or_try_init(clone_once).await?.clone(),
+        None => clone_once().await?,
+    };
     agentic_review(
         client,
         cfg,
@@ -1506,6 +1517,10 @@ pub async fn run_review_with(
     let injected_rules = crate::prompt::injected_rules(cfg);
     // Composed here, once, for every backend — see `ReviewContext::pr_body`.
     let pr_body = crate::prompt::pr_body_block(cfg, &meta);
+    // One clone for the whole review, however many samples it takes. Created
+    // lazily by the first agentic sample and dropped with this scope, so the
+    // temporary directory's lifetime is unchanged.
+    let workspace = crate::backend::SharedWorkspace::new();
     let ctx = ReviewContext {
         client: &client,
         cfg,
@@ -1513,6 +1528,7 @@ pub async fn run_review_with(
         // A PR's code is only reachable by cloning; the agentic path does that
         // itself when enabled.
         local_root: None,
+        workspace: Some(&workspace),
         repo: &input.repo,
         meta: &meta,
         diff: &diff,
@@ -1733,6 +1749,8 @@ pub async fn run_review_local(
         cfg,
         provider: None,
         local_root: input.repo_root.as_deref(),
+        // No host to clone from on this path, so there is nothing to share.
+        workspace: None,
         repo: &input.label,
         meta: &meta,
         diff: &diff,

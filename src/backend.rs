@@ -29,6 +29,10 @@ use crate::review::run_agentic;
 /// checkout) should prefer `local_root` when it is set — the caller already has the
 /// code on disk — and otherwise clone one via [`Provider::clone_url`] +
 /// `Workspace::clone` using `provider` and `repo`.
+/// A clone created at most once and shared by every sample of one review.
+pub type SharedWorkspace = tokio::sync::OnceCell<std::sync::Arc<crate::repo::Workspace>>;
+
+/// Everything a backend needs to review one change.
 pub struct ReviewContext<'a> {
     pub client: &'a reqwest::Client,
     pub cfg: &'a Config,
@@ -39,6 +43,19 @@ pub struct ReviewContext<'a> {
     /// A checkout of the code under review, when the caller has one. Set on the
     /// local path; `None` for a PR, where the code is only reachable by cloning.
     pub local_root: Option<&'a std::path::Path>,
+    /// A clone shared by every sample of one review.
+    ///
+    /// The agentic path clones the repository to explore it, and that used to
+    /// happen inside each `review` call — so `REVIEW_SAMPLES=3` cloned the same
+    /// commit three times. Measured on `nomnaviet/nomnaviet#91`: 714 MB, three
+    /// times, several minutes of a single review's wall clock spent fetching
+    /// bytes it already had.
+    ///
+    /// Every sample reviews the *same* commit by definition, so one clone is
+    /// correct as well as cheaper. The cell is created per review and dropped
+    /// with it, so the temporary directory is still cleaned up on the same
+    /// schedule as before — this shares a clone, it does not cache one.
+    pub workspace: Option<&'a SharedWorkspace>,
     /// `owner/repo` (GitHub) or `workspace/repo` (Bitbucket). On the local path
     /// this is the caller's label for the change, not a host coordinate.
     pub repo: &'a str,
@@ -173,6 +190,7 @@ impl ReviewBackend for OpenRouterBackend {
                 ctx.pr_body,
                 ctx.repo,
                 &ctx.system_prompt(crate::agent::AGENT_SYSTEM_PROMPT),
+                ctx.workspace,
             )
             .await
             {

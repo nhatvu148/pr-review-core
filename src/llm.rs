@@ -105,6 +105,35 @@ where
     })
 }
 
+/// What a rejected finding actually looked like, for the log.
+///
+/// `missing field \`body\`` names what was absent and nothing about what was
+/// present, which is the wrong half: six of these in one production review said
+/// nothing about whether the model had used a different key, emitted an empty
+/// object, or returned a bare string. Field *names* are safe to log where their
+/// values are not — a finding body can quote source.
+fn describe_shape(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Object(map) if map.is_empty() => "an empty object".to_string(),
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&str> = map.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            format!("keys [{}]", keys.join(", "))
+        }
+        serde_json::Value::Null => "null".to_string(),
+        serde_json::Value::Array(a) => format!("an array of {}", a.len()),
+        other => format!(
+            "a bare {}",
+            match other {
+                serde_json::Value::String(_) => "string",
+                serde_json::Value::Number(_) => "number",
+                serde_json::Value::Bool(_) => "bool",
+                _ => "value",
+            }
+        ),
+    }
+}
+
 /// Parse a findings array element-by-element, dropping (with a warning) any element
 /// that still can't be understood. One malformed finding must never invalidate the
 /// review it sits in — that trades a whole expensive review for a formatting slip.
@@ -114,11 +143,17 @@ pub(crate) fn findings_from_values(raw: Vec<serde_json::Value>) -> (Vec<Finding>
     let mut kept = Vec::with_capacity(raw.len());
     let mut dropped = 0usize;
     for v in raw {
-        match serde_json::from_value::<Finding>(v) {
+        // Deserialize from a reference so the element survives a failure and can
+        // be described. Consuming it would force describing every element up
+        // front, including the ones that parse.
+        match Finding::deserialize(&v) {
             Ok(f) => kept.push(f),
             Err(e) => {
                 dropped += 1;
-                tracing::warn!("dropping malformed finding ({e})");
+                tracing::warn!(
+                    "dropping malformed finding ({e}); it had {}",
+                    describe_shape(&v)
+                );
             }
         }
     }
@@ -570,6 +605,32 @@ mod tests {
     //! after a ~5-minute agent run). These pin the salvage behaviour.
 
     use super::{findings_from_values, Review};
+
+    /// The warning has to say what arrived, not only what was missing.
+    ///
+    /// Six `missing field \`body\`` lines in one production review said nothing
+    /// about whether the model had used a different key, returned an empty
+    /// object, or emitted a bare string — three different bugs with the same
+    /// message. Keys are safe to log; values are not, since a finding body can
+    /// quote source.
+    #[test]
+    fn a_rejected_finding_is_described_by_what_it_contained() {
+        use super::describe_shape;
+        assert_eq!(
+            describe_shape(&serde_json::json!({"file": "a.rs", "message": "x"})),
+            "keys [file, message]"
+        );
+        assert_eq!(describe_shape(&serde_json::json!({})), "an empty object");
+        assert_eq!(describe_shape(&serde_json::json!(null)), "null");
+        assert_eq!(
+            describe_shape(&serde_json::json!("just a string")),
+            "a bare string"
+        );
+        assert_eq!(
+            describe_shape(&serde_json::json!([1, 2, 3])),
+            "an array of 3"
+        );
+    }
 
     #[test]
     fn finding_missing_severity_defaults_to_medium() {

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**A review clones the repository once, however many samples it takes.** The agentic backends cloned inside each `review` call, so `REVIEW_SAMPLES=3` fetched the same commit three times — measured on a real pull request at **714 MB, three times**, several minutes of one review's wall clock spent re-fetching bytes it already had.
+
+Every sample reviews the same commit by definition, so one clone is correct as well as cheaper. `ReviewContext` carries a clone shared across the samples of a single review; it is created by the first sample that needs it and dropped when the review ends, so the checkout's lifetime is unchanged. Consumers implementing `ReviewBackend` should read `ctx.workspace` rather than cloning per call.
+
+**A dropped finding says what it contained.** `dropping malformed finding (missing field \`body\`)` named what was absent and nothing about what arrived — six of those in one production review could equally have meant a renamed key, an empty object, or a bare string, which are three different bugs. The warning now reports the element's shape. Field *names* only: a finding body can quote source.
+
 ## 0.30.0
 
 **A finding is never retracted on a commit that never changed.** Reconciliation reads "not flagged this round" as "fixed" and resolves the thread. That inference is only as good as the assumption that the reviewer would flag the same thing twice — and it would not: consecutive reviews of a frozen commit shared 61–74% of their findings, and a HIGH at confidence 75/78 was missed outright by one run in three.
