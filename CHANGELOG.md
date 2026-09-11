@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.29.0
+
+**A round's GitLab findings publish as one review, not N discussions.** `draft_notes` plus `draft_notes/bulk_publish` is GitLab's equivalent of the batched review added for GitHub in 0.28.0: a note is staged per finding and published in one call, so a merge request shows one review instead of N separate discussions each firing its own notification.
+
+Lower risk than the GitHub change, because this provider has no reconciliation to break — `post_review` already deleted the bot's prior inline notes and reposted the whole set every round. What changes is how the set is delivered, not which comments exist.
+
+Nothing is sent that could bind. No `reviewer_state`: the API documents `reviewed` as recording no formal approval, so it would be safe, but `requested_changes` sits next to it and formal approval lives on a separate `/approve` endpoint this crate never calls. No `note` either, because the summary is an issue note that is edited across rounds and duplicating it into the published review would leave a stale copy per round.
+
+**The care is all in one place: `bulk_publish` has no filter.** It publishes every pending draft the token owns, and that token is usually a person's rather than a robot's. So a draft that is not ours is untouchable in both directions — deleting it would destroy a review someone is still writing, publishing it would post their unfinished words inside our round. When any foreign draft is pending, the round is posted the old way instead. The check reads every page, because an unlisted draft would otherwise count as absent; it runs again immediately before publishing, because staging is many requests and a colleague can start a review during them; and a failed publish is not taken as proof that nothing published — our drafts being gone is checked first, since reposting on top of a review that already landed would duplicate the round.
+
+Bitbucket is unchanged. Its API has no grouped-review construct at all, and its `/approve` and `/request-changes` set participant state directly with no advisory middle.
+
 ## 0.28.1
 
 **A reworded finding that drifted a line keeps its thread.** Re-reviewing an *unchanged* PR could churn every inline thread: the model rewords a finding between runs, which breaks the `sha256(path|body)` fingerprint, and anchors it a line or two away, which broke the positional fallback — because that fallback required an *exact* line match. Both keys miss, the finding looks new, and its own thread is deleted as stale.
