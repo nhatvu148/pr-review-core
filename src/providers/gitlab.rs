@@ -512,31 +512,19 @@ async fn publish_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> R
     Ok(())
 }
 
-/// Clear our own orphaned drafts, and report whether batching is safe at all.
+/// Every draft note pending on this merge request, paginated.
 ///
-/// Two hazards, both from `bulk_publish` having no filter: it publishes **every**
-/// pending draft the token owns, and this token is very likely a person's rather
-/// than a robot's.
-///
-/// So a draft that is not ours is untouchable in both directions. Deleting it
-/// would destroy a review someone is still writing; publishing it would post
-/// their unfinished words inside our round. Neither is ours to do, and the safe
-/// response is simply not to batch — the per-discussion path touches no drafts.
-///
-/// `Ok(true)` means the merge request holds no drafts but ours, now removed.
-/// `Ok(false)` means someone else has drafts pending. `Err` means the state could
-/// not be established, which is not a licence to proceed: an unlisted or
-/// undeleted orphan is exactly what `bulk_publish` would sweep into this round.
-async fn clear_our_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<bool> {
+/// Paginated like `list_discussions` and `list_notes`, and for a sharper reason
+/// than consistency: callers treat an unlisted draft as an absent one, so a
+/// page-size blind spot here would let `bulk_publish` post someone else's work.
+async fn list_drafts(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+) -> Result<Vec<serde_json::Value>> {
     let url = format!("{}/draft_notes", mr_base(cfg, repo, pr));
-
-    // Paginated, like `list_discussions` and `list_notes` in this file, and for a
-    // sharper reason than consistency: an unlisted draft is counted as absent, so
-    // a single unpaginated GET would report `foreign == 0` while foreign drafts
-    // sat on page 2 — and `bulk_publish` would then post them. The one check
-    // standing between this code and publishing someone else's unfinished review
-    // must not have a page-size blind spot.
-    let mut drafts: Vec<serde_json::Value> = Vec::new();
+    let mut all: Vec<serde_json::Value> = Vec::new();
     let mut page = 1u32;
     loop {
         let res = gl(client.get(format!("{url}?per_page=100&page={page}")), cfg)
@@ -551,33 +539,55 @@ async fn clear_our_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) ->
         }
         let batch: Vec<serde_json::Value> = res.json().await?;
         let n = batch.len();
-        drafts.extend(batch);
+        all.extend(batch);
         if n < 100 {
-            break;
+            return Ok(all);
         }
         page += 1;
     }
+}
 
+/// Split pending drafts into ours (by id) and a count of everyone else's.
+///
+/// A draft we cannot identify counts as foreign. Guessing the other way risks
+/// deleting or publishing a person's unfinished review; guessing this way costs
+/// only a batched round.
+fn partition_drafts(cfg: &Config, drafts: &[serde_json::Value]) -> (Vec<u64>, usize) {
+    let mut ours = Vec::new();
     let mut foreign = 0usize;
-    for d in &drafts {
-        let ours = d
+    for d in drafts {
+        let is_ours = d
             .get("note")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|b| is_bot_comment(cfg, b));
-        let id = d.get("id").and_then(serde_json::Value::as_u64);
-        match (ours, id) {
-            (true, Some(id)) => {
-                let del = gl(client.delete(format!("{url}/{id}")), cfg).send().await?;
-                if !del.status().is_success() {
-                    anyhow::bail!("GitLab delete draft_note {id}: {}", del.status());
-                }
-            }
-            // Not ours, or ours but unidentifiable — either way it stays, and
-            // its presence is what makes bulk_publish unsafe this round.
+        match (is_ours, d.get("id").and_then(serde_json::Value::as_u64)) {
+            (true, Some(id)) => ours.push(id),
             _ => foreign += 1,
         }
     }
+    (ours, foreign)
+}
 
+/// Delete our own pending drafts, and report whether anyone else's remain.
+///
+/// `bulk_publish` has no filter: it publishes **every** pending draft the token
+/// owns, and that token is very likely a person's rather than a robot's. So a
+/// draft that is not ours is untouchable in both directions — deleting it would
+/// destroy a review someone is still writing, publishing it would post their
+/// unfinished words inside our round — and the safe answer is not to batch. The
+/// per-discussion path touches no drafts.
+///
+/// `Ok(false)` means someone else has drafts pending. `Err` means the state could
+/// not be established, which is not a licence to proceed.
+async fn clear_our_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<bool> {
+    let url = format!("{}/draft_notes", mr_base(cfg, repo, pr));
+    let (ours, foreign) = partition_drafts(cfg, &list_drafts(client, cfg, repo, pr).await?);
+    for id in ours {
+        let del = gl(client.delete(format!("{url}/{id}")), cfg).send().await?;
+        if !del.status().is_success() {
+            anyhow::bail!("GitLab delete draft_note {id}: {}", del.status());
+        }
+    }
     if foreign > 0 {
         tracing::info!(
             "{foreign} draft note(s) on {repo}!{pr} are not ours; posting individually so \
@@ -634,9 +644,6 @@ async fn publish_as_one_review(
     refs: &DiffRefs,
     inline: &[InlineComment],
 ) -> Result<()> {
-    // Anything already staged is either an orphan from an earlier aborted run of
-    // ours, or someone else's pending review. bulk_publish cannot tell them
-    // apart, so the second case means this round is posted the old way.
     if !clear_our_drafts(client, cfg, repo, pr).await? {
         anyhow::bail!("draft notes from another author are pending");
     }
@@ -647,9 +654,35 @@ async fn publish_as_one_review(
             return Err(e);
         }
     }
-    if let Err(e) = publish_drafts(client, cfg, repo, pr).await {
+
+    // Check again. Staging is many requests, and a colleague can open a review
+    // during them. This narrows the window rather than closing it — the API
+    // offers no way to publish only named drafts — but it shrinks the exposure
+    // from the whole staging run to the gap before the next call.
+    let (_, foreign) = partition_drafts(cfg, &list_drafts(client, cfg, repo, pr).await?);
+    if foreign > 0 {
         let _ = clear_our_drafts(client, cfg, repo, pr).await;
-        return Err(e);
+        anyhow::bail!("draft notes from another author appeared while staging");
+    }
+
+    if let Err(e) = publish_drafts(client, cfg, repo, pr).await {
+        // The call failed, but GitLab may have processed it and lost the
+        // response. Our drafts being gone is the only evidence separating the
+        // two, and it is worth asking for: returning an error here makes the
+        // caller repost every finding on top of a review that already published.
+        match list_drafts(client, cfg, repo, pr).await {
+            Ok(remaining) if partition_drafts(cfg, &remaining).0.is_empty() => {
+                tracing::warn!(
+                    "GitLab bulk_publish for {repo}!{pr} reported an error ({e:#}) but our \
+                     drafts are gone; treating the review as published"
+                );
+                return Ok(());
+            }
+            _ => {
+                let _ = clear_our_drafts(client, cfg, repo, pr).await;
+                return Err(e);
+            }
+        }
     }
     Ok(())
 }
