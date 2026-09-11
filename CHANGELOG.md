@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.30.0
 
 **A finding is never retracted on a commit that never changed.** Reconciliation reads "not flagged this round" as "fixed" and resolves the thread. That inference is only as good as the assumption that the reviewer would flag the same thing twice — and it would not: consecutive reviews of a frozen commit shared 61–74% of their findings, and a HIGH at confidence 75/78 was missed outright by one run in three.
 
