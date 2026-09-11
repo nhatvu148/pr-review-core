@@ -529,15 +529,34 @@ async fn publish_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> R
 /// undeleted orphan is exactly what `bulk_publish` would sweep into this round.
 async fn clear_our_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<bool> {
     let url = format!("{}/draft_notes", mr_base(cfg, repo, pr));
-    let res = gl(client.get(&url), cfg).send().await?;
-    let status = res.status();
-    if !status.is_success() {
-        anyhow::bail!(
-            "GitLab list draft_notes {status}: {}",
-            clip(&res.text().await.unwrap_or_default(), 200)
-        );
+
+    // Paginated, like `list_discussions` and `list_notes` in this file, and for a
+    // sharper reason than consistency: an unlisted draft is counted as absent, so
+    // a single unpaginated GET would report `foreign == 0` while foreign drafts
+    // sat on page 2 — and `bulk_publish` would then post them. The one check
+    // standing between this code and publishing someone else's unfinished review
+    // must not have a page-size blind spot.
+    let mut drafts: Vec<serde_json::Value> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let res = gl(client.get(format!("{url}?per_page=100&page={page}")), cfg)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "GitLab list draft_notes {status}: {}",
+                clip(&res.text().await.unwrap_or_default(), 200)
+            );
+        }
+        let batch: Vec<serde_json::Value> = res.json().await?;
+        let n = batch.len();
+        drafts.extend(batch);
+        if n < 100 {
+            break;
+        }
+        page += 1;
     }
-    let drafts: Vec<serde_json::Value> = res.json().await?;
 
     let mut foreign = 0usize;
     for d in &drafts {
