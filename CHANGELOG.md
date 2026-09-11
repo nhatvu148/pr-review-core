@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**A round whose inline findings may not have reached the PR now says so on the PR.** The summary is composed before posting and states `N inline comment(s) below.` from what the model produced. When creation fails in a way that cannot be retried safely — a 5xx, a rate limit, a lost response, where reposting risks duplicating the round — that sentence can be untrue with only a log line to the contrary. The same holds when reconciliation fails outright, or when the head SHA is unavailable and nothing can be anchored at all.
+
+The wording is *not confirmed* rather than *not posted*, deliberately. The main case is a lost response, where the comments may well have been created and only the acknowledgement went missing — claiming absence would replace one false statement with another.
+
+A `⚠️ Not confirmed this round` section is appended instead of rewriting the count, because editing prose the review layer composed would couple every provider to its exact phrasing. It is also the more honest artifact: the reader learns that something was lost rather than simply seeing a smaller number.
+
 **A review can take more than one sample of itself.** `REVIEW_SAMPLES=3` asks the backend for three independent reviews of the same diff and unions the findings into one posted review — no extra rounds, no extra threads, no reconciliation churn.
 
 The reason is measured rather than assumed. A single pass is a **sample, not a sweep**: on a frozen commit, consecutive reviews shared only 61–74% of their findings, and a HIGH at confidence 75/78 was missed outright by one run in three. Across five runs a diff surfaced 1.5–2.4× the distinct issues any single run found. That gap is pure recall, and recall is the one failure a pull request can never reveal on its own — nothing on a PR says what the reviewer did not look at.
