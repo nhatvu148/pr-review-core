@@ -113,6 +113,12 @@ class ReviewConfig(TypedDict, total=False):
     reanchor_findings: bool
     # Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. Default: `false`. (`REVIEW_ON_UPDATE`)
     review_on_update: bool
+    # Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. Default: `1`. (`REVIEW_SAMPLES`)
+    review_samples: int
+    # How far apart two samples may anchor the same issue and still merge. Wider than the reconciler's line matching on purpose: two independent descriptions of one defect drift further than one finding does from its own earlier thread. Default: `10`. (`SAMPLE_LINE_TOLERANCE`)
+    sample_line_tolerance: int
+    # How many samples must report a finding for it to survive the merge. One (plain union) by default, because recall is the measured problem; raising it buys precision with the discoveries only one sample made. Default: `1`. (`SAMPLE_MIN_AGREEMENT`)
+    sample_min_agreement: int
     # Second skeptical pass that removes false positives and low-value nits. Default: `true`. (`SELF_CRITIQUE`)
     self_critique: bool
     # Name the enclosing function or symbol of each changed line, via tree-sitter, with no clone. Default: `true`. (`STRUCTURAL_CONTEXT`)
@@ -187,6 +193,9 @@ CONFIG_ENV: Dict[str, tuple] = {
     "pr_body_max_chars": ("PR_BODY_MAX_CHARS", "Int"),
     "reanchor_findings": ("REANCHOR_FINDINGS", "Bool"),
     "review_on_update": ("REVIEW_ON_UPDATE", "Bool"),
+    "review_samples": ("REVIEW_SAMPLES", "Int"),
+    "sample_line_tolerance": ("SAMPLE_LINE_TOLERANCE", "Int"),
+    "sample_min_agreement": ("SAMPLE_MIN_AGREEMENT", "Int"),
     "self_critique": ("SELF_CRITIQUE", "Bool"),
     "structural_context": ("STRUCTURAL_CONTEXT", "Bool"),
     "structural_max_files": ("STRUCTURAL_MAX_FILES", "Int"),

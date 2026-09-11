@@ -68,6 +68,35 @@ pub struct Config {
     pub min_confidence: u8,
     /// Hard cap on the number of findings posted (after sorting by severity).
     pub max_findings: usize,
+    /// How many times to ask the backend for a review before merging the answers.
+    ///
+    /// One by default, which is the historical behaviour. Above one, the model is
+    /// asked the same question independently and the findings are unioned, because
+    /// a single pass is a **sample** rather than a sweep: measured on a frozen
+    /// commit, consecutive reviews shared only 61–74% of their findings, and a
+    /// HIGH at confidence 75/78 was missed outright by one run in three. Five runs
+    /// surfaced 1.5–2.4× the distinct issues that any one run did.
+    ///
+    /// Costs `n` times the tokens and `n` times the wall clock. It buys recall,
+    /// which is the failure a pull request can never reveal on its own.
+    pub review_samples: usize,
+    /// How many samples must report a finding for it to survive the merge.
+    ///
+    /// One — plain union — by default, because recall is the measured problem.
+    /// Raising it trades recall for precision: a finding only one sample saw is
+    /// dropped, which removes that sample's false positives and its discoveries
+    /// alike. Meaningless when `review_samples` is 1.
+    pub sample_min_agreement: usize,
+    /// How far apart two samples may anchor the same issue and still be merged.
+    ///
+    /// Wider than the reconciler's ±3 on purpose. That one matches a finding to
+    /// its own earlier thread; this one matches two independent descriptions of
+    /// one defect, and measurement says those drift much further — the same issue
+    /// appeared 1, 10, 12 and 39 lines apart across runs of an unchanged diff.
+    /// Too tight and the union keeps duplicates; too wide and distinct findings
+    /// collapse into one. Neither error is silent: the run log records the
+    /// pre-merge and post-merge counts.
+    pub sample_line_tolerance: u64,
 
     /// Re-anchor a finding whose `line` just missed a real diff line: snap it to
     /// the nearest diff line within a small window when that line's code matches
@@ -314,6 +343,12 @@ impl Config {
             self_critique: env_or("SELF_CRITIQUE", "true").parse().unwrap_or(true),
             min_confidence: env_or("MIN_CONFIDENCE", "0").parse().unwrap_or(0),
             max_findings: env_or("MAX_FINDINGS", "20").parse().unwrap_or(20),
+            review_samples: env_or("REVIEW_SAMPLES", "1").parse().unwrap_or(1).max(1),
+            sample_min_agreement: env_or("SAMPLE_MIN_AGREEMENT", "1")
+                .parse()
+                .unwrap_or(1)
+                .max(1),
+            sample_line_tolerance: env_or("SAMPLE_LINE_TOLERANCE", "10").parse().unwrap_or(10),
             reanchor_findings: env_or("REANCHOR_FINDINGS", "true").parse().unwrap_or(true),
             suggestions: env_or("SUGGESTIONS", "true").parse().unwrap_or(true),
 

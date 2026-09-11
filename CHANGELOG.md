@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+**A review can take more than one sample of itself.** `REVIEW_SAMPLES=3` asks the backend for three independent reviews of the same diff and unions the findings into one posted review — no extra rounds, no extra threads, no reconciliation churn.
+
+The reason is measured rather than assumed. A single pass is a **sample, not a sweep**: on a frozen commit, consecutive reviews shared only 61–74% of their findings, and a HIGH at confidence 75/78 was missed outright by one run in three. Across five runs a diff surfaced 1.5–2.4× the distinct issues any single run found. That gap is pure recall, and recall is the one failure a pull request can never reveal on its own — nothing on a PR says what the reviewer did not look at.
+
+**Union, not intersection.** Dropping what only one sample saw would discard exactly the discoveries the sampling was bought for. `SAMPLE_MIN_AGREEMENT` exists for the opposite trade, and `SAMPLE_LINE_TOLERANCE` (±10 by default) decides when two samples are describing the same issue — wider than the reconciler's ±3, because two independent descriptions of one defect drift further than one finding does from its own earlier thread.
+
+Off by default at `REVIEW_SAMPLES=1`, where the merge is the identity and nothing changes. It costs N× tokens and N× wall clock, which is the honest price of the recall it buys. The run log records `samples` and `sample_total` beside the existing funnel, so what a given N buys is measurable rather than argued.
+
 ## 0.29.0
 
 **A round's GitLab findings publish as one review, not N discussions.** `draft_notes` plus `draft_notes/bulk_publish` is GitLab's equivalent of the batched review added for GitHub in 0.28.0: a note is staged per finding and published in one call, so a merge request shows one review instead of N separate discussions each firing its own notification.

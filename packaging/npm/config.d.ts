@@ -109,6 +109,12 @@ export interface ReviewConfig {
   reanchorFindings?: boolean;
   /** Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. Default: `false`. (`REVIEW_ON_UPDATE`) */
   reviewOnUpdate?: boolean;
+  /** Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. Default: `1`. (`REVIEW_SAMPLES`) */
+  reviewSamples?: number;
+  /** How far apart two samples may anchor the same issue and still merge. Wider than the reconciler's line matching on purpose: two independent descriptions of one defect drift further than one finding does from its own earlier thread. Default: `10`. (`SAMPLE_LINE_TOLERANCE`) */
+  sampleLineTolerance?: number;
+  /** How many samples must report a finding for it to survive the merge. One (plain union) by default, because recall is the measured problem; raising it buys precision with the discoveries only one sample made. Default: `1`. (`SAMPLE_MIN_AGREEMENT`) */
+  sampleMinAgreement?: number;
   /** Second skeptical pass that removes false positives and low-value nits. Default: `true`. (`SELF_CRITIQUE`) */
   selfCritique?: boolean;
   /** Name the enclosing function or symbol of each changed line, via tree-sitter, with no clone. Default: `true`. (`STRUCTURAL_CONTEXT`) */

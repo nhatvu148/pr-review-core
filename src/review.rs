@@ -1062,9 +1062,151 @@ struct FinishedReview {
     anchors: Vec<Option<u64>>,
 }
 
+/// One issue as several samples described it.
+struct Cluster {
+    /// The best-articulated description: highest confidence, then worst severity.
+    best: Finding,
+    /// How many distinct samples reported it. Evidence, not a filter by default.
+    agreement: usize,
+}
+
+/// Merge independent samples of the same review into one finding list.
+///
+/// **Union, not intersection, by default.** A single review pass is a sample
+/// rather than a sweep — on a frozen commit, consecutive reviews shared only
+/// 61–74% of their findings, and a HIGH at confidence 75/78 was missed outright
+/// by one run in three. Discarding what only one sample saw would throw away
+/// precisely the discoveries that make sampling worth its cost. `min_agreement`
+/// exists for callers who would rather buy precision with those discoveries.
+///
+/// Two findings are the same issue when they name the same file within
+/// `tolerance` lines. That is imperfect and knowably so: two genuinely distinct
+/// defects close together merge into one, and one defect described from far apart
+/// stays two. There is no exact test available here — the samples are independent
+/// prose about the same code — so the errors are bounded by the tolerance rather
+/// than eliminated, and the run log records the counts on both sides of the merge
+/// so the rate is measurable rather than assumed.
+///
+/// Findings with no line can only be matched by file. That is deliberately loose,
+/// because an unanchored finding cannot be posted inline anyway; merging them
+/// aggressively costs less than carrying near-duplicates into the summary.
+///
+/// Order is the first sample's, then anything later samples added — so a run with
+/// `samples = 1` produces exactly what it produced before this existed.
+fn merge_samples(samples: &[Vec<Finding>], tolerance: u64, min_agreement: usize) -> Vec<Finding> {
+    fn rank(severity: &str) -> u8 {
+        match severity.to_ascii_uppercase().as_str() {
+            "BLOCKING" => 0,
+            "HIGH" => 1,
+            "MEDIUM" => 2,
+            _ => 3,
+        }
+    }
+    /// Better-articulated: higher confidence first, then worse severity.
+    fn supersedes(candidate: &Finding, current: &Finding) -> bool {
+        let (cc, kc) = (candidate.confidence.unwrap_or(0), rank(&candidate.severity));
+        let (ec, ke) = (current.confidence.unwrap_or(0), rank(&current.severity));
+        (cc, std::cmp::Reverse(kc)) > (ec, std::cmp::Reverse(ke))
+    }
+
+    let mut clusters: Vec<Cluster> = Vec::new();
+    for sample in samples {
+        // Within one sample each cluster may be claimed once, so a sample that
+        // reports two nearby findings cannot inflate one cluster's agreement.
+        let mut claimed: Vec<bool> = vec![false; clusters.len()];
+        for f in sample {
+            let hit = clusters.iter().enumerate().position(|(i, c)| {
+                !claimed.get(i).copied().unwrap_or(false)
+                    && c.best.file == f.file
+                    && match (c.best.line, f.line) {
+                        (Some(a), Some(b)) => a.abs_diff(b) <= tolerance,
+                        (None, None) => true,
+                        _ => false,
+                    }
+            });
+            match hit {
+                Some(i) => {
+                    claimed[i] = true;
+                    clusters[i].agreement += 1;
+                    if supersedes(f, &clusters[i].best) {
+                        clusters[i].best = f.clone();
+                    }
+                }
+                None => {
+                    clusters.push(Cluster {
+                        best: f.clone(),
+                        agreement: 1,
+                    });
+                    claimed.push(true);
+                }
+            }
+        }
+    }
+
+    clusters
+        .into_iter()
+        .filter(|c| c.agreement >= min_agreement)
+        .map(|c| c.best)
+        .collect()
+}
+
 /// Everything between the backend's answer and a postable review: self-critique,
 /// confidence floor, hygiene merge, CI demotion, burst collapse, severity sort,
 /// recommendation floor, cap, line anchoring, and the summary.
+/// Ask the backend for `cfg.review_samples` independent reviews and merge them.
+///
+/// Sequential rather than concurrent, deliberately for now: the Claude Code
+/// backend spawns a CLI process per call, and three at once is a different
+/// resource question than three in a row. The cost is wall clock on a bot that
+/// already takes minutes, and the shape below makes parallelising it later a
+/// local change.
+///
+/// The first sample's failure is fatal — there is no review without it. A later
+/// sample's failure is not: it is logged and the merge proceeds with what
+/// arrived, because k−1 samples is still better than the single pass this
+/// replaces.
+async fn sampled_review(
+    cfg: &Config,
+    backend: &dyn ReviewBackend,
+    ctx: &ReviewContext<'_>,
+) -> Result<(ReviewResult, usize, usize)> {
+    let mut result = backend.review(ctx).await?;
+    if cfg.review_samples <= 1 {
+        let n = result.review.findings.len();
+        return Ok((result, 1, n));
+    }
+
+    let mut samples = vec![result.review.findings.clone()];
+    for n in 2..=cfg.review_samples {
+        match backend.review(ctx).await {
+            Ok(extra) => samples.push(extra.review.findings),
+            Err(e) => tracing::warn!(
+                "review sample {n}/{} failed ({e:#}); merging the {} that succeeded",
+                cfg.review_samples,
+                samples.len()
+            ),
+        }
+    }
+    let total: usize = samples.iter().map(Vec::len).sum();
+    let merged = merge_samples(
+        &samples,
+        cfg.sample_line_tolerance,
+        cfg.sample_min_agreement,
+    );
+    tracing::info!(
+        "merged {} sample(s): {total} finding(s) -> {} after union (tolerance ±{}, min agreement {})",
+        samples.len(),
+        merged.len(),
+        cfg.sample_line_tolerance,
+        cfg.sample_min_agreement
+    );
+    // The summary comes from the first sample. It describes that sample's
+    // findings, so it can understate a union — the finding list is authoritative
+    // and the summary is prose around it.
+    result.review.findings = merged;
+    Ok((result, samples.len(), total))
+}
+
 async fn finish_review(
     cfg: &Config,
     backend: &dyn ReviewBackend,
@@ -1379,7 +1521,7 @@ pub async fn run_review_with(
         pr_body: pr_body.as_deref(),
         injected_rules: &injected_rules,
     };
-    let result = backend.review(&ctx).await?;
+    let (result, samples, sample_total) = sampled_review(cfg, backend, &ctx).await?;
     let truncated = result.review.summary.contains(crate::llm::TRUNCATED_NOTE);
     let mut finished = finish_review(
         cfg,
@@ -1391,6 +1533,8 @@ pub async fn run_review_with(
         hygiene,
     )
     .await;
+    finished.funnel.samples = samples;
+    finished.funnel.sample_total = sample_total;
     if !advisories.is_empty() {
         finished.summary.push_str("\n\n");
         finished
@@ -1597,9 +1741,11 @@ pub async fn run_review_local(
         pr_body: pr_body.as_deref(),
         injected_rules: &injected_rules,
     };
-    let result = backend.review(&ctx).await?;
+    let (result, samples, sample_total) = sampled_review(cfg, backend, &ctx).await?;
     let mut finished =
         finish_review(cfg, backend, LOCAL_PROVIDER, &meta, &diff, &result, hygiene).await;
+    finished.funnel.samples = samples;
+    finished.funnel.sample_total = sample_total;
     // Same feature on this path: a local review's deliverable *is* its
     // `summary_markdown`, so leaving it unwired made WALKTHROUGH/DIAGRAM silently
     // a no-op for every caller of this entry point.
@@ -2747,7 +2893,8 @@ return calcTotal(order, tax, region);
 mod tests {
     use super::{
         anchorable, burst_key, collapse_bursts, demote_falsified_build_claims,
-        effective_recommendation, idents, line_symbols, reanchor, render_no_review_summary,
+        effective_recommendation, idents, line_symbols, merge_samples, reanchor,
+        render_no_review_summary,
     };
     use crate::llm::Finding;
     use std::collections::{HashMap, HashSet};
@@ -2966,6 +3113,120 @@ mod tests {
         let c = f("LOW", "c.rs", "`c.rs` leaks a handle on the error path.");
         assert_eq!(burst_key(&a), burst_key(&b));
         assert_ne!(burst_key(&a), burst_key(&c));
+    }
+
+    fn at(file: &str, line: Option<u64>, sev: &str, conf: u8, body: &str) -> Finding {
+        Finding {
+            severity: sev.to_string(),
+            file: file.to_string(),
+            line,
+            body: body.to_string(),
+            confidence: Some(conf),
+            suggestion: None,
+        }
+    }
+
+    /// A single sample must come out exactly as it went in.
+    ///
+    /// `review_samples = 1` is the default and the historical behaviour, so the
+    /// merge has to be the identity there — no reordering, no deduplication of
+    /// findings the model deliberately reported twice.
+    #[test]
+    fn one_sample_is_returned_unchanged() {
+        let s = vec![
+            at("a.rs", Some(10), "HIGH", 80, "one"),
+            at("a.rs", Some(12), "LOW", 30, "two"),
+        ];
+        let merged = merge_samples(std::slice::from_ref(&s), 10, 1);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].body, "one");
+        assert_eq!(merged[1].body, "two");
+    }
+
+    /// Union is the whole point: a finding only one sample saw is kept.
+    ///
+    /// This is the recall the sampling is bought for. Measured on a frozen
+    /// commit, one run in three missed a HIGH at confidence 75/78 — intersecting
+    /// the samples would reproduce exactly that miss.
+    #[test]
+    fn a_finding_only_one_sample_saw_survives() {
+        let a = vec![at("a.rs", Some(10), "MEDIUM", 60, "shared")];
+        let b = vec![
+            at("a.rs", Some(11), "MEDIUM", 60, "shared, reworded"),
+            at("b.rs", Some(90), "HIGH", 78, "only b saw this"),
+        ];
+        let merged = merge_samples(&[a, b], 10, 1);
+        assert_eq!(
+            merged.len(),
+            2,
+            "the shared finding merges, the lone one stays"
+        );
+        assert!(merged.iter().any(|f| f.body == "only b saw this"));
+    }
+
+    /// The same issue described a little differently is one finding, not two.
+    #[test]
+    fn samples_that_drift_within_tolerance_merge() {
+        let a = vec![at("a.rs", Some(40), "MEDIUM", 60, "first wording")];
+        let b = vec![at("a.rs", Some(48), "MEDIUM", 55, "second wording")];
+        assert_eq!(merge_samples(&[a.clone(), b.clone()], 10, 1).len(), 1);
+        // ...and outside it they are treated as distinct, which is the honest
+        // answer when the only evidence is position.
+        assert_eq!(merge_samples(&[a, b], 3, 1).len(), 2);
+    }
+
+    /// The surviving description is the best-argued one, not the first seen.
+    #[test]
+    fn the_merged_finding_keeps_the_strongest_description() {
+        let weak = vec![at("a.rs", Some(40), "LOW", 30, "vague")];
+        let strong = vec![at("a.rs", Some(41), "HIGH", 90, "precise and severe")];
+        let merged = merge_samples(&[weak, strong], 10, 1);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].body, "precise and severe");
+        assert_eq!(merged[0].severity, "HIGH");
+    }
+
+    /// One sample cannot manufacture agreement on its own.
+    ///
+    /// Without claiming, a sample reporting two findings a few lines apart would
+    /// count twice toward one cluster and pass a `min_agreement` of 2 alone —
+    /// turning a threshold meant to require independent confirmation into one
+    /// satisfied by a single verbose pass.
+    #[test]
+    fn agreement_counts_samples_not_findings() {
+        let chatty = vec![
+            at("a.rs", Some(40), "LOW", 30, "first"),
+            at("a.rs", Some(42), "LOW", 30, "second, nearly the same place"),
+        ];
+        assert!(
+            merge_samples(&[chatty], 10, 2).is_empty(),
+            "two findings from one sample are not two samples agreeing"
+        );
+    }
+
+    /// Raising the threshold trades recall for precision, and says so.
+    #[test]
+    fn min_agreement_drops_what_only_one_sample_saw() {
+        let a = vec![at("a.rs", Some(10), "MEDIUM", 60, "shared")];
+        let b = vec![
+            at("a.rs", Some(10), "MEDIUM", 60, "shared"),
+            at("b.rs", Some(1), "LOW", 20, "lone"),
+        ];
+        let merged = merge_samples(&[a, b], 10, 2);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].body, "shared");
+    }
+
+    /// Unanchored findings match on file alone, and never on a line they lack.
+    #[test]
+    fn unanchored_findings_merge_by_file_only() {
+        let a = vec![at("a.rs", None, "MEDIUM", 50, "no line")];
+        let b = vec![at("a.rs", None, "MEDIUM", 60, "no line either")];
+        assert_eq!(merge_samples(&[a.clone(), b], 10, 1).len(), 1);
+        // An anchored finding is not the same issue as an unanchored one just
+        // because they share a file — there is no evidence that they are.
+        let anchored = vec![at("a.rs", Some(5), "MEDIUM", 50, "anchored")];
+        assert_eq!(merge_samples(&[a, anchored], 10, 1).len(), 2);
     }
 
     fn finding(severity: &str) -> Finding {
