@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**A finding is never retracted on a commit that never changed.** Reconciliation reads "not flagged this round" as "fixed" and resolves the thread. That inference is only as good as the assumption that the reviewer would flag the same thing twice — and it would not: consecutive reviews of a frozen commit shared 61–74% of their findings, and a HIGH at confidence 75/78 was missed outright by one run in three.
+
+When the review is looking at the same commit a thread was written against, nothing has been edited in between, so the finding cannot have been fixed and its absence is a sampling miss by definition. Resolving there posted `✅ Resolved — no longer flagged as of <sha>` naming the very commit the finding was found on. Observed on a real PR reviewed three times with no push between.
+
+No new state: the commit each thread was written against comes from the threads query that already runs. Once the code moves, a missing finding resolves exactly as before, and a legacy thread with no recorded commit behaves as it always has rather than being stranded forever.
+
 **A round whose inline findings may not have reached the PR now says so on the PR.** The summary is composed before posting and states `N inline comment(s) below.` from what the model produced. When creation fails in a way that cannot be retried safely — a 5xx, a rate limit, a lost response, where reposting risks duplicating the round — that sentence can be untrue with only a log line to the contrary. The same holds when reconciliation fails outright, or when the head SHA is unavailable and nothing can be anchored at all.
 
 The wording is *not confirmed* rather than *not posted*, deliberately. The main case is a lost response, where the comments may well have been created and only the acknowledgement went missing — claiming absence would replace one false statement with another.
