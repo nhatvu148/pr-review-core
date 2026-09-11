@@ -512,24 +512,60 @@ async fn publish_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> R
     Ok(())
 }
 
-/// Discard whatever this token has staged but not published.
+/// Clear our own orphaned drafts, and report whether batching is safe at all.
 ///
-/// Runs before staging and after a failed publish. Draft notes persist on the
-/// merge request until published or deleted, so a run that dies mid-staging
-/// would otherwise leave orphans that the NEXT run's `bulk_publish` would sweep
-/// up and post — findings from an abandoned review, appearing minutes later
-/// attached to a round that never produced them.
-async fn discard_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) {
+/// Two hazards, both from `bulk_publish` having no filter: it publishes **every**
+/// pending draft the token owns, and this token is very likely a person's rather
+/// than a robot's.
+///
+/// So a draft that is not ours is untouchable in both directions. Deleting it
+/// would destroy a review someone is still writing; publishing it would post
+/// their unfinished words inside our round. Neither is ours to do, and the safe
+/// response is simply not to batch — the per-discussion path touches no drafts.
+///
+/// `Ok(true)` means the merge request holds no drafts but ours, now removed.
+/// `Ok(false)` means someone else has drafts pending. `Err` means the state could
+/// not be established, which is not a licence to proceed: an unlisted or
+/// undeleted orphan is exactly what `bulk_publish` would sweep into this round.
+async fn clear_our_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<bool> {
     let url = format!("{}/draft_notes", mr_base(cfg, repo, pr));
-    let Ok(res) = gl(client.get(&url), cfg).send().await else {
-        return;
-    };
-    let drafts: Vec<serde_json::Value> = res.json().await.unwrap_or_default();
-    for d in drafts {
-        if let Some(id) = d.get("id").and_then(serde_json::Value::as_u64) {
-            let _ = gl(client.delete(format!("{url}/{id}")), cfg).send().await;
+    let res = gl(client.get(&url), cfg).send().await?;
+    let status = res.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "GitLab list draft_notes {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 200)
+        );
+    }
+    let drafts: Vec<serde_json::Value> = res.json().await?;
+
+    let mut foreign = 0usize;
+    for d in &drafts {
+        let ours = d
+            .get("note")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|b| is_bot_comment(cfg, b));
+        let id = d.get("id").and_then(serde_json::Value::as_u64);
+        match (ours, id) {
+            (true, Some(id)) => {
+                let del = gl(client.delete(format!("{url}/{id}")), cfg).send().await?;
+                if !del.status().is_success() {
+                    anyhow::bail!("GitLab delete draft_note {id}: {}", del.status());
+                }
+            }
+            // Not ours, or ours but unidentifiable — either way it stays, and
+            // its presence is what makes bulk_publish unsafe this round.
+            _ => foreign += 1,
         }
     }
+
+    if foreign > 0 {
+        tracing::info!(
+            "{foreign} draft note(s) on {repo}!{pr} are not ours; posting individually so \
+             bulk_publish cannot publish them"
+        );
+    }
+    Ok(foreign == 0)
 }
 
 async fn post_inline(
@@ -579,18 +615,21 @@ async fn publish_as_one_review(
     refs: &DiffRefs,
     inline: &[InlineComment],
 ) -> Result<()> {
-    // Anything already staged is an orphan from an earlier aborted run, and
-    // bulk_publish below would sweep it up with this round's findings.
-    discard_drafts(client, cfg, repo, pr).await;
+    // Anything already staged is either an orphan from an earlier aborted run of
+    // ours, or someone else's pending review. bulk_publish cannot tell them
+    // apart, so the second case means this round is posted the old way.
+    if !clear_our_drafts(client, cfg, repo, pr).await? {
+        anyhow::bail!("draft notes from another author are pending");
+    }
 
     for c in inline {
         if let Err(e) = stage_draft(client, cfg, repo, pr, refs, c).await {
-            discard_drafts(client, cfg, repo, pr).await;
+            let _ = clear_our_drafts(client, cfg, repo, pr).await;
             return Err(e);
         }
     }
     if let Err(e) = publish_drafts(client, cfg, repo, pr).await {
-        discard_drafts(client, cfg, repo, pr).await;
+        let _ = clear_our_drafts(client, cfg, repo, pr).await;
         return Err(e);
     }
     Ok(())
