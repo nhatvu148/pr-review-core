@@ -89,10 +89,16 @@ pub struct Config {
     pub sample_min_agreement: usize,
     /// How far apart two samples may anchor the same issue and still be merged.
     ///
-    /// Wider than the reconciler's ±3 on purpose. That one matches a finding to
-    /// its own earlier thread; this one matches two independent descriptions of
-    /// one defect, and measurement says those drift much further — the same issue
-    /// appeared 1, 10, 12 and 39 lines apart across runs of an unchanged diff.
+    /// Set from measurement rather than intuition: on unchanged diffs the same
+    /// issue was observed 1, 7, 10, 12 and 39 lines from where another run had
+    /// reported it. Ten catches three of those five; the rest stay separate,
+    /// which is the honest outcome when position is the only evidence.
+    ///
+    /// The reconciler's `LINE_TOLERANCE` is the same number, because it answers
+    /// the same question one review later — whether two descriptions are one
+    /// issue. It was ±3 for a while, inherited from a benchmark that scores
+    /// findings against hand-annotated lines, which is a different question.
+    ///
     /// Too tight and the union keeps duplicates; too wide and distinct findings
     /// collapse into one. Neither error is silent: the run log records the
     /// pre-merge and post-merge counts.

@@ -264,7 +264,7 @@ The tables in this section and the next cover the knobs worth a paragraph. This 
 | `REANCHOR_FINDINGS` | `true` | Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. |
 | `REVIEW_ON_UPDATE` | `false` | Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. |
 | `REVIEW_SAMPLES` | `1` | Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. |
-| `SAMPLE_LINE_TOLERANCE` | `10` | How far apart two samples may anchor the same issue and still merge. Wider than the reconciler's line matching on purpose: two independent descriptions of one defect drift further than one finding does from its own earlier thread. |
+| `SAMPLE_LINE_TOLERANCE` | `10` | How far apart two samples may anchor the same issue and still merge. Set from measurement: the same issue was observed 1, 7, 10, 12 and 39 lines from where another run reported it. The reconciler uses the same window for the same reason, since both answer whether two descriptions are one issue. |
 | `SAMPLE_MIN_AGREEMENT` | `1` | How many samples must report a finding for it to survive the merge. One (plain union) by default, because recall is the measured problem; raising it buys precision with the discoveries only one sample made. |
 | `SELF_CRITIQUE` | `true` | Second skeptical pass that removes false positives and low-value nits. |
 | `STRUCTURAL_CONTEXT` | `true` | Name the enclosing function or symbol of each changed line, via tree-sitter, with no clone. |
