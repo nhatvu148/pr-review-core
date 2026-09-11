@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.30.1
 
 **A review clones the repository once, however many samples it takes.** The agentic backends cloned inside each `review` call, so `REVIEW_SAMPLES=3` fetched the same commit three times — measured on a real pull request at **714 MB, three times**, several minutes of one review's wall clock spent re-fetching bytes it already had.
 
