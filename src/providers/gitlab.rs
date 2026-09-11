@@ -432,6 +432,174 @@ async fn delete_prior_inline(client: &Client, cfg: &Config, repo: &str, pr: u64)
     Ok(())
 }
 
+/// The position object identifying the line a finding anchors to.
+///
+/// Shared by the draft-note and discussion paths so the two cannot drift: a
+/// finding published one way must land on exactly the line it would have landed
+/// on the other way, or the fallback below changes where comments appear.
+fn inline_position(refs: &DiffRefs, c: &InlineComment) -> serde_json::Value {
+    serde_json::json!({
+        "position_type": "text",
+        "base_sha": refs.base_sha,
+        "start_sha": refs.start_sha,
+        "head_sha": refs.head_sha,
+        "new_path": c.path,
+        "new_line": c.line,
+    })
+}
+
+/// Stage one finding as a draft note, to be published with the rest in one call.
+///
+/// Errors rather than warning, unlike `post_inline`: a draft note that fails to
+/// stage would otherwise be silently missing from the published review, and the
+/// caller can still fall back to posting every finding as its own discussion.
+async fn stage_draft(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    refs: &DiffRefs,
+    c: &InlineComment,
+) -> Result<()> {
+    let body = format!("{}\n\n_{}_", c.body, cfg.comment_marker);
+    let res = gl(
+        client.post(format!("{}/draft_notes", mr_base(cfg, repo, pr))),
+        cfg,
+    )
+    .json(&serde_json::json!({ "note": body, "position": inline_position(refs, c) }))
+    .send()
+    .await?;
+    let status = res.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "GitLab draft_note {status} on {}:{}: {}",
+            c.path,
+            c.line,
+            clip(&res.text().await.unwrap_or_default(), 200)
+        );
+    }
+    Ok(())
+}
+
+/// Publish every staged draft note as ONE review.
+///
+/// `reviewer_state` is deliberately not sent. The API documents `reviewed` as
+/// recording no formal approval, so it would be safe — but this reviewer is
+/// advisory and says so in its own summary, and `requested_changes` is the
+/// neighbouring value nobody should reach for by habit. Formal approval lives on
+/// a separate `/approve` endpoint that this crate never calls.
+///
+/// No `note` either: that would put the summary in the published review, while
+/// `upsert_summary` EDITS one summary note across rounds. Sending both would
+/// leave a stale copy per round.
+async fn publish_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<()> {
+    let res = gl(
+        client.post(format!(
+            "{}/draft_notes/bulk_publish",
+            mr_base(cfg, repo, pr)
+        )),
+        cfg,
+    )
+    .send()
+    .await?;
+    let status = res.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "GitLab bulk_publish {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 200)
+        );
+    }
+    Ok(())
+}
+
+/// Every draft note pending on this merge request, paginated.
+///
+/// Paginated like `list_discussions` and `list_notes`, and for a sharper reason
+/// than consistency: callers treat an unlisted draft as an absent one, so a
+/// page-size blind spot here would let `bulk_publish` post someone else's work.
+async fn list_drafts(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+) -> Result<Vec<serde_json::Value>> {
+    let url = format!("{}/draft_notes", mr_base(cfg, repo, pr));
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let res = gl(client.get(format!("{url}?per_page=100&page={page}")), cfg)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "GitLab list draft_notes {status}: {}",
+                clip(&res.text().await.unwrap_or_default(), 200)
+            );
+        }
+        let batch: Vec<serde_json::Value> = res.json().await?;
+        let n = batch.len();
+        all.extend(batch);
+        if n < 100 {
+            return Ok(all);
+        }
+        page += 1;
+    }
+}
+
+/// Split pending drafts into ours (by id) and a count of everyone else's.
+///
+/// A draft we cannot identify counts as foreign. Guessing the other way risks
+/// deleting or publishing a person's unfinished review; guessing this way costs
+/// only a batched round.
+fn partition_drafts(marker: &str, drafts: &[serde_json::Value]) -> (Vec<u64>, usize) {
+    let mut ours = Vec::new();
+    let mut foreign = 0usize;
+    for d in drafts {
+        let is_ours = d
+            .get("note")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|b| b.contains(marker));
+        match (is_ours, d.get("id").and_then(serde_json::Value::as_u64)) {
+            (true, Some(id)) => ours.push(id),
+            _ => foreign += 1,
+        }
+    }
+    (ours, foreign)
+}
+
+/// Delete our own pending drafts, and report whether anyone else's remain.
+///
+/// `bulk_publish` has no filter: it publishes **every** pending draft the token
+/// owns, and that token is very likely a person's rather than a robot's. So a
+/// draft that is not ours is untouchable in both directions — deleting it would
+/// destroy a review someone is still writing, publishing it would post their
+/// unfinished words inside our round — and the safe answer is not to batch. The
+/// per-discussion path touches no drafts.
+///
+/// `Ok(false)` means someone else has drafts pending. `Err` means the state could
+/// not be established, which is not a licence to proceed.
+async fn clear_our_drafts(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Result<bool> {
+    let url = format!("{}/draft_notes", mr_base(cfg, repo, pr));
+    let (ours, foreign) = partition_drafts(
+        &cfg.comment_marker,
+        &list_drafts(client, cfg, repo, pr).await?,
+    );
+    for id in ours {
+        let del = gl(client.delete(format!("{url}/{id}")), cfg).send().await?;
+        if !del.status().is_success() {
+            anyhow::bail!("GitLab delete draft_note {id}: {}", del.status());
+        }
+    }
+    if foreign > 0 {
+        tracing::info!(
+            "{foreign} draft note(s) on {repo}!{pr} are not ours; posting individually so \
+             bulk_publish cannot publish them"
+        );
+    }
+    Ok(foreign == 0)
+}
+
 async fn post_inline(
     client: &Client,
     cfg: &Config,
@@ -445,17 +613,7 @@ async fn post_inline(
         client.post(format!("{}/discussions", mr_base(cfg, repo, pr))),
         cfg,
     )
-    .json(&serde_json::json!({
-        "body": body,
-        "position": {
-            "position_type": "text",
-            "base_sha": refs.base_sha,
-            "start_sha": refs.start_sha,
-            "head_sha": refs.head_sha,
-            "new_path": c.path,
-            "new_line": c.line,
-        }
-    }))
+    .json(&serde_json::json!({ "body": body, "position": inline_position(refs, c) }))
     .send()
     .await?;
     if !res.status().is_success() {
@@ -467,6 +625,74 @@ async fn post_inline(
             c.line,
             clip(&res.text().await.unwrap_or_default(), 200)
         );
+    }
+    Ok(())
+}
+
+/// Stage every finding as a draft note, then publish them as one review.
+///
+/// Unlike the GitHub provider, there is nothing to reconcile here: `post_review`
+/// deletes the bot's prior inline notes and reposts the whole set each round, so
+/// this changes how the set is delivered and not which comments exist.
+///
+/// Any failure discards the drafts before returning. Leaving them staged would
+/// be worse than not batching at all — the next run's `bulk_publish` publishes
+/// every pending draft this token owns, so an abandoned review's findings would
+/// surface later attached to a round that never produced them.
+async fn publish_as_one_review(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    refs: &DiffRefs,
+    inline: &[InlineComment],
+) -> Result<()> {
+    if !clear_our_drafts(client, cfg, repo, pr).await? {
+        anyhow::bail!("draft notes from another author are pending");
+    }
+
+    for c in inline {
+        if let Err(e) = stage_draft(client, cfg, repo, pr, refs, c).await {
+            let _ = clear_our_drafts(client, cfg, repo, pr).await;
+            return Err(e);
+        }
+    }
+
+    // Check again. Staging is many requests, and a colleague can open a review
+    // during them. This narrows the window rather than closing it — the API
+    // offers no way to publish only named drafts — but it shrinks the exposure
+    // from the whole staging run to the gap before the next call.
+    let (_, foreign) = partition_drafts(
+        &cfg.comment_marker,
+        &list_drafts(client, cfg, repo, pr).await?,
+    );
+    if foreign > 0 {
+        let _ = clear_our_drafts(client, cfg, repo, pr).await;
+        anyhow::bail!("draft notes from another author appeared while staging");
+    }
+
+    if let Err(e) = publish_drafts(client, cfg, repo, pr).await {
+        // The call failed, but GitLab may have processed it and lost the
+        // response. Our drafts being gone is the only evidence separating the
+        // two, and it is worth asking for: returning an error here makes the
+        // caller repost every finding on top of a review that already published.
+        match list_drafts(client, cfg, repo, pr).await {
+            Ok(remaining)
+                if partition_drafts(&cfg.comment_marker, &remaining)
+                    .0
+                    .is_empty() =>
+            {
+                tracing::warn!(
+                    "GitLab bulk_publish for {repo}!{pr} reported an error ({e:#}) but our \
+                     drafts are gone; treating the review as published"
+                );
+                return Ok(());
+            }
+            _ => {
+                let _ = clear_our_drafts(client, cfg, repo, pr).await;
+                return Err(e);
+            }
+        }
     }
     Ok(())
 }
@@ -486,8 +712,22 @@ pub async fn post_review(
         match get_diff_refs(client, cfg, repo, pr).await {
             Ok(refs) => {
                 delete_prior_inline(client, cfg, repo, pr).await?;
-                for c in &review.inline {
-                    post_inline(client, cfg, repo, pr, &refs, c).await?;
+                if let Err(e) =
+                    publish_as_one_review(client, cfg, repo, pr, &refs, &review.inline).await
+                {
+                    // Fall back to one discussion per finding — the path this
+                    // provider used before draft notes existed here. Safe to
+                    // retry from scratch because `publish_as_one_review`
+                    // discards its own drafts on failure, so nothing it staged
+                    // can be published later alongside these.
+                    tracing::warn!(
+                        "GitLab batched review failed for {repo}!{pr} ({e:#}); posting {} \
+                         comment(s) individually",
+                        review.inline.len()
+                    );
+                    for c in &review.inline {
+                        post_inline(client, cfg, repo, pr, &refs, c).await?;
+                    }
                 }
             }
             Err(e) => {
@@ -497,4 +737,70 @@ pub async fn post_review(
     }
 
     upsert_summary(client, cfg, repo, pr, &review.summary).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::inline_position;
+    use crate::providers::types::InlineComment;
+
+    fn refs() -> super::DiffRefs {
+        super::DiffRefs {
+            base_sha: Some("base".into()),
+            start_sha: Some("start".into()),
+            head_sha: Some("head".into()),
+        }
+    }
+
+    /// The classifier the whole safety guarantee rests on.
+    ///
+    /// `bulk_publish` publishes every pending draft the token owns, and the token
+    /// is usually a person's. So misfiling one draft as ours does not cost a
+    /// comment — it deletes or publishes somebody's unfinished review. Both
+    /// directions are pinned here, including the two ways a draft can be
+    /// unidentifiable.
+    #[test]
+    fn a_draft_is_ours_only_when_it_is_marked_and_addressable() {
+        let drafts = vec![
+            serde_json::json!({"id": 1, "note": "finding\n\n_🤖 mark_"}),
+            serde_json::json!({"id": 2, "note": "a colleague's half-written thought"}),
+            serde_json::json!({"note": "finding\n\n_🤖 mark_"}),
+            serde_json::json!({"id": 4}),
+        ];
+        let (ours, foreign) = super::partition_drafts("🤖 mark", &drafts);
+        assert_eq!(ours, vec![1], "only the marked draft with an id is ours");
+        assert_eq!(
+            foreign, 3,
+            "unmarked, marked-but-idless, and bodiless drafts all count as foreign"
+        );
+    }
+
+    /// No drafts at all is the ordinary case, and must read as safe to batch.
+    #[test]
+    fn an_empty_merge_request_is_safe_to_batch() {
+        assert_eq!(super::partition_drafts("🤖 mark", &[]), (vec![], 0));
+    }
+
+    /// The two creation paths must anchor identically.
+    ///
+    /// A finding published as a draft note and the same finding posted as a
+    /// discussion have to land on the same line, or the fallback silently moves
+    /// comments when it fires — and the fallback only fires when something has
+    /// already gone wrong, which is the worst moment to also change where
+    /// comments appear.
+    #[test]
+    fn a_draft_note_anchors_exactly_where_a_discussion_would() {
+        let c = InlineComment {
+            path: "src/a.py".into(),
+            line: 42,
+            body: "x".into(),
+        };
+        let pos = inline_position(&refs(), &c);
+        assert_eq!(pos["position_type"], "text");
+        assert_eq!(pos["new_path"], "src/a.py");
+        assert_eq!(pos["new_line"], 42);
+        assert_eq!(pos["base_sha"], "base");
+        assert_eq!(pos["start_sha"], "start");
+        assert_eq!(pos["head_sha"], "head");
+    }
 }
