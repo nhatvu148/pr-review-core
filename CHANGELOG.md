@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+**Thread matching widens from ±3 to ±10 lines, so a re-review posts fewer duplicates.** With findings no longer retracted on an unchanged commit (0.30.0), threads accumulate across rounds — which made the matching visibly too tight. Measured on real pull requests, the same issue recurs 1, 7, 10, 12 and 39 lines from where it was first reported; ±3 recognised one of those five, ±10 recognises three.
+
+Three was chosen to match `examples/bench.rs`, and that was the wrong reference. The bench scores a finding against a **hand-annotated line**, where ±3 is generous. This matches a finding against **its own earlier description**, which moves much further. It now agrees with `SAMPLE_LINE_TOLERANCE`, which answers the same question one review earlier.
+
+The two recurrences it still misses post a duplicate thread, which is the honest outcome: position is a weak proxy for identity, and the pair this change was traced from were recognisable as duplicates from their *text*, not their line numbers.
+
 ## 0.30.1
 
 **A review clones the repository once, however many samples it takes.** The agentic backends cloned inside each `review` call, so `REVIEW_SAMPLES=3` fetched the same commit three times — measured on a real pull request at **714 MB, three times**, several minutes of one review's wall clock spent re-fetching bytes it already had.

@@ -438,7 +438,7 @@ pub const SPEC: &[ConfigVar] = &[
         aliases: &[],
         kind: ConfigKind::Int,
         default: Some("10"),
-        doc: "How far apart two samples may anchor the same issue and still merge. Wider than the reconciler's line matching on purpose: two independent descriptions of one defect drift further than one finding does from its own earlier thread.",
+        doc: "How far apart two samples may anchor the same issue and still merge. Set from measurement: the same issue was observed 1, 7, 10, 12 and 39 lines from where another run reported it. The reconciler uses the same window for the same reason, since both answer whether two descriptions are one issue.",
     },
     ConfigVar {
         env: "SAMPLE_MIN_AGREEMENT",

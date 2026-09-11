@@ -115,7 +115,7 @@ class ReviewConfig(TypedDict, total=False):
     review_on_update: bool
     # Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. Default: `1`. (`REVIEW_SAMPLES`)
     review_samples: int
-    # How far apart two samples may anchor the same issue and still merge. Wider than the reconciler's line matching on purpose: two independent descriptions of one defect drift further than one finding does from its own earlier thread. Default: `10`. (`SAMPLE_LINE_TOLERANCE`)
+    # How far apart two samples may anchor the same issue and still merge. Set from measurement: the same issue was observed 1, 7, 10, 12 and 39 lines from where another run reported it. The reconciler uses the same window for the same reason, since both answer whether two descriptions are one issue. Default: `10`. (`SAMPLE_LINE_TOLERANCE`)
     sample_line_tolerance: int
     # How many samples must report a finding for it to survive the merge. One (plain union) by default, because recall is the measured problem; raising it buys precision with the discoveries only one sample made. Default: `1`. (`SAMPLE_MIN_AGREEMENT`)
     sample_min_agreement: int

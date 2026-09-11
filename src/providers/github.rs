@@ -1028,10 +1028,36 @@ async fn bot_threads(
 /// falsifies the property `/pr-loop` depends on, that a finding still present
 /// keeps its existing thread.
 ///
-/// Matches `examples/bench.rs`. Deliberately much tighter than `headtohead.py`'s
-/// ±8: that answers "did two reviewers mean the same place?", while this decides
-/// whether to delete a thread, and a wrong answer here loses a conversation.
-const LINE_TOLERANCE: u64 = 3;
+/// Three was the value that followed, chosen to match `examples/bench.rs`. That
+/// was the wrong reference: the bench scores a finding against a **hand-annotated
+/// line**, where ±3 is generous. This matches a finding against **its own earlier
+/// description**, and measurement says those move much further. Every same-issue
+/// recurrence observed across rounds, on unchanged diffs:
+///
+/// | drift | caught at ±3 | caught at ±10 |
+/// |---|---|---|
+/// | 1 line | yes | yes |
+/// | 7 lines | no | yes |
+/// | 10 lines | no | yes |
+/// | 12 lines | no | no |
+/// | 39 lines | no | no |
+///
+/// So ±10 recognises three of five where ±3 recognised one. The rest stay
+/// unmatched and post a duplicate thread, which is the honest outcome: position
+/// is a weak proxy for identity, and the two threads it misses were recognisable
+/// as duplicates from their *text*, not their line numbers. Body similarity is
+/// the real fix and a much larger change.
+///
+/// Widening is bounded by two things already in place. `pair_findings` reserves
+/// every exact fingerprint match before any positional one, so a drifted finding
+/// cannot steal a thread that another finding matches exactly; and within the
+/// positional pass the closest unclaimed thread wins. Both matter more at ±10
+/// than they did at ±3.
+///
+/// Ten also matches `SAMPLE_LINE_TOLERANCE`, which answers the same question one
+/// review earlier — whether two descriptions are one issue. Those had no reason
+/// to disagree, and did.
+const LINE_TOLERANCE: u64 = 10;
 
 /// Pair every finding to at most one existing thread, or `None` to post it anew.
 ///
@@ -1426,6 +1452,27 @@ mod tests {
         ));
     }
 
+    /// The duplicate this widening removes, from a real pull request.
+    ///
+    /// `nomnaviet/nomnaviet#64` carried two threads for one defect — "lowering
+    /// the abbreviation threshold from >= 2 to >= 1" — reported at lines 216 and
+    /// 223 in consecutive rounds. Seven lines apart, so ±3 posted a second
+    /// thread for a finding that already had one.
+    #[test]
+    fn a_finding_that_drifted_seven_lines_is_not_a_new_one() {
+        let threads = vec![thread("aaaa", "ime-engine.ts", Some(216))];
+        let paired = super::pair_findings(&threads, &[finding("ime-engine.ts", 223, "REWORDED")]);
+        assert_eq!(paired, vec![Some(0)]);
+    }
+
+    /// Widening must not reach across a gap the measurements never showed.
+    #[test]
+    fn a_finding_far_from_any_thread_is_still_new() {
+        let threads = vec![thread("aaaa", "ime-engine.ts", Some(216))];
+        let paired = super::pair_findings(&threads, &[finding("ime-engine.ts", 255, "OTHER")]);
+        assert_eq!(paired, vec![None]);
+    }
+
     /// The exact-match bug the tolerance exists for.
     ///
     /// Re-reviewing an unchanged PR churned every thread: the model rewords a
@@ -1439,16 +1486,20 @@ mod tests {
         assert_eq!(
             paired,
             vec![Some(0)],
-            "±3 drift with a broken fingerprint must still match"
+            "drift inside the tolerance with a broken fingerprint must still match"
         );
     }
 
     /// The other half: tolerance must not swallow a genuinely different finding.
+    ///
+    /// The gap here was 10 lines while the tolerance was 3. Widening to 10 made
+    /// that gap a match, so the case moved out rather than away — the boundary
+    /// is what changed, not the property being asserted.
     #[test]
     fn a_finding_beyond_tolerance_is_new() {
         let threads = vec![thread("aaaa", "src/a.rs", Some(40))];
         assert_eq!(
-            super::pair_findings(&threads, &[finding("src/a.rs", 50, "OTHER")]),
+            super::pair_findings(&threads, &[finding("src/a.rs", 60, "OTHER")]),
             vec![None]
         );
         assert_eq!(
