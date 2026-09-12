@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**A review waiting for a slot now says so on the PR.** `post_review_queued` posts an "⏳ Queued — waiting for a review slot" summary, the counterpart to the existing "Reviewing this PR…" placeholder. Upserted like every other summary, so the review replaces it in place when it starts.
+
+Until now a queued review posted nothing at all until it began, which from the PR is indistinguishable from a webhook that never arrived. Observed on a consumer running `REVIEW_CONCURRENCY=1`: a pull request opened six minutes after a `/review` had taken the only slot sat with no bot comment for twenty minutes, while the server log recorded the wait to nobody. "The bot ignored my PR" is the wrong conclusion, and it was the only one available.
+
+It carries `REVIEW_PENDING_MARKER` rather than a marker of its own. Consumers ask one question — "has this been reviewed?" — and the answer for a queued review is the same no as for a running one, so `is_incomplete_review` needed no change and boot reconciliation still treats the PR as needing a review. Unlike `post_review_failure` it is safe on a PR the engine has never commented on, since creating the summary is the point; the caller's only duty is to skip it for runs that post nothing, such as a dry run.
+
 **Thread matching widens from ±3 to ±10 lines, so a re-review posts fewer duplicates.** With findings no longer retracted on an unchanged commit (0.30.0), threads accumulate across rounds — which made the matching visibly too tight. Measured on real pull requests, the same issue recurs 1, 7, 10, 12 and 39 lines from where it was first reported; ±3 recognised one of those five, ±10 recognises three.
 
 Three was chosen to match `examples/bench.rs`, and that was the wrong reference. The bench scores a finding against a **hand-annotated line**, where ±3 is generous. This matches a finding against **its own earlier description**, which moves much further. It now agrees with `SAMPLE_LINE_TOLERANCE`, which answers the same question one review earlier.
