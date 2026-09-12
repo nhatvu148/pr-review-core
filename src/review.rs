@@ -692,6 +692,63 @@ fn render_pending() -> String {
     )
 }
 
+/// Placeholder summary body shown while a review waits for a free slot.
+///
+/// Worded apart from [`render_pending`] because the two states are genuinely
+/// different to whoever opened the PR: one says a machine is reading the diff,
+/// the other says nothing has started yet. Both carry [`REVIEW_PENDING_MARKER`],
+/// so every consumer asking "has this been reviewed?" still gets "no" without
+/// having to learn a third state.
+///
+/// This exists because a queued review posts nothing at all until it starts,
+/// which from the PR is indistinguishable from a webhook that never arrived —
+/// and "the bot ignored my PR" is the wrong conclusion to leave available.
+fn render_queued() -> String {
+    format!(
+        "🤖 **Automated review**\n\n⏳ _Queued — waiting for a review slot. This comment \
+         will update when the review starts._\n\n{REVIEW_PENDING_MARKER}"
+    )
+}
+
+/// Announce that a review is queued rather than running.
+///
+/// Upserted like every other summary, so the review replaces this in place the
+/// moment it begins — there is never a second comment.
+///
+/// Unlike [`post_review_failure`] this is safe on a PR the engine has not
+/// commented on: creating the summary is the point. Call it only for a review
+/// that *will* post a placeholder when it starts, so a dry run stays silent.
+pub async fn post_review_queued(provider_name: &str, cfg: &Config, repo: &str, pr: u64) {
+    let provider = match Provider::from_name(provider_name) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("could not announce queue position for {repo}#{pr}: {e:#}");
+            return;
+        }
+    };
+    // Summary-only, so no `head_sha` is needed: that field only anchors inline
+    // comments, and a queue notice has none.
+    let meta = PrMeta {
+        repo: repo.to_string(),
+        pr,
+        title: None,
+        base_branch: None,
+        head_sha: None,
+        body: None,
+        ci_status: None,
+    };
+    let post = ReviewPost {
+        summary: render_queued(),
+        inline: Vec::new(),
+    };
+    let client = reqwest::Client::new();
+    if let Err(e) = provider.post_review(&client, cfg, &meta, &post).await {
+        // Best-effort: failing to say "queued" must never fail the review that
+        // is about to run anyway.
+        tracing::warn!("could not announce queue position for {repo}#{pr}: {e:#}");
+    }
+}
+
 /// Summary body replacing a placeholder whose review died.
 ///
 /// The placeholder is upserted, so this **replaces** it rather than adding a
@@ -3529,6 +3586,19 @@ mod placeholder_tests {
     /// The whole point: a placeholder must not read as a finished review, or a
     /// consumer's boot sweep counts a died-mid-flight review as covered — which is
     /// exactly the case it exists to catch.
+    #[test]
+    fn a_queued_placeholder_is_not_a_completed_review() {
+        // The whole reason it carries the marker: a PR waiting in line has not
+        // been reviewed, and boot reconciliation has to keep saying so.
+        assert!(is_incomplete_review(&render_queued()));
+        assert!(render_queued().contains(REVIEW_PENDING_MARKER));
+    }
+
+    #[test]
+    fn a_queued_placeholder_reads_differently_from_a_running_one() {
+        assert_ne!(render_queued(), render_pending());
+    }
+
     #[test]
     fn a_placeholder_is_not_a_completed_review() {
         assert!(is_incomplete_review(&render_pending()));
