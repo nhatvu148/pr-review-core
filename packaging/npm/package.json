@@ -1,6 +1,6 @@
 {
   "name": "kaniscope",
-  "version": "0.30.1",
+  "version": "0.31.0",
   "description": "AI pull-request reviewer — line-anchored inline comments plus a summary, for GitHub, GitLab and Bitbucket. Ships a native binary; no Rust toolchain required.",
   "keywords": [
     "code-review",
@@ -34,10 +34,10 @@
     "README.md"
   ],
   "optionalDependencies": {
-    "@nhatvu148/kaniscope-darwin-arm64": "0.30.1",
-    "@nhatvu148/kaniscope-darwin-x64": "0.30.1",
-    "@nhatvu148/kaniscope-linux-arm64": "0.30.1",
-    "@nhatvu148/kaniscope-linux-x64": "0.30.1",
-    "@nhatvu148/kaniscope-win32-x64": "0.30.1"
+    "@nhatvu148/kaniscope-darwin-arm64": "0.31.0",
+    "@nhatvu148/kaniscope-darwin-x64": "0.31.0",
+    "@nhatvu148/kaniscope-linux-arm64": "0.31.0",
+    "@nhatvu148/kaniscope-linux-x64": "0.31.0",
+    "@nhatvu148/kaniscope-win32-x64": "0.31.0"
   }
 }
