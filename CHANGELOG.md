@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.31.0
 
 **A review waiting for a slot now says so on the PR.** `post_review_queued` posts an "⏳ Queued — waiting for a review slot" summary, the counterpart to the existing "Reviewing this PR…" placeholder. Upserted like every other summary, so the review replaces it in place when it starts.
 
