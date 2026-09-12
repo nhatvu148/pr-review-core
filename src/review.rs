@@ -3583,22 +3583,26 @@ mod change_map_tests {
 mod placeholder_tests {
     use super::*;
 
-    /// The whole point: a placeholder must not read as a finished review, or a
-    /// consumer's boot sweep counts a died-mid-flight review as covered — which is
-    /// exactly the case it exists to catch.
+    /// A review that has not started yet has not been done either. The queued
+    /// placeholder carries the same marker as the running one so a consumer's
+    /// "does this PR need a review?" keeps answering yes while it waits.
     #[test]
     fn a_queued_placeholder_is_not_a_completed_review() {
-        // The whole reason it carries the marker: a PR waiting in line has not
-        // been reviewed, and boot reconciliation has to keep saying so.
         assert!(is_incomplete_review(&render_queued()));
         assert!(render_queued().contains(REVIEW_PENDING_MARKER));
     }
 
+    /// Same marker, different words — the marker is for machines, the prose is
+    /// for whoever opened the PR, and they want to know which of the two states
+    /// it is in.
     #[test]
     fn a_queued_placeholder_reads_differently_from_a_running_one() {
         assert_ne!(render_queued(), render_pending());
     }
 
+    /// The whole point: a placeholder must not read as a finished review, or a
+    /// consumer's boot sweep counts a died-mid-flight review as covered — which is
+    /// exactly the case it exists to catch.
     #[test]
     fn a_placeholder_is_not_a_completed_review() {
         assert!(is_incomplete_review(&render_pending()));
