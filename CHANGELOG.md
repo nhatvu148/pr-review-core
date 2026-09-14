@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**A coding agent can read a pull request's open findings and work through them.** `kaniscope get-findings`, `resolve-findings` and `explain-finding`, all read-only.
+
+A review's findings live as provider comments once posted, and the only code that ever read them back was reconciliation — which needs them to decide what to resolve and discards the rest. So an agent asked to "fix what the bot found" had no way to ask what the bot found, short of scraping rendered comment markdown.
+
+**"Outstanding" means the lifecycle, not the marker.** A comment carrying the bot signature may have been resolved two rounds ago; returning it as open hands an agent work that was finished last week. `get-findings` separates `active`, `resolved` and `unparseable` using the fingerprint semantics reconciliation already uses, and reports the commit each finding was written against.
+
+**A provider that cannot answer says so.** GitLab deletes and reposts its inline discussions on every review, so nothing on an MR survives a round to have a state; Bitbucket renders HTML comments literally, so the fingerprint marker was never written there. Both return `unsupported` with a reason rather than an empty list. An empty list reads as "no open findings", which is a conclusion an agent acts on by stopping — the most damaging wrong answer this API could give, and the one the obvious `Option`-shaped return would have made the default.
+
+**`resolve-findings` resolves nothing, and says so in the payload.** It selects findings and classifies each one — `investigate`, `reverifyAgainstHead`, `alreadyResolved`, `notFound`, `needsHumanJudgement` — with a rationale. Deterministic: no model call hides inside it. The disclaimer is a field rather than documentation because an agent reading a field called "resolve" will assume something was done unless the data tells it otherwise.
+
+**`explain-finding` checks one finding against the real file** and returns `holds`, `doesNotHold` or `inconclusive` with evidence, stated uncertainty and a suggested verification. `doesNotHold` is a first-class answer: reviewers produce false positives, and confirming one because it was written confidently is the failure this pass exists to catch. An explanation that states no uncertainty has that noted in the output rather than presented as an empty field.
+
+Revision mismatch is explicit everywhere it can occur. A finding's line number refers to the commit it was written against; providers move threads as files change beneath them, which keeps the thread in the right place and says nothing about whether the finding still holds. Both operations state the mismatch rather than letting a caller assume the numbers line up.
+
+**The type generator learned string enums**, so `FindingState`, `HandoffAction` and `ExplanationVerdict` reach both clients as narrowable literal unions rather than bare strings. Like the tagged-union support before it, the generator refused the new shape rather than guessing — which is what made it a two-line change instead of a silent mistranslation.
+
 **The engine has explicit operations, so a program can say what it wants.** `kaniscope review-local`, `review-pr`, `review-file`, `get-rules` and `schema` sit alongside the existing flat flags, each printing exactly one JSON document on stdout.
 
 The flat flags were a mode selector in disguise — `--local` means "this is a local review", and you had to know that. That was fine while the only callers were two wrapper packages written against it. It stops being fine once the caller is a coding agent choosing an operation by name, and it left no room for operations that are not reviews at all.

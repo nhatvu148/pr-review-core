@@ -303,6 +303,44 @@ console.log();
   try { await client.reviewFile({ binary }); } catch (e) { threw = e instanceof TypeError; }
   check("reviewFile without a path is a TypeError", threw);
 
+  // The findings operations. `explainFinding` is the one with a stdin payload,
+  // and a finding that never reached the child would be explained against
+  // nothing — with the child's own error, not the client's, as the only clue.
+  const io = fakeBinary(
+    `A="$*"\nN=$(cat | wc -c | tr -d ' ')\ncat <<EOF\n{"echoed":"$A","stdinBytes":$N}\nEOF`
+  );
+  const findings = await client.getFindings({ binary: io, provider: "github", repo: "o/r", pr: 1 });
+  check(
+    "getFindings sends the PR coordinates",
+    findings.echoed === "get-findings --provider github --repo o/r --pr 1",
+    findings.echoed
+  );
+
+  const resolved = await client.resolveFindings({
+    binary: io, provider: "github", repo: "o/r", pr: 1, fingerprints: ["aa", "bb"],
+  });
+  check(
+    "resolveFindings repeats --fingerprint per selection",
+    resolved.echoed.endsWith("--fingerprint aa --fingerprint bb"),
+    resolved.echoed
+  );
+
+  const explained = await client.explainFinding({
+    binary: io, finding: { file: "a.rs", line: 3, body: "x" }, repoRoot: "/w", headSha: "abc",
+  });
+  check(
+    "explainFinding passes the finding on stdin, not the argv",
+    explained.echoed === "explain-finding --finding @- --repo-root /w --head-sha abc" &&
+      explained.stdinBytes > 0,
+    `${explained.echoed} (${explained.stdinBytes} bytes)`
+  );
+
+  // Missing PR coordinates is the caller's bug and must surface as one, rather
+  // than reaching the binary as the string "undefined".
+  let missing = false;
+  try { await client.getFindings({ binary: io, repo: "o/r" }); } catch (e) { missing = e instanceof TypeError; }
+  check("getFindings without a provider is a TypeError", missing);
+
   const scoped = await client.schema({ binary, operation: "get-rules" });
   check("schema selects an operation", scoped.echoed === "schema get-rules", scoped.echoed);
 }

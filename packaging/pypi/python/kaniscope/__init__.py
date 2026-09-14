@@ -33,6 +33,9 @@ from typing import Any, Callable, Dict, Mapping, Optional
 from ._config import CONFIG_ENV, ReviewConfig, config_to_env
 from ._types import (
     EffectiveRules,
+    ExplainOutput,
+    FindingsOutput,
+    ResolveOutput,
     FileReviewOutput,
     Finding,
     InlineComment,
@@ -46,6 +49,9 @@ __all__ = [
     "review_async",
     "review_file",
     "get_rules",
+    "get_findings",
+    "resolve_findings",
+    "explain_finding",
     "schema",
     "version",
     "binary_path",
@@ -55,7 +61,10 @@ __all__ = [
     "RunReviewOutput",
     "Usage",
     "EffectiveRules",
+    "ExplainOutput",
     "FileReviewOutput",
+    "FindingsOutput",
+    "ResolveOutput",
     "ReviewSettings",
     "ReviewConfig",
     "CONFIG_ENV",
@@ -239,6 +248,91 @@ def get_rules(
     a secret added to the engine's configuration cannot leak into it by default.
     """
     return _run_operation("get-rules", _scope_args(repo_root, provider, repo, pr), locals())
+
+
+def _pr_args(provider: Optional[str], repo: Optional[str], pr: Optional[int]) -> list:
+    """PR coordinates, all three required by the findings operations."""
+    missing = [n for n, v in (("provider", provider), ("repo", repo), ("pr", pr)) if v is None]
+    if missing:
+        raise TypeError(f"kaniscope: this operation needs {', '.join(missing)}")
+    return ["--provider", str(provider), "--repo", str(repo), "--pr", str(pr)]
+
+
+def get_findings(
+    *,
+    provider: Optional[str] = None,
+    repo: Optional[str] = None,
+    pr: Optional[int] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> FindingsOutput:
+    """The findings currently on a pull request, with their lifecycle state.
+
+    Read-only. Check ``outcome["status"]``: a provider that cannot track findings
+    returns ``unsupported`` rather than an empty list, because "no open findings"
+    is a conclusion a caller acts on and must never come from a question that was
+    never asked.
+    """
+    return _run_operation("get-findings", _pr_args(provider, repo, pr), locals())
+
+
+def resolve_findings(
+    *,
+    provider: Optional[str] = None,
+    repo: Optional[str] = None,
+    pr: Optional[int] = None,
+    fingerprints: Optional[list] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> ResolveOutput:
+    """Package findings for your own edit loop.
+
+    Changes nothing — no edits, no posts, no provider thread resolution. The name
+    is the operation's; the returned ``disclaimer`` says so in the payload.
+
+    Omit ``fingerprints`` to take every active finding.
+    """
+    fps = [a for fp in (fingerprints or []) for a in ("--fingerprint", str(fp))]
+    return _run_operation("resolve-findings", [*_pr_args(provider, repo, pr), *fps], locals())
+
+
+def explain_finding(
+    *,
+    finding: Mapping[str, Any],
+    repo_root: Optional[str] = None,
+    head_sha: Optional[str] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> ExplainOutput:
+    """Investigate one finding against a local checkout. Never posts.
+
+    The finding goes in on stdin rather than as a flag: a finding body is
+    multi-line prose containing quotes and backticks, which is exactly what an
+    argv mangles.
+    """
+    args = ["--finding", "@-"]
+    if repo_root:
+        args += ["--repo-root", str(repo_root)]
+    if head_sha:
+        args += ["--head-sha", str(head_sha)]
+    result = subprocess.run(
+        [binary or binary_path(), "explain-finding", *args],
+        capture_output=True,
+        text=True,
+        env=_environment(env, inherit_env, config),
+        timeout=timeout,
+        input=json.dumps(finding),
+    )
+    return _parse(result.stdout, result.stderr, result.returncode)
 
 
 def review_file(

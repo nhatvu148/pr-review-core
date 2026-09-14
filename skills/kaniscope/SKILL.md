@@ -1,6 +1,6 @@
 ---
 name: kaniscope
-description: Run an independent, advisory code review with the kaniscope engine — review uncommitted or unpushed local changes, review a pull request, deep-review one file, or show the review rules currently in effect. Use when asked to review a change, get a second opinion on a diff before pushing or opening a PR, check work against what it was supposed to do, or explain why the reviewer behaved a certain way. Read-only: it never edits code and never posts without being told to.
+description: Run an independent, advisory code review with the kaniscope engine — review uncommitted or unpushed local changes, review a pull request, deep-review one file, show the review rules in effect, list the findings still open on a PR, or investigate one finding against the code. Use when asked to review a change, get a second opinion on a diff before pushing or opening a PR, check work against what it was supposed to do, work through a PR bot's open findings, or explain why the reviewer flagged something. Read-only: it never edits code and never posts without being told to.
 ---
 
 # Kaniscope
@@ -70,9 +70,52 @@ Needs no model key. Answers "why did it flag that?" and "why did it *not*?": the
 
 Read `warnings` first — a repository config that failed to parse is applied silently as *nothing*, and this is the only place that says so.
 
+### Work through a PR's open findings
+
+```sh
+kaniscope get-findings --provider github --repo owner/name --pr 12
+```
+
+Read `outcome.status` first:
+
+- `listed` — `active` is what is still open, `resolved` what the PR already closed, `unparseable` bot comments that carry no fingerprint and need a person.
+- `unsupported` — **this provider cannot answer**, and the `reason` says why. GitLab reposts its inline discussions every run and Bitbucket never carries the fingerprint marker, so neither has a lifecycle to report. Treat this as "unknown", never as "nothing is open".
+
+Then take the ones you intend to work on:
+
+```sh
+kaniscope resolve-findings --provider github --repo owner/name --pr 12   --fingerprint <fp> --fingerprint <fp>          # omit for every active finding
+```
+
+Despite the name it **resolves nothing** — no edits, no posts, no threads closed. It hands you each finding with an `action`:
+
+| action | what it means |
+|---|---|
+| `investigate` | open on the current head — read the code and decide |
+| `reverifyAgainstHead` | written against an earlier commit; the line number refers to *that* commit, so re-read before touching anything |
+| `alreadyResolved` | the PR already closed it |
+| `notFound` | no finding on this PR has that fingerprint |
+| `needsHumanJudgement` | unmatchable comment — escalate, do not guess |
+
+Apply a fix only if the user's request already authorized you to change code. Otherwise report and stop.
+
+### Investigate one finding
+
+```sh
+echo '{"file":"src/auth.rs","line":42,"body":"<what the reviewer said>"}'   | kaniscope explain-finding --finding @- --repo-root . --head-sha "$(git rev-parse HEAD)"
+```
+
+Reads the real file and returns a `verdict` of `holds`, `doesNotHold` or `inconclusive`, with `evidence`, `uncertainty` and a `suggestedVerification`.
+
+`doesNotHold` is a real and useful answer — reviewers produce false positives. Do not "fix" a finding this pass says does not hold; report that it does not. `inconclusive` means go look yourself.
+
+Pass `--head-sha` whenever you have it. Without it a revision mismatch cannot be detected, and you may be reading line numbers from a different commit.
+
 ### Schemas
 
 `kaniscope schema` lists the operations; `kaniscope schema get-rules` prints one operation's output schema.
+
+JSON comes in through `@-` (stdin) or `@path` wherever a flag takes it — a finding body is prose full of quotes and backticks, and a shell will mangle it inline.
 
 ## Reading the result
 

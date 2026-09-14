@@ -257,3 +257,126 @@ class RulesScopePr(TypedDict):
 
 # What the rules were resolved for.
 RulesScope = Union[RulesScopeLocal, RulesScopePr]
+
+
+class _FindingsOutputRequired(TypedDict):
+    outcome: FindingsOutcome
+    pr: int
+    provider: str
+    repo: str
+
+
+class FindingsOutput(_FindingsOutputRequired, total=False):
+    """The findings currently on one pull request."""
+
+    headSha: Optional[str]
+    revisionWarning: Optional[str]
+
+
+# Where a finding is in its lifecycle.
+FindingState = Literal["active", "resolved", "unparseable"]
+
+
+class FindingsOutcomeListed(TypedDict):
+    """The provider tracks finding lifecycle and this is what it holds."""
+
+    active: List[OutstandingFinding]
+    resolved: List[OutstandingFinding]
+    status: Literal["listed"]
+    unparseable: List[OutstandingFinding]
+
+
+class FindingsOutcomeUnsupported(TypedDict):
+    """This provider cannot answer the question, and why."""
+
+    reason: str
+    status: Literal["unsupported"]
+
+
+# Whether the provider could answer at all.
+FindingsOutcome = Union[FindingsOutcomeListed, FindingsOutcomeUnsupported]
+
+
+class _OutstandingFindingRequired(TypedDict):
+    body: str
+    commentId: str
+    path: str
+    state: FindingState
+
+
+class OutstandingFinding(_OutstandingFindingRequired, total=False):
+    """One finding as it currently exists on the pull request."""
+
+    fingerprint: Optional[str]
+    line: Optional[int]
+    originalCommit: Optional[str]
+    threadId: Optional[str]
+
+
+class _ResolveOutputRequired(TypedDict):
+    disclaimer: str
+    handoffs: List[FindingHandoff]
+    pr: int
+    provider: str
+    repo: str
+
+
+class ResolveOutput(_ResolveOutputRequired, total=False):
+    """A bundle of findings handed over for investigation."""
+
+    headSha: Optional[str]
+
+
+class _FindingHandoffRequired(TypedDict):
+    action: HandoffAction
+    rationale: str
+    requested: str
+
+
+class FindingHandoff(_FindingHandoffRequired, total=False):
+    """One finding, packaged for a coding agent to act on."""
+
+    finding: Optional[OutstandingFinding]
+
+
+# What a caller should do with one selected finding.
+HandoffAction = Literal["investigate", "reverifyAgainstHead", "alreadyResolved", "notFound", "needsHumanJudgement"]
+
+
+class _ExplainOutputRequired(TypedDict):
+    explanation: Explanation
+    finding: ExplainInput
+
+
+class ExplainOutput(_ExplainOutputRequired, total=False):
+    """One finding explained against a local checkout."""
+
+    revisionWarning: Optional[str]
+
+
+class _ExplainInputRequired(TypedDict):
+    body: str
+    file: str
+
+
+class ExplainInput(_ExplainInputRequired, total=False):
+    """The finding to explain."""
+
+    line: Optional[int]
+    originalCommit: Optional[str]
+    severity: Optional[str]
+
+
+class Explanation(TypedDict):
+    """A structured explanation of one finding, checked against real code."""
+
+    affectedBehavior: str
+    claim: str
+    evidence: str
+    suggestedVerification: str
+    uncertainty: str
+    verdict: ExplanationVerdict
+
+
+# What the investigation concluded.
+ExplanationVerdict = Literal["holds", "doesNotHold", "inconclusive"]

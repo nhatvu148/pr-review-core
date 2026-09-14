@@ -239,3 +239,120 @@ export interface RulesScopePr {
 /** What the rules were resolved for. */
 export type RulesScope = RulesScopeLocal | RulesScopePr;
 
+/** The findings currently on one pull request. */
+export interface FindingsOutput {
+  /** The PR's head as of this call, when the provider reported one. */
+  headSha?: string | null;
+  outcome: FindingsOutcome;
+  pr: number;
+  provider: string;
+  repo: string;
+  /** Present when at least one active finding was written against a commit other than the current head. */
+  revisionWarning?: string | null;
+}
+
+/** Where a finding is in its lifecycle. */
+export type FindingState = "active" | "resolved" | "unparseable";
+
+/** The provider tracks finding lifecycle and this is what it holds. */
+export interface FindingsOutcomeListed {
+  /** Open findings — the ones worth acting on. */
+  active: OutstandingFinding[];
+  /** Findings the provider considers closed. */
+  resolved: OutstandingFinding[];
+  status: "listed";
+  /** Bot comments that carry no fingerprint and cannot be matched. */
+  unparseable: OutstandingFinding[];
+}
+
+/** This provider cannot answer the question, and why. */
+export interface FindingsOutcomeUnsupported {
+  reason: string;
+  status: "unsupported";
+}
+
+/** Whether the provider could answer at all. */
+export type FindingsOutcome = FindingsOutcomeListed | FindingsOutcomeUnsupported;
+
+/** One finding as it currently exists on the pull request. */
+export interface OutstandingFinding {
+  /** The comment body as posted, rendered markdown and all. */
+  body: string;
+  /** The provider's id for the comment, for a caller that wants to link to it. */
+  commentId: string;
+  /** The reconciliation fingerprint — stable across rewordings of the same finding, and the identity to pass back to `resolve-findings`. */
+  fingerprint?: string | null;
+  /** The line the provider currently tracks this thread at — which is not necessarily the line it was posted on, since a provider moves a thread as the file is edited beneath it. */
+  line?: number | null;
+  /** The commit this finding was first written against. */
+  originalCommit?: string | null;
+  path: string;
+  state: FindingState;
+  /** The provider's thread id, where it has threads. */
+  threadId?: string | null;
+}
+
+/** A bundle of findings handed over for investigation. */
+export interface ResolveOutput {
+  /** Stated in the payload, not left to the caller's memory. */
+  disclaimer: string;
+  handoffs: FindingHandoff[];
+  headSha?: string | null;
+  pr: number;
+  provider: string;
+  repo: string;
+}
+
+/** One finding, packaged for a coding agent to act on. */
+export interface FindingHandoff {
+  action: HandoffAction;
+  /** Absent only for [`HandoffAction::NotFound`]. */
+  finding?: OutstandingFinding | null;
+  /** Why this action, in one sentence a caller can show a user. */
+  rationale: string;
+  /** The identity that was asked for — echoed back so a caller can match up a request that produced [`HandoffAction::NotFound`]. */
+  requested: string;
+}
+
+/** What a caller should do with one selected finding. */
+export type HandoffAction = "investigate" | "reverifyAgainstHead" | "alreadyResolved" | "notFound" | "needsHumanJudgement";
+
+/** One finding explained against a local checkout. */
+export interface ExplainOutput {
+  explanation: Explanation;
+  /** The finding as given. */
+  finding: ExplainInput;
+  /** Set when the finding names a revision that is not the one that was read. */
+  revisionWarning?: string | null;
+}
+
+/** The finding to explain. */
+export interface ExplainInput {
+  /** What the reviewer said. */
+  body: string;
+  file: string;
+  line?: number | null;
+  /** The commit the finding was written against, when known. */
+  originalCommit?: string | null;
+  severity?: string | null;
+}
+
+/** A structured explanation of one finding, checked against real code. */
+export interface Explanation {
+  /** What goes wrong if the claim holds, in terms of behaviour rather than style. */
+  affectedBehavior: string;
+  /** What the finding asserts, restated plainly. */
+  claim: string;
+  /** What in the code supports or contradicts it — file, line, and what is actually there. */
+  evidence: string;
+  /** How a person could confirm or refute this — a test to write, a command to run, a line to read. */
+  suggestedVerification: string;
+  /** What the explanation could not settle. */
+  uncertainty: string;
+  /** Whether the investigation found the finding to hold. */
+  verdict: ExplanationVerdict;
+}
+
+/** What the investigation concluded. */
+export type ExplanationVerdict = "holds" | "doesNotHold" | "inconclusive";
+
