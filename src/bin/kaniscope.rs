@@ -143,11 +143,16 @@ struct FileArgs {
     /// Review the file in this checkout. Mutually exclusive with `--provider`.
     #[arg(long = "repo-root", conflicts_with_all = ["provider", "repo", "pr"])]
     repo_root: Option<PathBuf>,
+    // `requires_all` on `provider` alone only enforces one direction, so
+    // `--repo o/r --pr 5` with no `--provider` parsed fine and then fell through
+    // to the local branch — silently reviewing the checkout instead of the pull
+    // request the caller named. Each field requires the other two, so an
+    // incomplete scope is refused rather than quietly redirected.
     #[arg(long, requires_all = ["repo", "pr"])]
     provider: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires_all = ["provider", "pr"])]
     repo: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires_all = ["provider", "repo"])]
     pr: Option<u64>,
     #[arg(long, default_value_t = false)]
     human: bool,
@@ -158,11 +163,12 @@ struct RulesArgs {
     /// Resolve the rules for this checkout. Mutually exclusive with `--provider`.
     #[arg(long = "repo-root", conflicts_with_all = ["provider", "repo", "pr"])]
     repo_root: Option<PathBuf>,
+    // Each requires the other two — see the note on `FileArgs`.
     #[arg(long, requires_all = ["repo", "pr"])]
     provider: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires_all = ["provider", "pr"])]
     repo: Option<String>,
-    #[arg(long)]
+    #[arg(long, requires_all = ["provider", "repo"])]
     pr: Option<u64>,
 }
 
@@ -425,7 +431,9 @@ async fn run_op(cfg: &Config, op: Op) -> anyhow::Result<()> {
             emit(&rules)
         }
         Op::ReviewFile(a) => {
-            let (out, _) = match (&a.provider, &a.repo, a.pr) {
+            // Clap now requires provider/repo/pr together, so this really is a
+            // two-way choice: all three, or none.
+            let out = match (&a.provider, &a.repo, a.pr) {
                 (Some(p), Some(r), Some(n)) => {
                     pr_review_core::filereview::review_pr_file(
                         cfg,
@@ -436,17 +444,17 @@ async fn run_op(cfg: &Config, op: Op) -> anyhow::Result<()> {
                         &a.path,
                     )
                     .await?
+                    .0
                 }
                 _ => {
                     let root = a.repo_root.unwrap_or_else(|| PathBuf::from("."));
-                    let out = pr_review_core::filereview::review_local(
+                    pr_review_core::filereview::review_local(
                         cfg,
                         &OpenRouterBackend,
                         &root,
                         &a.path,
                     )
-                    .await?;
-                    (out, cfg.clone())
+                    .await?
                 }
             };
             if a.human {
@@ -1325,6 +1333,55 @@ mod tests {
             Some(super::Op::ReviewPr(a)) => assert!(a.post),
             _ => panic!("expected review-pr"),
         }
+    }
+
+    /// A PR scope missing one of its three parts must be REFUSED, not quietly
+    /// downgraded to the local checkout.
+    ///
+    /// `requires_all` on `provider` alone only enforced one direction, so
+    /// `--repo o/r --pr 5` parsed fine, fell through the `(Some, Some, Some)`
+    /// match into the local branch, and answered for the current directory — a
+    /// result that looks entirely normal and is about the wrong thing. Exactly
+    /// the ambiguity the diff modes are refused for.
+    #[test]
+    fn an_incomplete_pr_scope_is_refused_not_treated_as_local() {
+        let partials: &[&[&str]] = &[
+            &["--repo", "o/r", "--pr", "5"],
+            &["--provider", "github", "--repo", "o/r"],
+            &["--provider", "github", "--pr", "5"],
+            &["--pr", "5"],
+        ];
+        for op in ["get-rules", "review-file"] {
+            for partial in partials {
+                let mut argv = vec!["kaniscope", op];
+                if op == "review-file" {
+                    argv.extend(["--path", "src/a.rs"]);
+                }
+                argv.extend(partial.iter().copied());
+                let err = Args::try_parse_from(argv.clone())
+                    .map(|_| ())
+                    .expect_err(&format!("{argv:?} must be refused, not read as local"));
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    "{argv:?} must be refused for a MISSING argument"
+                );
+            }
+        }
+
+        // The two complete forms still parse.
+        Args::try_parse_from(["kaniscope", "get-rules", "--repo-root", "."]).expect("local");
+        Args::try_parse_from([
+            "kaniscope",
+            "get-rules",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "5",
+        ])
+        .expect("full PR scope");
     }
 
     /// Every name `schema` advertises must actually resolve, or a client

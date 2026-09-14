@@ -171,16 +171,19 @@ async fn run_review_file(
     pr: u64,
     path: &str,
 ) -> Result<CommandOutcome> {
-    let (out, effective) =
+    let (out, ctx) =
         crate::filereview::review_pr_file(cfg, backend, provider_name, repo, pr, path).await?;
 
     // Posted for every outcome, refusals included: the command was issued in a
     // comment thread, and silence there reads as the bot being broken rather than
     // as a considered refusal.
-    let provider = Provider::from_name(provider_name)?;
-    let client = reqwest::Client::new();
-    let url = provider
-        .post_comment(&client, &effective, repo, pr, &out.summary_markdown)
+    //
+    // Reusing the provider, client and merged config the review already resolved
+    // — a fresh `reqwest::Client` here would open a second connection pool and
+    // repeat the TLS handshake to post one comment.
+    let url = ctx
+        .provider
+        .post_comment(&ctx.client, &ctx.cfg, repo, pr, &out.summary_markdown)
         .await?;
     Ok(CommandOutcome {
         command: "review-file",

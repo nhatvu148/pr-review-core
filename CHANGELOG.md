@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+**Local file review obeys the repository's own rules, and cannot be talked into reading outside the checkout.** Both found in review of this change.
+
+`filereview::review_local` authorized the path against the *deployment's* config and never loaded the checkout's `.prbot.toml`, while `review_pr_file` loaded it before the same check. So a repository's `exclude_globs` governed what `/review-file` could read on a pull request and silently did not govern `kaniscope review-file` locally — along with `min_confidence`, `max_findings` and `model`, which is the parity Phase 1 established for diff reviews and this path never got.
+
+The path check was also lexical only. `Path::join` **discards the base** when its argument is absolute, so `repo_root.join("/etc/passwd")` is `/etc/passwd`, and the default filters exclude lockfiles and build output rather than the filesystem. A symlink inside the checkout defeated the `..` and absolute-path guards for a different reason: they read the string, and a symlink is not in the string. Both now go through one resolver that canonicalizes the root and the target, refuses anything landing outside, re-applies the filters to what the path actually *resolved* to (so `allowed.md -> .env` is caught), and refuses anything that is not a regular file — `read_to_string` on a fifo blocks forever.
+
+This matters more than an ordinary read bug because the file's contents are sent to a model: a read here is a disclosure.
+
+**An incomplete pull-request scope is refused instead of silently becoming a local one.** `--repo o/r --pr 5` with `--provider` omitted parsed fine — `requires_all` was on `provider` alone, which only enforces one direction — then fell through the match into the local branch and answered for the current directory. A result that looks entirely normal and is about the wrong thing, which is the ambiguity the diff modes are already refused for. Each of the three now requires the other two, and both wrapper clients raise rather than stringifying the missing pieces into the argv as `undefined` / `None`.
+
+**The `/review-file` command reuses the provider and client the review already resolved** rather than building a second `reqwest::Client` — a second connection pool and TLS handshake to post one comment.
+
 **The engine has explicit operations, so a program can say what it wants.** `kaniscope review-local`, `review-pr`, `review-file`, `get-rules` and `schema` sit alongside the existing flat flags, each printing exactly one JSON document on stdout.
 
 The flat flags were a mode selector in disguise — `--local` means "this is a local review", and you had to know that. That was fine while the only callers were two wrapper packages written against it. It stops being fine once the caller is a coding agent choosing an operation by name, and it left no room for operations that are not reviews at all.

@@ -303,6 +303,19 @@ console.log();
   try { await client.reviewFile({ binary }); } catch (e) { threw = e instanceof TypeError; }
   check("reviewFile without a path is a TypeError", threw);
 
+    // A partial PR scope is a caller error. It used to stringify the missing
+  // pieces into the argv ("--provider undefined"), so the binary complained
+  // about a provider named "undefined" and pointed at the wrong thing.
+  for (const partial of [{ repo: "o/r", pr: 1 }, { provider: "github", repo: "o/r" }, { pr: 1 }]) {
+    let msg = "";
+    try { await client.getRules({ binary, ...partial }); } catch (e) { msg = e.message; }
+    check(
+      `a partial PR scope is refused (${Object.keys(partial).join("+")})`,
+      msg.includes("needs provider, repo and pr"),
+      msg || "(no error at all)"
+    );
+  }
+
   const scoped = await client.schema({ binary, operation: "get-rules" });
   check("schema selects an operation", scoped.echoed === "schema get-rules", scoped.echoed);
 }

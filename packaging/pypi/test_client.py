@@ -241,6 +241,21 @@ def test_toolbox_operations_send_their_argv() -> None:
             f["echoed"],
         )
 
+                # A partial PR scope is a caller error — it used to stringify the
+        # missing pieces into the argv ("--provider None"), so the binary
+        # complained about a provider named "None" and pointed at the wrong thing.
+        for partial in ({"repo": "o/r", "pr": 1}, {"provider": "github", "repo": "o/r"}, {"pr": 1}):
+            msg = ""
+            try:
+                kaniscope.get_rules(binary=echoes, **partial)
+            except TypeError as exc:
+                msg = str(exc)
+            check(
+                f"a partial PR scope is refused ({'+'.join(partial)})",
+                "needs provider, repo and pr" in msg,
+                msg or "(no error at all)",
+            )
+
         scoped = kaniscope.schema(binary=echoes, operation="get-rules")
         check(
             "schema selects an operation",

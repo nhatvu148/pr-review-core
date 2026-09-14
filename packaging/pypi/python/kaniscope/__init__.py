@@ -211,10 +211,23 @@ def _scope_args(
     repo: Optional[str],
     pr: Optional[int],
 ) -> list:
-    """Flags for the operations that take a checkout OR a pull request."""
-    if provider or repo or pr is not None:
-        return ["--provider", str(provider), "--repo", str(repo), "--pr", str(pr)]
-    return ["--repo-root", str(repo_root)] if repo_root else []
+    """Flags for the operations that take a checkout OR a pull request.
+
+    A PARTIAL scope is a caller error and is refused here. It used to stringify
+    whatever was missing into the argv — ``--provider None --repo o/r`` — which
+    the binary then rejected with a message about a provider named "None",
+    pointing at the wrong thing entirely.
+    """
+    given = [n for n, v in (("provider", provider), ("repo", repo), ("pr", pr)) if v is not None]
+    if not given:
+        return ["--repo-root", str(repo_root)] if repo_root else []
+    if len(given) != 3:
+        missing = [n for n in ("provider", "repo", "pr") if n not in given]
+        raise TypeError(
+            "kaniscope: a pull-request scope needs provider, repo and pr — "
+            f"missing {', '.join(missing)}"
+        )
+    return ["--provider", str(provider), "--repo", str(repo), "--pr", str(pr)]
 
 
 def get_rules(

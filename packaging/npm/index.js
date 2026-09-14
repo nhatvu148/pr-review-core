@@ -257,12 +257,30 @@ async function runOperation(op, args, options) {
   }
 }
 
-/** Scope flags shared by the operations that take a checkout OR a pull request. */
+/**
+ * Scope flags shared by the operations that take a checkout OR a pull request.
+ *
+ * A PARTIAL scope is a caller error and is refused here. It used to stringify
+ * whatever was missing into the argv — `--provider undefined --repo o/r` — which
+ * the binary then rejected with a message about a provider named "undefined",
+ * pointing at the wrong thing entirely. Worse, before the CLI required the full
+ * trio it would have been read as a local request and answered for the wrong
+ * scope without any error at all.
+ */
 function scopeArgs(options) {
-  if (options.provider || options.repo || options.pr !== undefined) {
-    return ["--provider", String(options.provider), "--repo", String(options.repo), "--pr", String(options.pr)];
+  const given = ["provider", "repo", "pr"].filter(
+    (k) => options[k] !== undefined && options[k] !== null
+  );
+  if (given.length === 0) {
+    return options.repoRoot ? ["--repo-root", String(options.repoRoot)] : [];
   }
-  return options.repoRoot ? ["--repo-root", String(options.repoRoot)] : [];
+  if (given.length !== 3) {
+    const missing = ["provider", "repo", "pr"].filter((k) => !given.includes(k));
+    throw new TypeError(
+      `kaniscope: a pull-request scope needs provider, repo and pr — missing ${missing.join(", ")}`
+    );
+  }
+  return ["--provider", String(options.provider), "--repo", String(options.repo), "--pr", String(options.pr)];
 }
 
 /**
