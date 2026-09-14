@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+**A malformed pull-request scope in an MCP call is an error, not a quiet local answer.** Found in review of this change. `get_rules` and `review_file` fell back to the local checkout on *any* scope error, so a call with one field missing — or with `pr` sent as a string, which models do routinely — returned a confident answer about the server's own working directory instead of the pull request that was asked for. Absent now means local; present-but-wrong is reported.
+
 **`kaniscope mcp` serves the toolbox as MCP tools over stdio.** Seven tools — `review_local`, `review_pr`, `review_file`, `get_rules`, `get_findings`, `resolve_findings`, `explain_finding` — each calling the same library function the matching subcommand calls and returning the same serialized type. An adapter, not a second implementation: a second path to the same answer drifts, and the drift is invisible because both sides keep returning plausible reviews.
 
 **The MCP surface is read-only, and deliberately narrower than the CLI.** Nothing exposed here can post, edit or resolve anything; `review_pr` always runs dry and no argument changes that. The asymmetry is the point — a CLI invocation is typed by someone who sees the flags, while a tool call is composed by a model from a description and issued without a human reading the arguments. A capability whose worst case is a comment on a colleague's pull request does not belong on the second kind of surface. A test asserts no tool schema accepts `post`, `dryRun` or `resolve`, and that the server states its read-only nature in the `initialize` instructions where a model will read it.

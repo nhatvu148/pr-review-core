@@ -467,8 +467,11 @@ async fn main() -> anyhow::Result<()> {
 
 /// Run one explicit operation and print exactly one JSON document on stdout.
 ///
-/// Every arm ends in `emit` or `emit_human`, so the "one document, nothing else"
-/// promise is kept in one place rather than by each arm remembering to.
+/// Every arm ends in `emit` or a review printer, so the "one document, nothing
+/// else" promise is kept in one place rather than by each arm remembering to.
+/// `Mcp` is the exception and not a leak: it serves indefinitely and owns its own
+/// stdout framing, because a protocol session is a stream of messages rather than
+/// one result.
 async fn run_op(cfg: &Config, op: Op) -> anyhow::Result<()> {
     match op {
         Op::Schema(a) => {

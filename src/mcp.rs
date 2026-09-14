@@ -68,6 +68,14 @@ pub async fn serve(cfg: &Config) -> anyhow::Result<()> {
             Err(e) => {
                 // -32700 is JSON-RPC's parse error. Answered with a null id
                 // because the id is exactly what could not be read.
+                //
+                // No explicit flush here, and that is not an oversight. Rust's
+                // `Stdout` wraps a `LineWriter`, so the `writeln!` in `respond`
+                // flushes on the newline whether stdout is a terminal or a pipe —
+                // unlike C, where a piped stdout is block-buffered and this really
+                // would hang a client waiting on the response. Verified against a
+                // piped child before relying on it. The flush at the bottom of the
+                // loop is belt-and-braces for the same reason.
                 respond(&error_response(
                     Value::Null,
                     -32700,
@@ -285,6 +293,18 @@ fn tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// What scope a tool call named — or that it named one badly.
+///
+/// Three cases rather than `Result`, because "the caller gave no scope" and "the
+/// caller gave a broken scope" must not collapse: the first is a local request,
+/// the second is a mistake, and treating the second as the first answers
+/// confidently about the wrong repository.
+enum Scope {
+    Local,
+    Pr(String, String, u64),
+    Invalid(String),
+}
+
 /// Dispatch one `tools/call`.
 async fn call_tool(cfg: &Config, params: &Value) -> anyhow::Result<Value> {
     use crate::backend::OpenRouterBackend;
@@ -297,25 +317,53 @@ async fn call_tool(cfg: &Config, params: &Value) -> anyhow::Result<Value> {
 
     let str_arg = |k: &str| args.get(k).and_then(Value::as_str).map(str::to_string);
     let root = || std::path::PathBuf::from(str_arg("repoRoot").unwrap_or_else(|| ".".to_string()));
-    // Required together: a PR tool called with two of the three would otherwise
-    // reach a provider as a malformed coordinate and fail with its error.
+    // Three-way, not two-way. The tools that accept either scope used to fall
+    // back to local on ANY `pr_coords` error, which meant a PR-scoped call with
+    // one field missing — or with `pr` sent as a string, which a model does
+    // routinely — silently inspected the server's own checkout and returned a
+    // plausible answer about the wrong thing. Absent means local; present but
+    // wrong is an error the caller has to see.
+    let scope = || -> Scope {
+        let present = ["provider", "repo", "pr"]
+            .iter()
+            .filter(|k| args.get(**k).is_some_and(|v| !v.is_null()))
+            .count();
+        if present == 0 {
+            return Scope::Local;
+        }
+        let Some(provider) = str_arg("provider") else {
+            return Scope::Invalid("`provider` is required for a pull-request scope".into());
+        };
+        let Some(repo) = str_arg("repo") else {
+            return Scope::Invalid("`repo` is required for a pull-request scope".into());
+        };
+        match args.get("pr").and_then(Value::as_u64) {
+            Some(pr) => Scope::Pr(provider, repo, pr),
+            None => Scope::Invalid(
+                "`pr` is required for a pull-request scope and must be a non-negative number"
+                    .into(),
+            ),
+        }
+    };
+    // For the tools that only ever take a PR.
     let pr_coords = || -> anyhow::Result<(String, String, u64)> {
-        let provider =
-            str_arg("provider").ok_or_else(|| anyhow::anyhow!("`provider` is required"))?;
-        let repo = str_arg("repo").ok_or_else(|| anyhow::anyhow!("`repo` is required"))?;
-        let pr = args
-            .get("pr")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("`pr` is required and must be a number"))?;
-        Ok((provider, repo, pr))
+        match scope() {
+            Scope::Pr(p, r, n) => Ok((p, r, n)),
+            Scope::Local => Err(anyhow::anyhow!(
+                "`provider`, `repo` and `pr` are required for this tool"
+            )),
+            Scope::Invalid(why) => Err(anyhow::anyhow!(why)),
+        }
     };
 
     match name {
-        "get_rules" => match pr_coords() {
-            Ok((p, r, n)) => tool_json(&crate::rules::remote(cfg, &p, &r, n).await?),
-            // Local is the fallback, not an error: `get_rules` with no scope at
-            // all means "this checkout", which is the common case.
-            Err(_) => tool_json(&crate::rules::local(cfg, Some(&root()))),
+        "get_rules" => match scope() {
+            Scope::Pr(p, r, n) => tool_json(&crate::rules::remote(cfg, &p, &r, n).await?),
+            // Local only when NOTHING was given: `get_rules` with no scope means
+            // "this checkout", which is the common case. A partial or malformed
+            // scope is the caller's mistake and is reported as one.
+            Scope::Local => tool_json(&crate::rules::local(cfg, Some(&root()))),
+            Scope::Invalid(why) => anyhow::bail!(why),
         },
         "get_findings" => {
             let (p, r, n) = pr_coords()?;
@@ -353,8 +401,8 @@ async fn call_tool(cfg: &Config, params: &Value) -> anyhow::Result<Value> {
         }
         "review_file" => {
             let path = str_arg("path").ok_or_else(|| anyhow::anyhow!("`path` is required"))?;
-            match pr_coords() {
-                Ok((p, r, n)) => {
+            match scope() {
+                Scope::Pr(p, r, n) => {
                     let (out, _) = crate::filereview::review_pr_file(
                         cfg,
                         &OpenRouterBackend,
@@ -366,10 +414,11 @@ async fn call_tool(cfg: &Config, params: &Value) -> anyhow::Result<Value> {
                     .await?;
                     tool_json(&out)
                 }
-                Err(_) => tool_json(
+                Scope::Local => tool_json(
                     &crate::filereview::review_local(cfg, &OpenRouterBackend, &root(), &path)
                         .await?,
                 ),
+                Scope::Invalid(why) => anyhow::bail!(why),
             }
         }
         "review_pr" => {
@@ -505,18 +554,30 @@ mod tests {
 
     /// Every advertised tool must dispatch. A name in the list that falls through
     /// to "unknown tool" is a tool a model will call once and never trust again.
+    ///
+    /// `repoRoot` points at an EMPTY temporary directory, not at the default `.`.
+    /// With `.`, `review_local` runs `git diff HEAD` against this repository — so
+    /// on a developer's machine with uncommitted work (the normal state while
+    /// running the tests) the diff is non-empty, dispatch continues into
+    /// `run_review_local`, and the unit test makes a real, billed OpenRouter call.
+    /// The test's behaviour must not depend on the working tree being clean.
     #[tokio::test]
     async fn every_advertised_tool_is_dispatchable() {
         let cfg = Config::from_env();
+        let empty = tempfile::tempdir().expect("tempdir");
+        let root = empty.path().to_string_lossy().to_string();
         for t in tool_definitions() {
             let name = t["name"].as_str().expect("named");
-            // Called with no arguments: each must fail on a MISSING ARGUMENT or
+            // Called with only a scope: each must fail on a MISSING ARGUMENT or
             // on doing its work, never on the name.
-            let err = call_tool(&cfg, &json!({ "name": name, "arguments": {} }))
-                .await
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_default();
+            let err = call_tool(
+                &cfg,
+                &json!({ "name": name, "arguments": { "repoRoot": root } }),
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
             assert!(
                 !err.contains("unknown tool"),
                 "{name} is advertised but not dispatched"
@@ -537,6 +598,43 @@ mod tests {
         assert_eq!(r["serverInfo"]["name"], "kaniscope");
         assert_eq!(r["serverInfo"]["version"], crate::VERSION);
         assert!(r["capabilities"]["tools"].is_object());
+    }
+
+    /// A malformed PR scope must be an error, not a silent local answer.
+    ///
+    /// `get_rules` and `review_file` used to fall back to local on ANY scope
+    /// error, so a model that sent `pr` as a string — which they do routinely —
+    /// got a confident answer about the server's own checkout instead of the
+    /// pull request it asked for.
+    #[tokio::test]
+    async fn a_malformed_pr_scope_is_an_error_not_a_local_answer() {
+        let cfg = Config::from_env();
+        let empty = tempfile::tempdir().expect("tempdir");
+        let root = empty.path().to_string_lossy().to_string();
+
+        for bad in [
+            json!({ "provider": "github", "repo": "o/r", "pr": "12" }), // a string
+            json!({ "provider": "github", "repo": "o/r" }),             // missing pr
+            json!({ "repo": "o/r", "pr": 12 }),                         // missing provider
+        ] {
+            let mut args = bad.as_object().expect("object").clone();
+            args.insert("repoRoot".into(), json!(root));
+            let err = call_tool(&cfg, &json!({ "name": "get_rules", "arguments": args }))
+                .await
+                .expect_err("a partial scope must not be answered locally");
+            assert!(
+                err.to_string().contains("pull-request scope"),
+                "{bad}: {err}"
+            );
+        }
+
+        // ...and no scope at all is still the local case, which is the common one.
+        call_tool(
+            &cfg,
+            &json!({ "name": "get_rules", "arguments": { "repoRoot": root } }),
+        )
+        .await
+        .expect("no scope means this checkout");
     }
 
     /// `review_local` cannot read a diff from stdin, because stdin is the
