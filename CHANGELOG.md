@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+The protocol suite declares `required-features = ["cli"]`, so a plain `cargo test` skips it rather than failing. It spawns the `kaniscope` binary, which only exists with that feature — without the declaration, cargo still defines `CARGO_BIN_EXE_kaniscope` and still compiles the target, so the breakage surfaced as seven confusing runtime failures on a missing executable rather than a build error naming the cause.
+
+**The MCP server is tested over its real transport.** `tests/mcp_protocol.rs` spawns the built binary and speaks newline-delimited JSON-RPC to it, as a host would.
+
+Every existing test called the module's functions directly, which covers the decisions — which tool, which backend, what refusal — and cannot cover what those decisions travel over. Two bugs found by hand while building this, a client that hung when it sent a request mid-sampling and a parse error written but never flushed, were both invisible to the unit tests and are both caught here.
+
+Offline and unbilled: `OPENROUTER_API_KEY` is set to the **empty string** rather than unset, because the binary loads a `.env` through `dotenvy` and dotenvy does not override a variable that is already present. Unsetting it lets a developer's local `.env` supply a real key and turns the suite into a live, billed review — which happened once while writing it.
+
+Writing the suite turned up behaviour worth pinning: a sampled review costs **two** round trips on the host's model, not one, because the self-critique pass runs on the same backend. That is now asserted rather than tolerated, so turning `SELF_CRITIQUE` off shows up as a changed expectation instead of silently.
+
 A concurrent request during a sampling round trip no longer hangs the client, and the sampled review clamps an oversized diff. Both found in review of this change.
 
 The read loop that waits for a `sampling/createMessage` response dropped every message with a different id — including client *requests*, which then waited forever for a reply that was never coming. They are answered with an explicit "busy" error instead. Notifications are still dropped, which is legal, at one real cost: a `notifications/cancelled` arriving mid-sampling is not honoured, so a cancelled request runs to completion. Fixing that properly needs stdin owned by one dispatcher routing responses through a pending map, which is the right shape for a server handling concurrent tool calls and not yet worth its complexity for one that handles them serially.
