@@ -53,6 +53,30 @@ function loadSchema() {
   return JSON.parse(execFileSync(binaryPath(), ["--schema"], { encoding: "utf8", maxBuffer: 32 << 20 }));
 }
 
+/** One operation's output schema, from `kaniscope schema <operation>`. */
+function loadOperationSchema(op) {
+  return JSON.parse(
+    execFileSync(binaryPath(), ["schema", op], { encoding: "utf8", maxBuffer: 32 << 20 })
+  );
+}
+
+/**
+ * The operations whose output types the clients ship.
+ *
+ * `review-local` and `review-pr` both return `RunReviewOutput`, which the root
+ * `--schema` already covers, so they are not repeated here. Taken from the
+ * binary rather than hard-coded as a list of types: an operation added in Rust
+ * and forgotten here shows up as a missing export in a client, which is exactly
+ * the silent-drift failure this generator exists to prevent.
+ */
+const TYPED_OPERATIONS = [
+  "review-file",
+  "get-rules",
+  "get-findings",
+  "resolve-findings",
+  "explain-finding",
+];
+
 /**
  * Split a schemars property into `{ types, nullable }`.
  *
@@ -91,6 +115,12 @@ function nullableOf(inner, lang) {
 /** Map one non-null schema node to a language type via `prims` + `ref`/`array`. */
 function render(node, lang) {
   if (node.$ref) return node.$ref.replace("#/$defs/", "");
+  // A tagged enum's discriminant. Rendering it as a plain `string` would throw
+  // away the only thing that makes the union narrowable — `if (s.kind === "pr")`
+  // in TS, and the same check in an editor's autocomplete.
+  if (typeof node.const === "string") {
+    return lang === "ts" ? JSON.stringify(node.const) : `Literal[${JSON.stringify(node.const)}]`;
+  }
   if (node.type === "array") {
     const item = variants(node.items);
     const inner = item.nullable
@@ -127,50 +157,126 @@ function summarize(description) {
   return first.length > 200 ? first.slice(0, 197).trimEnd() + "..." : first;
 }
 
-/** Every named object in the schema: the root plus each `$defs` entry. */
+/** Read one object node's properties into language-rendered fields. */
+function fieldsOf(name, node) {
+  const required = new Set(node.required || []);
+  return Object.entries(node.properties).map(([key, prop]) => {
+    const { types, nullable } = variants(prop);
+    if (types.length !== 1) {
+      throw new Error(`${name}.${key}: expected one non-null variant, got ${types.length}`);
+    }
+    const ts = render(types[0], "ts");
+    const py = render(types[0], "py");
+    return {
+      key,
+      doc: summarize(prop.description),
+      // Whether the KEY can be absent. Distinct from whether its VALUE can be
+      // null: a `#[serde(default)]` field is optional and not nullable, an
+      // `Option<T>` that serializes is nullable and not optional, and a field
+      // can be both. Collapsing the two mislabels every one of those cases.
+      optional: !required.has(key),
+      ts: nullable ? nullableOf(ts, "ts") : ts,
+      py: nullable ? nullableOf(py, "py") : py,
+    };
+  });
+}
+
+/**
+ * The tag property of an internally-tagged enum branch, or null.
+ *
+ * Identified by the `const` string that schemars emits for the discriminant.
+ * Used to name the branch, so `RulesScope`'s variants become `RulesScopeLocal`
+ * and `RulesScopePr` rather than `RulesScope1` and `RulesScope2` — a generated
+ * name a human has to read is worth getting right.
+ */
+function tagOf(branch) {
+  for (const [key, prop] of Object.entries(branch.properties || {})) {
+    if (typeof prop.const === "string") return { key, value: prop.const };
+  }
+  return null;
+}
+
+/** `local` -> `Local`, `review-file` -> `ReviewFile`. */
+function pascal(value) {
+  return value.replace(/(^|[-_])([a-z0-9])/g, (_, __, c) => c.toUpperCase());
+}
+
+/**
+ * Every named type in the schema: the root plus each `$defs` entry.
+ *
+ * Handles two shapes and refuses the rest, which is the same trade the rest of
+ * this file makes — an unhandled shape becomes a build failure on the day it is
+ * introduced, rather than plausible-looking types that are quietly wrong.
+ */
 function objects(schema) {
-  return [
-    [schema.title, schema],
-    ...Object.entries(schema.$defs || {}),
-  ].map(([name, node]) => {
-    if (!node.properties) throw new Error(`${name} is not an object schema`);
-    const required = new Set(node.required || []);
-    const fields = Object.entries(node.properties).map(([key, prop]) => {
-      const { types, nullable } = variants(prop);
-      if (types.length !== 1) {
-        throw new Error(`${name}.${key}: expected one non-null variant, got ${types.length}`);
-      }
-      const ts = render(types[0], "ts");
-      const py = render(types[0], "py");
+  return [[schema.title, schema], ...Object.entries(schema.$defs || {})].map(([name, node]) => {
+    if (node.properties) {
+      return { kind: "object", name, doc: summarize(node.description), fields: fieldsOf(name, node) };
+    }
+    const branches = node.oneOf;
+    // A unit-variant enum: `oneOf` of bare string consts, no properties anywhere.
+    // Emitted as a union of string literals, which is what makes a `state` field
+    // narrowable in an editor instead of just `string`.
+    if (
+      Array.isArray(branches) &&
+      branches.length > 0 &&
+      branches.every((b) => typeof b.const === "string" && !b.properties)
+    ) {
       return {
-        key,
-        doc: summarize(prop.description),
-        // Whether the KEY can be absent. Distinct from whether its VALUE can be
-        // null: a `#[serde(default)]` field is optional and not nullable, an
-        // `Option<T>` that serializes is nullable and not optional, and a field
-        // can be both. Collapsing the two mislabels every one of those cases.
-        optional: !required.has(key),
-        ts: nullable ? nullableOf(ts, "ts") : ts,
-        py: nullable ? nullableOf(py, "py") : py,
+        kind: "stringEnum",
+        name,
+        doc: summarize(node.description),
+        values: branches.map((b) => b.const),
       };
-    });
-    return { name, doc: summarize(node.description), fields };
+    }
+    if (Array.isArray(branches) && branches.every((b) => b.properties && tagOf(b))) {
+      return {
+        kind: "union",
+        name,
+        doc: summarize(node.description),
+        variants: branches.map((b) => {
+          const tag = tagOf(b);
+          return {
+            name: `${name}${pascal(tag.value)}`,
+            doc: summarize(b.description),
+            fields: fieldsOf(`${name}.${tag.value}`, b),
+          };
+        }),
+      };
+    }
+    throw new Error(`${name} is neither an object schema nor a tagged union`);
   });
 }
 
 const BANNER = (cmd) =>
   `// GENERATED by packaging/generate-types.mjs — do not edit.\n// Regenerate with: ${cmd}\n`;
 
+function tsInterface(name, doc, fields) {
+  let out = "";
+  if (doc) out += `/** ${doc} */\n`;
+  out += `export interface ${name} {\n`;
+  for (const f of fields) {
+    if (f.doc) out += `  /** ${f.doc} */\n`;
+    out += `  ${f.key}${f.optional ? "?" : ""}: ${f.ts};\n`;
+  }
+  return out + "}\n\n";
+}
+
 function emitTs(defs) {
   let out = BANNER("node packaging/generate-types.mjs") + "\n";
   for (const def of defs) {
-    if (def.doc) out += `/** ${def.doc} */\n`;
-    out += `export interface ${def.name} {\n`;
-    for (const f of def.fields) {
-      if (f.doc) out += `  /** ${f.doc} */\n`;
-      out += `  ${f.key}${f.optional ? "?" : ""}: ${f.ts};\n`;
+    if (def.kind === "stringEnum") {
+      if (def.doc) out += `/** ${def.doc} */\n`;
+      out += `export type ${def.name} = ${def.values.map((v) => JSON.stringify(v)).join(" | ")};\n\n`;
+      continue;
     }
-    out += "}\n\n";
+    if (def.kind === "union") {
+      for (const v of def.variants) out += tsInterface(v.name, v.doc, v.fields);
+      if (def.doc) out += `/** ${def.doc} */\n`;
+      out += `export type ${def.name} = ${def.variants.map((v) => v.name).join(" | ")};\n\n`;
+      continue;
+    }
+    out += tsInterface(def.name, def.doc, def.fields);
   }
   return out;
 }
@@ -178,27 +284,50 @@ function emitTs(defs) {
 function emitPy(defs) {
   let out =
     BANNER("node packaging/generate-types.mjs").replaceAll("//", "#") +
-    "\nfrom __future__ import annotations\n\nfrom typing import List, Optional, TypedDict\n\n";
+    "\nfrom __future__ import annotations\n\nfrom typing import List, Literal, Optional, TypedDict, Union\n\n";
   for (const def of defs) {
-    // `total=False` on a second class, not `NotRequired` inline: this has to
-    // import on the oldest Python the wheel claims, and `NotRequired` is 3.11+
-    // outside typing_extensions, which is a dependency this package will not add.
-    const req = def.fields.filter((f) => !f.optional);
-    const opt = def.fields.filter((f) => f.optional);
-    const base = opt.length ? `_${def.name}Required` : def.name;
-    out += `class ${base}(TypedDict):\n`;
-    if (def.doc && !opt.length) out += `    """${def.doc}"""\n\n`;
-    if (!req.length) out += "    pass\n";
-    for (const f of req) out += `    ${f.key}: ${f.py}\n`;
-    out += "\n\n";
-    if (opt.length) {
-      out += `class ${def.name}(${base}, total=False):\n`;
-      if (def.doc) out += `    """${def.doc}"""\n\n`;
-      for (const f of opt) out += `    ${f.key}: ${f.py}\n`;
-      out += "\n\n";
+    if (def.kind === "stringEnum") {
+      if (def.doc) out += `# ${def.doc}\n`;
+      out += `${def.name} = Literal[${def.values.map((v) => JSON.stringify(v)).join(", ")}]\n\n\n`;
+      continue;
     }
+    if (def.kind === "union") {
+      for (const v of def.variants) out += pyTypedDict(v.name, v.doc, v.fields);
+      if (def.doc) out += `# ${def.doc}\n`;
+      out += `${def.name} = Union[${def.variants.map((v) => v.name).join(", ")}]\n\n\n`;
+      continue;
+    }
+    out += pyTypedDict(def.name, def.doc, def.fields);
   }
+  // `__all__`, so `__init__.py` can re-export the whole generated surface with a
+  // star import instead of a hand-kept list. The two clients had drifted to
+  // publishing different subsets — TypeScript 22 names, Python 10 — which makes
+  // the same type reachable in one language and private in the other.
+  const names = defs.map((d) => d.name).sort();
+  out += `\n__all__ = [\n${names.map((n) => `    "${n}",`).join("\n")}\n]\n`;
   return out.trimEnd() + "\n";
+}
+
+function pyTypedDict(name, doc, fields) {
+  // `total=False` on a second class, not `NotRequired` inline: this has to
+  // import on the oldest Python the wheel claims, and `NotRequired` is 3.11+
+  // outside typing_extensions, which is a dependency this package will not add.
+  let out = "";
+  const req = fields.filter((f) => !f.optional);
+  const opt = fields.filter((f) => f.optional);
+  const base = opt.length ? `_${name}Required` : name;
+  out += `class ${base}(TypedDict):\n`;
+  if (doc && !opt.length) out += `    """${doc}"""\n\n`;
+  if (!req.length) out += "    pass\n";
+  for (const f of req) out += `    ${f.key}: ${f.py}\n`;
+  out += "\n\n";
+  if (opt.length) {
+    out += `class ${name}(${base}, total=False):\n`;
+    if (doc) out += `    """${doc}"""\n\n`;
+    for (const f of opt) out += `    ${f.key}: ${f.py}\n`;
+    out += "\n\n";
+  }
+  return out;
 }
 
 /** One doc line, wrapped as a comment, with the env name and default appended.
@@ -332,7 +461,34 @@ def config_to_env(config: Optional[Mapping[str, Any]]) -> Dict[str, str]:
 }
 
 const schema = loadSchema();
-const defs = objects(schema);
+// Every operation's defs in one list, deduplicated by name. `Finding` and `Usage`
+// appear in more than one operation's schema and are the same type in each; two
+// declarations of one name would not compile in TypeScript.
+//
+// A repeat that is NOT identical is a hard failure, not a first-one-wins. Keeping
+// whichever schema happened to be read first would publish one client type that
+// is quietly wrong for the other operation — a `Finding` that gains a field on
+// only one path, or two unrelated Rust types that happen to share an ident. That
+// is exactly the silent drift this generator exists to turn into a build error,
+// and `continue` here was a hole in it.
+const defs = [];
+const seen = new Map();
+for (const s of [schema, ...TYPED_OPERATIONS.map(loadOperationSchema)]) {
+  for (const def of objects(s)) {
+    const previous = seen.get(def.name);
+    if (previous) {
+      if (JSON.stringify(previous) !== JSON.stringify(def)) {
+        throw new Error(
+          `${def.name} is declared differently by two operations — one client type ` +
+            `would be wrong for one of them. Rename one, or reconcile the Rust types.`
+        );
+      }
+      continue;
+    }
+    seen.set(def.name, def);
+    defs.push(def);
+  }
+}
 const configVars = loadConfigSpec();
 const files = {
   [OUTPUTS.schema]: JSON.stringify(schema, null, 2) + "\n",

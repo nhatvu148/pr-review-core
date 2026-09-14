@@ -105,6 +105,8 @@ export interface ReviewConfig {
   prBody?: boolean;
   /** Cap on the description handed to the reviewer. A clipped one is marked truncated, so absence is not read as out-of-scope. Default: `12000`. (`PR_BODY_MAX_CHARS`) */
   prBodyMaxChars?: number;
+  /** Cap on the stated change intent handed to the reviewer on a local review. A clipped one is marked truncated, so absence is not read as out-of-scope. Default: `12000`. (`CHANGE_INTENT_MAX_CHARS`) */
+  changeIntentMaxChars?: number;
   /** Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. Default: `true`. (`REANCHOR_FINDINGS`) */
   reanchorFindings?: boolean;
   /** Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. Default: `false`. (`REVIEW_ON_UPDATE`) */

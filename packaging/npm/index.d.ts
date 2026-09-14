@@ -1,6 +1,17 @@
-import type { RunReviewOutput } from "./types";
+import type {
+  RunReviewOutput,
+  FileReviewOutput,
+  EffectiveRules,
+  FindingsOutput,
+  ResolveOutput,
+  ExplainOutput,
+  ExplainInput,
+} from "./types";
 
-export type { RunReviewOutput, Finding, InlineComment, Usage } from "./types";
+// The WHOLE generated surface. A hand-kept list drifted from the Python
+// client's — 22 names here against 10 there — so the same generated type was
+// public in one language and private in the other. `export *` cannot fall behind.
+export * from "./types";
 
 export type { ReviewConfig } from "./config";
 
@@ -49,6 +60,17 @@ export interface ReviewOptions extends SpawnOptions {
   repoRoot?: string;
   /** With {@link local}: what to call this change. Defaults to the branch name. */
   label?: string;
+  /**
+   * With {@link local}: what this change is MEANT to do — the task, or the
+   * instruction given to a coding agent. The reviewer checks the diff against
+   * it, the way it checks a PR against its description.
+   *
+   * Treated as untrusted data: fenced and labelled before it reaches the model,
+   * and unable to direct the review. Mutually exclusive with {@link intentFile}.
+   */
+  intent?: string;
+  /** With {@link local}: read {@link intent} from this file instead. */
+  intentFile?: string;
   /** Also write the result as JSON to this path, atomically. */
   jsonOut?: string;
   /**
@@ -71,8 +93,91 @@ export interface ReviewOptions extends SpawnOptions {
  */
 export function review(options?: ReviewOptions): Promise<RunReviewOutput>;
 
-/** The JSON Schema of a {@link review} result. Needs no key and no network. */
-export function schema(options?: SpawnOptions): Promise<Record<string, unknown>>;
+/** Selects a checkout, or a pull request. Give one or the other, not both. */
+export interface ScopeOptions extends SpawnOptions {
+  /** The checkout to resolve against. Defaults to the current directory. */
+  repoRoot?: string;
+  /** `github` | `gitlab` | `bitbucket`. With {@link repo} and {@link pr}. */
+  provider?: string;
+  repo?: string;
+  pr?: number;
+}
+
+export interface ReviewFileOptions extends ScopeOptions {
+  /** Repository-relative path of the file to review. Required. */
+  path: string;
+}
+
+/**
+ * The effective review rules: merged settings, which `.prbot.toml` was read,
+ * what it overrode, and the exact instructions injected into the system prompt.
+ *
+ * Makes no model call, so it needs no `OPENROUTER_API_KEY`. Never includes
+ * credentials — the result is built from an explicit allowlist of settings.
+ */
+export function getRules(options?: ScopeOptions): Promise<EffectiveRules>;
+
+/**
+ * Deep-review one complete file, in a checkout or at a PR head.
+ *
+ * Posts nothing. A path excluded by the repository's review filters comes back
+ * as an `excluded` outcome rather than an error, so it can be reported without
+ * being retried.
+ */
+export function reviewFile(options: ReviewFileOptions): Promise<FileReviewOutput>;
+
+/** PR coordinates. All three are required. */
+export interface PrOptions extends SpawnOptions {
+  provider: string;
+  repo: string;
+  pr: number;
+}
+
+/**
+ * The findings currently on a pull request, with lifecycle state.
+ *
+ * Read-only. Check `outcome.status`: a provider that cannot track findings
+ * returns `unsupported` rather than an empty list, because "no open findings" is
+ * a conclusion and must never come from a question that was never asked.
+ */
+export function getFindings(options: PrOptions): Promise<FindingsOutput>;
+
+export interface ResolveOptions extends PrOptions {
+  /** Fingerprints to hand over. Omit for every active finding. */
+  fingerprints?: string[];
+}
+
+/**
+ * Package findings for your own edit loop.
+ *
+ * Changes nothing — no edits, no posts, no thread resolution. The name is the
+ * operation's, and the returned `disclaimer` says so in the payload.
+ */
+export function resolveFindings(options: ResolveOptions): Promise<ResolveOutput>;
+
+export interface ExplainOptions extends SpawnOptions {
+  /** The finding to investigate. */
+  finding: ExplainInput;
+  /** The checkout to read the file from. Defaults to the current directory. */
+  repoRoot?: string;
+  /** The commit the checkout is at, so a revision mismatch can be reported. */
+  headSha?: string;
+}
+
+/** Investigate one finding against a local checkout. Never posts. */
+export function explainFinding(options: ExplainOptions): Promise<ExplainOutput>;
+
+export interface SchemaOptions extends SpawnOptions {
+  /**
+   * Which operation's output schema to fetch — `review-file`, `get-rules`,
+   * `get-findings`, `resolve-findings`, `explain-finding`, `review-local`,
+   * `review-pr`. Omit for the review output's schema.
+   */
+  operation?: string;
+}
+
+/** The JSON Schema of an operation's result. Needs no key and no network. */
+export function schema(options?: SchemaOptions): Promise<Record<string, unknown>>;
 
 /** The engine version this package's binary was built from. */
 export function version(options?: SpawnOptions): Promise<string>;

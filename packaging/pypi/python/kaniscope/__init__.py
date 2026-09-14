@@ -31,22 +31,28 @@ import sysconfig
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from ._config import CONFIG_ENV, ReviewConfig, config_to_env
-from ._types import Finding, InlineComment, RunReviewOutput, Usage
+# The WHOLE generated surface, not a hand-kept subset. The two clients had
+# drifted to publishing different sets of the same generated types, which makes a
+# type public in TypeScript and private in Python for no reason anyone chose.
+# `_types` carries its own generated `__all__`, so this cannot fall behind again.
+from ._types import *  # noqa: F401,F403
+from ._types import __all__ as _TYPE_NAMES
 
 __all__ = [
     "review",
     "review_async",
+    "review_file",
+    "get_rules",
+    "get_findings",
+    "resolve_findings",
+    "explain_finding",
     "schema",
     "version",
     "binary_path",
     "KaniscopeError",
-    "Finding",
-    "InlineComment",
-    "RunReviewOutput",
-    "Usage",
     "ReviewConfig",
     "CONFIG_ENV",
-]
+] + list(_TYPE_NAMES)
 
 _EXE = "kaniscope.exe" if os.name == "nt" else "kaniscope"
 
@@ -99,6 +105,8 @@ _VALUE_FLAGS = {
     "base": "--base",
     "repo_root": "--repo-root",
     "label": "--label",
+    "intent": "--intent",
+    "intent_file": "--intent-file",
     "json_out": "--json-out",
 }
 
@@ -172,6 +180,184 @@ def _parse(stdout: str, stderr: str, code: int) -> RunReviewOutput:
         ) from exc
 
 
+def _run_operation(op: str, args: list, options: Mapping[str, Any]) -> Any:
+    """Run one explicit toolbox operation and parse its single JSON document.
+
+    Shared so the operations below cannot diverge in how they report a crash
+    versus a stdout that is not JSON — the two failures a caller most needs told
+    apart, and the two a bare ``JSONDecodeError`` conflates.
+    """
+    result = subprocess.run(
+        [options.get("binary") or binary_path(), op, *args],
+        capture_output=True,
+        text=True,
+        env=_environment(options.get("env"), options.get("inherit_env", True), options.get("config")),
+        timeout=options.get("timeout"),
+        stdin=subprocess.DEVNULL,
+    )
+    return _parse(result.stdout, result.stderr, result.returncode)
+
+
+def _scope_args(
+    repo_root: Optional[str],
+    provider: Optional[str],
+    repo: Optional[str],
+    pr: Optional[int],
+) -> list:
+    """Flags for the operations that take a checkout OR a pull request.
+
+    A PARTIAL scope is a caller error and is refused here. It used to stringify
+    whatever was missing into the argv — ``--provider None --repo o/r`` — which
+    the binary then rejected with a message about a provider named "None",
+    pointing at the wrong thing entirely.
+    """
+    given = [n for n, v in (("provider", provider), ("repo", repo), ("pr", pr)) if v is not None]
+    if not given:
+        return ["--repo-root", str(repo_root)] if repo_root else []
+    if len(given) != 3:
+        missing = [n for n in ("provider", "repo", "pr") if n not in given]
+        raise TypeError(
+            "kaniscope: a pull-request scope needs provider, repo and pr — "
+            f"missing {', '.join(missing)}"
+        )
+    return ["--provider", str(provider), "--repo", str(repo), "--pr", str(pr)]
+
+
+def get_rules(
+    *,
+    repo_root: Optional[str] = None,
+    provider: Optional[str] = None,
+    repo: Optional[str] = None,
+    pr: Optional[int] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> EffectiveRules:
+    """The effective review rules for a checkout or a pull request.
+
+    Merged settings, which ``.prbot.toml`` was read (or why none was), what it
+    overrode, and the exact instructions injected into the system prompt.
+
+    Makes no model call, so it needs no ``OPENROUTER_API_KEY``. Credentials never
+    appear in the result: it is built from an explicit allowlist of settings, so
+    a secret added to the engine's configuration cannot leak into it by default.
+    """
+    return _run_operation("get-rules", _scope_args(repo_root, provider, repo, pr), locals())
+
+
+def _pr_args(provider: Optional[str], repo: Optional[str], pr: Optional[int]) -> list:
+    """PR coordinates, all three required by the findings operations."""
+    missing = [n for n, v in (("provider", provider), ("repo", repo), ("pr", pr)) if v is None]
+    if missing:
+        raise TypeError(f"kaniscope: this operation needs {', '.join(missing)}")
+    return ["--provider", str(provider), "--repo", str(repo), "--pr", str(pr)]
+
+
+def get_findings(
+    *,
+    provider: Optional[str] = None,
+    repo: Optional[str] = None,
+    pr: Optional[int] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> FindingsOutput:
+    """The findings currently on a pull request, with their lifecycle state.
+
+    Read-only. Check ``outcome["status"]``: a provider that cannot track findings
+    returns ``unsupported`` rather than an empty list, because "no open findings"
+    is a conclusion a caller acts on and must never come from a question that was
+    never asked.
+    """
+    return _run_operation("get-findings", _pr_args(provider, repo, pr), locals())
+
+
+def resolve_findings(
+    *,
+    provider: Optional[str] = None,
+    repo: Optional[str] = None,
+    pr: Optional[int] = None,
+    fingerprints: Optional[list] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> ResolveOutput:
+    """Package findings for your own edit loop.
+
+    Changes nothing — no edits, no posts, no provider thread resolution. The name
+    is the operation's; the returned ``disclaimer`` says so in the payload.
+
+    Omit ``fingerprints`` to take every active finding.
+    """
+    fps = [a for fp in (fingerprints or []) for a in ("--fingerprint", str(fp))]
+    return _run_operation("resolve-findings", [*_pr_args(provider, repo, pr), *fps], locals())
+
+
+def explain_finding(
+    *,
+    finding: Mapping[str, Any],
+    repo_root: Optional[str] = None,
+    head_sha: Optional[str] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> ExplainOutput:
+    """Investigate one finding against a local checkout. Never posts.
+
+    The finding goes in on stdin rather than as a flag: a finding body is
+    multi-line prose containing quotes and backticks, which is exactly what an
+    argv mangles.
+    """
+    args = ["--finding", "@-"]
+    if repo_root:
+        args += ["--repo-root", str(repo_root)]
+    if head_sha:
+        args += ["--head-sha", str(head_sha)]
+    result = subprocess.run(
+        [binary or binary_path(), "explain-finding", *args],
+        capture_output=True,
+        text=True,
+        env=_environment(env, inherit_env, config),
+        timeout=timeout,
+        input=json.dumps(finding),
+    )
+    return _parse(result.stdout, result.stderr, result.returncode)
+
+
+def review_file(
+    *,
+    path: str,
+    repo_root: Optional[str] = None,
+    provider: Optional[str] = None,
+    repo: Optional[str] = None,
+    pr: Optional[int] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> FileReviewOutput:
+    """Deep-review one complete file, in a checkout or at a pull request's head.
+
+    Posts nothing. A path excluded by the repository's review filters comes back
+    as an ``excluded`` outcome rather than raising, so a caller can report it
+    without retrying it forever.
+    """
+    return _run_operation(
+        "review-file",
+        ["--path", str(path), *_scope_args(repo_root, provider, repo, pr)],
+        locals(),
+    )
+
+
 def review(
     *,
     provider: Optional[str] = None,
@@ -182,6 +368,8 @@ def review(
     base: Optional[str] = None,
     repo_root: Optional[str] = None,
     label: Optional[str] = None,
+    intent: Optional[str] = None,
+    intent_file: Optional[str] = None,
     json_out: Optional[str] = None,
     diff: Optional[str] = None,
     config: Optional[ReviewConfig] = None,
@@ -204,6 +392,12 @@ def review(
     wins. That ordering is deliberate: ``config`` cannot model everything and can
     model something wrongly, and an escape hatch is only an escape hatch if it
     wins. Both are merged over ``os.environ`` unless ``inherit_env=False``.
+
+    ``intent`` (or ``intent_file``, which is mutually exclusive with it) says
+    what a ``local=True`` change is MEANT to do, so the reviewer can check the
+    diff against it the way it checks a PR against its description. It is treated
+    as untrusted data: fenced and labelled before it reaches the model, and unable
+    to direct the review.
 
     Keyword-only on purpose: ``provider``/``repo``/``pr`` are three adjacent
     values of which two are strings, and a positional call that swapped them
@@ -256,6 +450,8 @@ async def review_async(
     base: Optional[str] = None,
     repo_root: Optional[str] = None,
     label: Optional[str] = None,
+    intent: Optional[str] = None,
+    intent_file: Optional[str] = None,
     json_out: Optional[str] = None,
     diff: Optional[str] = None,
     config: Optional[ReviewConfig] = None,
@@ -386,14 +582,22 @@ async def _terminate(proc: Any) -> None:
     await proc.wait()
 
 
-def schema(*, binary: Optional[str] = None) -> Dict[str, Any]:
-    """The JSON Schema of a :func:`review` result. Needs no key and no network."""
+def schema(
+    *, operation: Optional[str] = None, binary: Optional[str] = None
+) -> Dict[str, Any]:
+    """The JSON Schema of an operation's result. Needs no key and no network.
+
+    ``operation`` selects a per-operation schema (``review-file``, ``get-rules``,
+    ``review-local``, ``review-pr``); omit it for the review output's schema,
+    which is what this has always returned.
+    """
+    args = ["schema", operation] if operation else ["--schema"]
     result = subprocess.run(
-        [binary or binary_path(), "--schema"], capture_output=True, text=True
+        [binary or binary_path(), *args], capture_output=True, text=True
     )
     if result.returncode != 0:
         raise KaniscopeError(
-            f"kaniscope --schema failed\n{_tail(result.stderr)}",
+            f"kaniscope schema failed\n{_tail(result.stderr)}",
             exit_code=result.returncode,
             stderr=result.stderr,
         )

@@ -157,6 +157,12 @@ pub async fn run_command_with(
 /// `/review-file <path>`: deep-review an entire file at the PR head and post the
 /// findings as a summary comment. Findings can anchor to any line in the file, so
 /// they're reported as text (a PR only accepts inline comments on diff lines).
+///
+/// The reviewing is [`crate::filereview::review_pr_file`]; this is the posting
+/// adapter around it. Split that way because everything before the post — the
+/// glob authorization, the head fetch, the confidence/sort/cap policy, the
+/// rendering — is wanted by callers that have no PR to write to, and a second
+/// implementation of the authorization step is the one copy nobody can afford.
 async fn run_review_file(
     cfg: &Config,
     backend: &dyn ReviewBackend,
@@ -165,110 +171,24 @@ async fn run_review_file(
     pr: u64,
     path: &str,
 ) -> Result<CommandOutcome> {
-    let provider = Provider::from_name(provider_name)?;
-    let client = reqwest::Client::new();
-    let meta = provider.get_meta(&client, cfg, repo, pr).await?;
-    let effective = load_repo_config(&provider, &client, cfg, repo, &meta).await;
-    let cfg = &effective;
+    let (out, ctx) =
+        crate::filereview::review_pr_file(cfg, backend, provider_name, repo, pr, path).await?;
 
-    // Honour the repo's include/exclude globs so `/review-file` can't be used to
-    // pull in a file the diff-based review would have filtered out (e.g. secrets
-    // or vendored paths excluded via `.prbot.toml`).
-    if !crate::diff::path_matches_globs(path, &cfg.include_globs, &cfg.exclude_globs) {
-        let url = provider
-            .post_comment(
-                &client,
-                cfg,
-                repo,
-                pr,
-                &format!(
-                    "> **/review-file** `{path}`\n\nThat path is excluded by this repo's review file filters, so I won't review it."
-                ),
-            )
-            .await?;
-        return Ok(CommandOutcome {
-            command: "review-file",
-            comment_url: url,
-        });
-    }
-
-    // Fetch the file at the PR head (fall back to the base branch if no head SHA).
-    let git_ref = match (meta.head_sha.as_deref(), meta.base_branch.as_deref()) {
-        (Some(s), _) if !s.is_empty() => s,
-        (_, Some(b)) if !b.is_empty() => b,
-        _ => anyhow::bail!("no git ref to fetch `{path}` against"),
-    };
-    let content = match provider
-        .get_file_contents(&client, cfg, repo, git_ref, path)
-        .await?
-    {
-        Some(c) => c,
-        None => {
-            let url = provider
-                .post_comment(
-                    &client,
-                    cfg,
-                    repo,
-                    pr,
-                    &format!(
-                        "> **/review-file** `{path}`\n\nCouldn't find that file at the PR head."
-                    ),
-                )
-                .await?;
-            return Ok(CommandOutcome {
-                command: "review-file",
-                comment_url: url,
-            });
-        }
-    };
-
-    let review = crate::llm::review_file(cfg, backend, path, &content).await?;
-    // Same post-processing as a diff review: confidence floor, severity sort, cap.
-    let mut findings = review.findings.clone();
-    findings.retain(|f| f.confidence.unwrap_or(100) >= cfg.min_confidence);
-    findings.sort_by(|a, b| {
-        crate::review::severity_rank(&b.severity)
-            .cmp(&crate::review::severity_rank(&a.severity))
-            // Secondary key: higher confidence first — matches the `/review` path.
-            .then(b.confidence.unwrap_or(0).cmp(&a.confidence.unwrap_or(0)))
-    });
-    findings.truncate(cfg.max_findings);
-
-    let body = render_file_review(path, &review, &findings);
-    let url = provider.post_comment(&client, cfg, repo, pr, &body).await?;
+    // Posted for every outcome, refusals included: the command was issued in a
+    // comment thread, and silence there reads as the bot being broken rather than
+    // as a considered refusal.
+    //
+    // Reusing the provider, client and merged config the review already resolved
+    // — a fresh `reqwest::Client` here would open a second connection pool and
+    // repeat the TLS handshake to post one comment.
+    let url = ctx
+        .provider
+        .post_comment(&ctx.client, &ctx.cfg, repo, pr, &out.summary_markdown)
+        .await?;
     Ok(CommandOutcome {
         command: "review-file",
         comment_url: url,
     })
-}
-
-/// Render a `/review-file` result as a summary comment.
-fn render_file_review(
-    path: &str,
-    review: &crate::llm::Review,
-    findings: &[crate::llm::Finding],
-) -> String {
-    let mut s = format!(
-        "🔍 **File review — `{path}`**\n\n{}\n\n**Recommendation:** {}",
-        review.summary.trim(),
-        review.recommendation.trim()
-    );
-    if findings.is_empty() {
-        s.push_str("\n\nNo issues found.");
-    } else {
-        s.push_str("\n\n## Findings");
-        for f in findings {
-            let loc = f.line.map(|l| format!(" (line {l})")).unwrap_or_default();
-            s.push_str(&format!(
-                "\n- {} **{}** — `{path}`{loc} — {}",
-                crate::review::severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
-                f.body.trim()
-            ));
-        }
-    }
-    s.push_str("\n\n_Automated advisory review — a human still owns the merge decision._");
-    s
 }
 
 /// Fetch the PR diff and prepare it exactly as the review path does — glob

@@ -192,6 +192,45 @@ impl Provider {
         }
     }
 
+    /// List the findings this bot has on a pull request, with their lifecycle
+    /// state. Read-only — posts nothing, resolves nothing.
+    ///
+    /// Only GitHub can answer fully; the other two return
+    /// [`crate::findings::FindingsOutcome::Unsupported`] saying why, rather than
+    /// an empty list that reads as "nothing is open".
+    pub async fn list_findings(
+        &self,
+        client: &Client,
+        cfg: &Config,
+        repo: &str,
+        pr: u64,
+        meta: &PrMeta,
+    ) -> Result<crate::findings::FindingsOutcome> {
+        use crate::findings::FindingsOutcome;
+        match self {
+            Provider::Github => github::list_findings(client, cfg, repo, pr, meta).await,
+            // Not "no findings": `gitlab::post_review` deletes the bot's prior
+            // inline discussions and reposts them every run, so nothing on an MR
+            // survives a round to have a state. Whatever is there is the latest
+            // review's output, which is a different question from this one.
+            Provider::Gitlab => Ok(FindingsOutcome::Unsupported {
+                reason: "GitLab inline discussions are deleted and reposted on every review, \
+                         so they carry no lifecycle to report. Read the merge request's \
+                         discussions directly, or re-run the review."
+                    .to_string(),
+            }),
+            // Bitbucket renders HTML comments literally, so the hidden
+            // fingerprint marker is never written there and there is nothing to
+            // match a comment back to a finding by.
+            Provider::Bitbucket => Ok(FindingsOutcome::Unsupported {
+                reason: "Bitbucket renders HTML comments literally, so findings are posted \
+                         without the hidden fingerprint marker that identifies them. There \
+                         is nothing to reconcile against."
+                    .to_string(),
+            }),
+        }
+    }
+
     /// Build an authenticated HTTPS clone URL for the agentic reviewer.
     pub fn clone_url(&self, cfg: &Config, repo: &str) -> Result<String> {
         match self {
@@ -261,6 +300,50 @@ impl Provider {
 #[cfg(test)]
 mod tests {
     use super::{extract_fp, finding_fingerprint, fp_marker, render_dropped, render_resolved};
+
+    /// A provider that cannot track findings must say so, never return an empty
+    /// list.
+    ///
+    /// "No open findings" is a conclusion an agent acts on — it stops looking,
+    /// and reports the PR as clean. Producing that from a provider that was
+    /// simply never asked is the most damaging wrong answer this API can give,
+    /// and it is the one an `Option`-shaped return would have made the default.
+    #[tokio::test]
+    async fn a_provider_without_lifecycle_refuses_rather_than_reporting_none() {
+        use crate::findings::FindingsOutcome;
+
+        let client = reqwest::Client::new();
+        let cfg = crate::config::Config::from_env();
+        let meta = crate::providers::PrMeta {
+            repo: "o/r".into(),
+            pr: 1,
+            title: None,
+            base_branch: None,
+            head_sha: None,
+            body: None,
+            ci_status: None,
+        };
+
+        for provider in [super::Provider::Gitlab, super::Provider::Bitbucket] {
+            // No network is configured here: if either arm ever starts making a
+            // request, this fails rather than passing quietly.
+            let outcome = provider
+                .list_findings(&client, &cfg, "o/r", 1, &meta)
+                .await
+                .expect("refusing is not an error");
+            match outcome {
+                FindingsOutcome::Unsupported { reason } => {
+                    assert!(!reason.trim().is_empty(), "the refusal must say why");
+                }
+                FindingsOutcome::Listed { .. } => {
+                    panic!(
+                        "{} cannot track findings and must not claim to",
+                        provider.name()
+                    )
+                }
+            }
+        }
+    }
 
     #[test]
     fn fingerprint_is_stable_and_normalizes() {

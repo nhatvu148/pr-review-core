@@ -1,5 +1,99 @@
 # Changelog
 
+## Unreleased
+
+**Three fixes from a live review of this change through the Claude Code backend**, which is the check compile-and-test cannot make.
+
+The type generator deduplicated definitions across operations **by name alone**, keeping whichever schema was read first. Two operations publishing the same name with different shapes would have shipped one client type quietly wrong for the other — the precise silent drift this generator exists to turn into a build error. A non-identical repeat is now a hard failure.
+
+The two clients had drifted to publishing different subsets of the generated types — 22 names in TypeScript against 10 in Python — so the same type was public in one language and private in the other. Both now re-export the whole generated surface, driven from the generator, so they cannot diverge again.
+
+`FileReviewOutput` carried `posted` and `comment_url` hardcoded to `false` and `None`, with a doc comment claiming `command.rs` set them. It never did — it reads `summary_markdown`, posts, and returns its own `CommandOutcome`. Two dead fields in a published wire contract are worse than absent ones: a consumer reads `posted: false` as a fact rather than as a field nobody fills in. Removed.
+
+**A malformed pull-request scope in an MCP call is an error, not a quiet local answer.** Found in review of this change. `get_rules` and `review_file` fell back to the local checkout on *any* scope error, so a call with one field missing — or with `pr` sent as a string, which models do routinely — returned a confident answer about the server's own working directory instead of the pull request that was asked for. Absent now means local; present-but-wrong is reported.
+
+**`kaniscope mcp` serves the toolbox as MCP tools over stdio.** Seven tools — `review_local`, `review_pr`, `review_file`, `get_rules`, `get_findings`, `resolve_findings`, `explain_finding` — each calling the same library function the matching subcommand calls and returning the same serialized type. An adapter, not a second implementation: a second path to the same answer drifts, and the drift is invisible because both sides keep returning plausible reviews.
+
+**The MCP surface is read-only, and deliberately narrower than the CLI.** Nothing exposed here can post, edit or resolve anything; `review_pr` always runs dry and no argument changes that. The asymmetry is the point — a CLI invocation is typed by someone who sees the flags, while a tool call is composed by a model from a description and issued without a human reading the arguments. A capability whose worst case is a comment on a colleague's pull request does not belong on the second kind of surface. A test asserts no tool schema accepts `post`, `dryRun` or `resolve`, and that the server states its read-only nature in the `initialize` instructions where a model will read it.
+
+**No new dependency.** MCP over stdio is newline-delimited JSON-RPC 2.0 with three methods that matter, which is less code than the wiring an SDK would need. This is a library crate, so every dependency added here is imposed on every consumer, and a fast-moving protocol SDK is a poor thing to impose — the same reasoning `packaging/generate-types.mjs` gives for being dependency-free.
+
+Configured per project through the repository's own `.mcp.json`, never user-globally.
+
+`review_local` has no stdin diff mode, because stdin is the protocol stream — reading a diff from it would consume the session. Its default is `git diff HEAD`, the one mode that covers committed, staged and unstaged work at once, which is what "review my changes" means to someone who has not thought about the distinction.
+
+**`explain-finding` could be pointed at any file on the host.** Found in review of this change. It checked the path against the repository's globs and nothing else — but a finding is a JSON object the caller supplies, so `"file": "/etc/passwd"` was reachable: `Path::join` discards the base when its argument is absolute, and the default filters exclude lockfiles, not the filesystem. The contents then go to a model, which makes it a disclosure rather than a read. It now uses the same resolver `review-file` does, so there is one place that decides what may be read rather than two that agree until one of them is edited.
+
+**`resolve-findings` on a provider that cannot track findings returns a reason instead of erroring.** Bailing there reintroduced as a hard crash exactly the ambiguity `get-findings` is designed to avoid, and a caller working through several pull requests would read one provider's limitation as a failed run. The bundle now carries `unsupported` with `handoffs` empty — and that emptiness means unknown, not "nothing to do".
+
+**A coding agent can read a pull request's open findings and work through them.** `kaniscope get-findings`, `resolve-findings` and `explain-finding`, all read-only.
+
+A review's findings live as provider comments once posted, and the only code that ever read them back was reconciliation — which needs them to decide what to resolve and discards the rest. So an agent asked to "fix what the bot found" had no way to ask what the bot found, short of scraping rendered comment markdown.
+
+**"Outstanding" means the lifecycle, not the marker.** A comment carrying the bot signature may have been resolved two rounds ago; returning it as open hands an agent work that was finished last week. `get-findings` separates `active`, `resolved` and `unparseable` using the fingerprint semantics reconciliation already uses, and reports the commit each finding was written against.
+
+**A provider that cannot answer says so.** GitLab deletes and reposts its inline discussions on every review, so nothing on an MR survives a round to have a state; Bitbucket renders HTML comments literally, so the fingerprint marker was never written there. Both return `unsupported` with a reason rather than an empty list. An empty list reads as "no open findings", which is a conclusion an agent acts on by stopping — the most damaging wrong answer this API could give, and the one the obvious `Option`-shaped return would have made the default.
+
+**`resolve-findings` resolves nothing, and says so in the payload.** It selects findings and classifies each one — `investigate`, `reverifyAgainstHead`, `alreadyResolved`, `notFound`, `needsHumanJudgement` — with a rationale. Deterministic: no model call hides inside it. The disclaimer is a field rather than documentation because an agent reading a field called "resolve" will assume something was done unless the data tells it otherwise.
+
+**`explain-finding` checks one finding against the real file** and returns `holds`, `doesNotHold` or `inconclusive` with evidence, stated uncertainty and a suggested verification. `doesNotHold` is a first-class answer: reviewers produce false positives, and confirming one because it was written confidently is the failure this pass exists to catch. An explanation that states no uncertainty has that noted in the output rather than presented as an empty field.
+
+Revision mismatch is explicit everywhere it can occur. A finding's line number refers to the commit it was written against; providers move threads as files change beneath them, which keeps the thread in the right place and says nothing about whether the finding still holds. Both operations state the mismatch rather than letting a caller assume the numbers line up.
+
+**The type generator learned string enums**, so `FindingState`, `HandoffAction` and `ExplanationVerdict` reach both clients as narrowable literal unions rather than bare strings. Like the tagged-union support before it, the generator refused the new shape rather than guessing — which is what made it a two-line change instead of a silent mistranslation.
+
+**Local file review obeys the repository's own rules, and cannot be talked into reading outside the checkout.** Both found in review of this change.
+
+`filereview::review_local` authorized the path against the *deployment's* config and never loaded the checkout's `.prbot.toml`, while `review_pr_file` loaded it before the same check. So a repository's `exclude_globs` governed what `/review-file` could read on a pull request and silently did not govern `kaniscope review-file` locally — along with `min_confidence`, `max_findings` and `model`, which is the parity Phase 1 established for diff reviews and this path never got.
+
+The path check was also lexical only. `Path::join` **discards the base** when its argument is absolute, so `repo_root.join("/etc/passwd")` is `/etc/passwd`, and the default filters exclude lockfiles and build output rather than the filesystem. A symlink inside the checkout defeated the `..` and absolute-path guards for a different reason: they read the string, and a symlink is not in the string. Both now go through one resolver that canonicalizes the root and the target, refuses anything landing outside, re-applies the filters to what the path actually *resolved* to (so `allowed.md -> .env` is caught), and refuses anything that is not a regular file — `read_to_string` on a fifo blocks forever.
+
+This matters more than an ordinary read bug because the file's contents are sent to a model: a read here is a disclosure.
+
+**An incomplete pull-request scope is refused instead of silently becoming a local one.** `--repo o/r --pr 5` with `--provider` omitted parsed fine — `requires_all` was on `provider` alone, which only enforces one direction — then fell through the match into the local branch and answered for the current directory. A result that looks entirely normal and is about the wrong thing, which is the ambiguity the diff modes are already refused for. Each of the three now requires the other two, and both wrapper clients raise rather than stringifying the missing pieces into the argv as `undefined` / `None`.
+
+**The `/review-file` command reuses the provider and client the review already resolved** rather than building a second `reqwest::Client` — a second connection pool and TLS handshake to post one comment.
+
+**The engine has explicit operations, so a program can say what it wants.** `kaniscope review-local`, `review-pr`, `review-file`, `get-rules` and `schema` sit alongside the existing flat flags, each printing exactly one JSON document on stdout.
+
+The flat flags were a mode selector in disguise — `--local` means "this is a local review", and you had to know that. That was fine while the only callers were two wrapper packages written against it. It stops being fine once the caller is a coding agent choosing an operation by name, and it left no room for operations that are not reviews at all.
+
+Nothing was taken away. `kaniscope --local --base main`, the `--provider/--repo/--pr` form, `--schema`, `--config-json` and `--config-docs` all parse and behave exactly as before, and a test asserts each invocation the wrapper clients build still does. The one deliberate difference is the posting default: `--dry-run` is opt-out on the flat path, while `review-pr` posts only with `--post`. Inverted because this surface is driven by agents, where the two mistakes are not symmetric — not posting costs a re-run, and posting costs a comment on someone's pull request that cannot be un-sent.
+
+**A local review can name what it is reviewing.** `--base <ref>` (everything through the working tree), `--staged`, `--working-tree`, or a diff on stdin, and conflicting modes are refused rather than silently ordered.
+
+"Committed and uncommitted changes" is ambiguous in a way that loses work quietly: a review that omitted staged changes returns a clean result for code it never read. Each mode now pins one git invocation, and the tests pin them against a real repository with one staged and one unstaged edit — including that `--base` still covers both.
+
+**`get-rules` says what the reviewer is actually configured to do.** The merged review settings, which `.prbot.toml` was read (or why none was), exactly which keys it overrode, the full injected calibration text, and warnings for anything that failed open. No model call, so no `OPENROUTER_API_KEY`; the local scope needs no credentials at all.
+
+Until now this was answerable only by reading a deployment's environment and a repository's config side by side and merging them by hand — and the case that most needs answering was invisible, because an invalid `.prbot.toml` is applied as *nothing* and the review still looks normal. That now arrives as a `warnings` entry naming the file and the parse error.
+
+The output is an explicit allowlist of review-relevant settings, not a serialized `Config`. That is the difference between a redaction that holds and one that lasts until the next secret is added: `Config` carries four tokens and three webhook secrets today, and a serialize-everything DTO would publish the next one silently, on the day it landed, in output an agent is encouraged to print. A test sets every credential to a sentinel and asserts none of them survives into the JSON.
+
+**`review-file` returns a result instead of only posting one.** The `/review-file` PR command kept its whole implementation inside the posting path, so the only way to get a file reviewed was to have a pull request and be willing to write a comment on it. The stages — authorize the path against the repository's globs, read the file, review, apply the confidence floor and cap, render — are now shared, and `command.rs` is the posting adapter over them. A path the repository's filters exclude comes back as an `excluded` outcome rather than an error, so a caller can report it without retrying forever.
+
+The glob authorization moved to the front of the shared path rather than staying in the command that first needed it. It is what stops `/review-file .env` printing a repository's secrets into a PR comment, and it has to keep applying to every new caller.
+
+**The type generator understands tagged unions.** The new operations return discriminated unions (`FileSource`, `RepoConfigSource`, `FileReviewOutcome`, `RulesScope`), and both clients now get them as real narrowable types — a TypeScript union over literal discriminants, a Python `Union` of `TypedDict`s. Generated from the binary's own `kaniscope schema <operation>`, like everything else in `packaging/`, so a variant added in Rust and missed in a client is a diff CI fails on rather than a runtime surprise.
+
+**An agent skill ships in [`skills/kaniscope`](skills/kaniscope/SKILL.md).** One skill covering the operations rather than one per operation — the handoff this work came from warns against a set of near-identical skills, and an agent picking between four descriptions that all say "review something" picks badly.
+
+**A local review can be told what the change is meant to do.** `kaniscope --local --intent "Retry 5xx with backoff; leave 4xx alone."` (or `--intent-file`, and `change_intent` on `LocalReviewInput`) hands the reviewer a statement of intent to check the diff against, and reports where the two disagree.
+
+This is the one input a pre-PR review had no way to receive. A pull request carries its description, which `PR_BODY` has passed to the reviewer since 0.21.0 as the coverage spec's class B input — "here is what this is supposed to do, check it". A branch or a worktree carries nothing, so the same review of the same code was strictly less informed before the PR existed than after, which is backwards: earlier is when the finding is cheapest to act on. It matters more now that the caller is frequently a coding agent, which has a task statement to hand and no PR to put it in.
+
+It is untrusted data, handled exactly as a PR description is: fenced with a per-prompt unguessable marker, labelled as data, capped by `CHANGE_INTENT_MAX_CHARS` (12,000, and a clipped one says so), and composed once by the orchestrator rather than by any backend. The prompt states that the diff wins where the two disagree — an intent is written before the work is finished, so a reviewer that resolved the disagreement the other way would report the plan instead of the code. The cap matches `PR_BODY_MAX_CHARS` rather than being tighter, from that feature's own post-mortem: clipping a statement of intent manufactures the "this exceeds its stated scope" finding that the missing text refutes.
+
+Not routed through the synthesized `PrMeta.body`, which would have worked and would have made the two indistinguishable in every prompt and log downstream. A PR description is author-written prose fetched from a host; a stated intent is typed by whoever is running this review, about work that may not exist anywhere yet.
+
+**A local review now reads the checkout's own `.prbot.toml`.** It always applied on the PR path, fetched from the head commit, and silently did not apply locally — so a change reviewed before it was a PR ran under different `exclude_globs`, a different `min_confidence` and none of the repository's plain-language `instructions` than the same change five minutes later. A pre-PR review whose findings do not predict the PR's findings is worth very little, and the divergence was invisible: both runs look like an ordinary review.
+
+Read from the working tree, deliberately, to match the PR path reading the PR *head* — the version the change itself proposes. That does let a change relax the rules it is about to be reviewed under; it is equally true on the PR path, the file is in the diff where a human can see it, and a local review that read the base ref would disagree with the PR review of the same commit precisely when the change edits `.prbot.toml`. Fail-open like the remote loader: a missing, unreadable or invalid file logs and leaves the review running.
+
+**Breaking, for consumers implementing `ReviewBackend`:** `ReviewContext::pr_body` is replaced by `ReviewContext::untrusted`, a `prompt::UntrustedContext` carrying the PR description and the stated intent, each already fenced. Append `ctx.untrusted.render()` where you appended `ctx.pr_body`. `llm::review_diff`, `agent::agentic_review` and `prompt::build_user_prompt` take the same struct in place of their `pr_body_block` argument, and `prompt::PrBody` is now `prompt::UntrustedText`.
+
+The field was replaced rather than given a sibling on purpose. A backend that kept reading `pr_body` alone would have compiled fine and ignored the stated intent forever — which is the shape of the #28 incident, where the deployed claude-code backend ran for months without the calibration rules because nothing forced it to look. One struct that every backend renders means the next untrusted input reaches all of them, and breaks the build of any that does not.
+
 ## 0.31.0
 
 **A review waiting for a slot now says so on the PR.** `post_review_queued` posts an "⏳ Queued — waiting for a review slot" summary, the counterpart to the existing "Reviewing this PR…" placeholder. Upserted like every other summary, so the review replaces it in place when it starts.

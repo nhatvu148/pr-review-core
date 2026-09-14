@@ -121,6 +121,7 @@ cargo install pr-review-core --features cli     # the crate is pr-review-core; t
 kaniscope --provider github --repo me/app --pr 12 --dry-run
 kaniscope --provider github --repo me/app --pr 12 --json | jq .findingsDetail
 kaniscope --local --base main                   # review a diff that has no PR yet
+kaniscope --local --base main --intent "Retry 5xx with backoff; leave 4xx alone."
 kaniscope --schema                              # the JSON Schema of --json output
 ```
 
@@ -130,6 +131,59 @@ Prebuilt binaries ship through the registries the bots live in, so there is no t
 npm install -g kaniscope  # `kaniscope` on PATH; drop -g for a project-local install
 pip install kaniscope     # or: uv tool install kaniscope
 ```
+
+### The toolbox operations
+
+Alongside the flat flags there is an explicit operation per subcommand, for callers that are programs — a coding agent, a CI step, a wrapper client. Each prints **exactly one JSON document on stdout**, with logs on stderr, and none of them posts anything unless told to:
+
+```sh
+kaniscope review-local --base main --intent "Retry 5xx with backoff"   # or --staged / --working-tree
+kaniscope review-pr --provider github --repo me/app --pr 12            # add --post to actually post
+kaniscope review-file --path src/auth.rs                               # one whole file, never posts
+kaniscope get-rules --repo-root .                                      # no model key needed
+kaniscope get-findings --provider github --repo me/app --pr 12         # what is still open
+kaniscope resolve-findings --provider github --repo me/app --pr 12     # hand them to your edit loop
+kaniscope explain-finding --finding @- --repo-root .                   # investigate one finding
+kaniscope schema get-rules                                             # one operation's output schema
+```
+
+`get-rules` answers "why did it flag that, and why not this?" — the merged settings, which `.prbot.toml` was read and what it overrode, and the exact instructions injected into the reviewer's system prompt. It never includes credentials: the output is built from an explicit allowlist of review settings, so a secret added to the engine's configuration cannot appear in it by accident.
+
+The original flat flags (`--local`, `--provider/--repo/--pr`, `--schema`) keep working exactly as before; the subcommands are additive. The one difference worth knowing is the posting default: `--dry-run` is opt-*out* on the flat path, while `review-pr` posts only with `--post`.
+
+`get-findings` reads the findings this bot has on a pull request with their lifecycle state — open, resolved, or unmatchable — using the same fingerprint semantics reconciliation uses, not "every comment with the marker in it". A provider that cannot track that returns an explicit `unsupported` rather than an empty list, because "no open findings" is a conclusion and must never come from a question that was never asked; today that means GitHub only, since GitLab reposts its inline discussions every run and Bitbucket never carries the marker.
+
+`resolve-findings` resolves nothing — it is a handoff. It returns the selected findings with an action (`investigate`, `reverifyAgainstHead`, `alreadyResolved`, `notFound`, `needsHumanJudgement`) and says in the payload that nothing was changed. The reviewer stays read-only; your agent owns every edit.
+
+`explain-finding` investigates one finding against the real file and returns a verdict of `holds`, `doesNotHold` or `inconclusive` with its evidence and what it could not settle. A finding written against an older commit is reported as a revision mismatch rather than being silently assumed to still line up.
+
+### As an MCP server
+
+```sh
+kaniscope mcp        # newline-delimited JSON-RPC over stdio
+```
+
+Configure it **per project**, in the repository's own `.mcp.json` — never user-globally, so a checkout carries its own reviewer configuration:
+
+```json
+{
+  "mcpServers": {
+    "kaniscope": {
+      "command": "kaniscope",
+      "args": ["mcp"],
+      "env": { "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}" }
+    }
+  }
+}
+```
+
+The tools are the operations above, and they are **read-only — narrower than the CLI on purpose**. Nothing exposed over MCP can post, edit or resolve anything; `review_pr` always runs dry, and there is no flag to change that. A CLI invocation is typed by someone who sees the flags, while an MCP tool call is composed by a model and issued without a human reading the arguments, and "comment on a colleague's pull request" does not belong on the second kind of surface. Posting stays on the CLI, behind `--post`.
+
+Each tool calls the same library function the matching subcommand calls and returns the same serialized type — it is an adapter, not a second implementation, so the two cannot drift.
+
+A ready-made agent skill for these lives in [`skills/kaniscope`](skills/kaniscope/SKILL.md) — copy it into your agent's skills directory.
+
+`--local` reviews a change before it is a pull request — a branch, a worktree, staged work — through the same pipeline, and reads the checkout's own `.prbot.toml`, so the rules that will apply on the PR apply now. `--intent` (or `--intent-file`) tells it what the change is *meant* to do, which is the one input a pre-PR review otherwise has no way to receive: a PR carries its description, a working tree carries nothing. The reviewer checks the diff against it and reports the mismatches. It is handled as untrusted data — fenced, labelled, capped by `CHANGE_INTENT_MAX_CHARS`, and unable to direct the review — which matters most when the text was written by a coding agent rather than typed by hand.
 
 A project-local `npm install kaniscope` does not put the command on `PATH` — use `npx kaniscope`, or `require("kaniscope")`, which is what a bot wants regardless.
 
@@ -261,6 +315,7 @@ The tables in this section and the next cover the knobs worth a paragraph. This 
 | `PRBOT_RUN_LOG` | *(unset)* | Path to append one JSON record per review to. `-` means stdout; empty means off, so a line in an env file can disable it without being deleted. |
 | `PR_BODY` | `true` | Give the reviewer the PR's own description as a statement of intent to check the diff against. Rendered inside an untrusted fence, so it can never direct the review. |
 | `PR_BODY_MAX_CHARS` | `12000` | Cap on the description handed to the reviewer. A clipped one is marked truncated, so absence is not read as out-of-scope. |
+| `CHANGE_INTENT_MAX_CHARS` | `12000` | Cap on the stated change intent handed to the reviewer on a local review. A clipped one is marked truncated, so absence is not read as out-of-scope. |
 | `REANCHOR_FINDINGS` | `true` | Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. |
 | `REVIEW_ON_UPDATE` | `false` | Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. |
 | `REVIEW_SAMPLES` | `1` | Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. |

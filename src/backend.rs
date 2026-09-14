@@ -67,10 +67,11 @@ pub struct ReviewContext<'a> {
     pub omitted_note: Option<&'a str>,
     /// Enclosing-symbol context for changed lines, if computed.
     pub structural_context: Option<&'a str>,
-    /// The PR's own description, **already wrapped in its untrusted fence** by
-    /// [`crate::prompt::pr_body_block`], or `None` when `PR_BODY` is off, the
-    /// description is blank, or there is no PR. Append it verbatim; do not read
-    /// `meta.body` yourself.
+    /// Everything this review was given that the reviewer must read as DATA and
+    /// never obey — the PR's own description, the caller's stated intent — each
+    /// **already wrapped in its untrusted fence** by its own renderer. Append
+    /// [`crate::prompt::UntrustedContext::render`] verbatim; do not read
+    /// `meta.body` or compose a fence yourself.
     ///
     /// Composed by the orchestrator for the same reason as `injected_rules`, and
     /// after the same failure. `PR_BODY` first shipped derived inside the two
@@ -79,7 +80,15 @@ pub struct ReviewContext<'a> {
     /// its own prompt. A backend that splices `meta.body` in by hand also loses the
     /// fence, which is the part that makes author-written prose safe to show a
     /// reviewer. One composition site, handed over ready to use, is what stops both.
-    pub pr_body: Option<&'a str>,
+    ///
+    /// It is a struct rather than one `pr_body` field so that the *next* untrusted
+    /// input cannot repeat that: adding a field reaches every backend that renders
+    /// this, and breaks the build of any that reads the fields one by one. That is
+    /// why this field replaced the former `pr_body` instead of gaining a sibling:
+    /// a consumer backend that kept reading `pr_body` alone would have compiled
+    /// fine and ignored `change_intent` forever, which is precisely the failure
+    /// being designed out.
+    pub untrusted: crate::prompt::UntrustedContext<'a>,
     /// Calibration/verification rules + the consumer's `extra_system_prompt`,
     /// composed by the orchestrator (see [`crate::prompt::injected_rules`]).
     ///
@@ -187,7 +196,7 @@ impl ReviewBackend for OpenRouterBackend {
                 ctx.diff,
                 ctx.omitted_note,
                 ctx.structural_context,
-                ctx.pr_body,
+                ctx.untrusted,
                 ctx.repo,
                 &ctx.system_prompt(crate::agent::AGENT_SYSTEM_PROMPT),
                 ctx.workspace,
@@ -208,7 +217,7 @@ impl ReviewBackend for OpenRouterBackend {
                         ctx.diff,
                         ctx.omitted_note.map(str::to_string),
                         ctx.structural_context,
-                        ctx.pr_body,
+                        ctx.untrusted,
                         &diff_only,
                     )
                     .await
@@ -222,7 +231,7 @@ impl ReviewBackend for OpenRouterBackend {
                 ctx.diff,
                 ctx.omitted_note.map(str::to_string),
                 ctx.structural_context,
-                ctx.pr_body,
+                ctx.untrusted,
                 &diff_only,
             )
             .await

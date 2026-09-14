@@ -938,6 +938,65 @@ struct BotThread {
     /// is what separates "the author fixed it" from "this round did not sample
     /// it" — see `finding_could_have_been_fixed`.
     original_commit: Option<String>,
+    /// The comment's body as posted. Reconciliation only needs the fingerprint
+    /// out of it, but `list_findings` returns the prose to a caller who is going
+    /// to act on the finding and therefore has to read what it said.
+    body: String,
+}
+
+/// List the bot's findings on a pull request, with their lifecycle state.
+///
+/// Read-only. Built on the same [`bot_threads`] call reconciliation uses, for the
+/// same reason `get-rules` shares the config loaders: a second way of deciding
+/// what counts as one of this bot's findings would drift from the one that
+/// actually resolves them, and the drift would show up as an agent being told a
+/// finding is open that the next review is about to close.
+pub(crate) async fn list_findings(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+    _meta: &PrMeta,
+) -> Result<crate::findings::FindingsOutcome> {
+    use crate::findings::{FindingState, FindingsOutcome, OutstandingFinding};
+
+    let (owner, name) = repo
+        .split_once('/')
+        .context("GitHub repo must be owner/name")?;
+    let threads = bot_threads(client, cfg, owner, name, pr).await?;
+
+    let (mut active, mut resolved, mut unparseable) = (Vec::new(), Vec::new(), Vec::new());
+    for t in threads {
+        // Order matters: a thread with no fingerprint is unparseable whether or
+        // not it is resolved, because the question "which finding is this?" has
+        // no answer for it either way.
+        let state = match (&t.fp, t.is_resolved) {
+            (None, _) => FindingState::Unparseable,
+            (Some(_), true) => FindingState::Resolved,
+            (Some(_), false) => FindingState::Active,
+        };
+        let finding = OutstandingFinding {
+            fingerprint: t.fp,
+            comment_id: t.comment_id.to_string(),
+            thread_id: Some(t.id),
+            path: t.path,
+            line: t.line,
+            body: t.body,
+            state,
+            original_commit: t.original_commit,
+        };
+        match state {
+            FindingState::Active => active.push(finding),
+            FindingState::Resolved => resolved.push(finding),
+            FindingState::Unparseable => unparseable.push(finding),
+        }
+    }
+
+    Ok(FindingsOutcome::Listed {
+        active,
+        resolved,
+        unparseable,
+    })
 }
 
 /// Whether a missing finding could plausibly have been fixed since it was posted.
@@ -998,6 +1057,7 @@ async fn bot_threads(
                     path: node["path"].as_str().unwrap_or_default().to_string(),
                     line: node["line"].as_u64(),
                     original_commit: first["originalCommit"]["oid"].as_str().map(str::to_string),
+                    body: body.to_string(),
                 });
             }
         }
@@ -1398,6 +1458,7 @@ mod tests {
             path: path.to_string(),
             line,
             original_commit: None,
+            body: String::new(),
         }
     }
 
@@ -1414,6 +1475,7 @@ mod tests {
             path: "src/a.rs".into(),
             line: Some(40),
             original_commit: commit.map(str::to_string),
+            body: String::new(),
         }
     }
 

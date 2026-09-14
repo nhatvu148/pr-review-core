@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
         &diff,
         None,
         None,
-        None,
+        pr_review_core::prompt::UntrustedContext::default(),
         &system,
     )
     .await?;

@@ -53,6 +53,7 @@ const CONFIG_ENV = {
   prbotRunLog: ["PRBOT_RUN_LOG", "Path"],
   prBody: ["PR_BODY", "Bool"],
   prBodyMaxChars: ["PR_BODY_MAX_CHARS", "Int"],
+  changeIntentMaxChars: ["CHANGE_INTENT_MAX_CHARS", "Int"],
   reanchorFindings: ["REANCHOR_FINDINGS", "Bool"],
   reviewOnUpdate: ["REVIEW_ON_UPDATE", "Bool"],
   reviewSamples: ["REVIEW_SAMPLES", "Int"],

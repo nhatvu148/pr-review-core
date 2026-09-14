@@ -171,6 +171,146 @@ def test_env_none_unsets() -> None:
     del os.environ["KANISCOPE_TEST_VAR"]
 
 
+def test_intent_reaches_the_argv() -> None:
+    """The local-review intent flags must actually be passed to the binary.
+
+    A value flag missing from ``_VALUE_FLAGS`` is accepted by the signature and
+    dropped on the way out, so the caller gets a review that silently checked the
+    diff against no stated intent. That failure is invisible from the result.
+    """
+    body = (
+        '{"model":"m","findings":0,"inlinePosted":0,"posted":false,"pr":0,'
+        '"provider":"p","recommendation":"%s","repo":"r","summaryMarkdown":""}'
+    )
+    echoes = fake_binary('A="$*"\ncat <<EOF\n' + (body % "[$A]") + "\nEOF")
+    try:
+        text = kaniscope.review(
+            binary=echoes, local=True, base="main", intent="Retry 5xx with backoff"
+        )
+        check(
+            "intent reaches the argv",
+            "--intent Retry 5xx with backoff" in text["recommendation"],
+            text["recommendation"],
+        )
+
+        via_file = kaniscope.review(binary=echoes, local=True, intent_file="task.md")
+        check(
+            "intent_file reaches the argv",
+            "--intent-file task.md" in via_file["recommendation"],
+            via_file["recommendation"],
+        )
+
+        # ...and neither is invented when the caller did not ask for one.
+        without = kaniscope.review(binary=echoes, local=True, base="main")
+        check(
+            "no intent flag without an intent argument",
+            "--intent" not in without["recommendation"],
+            without["recommendation"],
+        )
+    finally:
+        os.unlink(echoes)
+
+
+def test_toolbox_operations_send_their_argv() -> None:
+    """Each toolbox operation is a separate argv shape a flag can be dropped from.
+
+    ``get_rules`` reaching the binary without ``--repo-root`` would still succeed,
+    against the wrong directory, and no assertion on the return value would catch
+    it. So assert on what the child was actually given.
+    """
+    echoes = fake_binary('A="$*"\ncat <<EOF\n{"echoed":"$A"}\nEOF')
+    try:
+        local = kaniscope.get_rules(binary=echoes, repo_root="/w")
+        check(
+            "get_rules sends the local scope",
+            local["echoed"] == "get-rules --repo-root /w",
+            local["echoed"],
+        )
+
+        remote = kaniscope.get_rules(binary=echoes, provider="github", repo="o/r", pr=12)
+        check(
+            "get_rules sends the PR scope",
+            remote["echoed"] == "get-rules --provider github --repo o/r --pr 12",
+            remote["echoed"],
+        )
+
+        f = kaniscope.review_file(binary=echoes, path="src/a.rs", repo_root="/w")
+        check(
+            "review_file sends the path and scope",
+            f["echoed"] == "review-file --path src/a.rs --repo-root /w",
+            f["echoed"],
+        )
+
+        # The findings operations. ``explain_finding`` carries its payload on
+        # stdin, and a finding that never reached the child would be explained
+        # against nothing, with only the child's own error as a clue.
+        io = fake_binary(
+            'A="$*"\nN=$(cat | wc -c | tr -d " ")\ncat <<EOF\n{"echoed":"$A","stdinBytes":$N}\nEOF'
+        )
+        try:
+            got = kaniscope.get_findings(binary=io, provider="github", repo="o/r", pr=1)
+            check(
+                "get_findings sends the PR coordinates",
+                got["echoed"] == "get-findings --provider github --repo o/r --pr 1",
+                got["echoed"],
+            )
+
+            res = kaniscope.resolve_findings(
+                binary=io, provider="github", repo="o/r", pr=1, fingerprints=["aa", "bb"]
+            )
+            check(
+                "resolve_findings repeats --fingerprint per selection",
+                res["echoed"].endswith("--fingerprint aa --fingerprint bb"),
+                res["echoed"],
+            )
+
+            exp = kaniscope.explain_finding(
+                binary=io,
+                finding={"file": "a.rs", "line": 3, "body": "x"},
+                repo_root="/w",
+                head_sha="abc",
+            )
+            check(
+                "explain_finding passes the finding on stdin, not the argv",
+                exp["echoed"] == "explain-finding --finding @- --repo-root /w --head-sha abc"
+                and exp["stdinBytes"] > 0,
+                f"{exp['echoed']} ({exp['stdinBytes']} bytes)",
+            )
+
+            raised = False
+            try:
+                kaniscope.get_findings(binary=io, repo="o/r")
+            except TypeError:
+                raised = True
+            check("get_findings without a provider is a TypeError", raised)
+        finally:
+            os.unlink(io)
+
+                # A partial PR scope is a caller error — it used to stringify the
+        # missing pieces into the argv ("--provider None"), so the binary
+        # complained about a provider named "None" and pointed at the wrong thing.
+        for partial in ({"repo": "o/r", "pr": 1}, {"provider": "github", "repo": "o/r"}, {"pr": 1}):
+            msg = ""
+            try:
+                kaniscope.get_rules(binary=echoes, **partial)
+            except TypeError as exc:
+                msg = str(exc)
+            check(
+                f"a partial PR scope is refused ({'+'.join(partial)})",
+                "needs provider, repo and pr" in msg,
+                msg or "(no error at all)",
+            )
+
+        scoped = kaniscope.schema(binary=echoes, operation="get-rules")
+        check(
+            "schema selects an operation",
+            scoped["echoed"] == "schema get-rules",
+            scoped["echoed"],
+        )
+    finally:
+        os.unlink(echoes)
+
+
 def test_diff_reaches_stdin() -> None:
     """``local=True`` with no ``base`` reads the diff from stdin.
 
@@ -266,6 +406,8 @@ if __name__ == "__main__":
     test_env_beats_config()
     test_unknown_config_key_is_rejected()
     test_diff_reaches_stdin()
+    test_intent_reaches_the_argv()
+    test_toolbox_operations_send_their_argv()
     test_nonzero_exit_carries_the_reason()
     print()
     if FAILURES:

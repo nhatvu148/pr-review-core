@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, TypedDict
+from typing import List, Literal, Optional, TypedDict, Union
 
 class _RunReviewOutputRequired(TypedDict):
     findings: int
@@ -58,3 +58,349 @@ class Usage(_UsageRequired, total=False):
     completion_tokens: Optional[int]
     prompt_tokens: Optional[int]
     total_tokens: Optional[int]
+
+
+class FileReviewOutput(TypedDict):
+    """One file review."""
+
+    outcome: FileReviewOutcome
+    path: str
+    source: FileSource
+    summaryMarkdown: str
+
+
+class FileReviewOutcomeReviewed(TypedDict):
+    """The file was read and reviewed."""
+
+    findings: List[Finding]
+    recommendation: str
+    status: Literal["reviewed"]
+    summary: str
+
+
+class FileReviewOutcomeExcluded(TypedDict):
+    """The path is excluded by this repository's review file filters."""
+
+    reason: str
+    status: Literal["excluded"]
+
+
+class FileReviewOutcomeNotFound(TypedDict):
+    """No such file at the resolved source."""
+
+    reason: str
+    status: Literal["notFound"]
+
+
+# What came of the request.
+FileReviewOutcome = Union[FileReviewOutcomeReviewed, FileReviewOutcomeExcluded, FileReviewOutcomeNotFound]
+
+
+class FileSourceLocal(TypedDict):
+    """A checkout on disk."""
+
+    kind: Literal["local"]
+    repoRoot: str
+
+
+class FileSourcePr(TypedDict):
+    """A host, at a specific ref — named, because "the file" is meaningless without saying which revision of it was read."""
+
+    gitRef: str
+    kind: Literal["pr"]
+    pr: int
+    provider: str
+    repo: str
+
+
+# Where the reviewed file was read from.
+FileSource = Union[FileSourceLocal, FileSourcePr]
+
+
+class EffectiveRules(TypedDict):
+    """Everything that shapes one review, resolved and redacted."""
+
+    injectedRules: str
+    repoConfig: RepoConfigSource
+    scope: RulesScope
+    settings: ReviewSettings
+    warnings: List[str]
+
+
+class _RepoConfigRequired(TypedDict):
+    pass
+
+
+class RepoConfig(_RepoConfigRequired, total=False):
+    """Per-repo review overrides parsed from a `.prbot.toml`."""
+
+    agentic: Optional[bool]
+    change_intent_max_chars: Optional[int]
+    ci_status: Optional[bool]
+    cve_scan: Optional[bool]
+    describe_instructions: Optional[str]
+    exclude_globs: Optional[List[str]]
+    file_bundling: Optional[bool]
+    grep_context: Optional[bool]
+    include_globs: Optional[List[str]]
+    instructions: Optional[str]
+    max_findings: Optional[int]
+    min_confidence: Optional[int]
+    model: Optional[str]
+    model_explore: Optional[str]
+    pr_body: Optional[bool]
+    pr_body_max_chars: Optional[int]
+    reanchor_findings: Optional[bool]
+    self_critique: Optional[bool]
+    suggestions: Optional[bool]
+    vendored: Optional[List[str]]
+
+
+class RepoConfigSourceUnavailable(TypedDict):
+    """Nothing to read against — no checkout, or a PR with no ref to fetch from."""
+
+    reason: str
+    status: Literal["unavailable"]
+
+
+class RepoConfigSourceAbsent(TypedDict):
+    """Looked, and the repository ships no `.prbot.toml`."""
+
+    location: str
+    status: Literal["absent"]
+
+
+class RepoConfigSourceApplied(TypedDict):
+    """Read, parsed, and merged over the environment config."""
+
+    location: str
+    overrides: RepoConfig
+    status: Literal["applied"]
+
+
+class RepoConfigSourceInvalid(TypedDict):
+    """Read, but rejected — invalid TOML or an unknown key."""
+
+    error: str
+    location: str
+    status: Literal["invalid"]
+
+
+# Where the per-repo configuration came from, and what it said.
+RepoConfigSource = Union[RepoConfigSourceUnavailable, RepoConfigSourceAbsent, RepoConfigSourceApplied, RepoConfigSourceInvalid]
+
+
+class ReviewSettings(TypedDict):
+    """The review-relevant configuration, after merging repo overrides."""
+
+    agentic: bool
+    blastMaxRefs: int
+    blastMaxSymbols: int
+    blastRadius: bool
+    changeIntentMaxChars: int
+    ciStatus: bool
+    commentMarker: str
+    complexityMetrics: bool
+    complexityMinCyclomatic: int
+    cveMaxPackages: int
+    cveScan: bool
+    diagram: bool
+    diagramMaxNodes: int
+    excludeGlobs: List[str]
+    fileBundling: bool
+    grepContext: bool
+    includeGlobs: List[str]
+    maxDiffChars: int
+    maxFindings: int
+    maxHistoryChars: int
+    maxTokens: int
+    maxTurns: int
+    minConfidence: int
+    model: str
+    modelExplore: str
+    prBody: bool
+    prBodyMaxChars: int
+    reanchorFindings: bool
+    reviewSamples: int
+    sampleLineTolerance: int
+    sampleMinAgreement: int
+    selfCritique: bool
+    structuralContext: bool
+    structuralMaxFiles: int
+    suggestions: bool
+    temperature: float
+    vendoredGlobs: List[str]
+    walkthrough: bool
+    walkthroughMaxSymbols: int
+
+
+class RulesScopeLocal(TypedDict):
+    """A checkout on disk — the pre-PR path."""
+
+    kind: Literal["local"]
+    repoRoot: str
+
+
+class RulesScopePr(TypedDict):
+    """A pull request on a host."""
+
+    kind: Literal["pr"]
+    pr: int
+    provider: str
+    repo: str
+
+
+# What the rules were resolved for.
+RulesScope = Union[RulesScopeLocal, RulesScopePr]
+
+
+class _FindingsOutputRequired(TypedDict):
+    outcome: FindingsOutcome
+    pr: int
+    provider: str
+    repo: str
+
+
+class FindingsOutput(_FindingsOutputRequired, total=False):
+    """The findings currently on one pull request."""
+
+    headSha: Optional[str]
+    revisionWarning: Optional[str]
+
+
+# Where a finding is in its lifecycle.
+FindingState = Literal["active", "resolved", "unparseable"]
+
+
+class FindingsOutcomeListed(TypedDict):
+    """The provider tracks finding lifecycle and this is what it holds."""
+
+    active: List[OutstandingFinding]
+    resolved: List[OutstandingFinding]
+    status: Literal["listed"]
+    unparseable: List[OutstandingFinding]
+
+
+class FindingsOutcomeUnsupported(TypedDict):
+    """This provider cannot answer the question, and why."""
+
+    reason: str
+    status: Literal["unsupported"]
+
+
+# Whether the provider could answer at all.
+FindingsOutcome = Union[FindingsOutcomeListed, FindingsOutcomeUnsupported]
+
+
+class _OutstandingFindingRequired(TypedDict):
+    body: str
+    commentId: str
+    path: str
+    state: FindingState
+
+
+class OutstandingFinding(_OutstandingFindingRequired, total=False):
+    """One finding as it currently exists on the pull request."""
+
+    fingerprint: Optional[str]
+    line: Optional[int]
+    originalCommit: Optional[str]
+    threadId: Optional[str]
+
+
+class _ResolveOutputRequired(TypedDict):
+    disclaimer: str
+    handoffs: List[FindingHandoff]
+    pr: int
+    provider: str
+    repo: str
+
+
+class ResolveOutput(_ResolveOutputRequired, total=False):
+    """A bundle of findings handed over for investigation."""
+
+    headSha: Optional[str]
+    unsupported: Optional[str]
+
+
+class _FindingHandoffRequired(TypedDict):
+    action: HandoffAction
+    rationale: str
+    requested: str
+
+
+class FindingHandoff(_FindingHandoffRequired, total=False):
+    """One finding, packaged for a coding agent to act on."""
+
+    finding: Optional[OutstandingFinding]
+
+
+# What a caller should do with one selected finding.
+HandoffAction = Literal["investigate", "reverifyAgainstHead", "alreadyResolved", "notFound", "needsHumanJudgement"]
+
+
+class _ExplainOutputRequired(TypedDict):
+    explanation: Explanation
+    finding: ExplainInput
+
+
+class ExplainOutput(_ExplainOutputRequired, total=False):
+    """One finding explained against a local checkout."""
+
+    revisionWarning: Optional[str]
+
+
+class _ExplainInputRequired(TypedDict):
+    body: str
+    file: str
+
+
+class ExplainInput(_ExplainInputRequired, total=False):
+    """The finding to explain."""
+
+    line: Optional[int]
+    originalCommit: Optional[str]
+    severity: Optional[str]
+
+
+class Explanation(TypedDict):
+    """A structured explanation of one finding, checked against real code."""
+
+    affectedBehavior: str
+    claim: str
+    evidence: str
+    suggestedVerification: str
+    uncertainty: str
+    verdict: ExplanationVerdict
+
+
+# What the investigation concluded.
+ExplanationVerdict = Literal["holds", "doesNotHold", "inconclusive"]
+
+
+
+__all__ = [
+    "EffectiveRules",
+    "ExplainInput",
+    "ExplainOutput",
+    "Explanation",
+    "ExplanationVerdict",
+    "FileReviewOutcome",
+    "FileReviewOutput",
+    "FileSource",
+    "Finding",
+    "FindingHandoff",
+    "FindingState",
+    "FindingsOutcome",
+    "FindingsOutput",
+    "HandoffAction",
+    "InlineComment",
+    "OutstandingFinding",
+    "RepoConfig",
+    "RepoConfigSource",
+    "ResolveOutput",
+    "ReviewSettings",
+    "RulesScope",
+    "RunReviewOutput",
+    "Usage",
+]

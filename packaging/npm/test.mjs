@@ -238,6 +238,126 @@ EOF`,
 }
 
 console.log();
+// The flags the engine gained for local review have to reach the argv, or the
+// option is accepted, does nothing, and the caller gets a review that silently
+// checked the diff against no stated intent at all. A value flag that is absent
+// from VALUE_FLAGS fails exactly that way — quietly.
+{
+  const binary = fakeBinary(
+    // Echo the argv back as the model name, so the client's own JSON parse is
+    // what reports what the child was actually given.
+    `args="$*"\ncat <<EOF\n{"model":"$args","findings":0,"inlinePosted":0,"posted":false,` +
+      `"pr":0,"provider":"p","recommendation":"r","repo":"r","summaryMarkdown":""}\nEOF`
+  );
+  const withIntent = await client.review({
+    binary,
+    local: true,
+    base: "main",
+    intent: "Retry 5xx with backoff",
+  });
+  check(
+    "intent reaches the argv",
+    withIntent.model.includes("--intent Retry 5xx with backoff"),
+    withIntent.model
+  );
+
+  const withFile = await client.review({ binary, local: true, intentFile: "task.md" });
+  check(
+    "intentFile reaches the argv",
+    withFile.model.includes("--intent-file task.md"),
+    withFile.model
+  );
+
+  // ...and neither is invented when the caller did not ask for one.
+  const without = await client.review({ binary, local: true, base: "main" });
+  check("no intent flag without an intent option", !without.model.includes("--intent"), without.model);
+}
+
+// The toolbox operations are separate argv shapes, and each is a place a flag can
+// be dropped silently. `getRules` reaching the binary without `--repo-root` would
+// still succeed — against the WRONG directory — which no assertion on the return
+// value would catch.
+{
+  const binary = fakeBinary(`args="$*"\ncat <<EOF\n{"echoed":"$args"}\nEOF`);
+
+  const local = await client.getRules({ binary, repoRoot: "/w" });
+  check("getRules sends the local scope", local.echoed === "get-rules --repo-root /w", local.echoed);
+
+  const remote = await client.getRules({ binary, provider: "github", repo: "o/r", pr: 12 });
+  check(
+    "getRules sends the PR scope",
+    remote.echoed === "get-rules --provider github --repo o/r --pr 12",
+    remote.echoed
+  );
+
+  const file = await client.reviewFile({ binary, path: "src/a.rs", repoRoot: "/w" });
+  check(
+    "reviewFile sends the path and scope",
+    file.echoed === "review-file --path src/a.rs --repo-root /w",
+    file.echoed
+  );
+
+  // A missing `path` is the caller's bug, and it must surface as one rather than
+  // as the engine complaining about a flag the caller never saw.
+  let threw = false;
+  try { await client.reviewFile({ binary }); } catch (e) { threw = e instanceof TypeError; }
+  check("reviewFile without a path is a TypeError", threw);
+
+  // The findings operations. `explainFinding` is the one with a stdin payload,
+  // and a finding that never reached the child would be explained against
+  // nothing — with the child's own error, not the client's, as the only clue.
+  const io = fakeBinary(
+    `A="$*"\nN=$(cat | wc -c | tr -d ' ')\ncat <<EOF\n{"echoed":"$A","stdinBytes":$N}\nEOF`
+  );
+  const findings = await client.getFindings({ binary: io, provider: "github", repo: "o/r", pr: 1 });
+  check(
+    "getFindings sends the PR coordinates",
+    findings.echoed === "get-findings --provider github --repo o/r --pr 1",
+    findings.echoed
+  );
+
+  const resolved = await client.resolveFindings({
+    binary: io, provider: "github", repo: "o/r", pr: 1, fingerprints: ["aa", "bb"],
+  });
+  check(
+    "resolveFindings repeats --fingerprint per selection",
+    resolved.echoed.endsWith("--fingerprint aa --fingerprint bb"),
+    resolved.echoed
+  );
+
+  const explained = await client.explainFinding({
+    binary: io, finding: { file: "a.rs", line: 3, body: "x" }, repoRoot: "/w", headSha: "abc",
+  });
+  check(
+    "explainFinding passes the finding on stdin, not the argv",
+    explained.echoed === "explain-finding --finding @- --repo-root /w --head-sha abc" &&
+      explained.stdinBytes > 0,
+    `${explained.echoed} (${explained.stdinBytes} bytes)`
+  );
+
+  // Missing PR coordinates is the caller's bug and must surface as one, rather
+  // than reaching the binary as the string "undefined".
+  let missing = false;
+  try { await client.getFindings({ binary: io, repo: "o/r" }); } catch (e) { missing = e instanceof TypeError; }
+  check("getFindings without a provider is a TypeError", missing);
+
+    // A partial PR scope is a caller error. It used to stringify the missing
+  // pieces into the argv ("--provider undefined"), so the binary complained
+  // about a provider named "undefined" and pointed at the wrong thing.
+  for (const partial of [{ repo: "o/r", pr: 1 }, { provider: "github", repo: "o/r" }, { pr: 1 }]) {
+    let msg = "";
+    try { await client.getRules({ binary, ...partial }); } catch (e) { msg = e.message; }
+    check(
+      `a partial PR scope is refused (${Object.keys(partial).join("+")})`,
+      msg.includes("needs provider, repo and pr"),
+      msg || "(no error at all)"
+    );
+  }
+
+  const scoped = await client.schema({ binary, operation: "get-rules" });
+  check("schema selects an operation", scoped.echoed === "schema get-rules", scoped.echoed);
+}
+
 if (failures.length) {
   console.error(`${failures.length} failure(s): ${failures.join(", ")}`);
   process.exit(1);

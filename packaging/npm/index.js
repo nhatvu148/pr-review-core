@@ -24,6 +24,8 @@ const VALUE_FLAGS = {
   base: "--base",
   repoRoot: "--repo-root",
   label: "--label",
+  intent: "--intent",
+  intentFile: "--intent-file",
   jsonOut: "--json-out",
 };
 
@@ -218,9 +220,137 @@ async function review(options = {}) {
 /** The JSON Schema of a {@link review} result. Needs no key and no network. */
 async function schema(options = {}) {
   const bin = options.binary || binaryPath();
-  const result = await run(bin, ["--schema"], options);
-  if (result.code !== 0) throw new Error(`kaniscope --schema failed\n${tail(result.stderr)}`);
+  // `operation` selects a per-operation schema; without it, the review output's,
+  // which is what this function has always returned.
+  const args = options.operation ? ["schema", options.operation] : ["--schema"];
+  const result = await run(bin, args, options);
+  if (result.code !== 0) throw new Error(`kaniscope schema failed\n${tail(result.stderr)}`);
   return JSON.parse(result.stdout);
+}
+
+/**
+ * Run one explicit toolbox operation and parse its single JSON document.
+ *
+ * Shared by the operations below so they cannot diverge in how they report a
+ * crash or a non-JSON stdout — the two failures a caller most needs told apart.
+ */
+async function runOperation(op, args, options) {
+  const bin = options.binary || binaryPath();
+  const result = await run(bin, [op, ...args], options);
+  if (result.code !== 0) {
+    const how = result.signal ? `killed by ${result.signal}` : `exited ${result.code}`;
+    const err = new Error(`kaniscope ${op} ${how}\n${tail(result.stderr)}`);
+    err.exitCode = result.code;
+    err.signal = result.signal;
+    err.stderr = result.stderr;
+    throw err;
+  }
+  try {
+    return JSON.parse(result.stdout);
+  } catch (cause) {
+    const err = new Error(
+      `kaniscope ${op} exited 0 but stdout was not JSON — is KANISCOPE_BINARY_PATH ` +
+        `pointing at a different program?\n${tail(result.stdout, 5)}`
+    );
+    err.cause = cause;
+    throw err;
+  }
+}
+
+/**
+ * Scope flags shared by the operations that take a checkout OR a pull request.
+ *
+ * A PARTIAL scope is a caller error and is refused here. It used to stringify
+ * whatever was missing into the argv — `--provider undefined --repo o/r` — which
+ * the binary then rejected with a message about a provider named "undefined",
+ * pointing at the wrong thing entirely. Worse, before the CLI required the full
+ * trio it would have been read as a local request and answered for the wrong
+ * scope without any error at all.
+ */
+function scopeArgs(options) {
+  const given = ["provider", "repo", "pr"].filter(
+    (k) => options[k] !== undefined && options[k] !== null
+  );
+  if (given.length === 0) {
+    return options.repoRoot ? ["--repo-root", String(options.repoRoot)] : [];
+  }
+  if (given.length !== 3) {
+    const missing = ["provider", "repo", "pr"].filter((k) => !given.includes(k));
+    throw new TypeError(
+      `kaniscope: a pull-request scope needs provider, repo and pr — missing ${missing.join(", ")}`
+    );
+  }
+  return ["--provider", String(options.provider), "--repo", String(options.repo), "--pr", String(options.pr)];
+}
+
+/**
+ * The effective review rules — merged settings, the repository's `.prbot.toml`,
+ * and the exact injected instructions.
+ *
+ * Makes no model call, so it needs no `OPENROUTER_API_KEY`. Credentials are
+ * never included in the result.
+ */
+async function getRules(options = {}) {
+  return runOperation("get-rules", scopeArgs(options), options);
+}
+
+/** PR coordinates, required by the findings operations. */
+function prArgs(options) {
+  for (const key of ["provider", "repo", "pr"]) {
+    if (options[key] === undefined || options[key] === null) {
+      throw new TypeError(`kaniscope: this operation needs \`${key}\``);
+    }
+  }
+  return ["--provider", String(options.provider), "--repo", String(options.repo), "--pr", String(options.pr)];
+}
+
+/**
+ * The findings currently on a pull request, with their lifecycle state.
+ *
+ * Read-only. Check `outcome.status` — a provider that cannot track findings
+ * returns `unsupported` rather than an empty list, because "no open findings" is
+ * a conclusion and must never come from a question that was never asked.
+ */
+async function getFindings(options = {}) {
+  return runOperation("get-findings", prArgs(options), options);
+}
+
+/**
+ * Package findings for your own edit loop. Changes nothing: Kaniscope does not
+ * edit code, post, or resolve provider threads.
+ *
+ * Omit `fingerprints` to take every active finding.
+ */
+async function resolveFindings(options = {}) {
+  const fps = (options.fingerprints || []).flatMap((fp) => ["--fingerprint", String(fp)]);
+  return runOperation("resolve-findings", [...prArgs(options), ...fps], options);
+}
+
+/**
+ * Investigate one finding against a local checkout. Never posts.
+ *
+ * The finding is passed as JSON on stdin rather than as a flag: a finding body
+ * is multi-line prose with quotes and backticks in it, which is exactly what an
+ * argv mangles.
+ */
+async function explainFinding(options = {}) {
+  if (!options.finding) throw new TypeError("kaniscope: explainFinding needs a `finding`");
+  const args = ["--finding", "@-"];
+  if (options.repoRoot) args.push("--repo-root", String(options.repoRoot));
+  if (options.headSha) args.push("--head-sha", String(options.headSha));
+  // `diff` is how `run` decides to open the child's stdin and what to write
+  // there; the name is historical and the content here is the finding, not a
+  // diff. The caller never sets it — `@-` above is what reads it.
+  return runOperation("explain-finding", args, {
+    ...options,
+    diff: JSON.stringify(options.finding),
+  });
+}
+
+/** Deep-review one complete file, locally or at a PR head. Never posts. */
+async function reviewFile(options = {}) {
+  if (!options.path) throw new TypeError("kaniscope: reviewFile needs a `path`");
+  return runOperation("review-file", ["--path", String(options.path), ...scopeArgs(options)], options);
 }
 
 /** The engine version this package's binary was built from. */
@@ -231,4 +361,14 @@ async function version(options = {}) {
   return result.stdout.trim().replace(/^kaniscope\s+/, "");
 }
 
-module.exports = { review, schema, version, binaryPath };
+module.exports = {
+  review,
+  reviewFile,
+  getRules,
+  getFindings,
+  resolveFindings,
+  explainFinding,
+  schema,
+  version,
+  binaryPath,
+};
