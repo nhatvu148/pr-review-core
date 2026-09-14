@@ -1,6 +1,37 @@
 # Changelog
 
-## Unreleased
+## 0.32.0
+
+**The engine becomes a toolbox a coding agent can drive** — explicit operations, a finding lifecycle API, and an MCP server — while staying an independent, advisory, read-only reviewer that never edits code and never posts unless told to.
+
+### Migration — every consumer this breaks
+
+`ReviewContext::pr_body` is replaced by `ReviewContext::untrusted` (`prompt::UntrustedContext`), carrying the PR description **and** a local review's stated intent, each already fenced. Append `ctx.untrusted.render()` where you appended `ctx.pr_body`. `llm::review_diff`, `agent::agentic_review` and `prompt::build_user_prompt` take the same struct in place of their `pr_body_block` argument; `prompt::PrBody` is now `prompt::UntrustedText`; `LocalReviewInput` gains `change_intent`.
+
+Replaced rather than given a sibling on purpose: a backend that kept reading `pr_body` would have compiled and ignored the new input forever — the shape of the #28 incident, where the deployed claude-code backend ran for months without the calibration rules because nothing forced it to look.
+
+What to change, by what you use:
+
+| if your code | change it to |
+|---|---|
+| reads `ctx.pr_body` in a `ReviewBackend` | `ctx.untrusted.render()`, appended verbatim |
+| destructures `ReviewContext { pr_body, .. }` | `ReviewContext { untrusted, .. }` |
+| calls `llm::review_diff` or `agent::agentic_review` | pass `UntrustedContext` in place of the `pr_body_block` argument |
+| calls `prompt::build_user_prompt` | the same |
+| constructs `LocalReviewInput` | add `change_intent: None` (or a stated intent) |
+| names `prompt::PrBody` | `prompt::UntrustedText` |
+
+A consumer that only calls `Config::from_env()`, `run_review` or `RunReviewInput` needs **no change**.
+
+Four consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — three of them needed the changes above, and only one is reachable by CI's `downstream compiles (public consumers)` job.
+
+### Behaviour changes — these ship silently
+
+Flagged separately from the API break per [Releasing](README.md#releasing) step 3: an API break fails a build and announces itself; these do not.
+
+- **A local review now reads the checkout's own `.prbot.toml`.** It never did. A repository with a config will see its `exclude_globs`, `min_confidence` and plain-language `instructions` apply to `--local` runs that previously used the deployment's settings alone — so a local review's findings can change without any code changing.
+- **`/review-file` now honours the repository config on the local path too**, for the same reason.
+- Nothing about the flat CLI flags changed. `--local`, `--provider/--repo/--pr`, `--schema`, `--config-json` and `--config-docs` parse and behave exactly as before, and a test asserts each invocation the wrapper clients build still does.
 
 **Three fixes from a live review of this change through the Claude Code backend**, which is the check compile-and-test cannot make.
 
