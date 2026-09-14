@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+A concurrent request during a sampling round trip no longer hangs the client, and the sampled review clamps an oversized diff. Both found in review of this change.
+
+The read loop that waits for a `sampling/createMessage` response dropped every message with a different id — including client *requests*, which then waited forever for a reply that was never coming. They are answered with an explicit "busy" error instead. Notifications are still dropped, which is legal, at one real cost: a `notifications/cancelled` arriving mid-sampling is not honoured, so a cancelled request runs to completion. Fixing that properly needs stdin owned by one dispatcher routing responses through a pending map, which is the right shape for a server handling concurrent tool calls and not yet worth its complexity for one that handles them serially.
+
+The sampled backend also passed the diff to the prompt builder unclamped with `truncated: false` hardcoded, where every other model-calling path applies `max_diff_chars` as a safety clamp for the residual case the packer cannot split. Skipping it mattered more here rather than less: this path bills the caller's own model, so an unbounded prompt is charged to someone who chose this backend to avoid paying twice.
+
+**The MCP server reviews through the caller's backend, and can review with no API key at all.**
+
+`mcp::serve` now takes a `ReviewBackend`. The first version hardcoded `OpenRouterBackend` at every tool that needed a model, which made the MCP surface the one part of this crate a consumer could not point at its own reviewer — in a module whose own documentation explains that a second path to the same answer is the thing to avoid. A consumer running an agent CLI could expose every operation over MCP except the ones that actually review.
+
+**With no key, the server asks the calling agent to run the model.** MCP lets a server request a completion from its host through `sampling/createMessage`; when the host is a coding agent, the reviewer runs on the agent's own model and credentials. No second key, no second subscription, no second bill for a model the caller already pays for — and because hosts surface sampling requests, a review that spends the user's tokens is one they approved.
+
+The sampled backend is not a shortcut around the rest of the pipeline: it takes its system prompt from `ctx.system_prompt`, so the orchestrator's calibration rules reach it like every other backend, and it runs the same JSON repair pass — routed back through the client, so a malformed review is salvaged on the host's model rather than suddenly needing the key this path exists to avoid. It reports its model as `mcp-sampling (client's model)` and no usage, because the host chose the model and spent the tokens; naming one would attribute findings to a model that may never have run.
+
+Backend selection is per tool, not per call. `get-rules`, `get-findings` and `resolve-findings` make no model call — needing no key is the whole point of the first — so they keep working when no reviewer is available. Only the four tools that use a model refuse, and the refusal names both ways out rather than reporting a missing `OPENROUTER_API_KEY` to someone who deliberately did not set one.
+
 ## 0.32.0
 
 **The engine becomes a toolbox a coding agent can drive** — explicit operations, a finding lifecycle API, and an MCP server — while staying an independent, advisory, read-only reviewer that never edits code and never posts unless told to.
