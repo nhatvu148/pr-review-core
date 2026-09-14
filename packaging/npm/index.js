@@ -24,6 +24,8 @@ const VALUE_FLAGS = {
   base: "--base",
   repoRoot: "--repo-root",
   label: "--label",
+  intent: "--intent",
+  intentFile: "--intent-file",
   jsonOut: "--json-out",
 };
 

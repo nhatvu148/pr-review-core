@@ -214,8 +214,8 @@ async fn run_case(cfg: &Config, client: &reqwest::Client, case: &Case, rounds: u
                 diff,
                 None,
                 None,
-                // Synthetic meta carries no PR description.
-                None,
+                // Synthetic meta carries no PR description and no stated intent.
+                pr_review_core::prompt::UntrustedContext::default(),
                 &pr_review_core::prompt::review_system_prompt(cfg),
             )
             .await

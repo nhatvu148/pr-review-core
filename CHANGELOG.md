@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+**A local review can be told what the change is meant to do.** `kaniscope --local --intent "Retry 5xx with backoff; leave 4xx alone."` (or `--intent-file`, and `change_intent` on `LocalReviewInput`) hands the reviewer a statement of intent to check the diff against, and reports where the two disagree.
+
+This is the one input a pre-PR review had no way to receive. A pull request carries its description, which `PR_BODY` has passed to the reviewer since 0.21.0 as the coverage spec's class B input — "here is what this is supposed to do, check it". A branch or a worktree carries nothing, so the same review of the same code was strictly less informed before the PR existed than after, which is backwards: earlier is when the finding is cheapest to act on. It matters more now that the caller is frequently a coding agent, which has a task statement to hand and no PR to put it in.
+
+It is untrusted data, handled exactly as a PR description is: fenced with a per-prompt unguessable marker, labelled as data, capped by `CHANGE_INTENT_MAX_CHARS` (12,000, and a clipped one says so), and composed once by the orchestrator rather than by any backend. The prompt states that the diff wins where the two disagree — an intent is written before the work is finished, so a reviewer that resolved the disagreement the other way would report the plan instead of the code. The cap matches `PR_BODY_MAX_CHARS` rather than being tighter, from that feature's own post-mortem: clipping a statement of intent manufactures the "this exceeds its stated scope" finding that the missing text refutes.
+
+Not routed through the synthesized `PrMeta.body`, which would have worked and would have made the two indistinguishable in every prompt and log downstream. A PR description is author-written prose fetched from a host; a stated intent is typed by whoever is running this review, about work that may not exist anywhere yet.
+
+**A local review now reads the checkout's own `.prbot.toml`.** It always applied on the PR path, fetched from the head commit, and silently did not apply locally — so a change reviewed before it was a PR ran under different `exclude_globs`, a different `min_confidence` and none of the repository's plain-language `instructions` than the same change five minutes later. A pre-PR review whose findings do not predict the PR's findings is worth very little, and the divergence was invisible: both runs look like an ordinary review.
+
+Read from the working tree, deliberately, to match the PR path reading the PR *head* — the version the change itself proposes. That does let a change relax the rules it is about to be reviewed under; it is equally true on the PR path, the file is in the diff where a human can see it, and a local review that read the base ref would disagree with the PR review of the same commit precisely when the change edits `.prbot.toml`. Fail-open like the remote loader: a missing, unreadable or invalid file logs and leaves the review running.
+
+**Breaking, for consumers implementing `ReviewBackend`:** `ReviewContext::pr_body` is replaced by `ReviewContext::untrusted`, a `prompt::UntrustedContext` carrying the PR description and the stated intent, each already fenced. Append `ctx.untrusted.render()` where you appended `ctx.pr_body`. `llm::review_diff`, `agent::agentic_review` and `prompt::build_user_prompt` take the same struct in place of their `pr_body_block` argument, and `prompt::PrBody` is now `prompt::UntrustedText`.
+
+The field was replaced rather than given a sibling on purpose. A backend that kept reading `pr_body` alone would have compiled fine and ignored the stated intent forever — which is the shape of the #28 incident, where the deployed claude-code backend ran for months without the calibration rules because nothing forced it to look. One struct that every backend renders means the next untrusted input reaches all of them, and breaks the build of any that does not.
+
 ## 0.31.0
 
 **A review waiting for a slot now says so on the PR.** `post_review_queued` posts an "⏳ Queued — waiting for a review slot" summary, the counterpart to the existing "Reviewing this PR…" placeholder. Upserted like every other summary, so the review replaces it in place when it starts.

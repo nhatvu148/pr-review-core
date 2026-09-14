@@ -413,6 +413,13 @@ pub const SPEC: &[ConfigVar] = &[
         doc: "Cap on the description handed to the reviewer. A clipped one is marked truncated, so absence is not read as out-of-scope.",
     },
     ConfigVar {
+        env: "CHANGE_INTENT_MAX_CHARS",
+        aliases: &[],
+        kind: ConfigKind::Int,
+        default: Some("12000"),
+        doc: "Cap on the stated change intent handed to the reviewer on a local review. A clipped one is marked truncated, so absence is not read as out-of-scope.",
+    },
+    ConfigVar {
         env: "REANCHOR_FINDINGS",
         aliases: &[],
         kind: ConfigKind::Bool,

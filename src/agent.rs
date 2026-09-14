@@ -293,9 +293,10 @@ pub async fn agentic_review(
     diff: &str,
     omitted_note: Option<&str>,
     structural_context: Option<&str>,
-    // The PR description, already fenced. Handed down rather than derived here:
-    // see `crate::backend::ReviewContext::pr_body`.
-    pr_body_block: Option<&str>,
+    // The PR description and/or the caller's stated intent, each already fenced.
+    // Handed down rather than derived here: see
+    // `crate::backend::ReviewContext::untrusted`.
+    untrusted: crate::prompt::UntrustedContext<'_>,
     ws: &Workspace,
     system_prompt: &str,
 ) -> Result<ReviewResult> {
@@ -323,9 +324,9 @@ pub async fn agentic_review(
     } else {
         format!("\n\n{blast}")
     };
-    let pr_body = pr_body_block.unwrap_or_default();
+    let untrusted = untrusted.render();
     let user = format!(
-        "Repository: {}\nPull request: #{}{}{omitted}{pr_body}{structural}{blast}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
+        "Repository: {}\nPull request: #{}{}{omitted}{untrusted}{structural}{blast}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---{}",
         meta.repo,
         meta.pr,
         meta.title.as_deref().map(|t| format!(" — {t}")).unwrap_or_default(),
@@ -582,7 +583,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -640,7 +641,10 @@ mod tests {
             DIFF,
             None,
             None,
-            block.as_deref(),
+            crate::prompt::UntrustedContext {
+                pr_body: block.as_deref(),
+                change_intent: None,
+            },
             &ws,
             &sys(&cfg),
         )
@@ -692,7 +696,10 @@ mod tests {
             DIFF,
             None,
             None,
-            block.as_deref(),
+            crate::prompt::UntrustedContext {
+                pr_body: block.as_deref(),
+                change_intent: None,
+            },
             &ws,
             &sys(&cfg),
         )
@@ -728,7 +735,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -762,7 +769,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -794,7 +801,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -835,7 +842,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -878,7 +885,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -919,7 +926,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -961,7 +968,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -988,7 +995,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -1006,7 +1013,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&same),
         )
@@ -1034,7 +1041,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -1060,7 +1067,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )
@@ -1095,7 +1102,7 @@ mod tests {
             DIFF,
             None,
             None,
-            None,
+            crate::prompt::UntrustedContext::default(),
             &ws,
             &sys(&cfg),
         )

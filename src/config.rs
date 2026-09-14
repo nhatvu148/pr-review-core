@@ -143,6 +143,22 @@ pub struct Config {
     /// that path, it does not remove the need for the note.
     pub pr_body_max_chars: usize,
 
+    /// Max characters of caller-stated change intent handed to the reviewer on a
+    /// local review (see [`crate::prompt::change_intent_block`]).
+    ///
+    /// Its own knob rather than a second use of [`Config::pr_body_max_chars`]:
+    /// the two inputs have different provenance, and a repository tuning the cap
+    /// on its PR descriptions must not silently move the cap on what a developer
+    /// types at the command line.
+    ///
+    /// Same default as `pr_body_max_chars`, from the same post-mortem. That cap
+    /// was 4,000 and it manufactured a false positive by clipping the sentence
+    /// that refuted the finding — text the reviewer compares the diff *against*
+    /// fails differently from a clipped diff, so a tight cap is not the
+    /// conservative choice it looks like. An agent handing over a plan is if
+    /// anything likelier to run long than a PR author is.
+    pub change_intent_max_chars: usize,
+
     /// Let the agentic reviewer's `grep` tool return N lines of context around
     /// each match. Off restores the previous behaviour exactly (bare matching
     /// lines), which is what makes this A/B-able.
@@ -391,6 +407,9 @@ impl Config {
             pr_body_max_chars: env_or("PR_BODY_MAX_CHARS", "12000")
                 .parse()
                 .unwrap_or(12000),
+            change_intent_max_chars: env_or("CHANGE_INTENT_MAX_CHARS", "12000")
+                .parse()
+                .unwrap_or(12000),
             grep_context: env_or("GREP_CONTEXT", "true").parse().unwrap_or(true),
 
             structural_context: env_or("STRUCTURAL_CONTEXT", "true").parse().unwrap_or(true),
@@ -474,6 +493,9 @@ impl Config {
         }
         if let Some(v) = rc.pr_body_max_chars {
             cfg.pr_body_max_chars = v;
+        }
+        if let Some(v) = rc.change_intent_max_chars {
+            cfg.change_intent_max_chars = v;
         }
         if let Some(v) = rc.grep_context {
             cfg.grep_context = v;
@@ -567,6 +589,21 @@ mod tests {
     /// A repo whose PRs carry long descriptions can raise its own cap without an
     /// env change, a restart, or a deploy — which is the point, since clipping a
     /// description is what made the reviewer assert a diff exceeded its scope.
+    /// A repo's cap on stated intent overrides the env one, and an absent key
+    /// leaves it alone — the same contract as every other per-repo knob.
+    #[test]
+    fn a_repo_can_tune_the_change_intent_cap() {
+        let base = Config::from_env();
+        let rc = crate::repo_config::parse("change_intent_max_chars = 4321").unwrap();
+        assert_eq!(base.with_repo_overrides(&rc).change_intent_max_chars, 4321);
+
+        let bare = crate::repo_config::parse("min_confidence = 60").unwrap();
+        assert_eq!(
+            base.with_repo_overrides(&bare).change_intent_max_chars,
+            base.change_intent_max_chars
+        );
+    }
+
     #[test]
     fn a_repo_can_tune_the_pr_body_and_grep_context_knobs() {
         let base = Config::from_env();

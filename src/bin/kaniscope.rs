@@ -19,6 +19,11 @@
 //! kaniscope --local --base main
 //! git diff --staged | kaniscope --local
 //!
+//! # --intent says what the change is MEANT to do, so the reviewer can check the
+//! # diff against it — the local stand-in for a PR description.
+//! kaniscope --local --base main --intent "Retry 5xx with backoff; leave 4xx alone."
+//! kaniscope --local --base main --intent-file task.md
+//!
 //! # The JSON Schema of the output, for generating typed clients.
 //! kaniscope --schema
 //! ```
@@ -60,6 +65,25 @@ struct Args {
     /// current branch name.
     #[arg(long)]
     label: Option<String>,
+    /// With --local: what this change is MEANT to do — the task you set out to
+    /// do, or the instruction you gave a coding agent. The reviewer checks the
+    /// diff against it, the way it checks a PR against its description.
+    ///
+    /// Treated as untrusted data: it is fenced and labelled before it reaches the
+    /// model, states what the change should do, and cannot direct the review.
+    #[arg(long, conflicts_with = "intent_file")]
+    intent: Option<String>,
+    /// With --local: read --intent from this file.
+    ///
+    /// A task statement worth writing is usually longer than a comfortable shell
+    /// argument and often already exists as a file — an issue body, a plan, an
+    /// agent's task description. Mutually exclusive with `--intent`: two sources
+    /// for one input is a silent-precedence bug waiting to happen.
+    ///
+    /// No `-` for stdin, deliberately: stdin is already how `--local` receives a
+    /// diff, and one pipe cannot carry both.
+    #[arg(long = "intent-file", value_name = "PATH", conflicts_with = "intent")]
+    intent_file: Option<PathBuf>,
     /// github | gitlab | bitbucket (PR mode)
     #[arg(long)]
     provider: Option<String>,
@@ -184,6 +208,16 @@ async fn main() -> anyhow::Result<()> {
         }
         run_local(&cfg, &args).await?
     } else {
+        // Refused rather than ignored, for the same reason as the check above. A
+        // pull request states its intent in its description, which the reviewer
+        // already reads; accepting `--intent` here would look like it worked and
+        // change nothing about the review.
+        if args.intent.is_some() || args.intent_file.is_some() {
+            anyhow::bail!(
+                "--intent/--intent-file describe a local change — a PR's intent is \
+                 its description, which the reviewer already reads (PR_BODY)"
+            );
+        }
         let (provider, repo, pr) = match (&args.provider, &args.repo, args.pr) {
             (Some(p), Some(r), Some(n)) => (p.clone(), r.clone(), n),
             _ => anyhow::bail!(
@@ -365,10 +399,40 @@ async fn run_local(cfg: &Config, args: &Args) -> anyhow::Result<RunReviewOutput>
             diff,
             repo_root: Some(root),
             label,
+            change_intent: change_intent(args)?,
         },
         &OpenRouterBackend,
     )
     .await
+}
+
+/// The caller's stated intent for this change: `--intent` verbatim, `--intent-file`
+/// read from disk, or `None`.
+///
+/// Clap enforces that at most one is set (`conflicts_with`), so this does not
+/// re-check it; what it does own is the failure mode of the file. An unreadable
+/// `--intent-file` is an ERROR rather than a silent `None`: the intent shapes what
+/// the review checks the diff against, so a typo'd path that degraded to "no
+/// intent" would return a review that looks complete and quietly answered a
+/// different question. The one case where losing it is invisible is the one case
+/// worth being loud about.
+///
+/// Blank content is not an error — an empty file is a legible way to say "no
+/// intent", and `change_intent_block` drops whitespace-only text anyway.
+fn change_intent(args: &Args) -> anyhow::Result<Option<String>> {
+    use anyhow::Context;
+
+    if let Some(text) = &args.intent {
+        return Ok(Some(text.clone()));
+    }
+    match &args.intent_file {
+        Some(path) => {
+            Ok(Some(std::fs::read_to_string(path).with_context(|| {
+                format!("reading --intent-file {}", path.display())
+            })?))
+        }
+        None => Ok(None),
+    }
 }
 
 /// A branch name from `git rev-parse --abbrev-ref HEAD`, or `None` when there
@@ -459,7 +523,8 @@ fn run_token() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{tmp_sibling, usable_branch};
+    use super::{change_intent, tmp_sibling, usable_branch, Args};
+    use clap::Parser;
     use std::path::Path;
 
     #[test]
@@ -516,6 +581,145 @@ mod tests {
             "posted",
         ] {
             assert!(props.contains_key(field), "schema is missing {field}");
+        }
+    }
+
+    /// Two sources for one input is a silent-precedence bug waiting to happen, so
+    /// clap refuses the pair rather than letting one quietly win.
+    #[test]
+    fn intent_text_and_intent_file_are_mutually_exclusive() {
+        let err = Args::try_parse_from([
+            "kaniscope",
+            "--local",
+            "--base",
+            "main",
+            "--intent",
+            "do the thing",
+            "--intent-file",
+            "task.md",
+        ])
+        .map(|_| ())
+        .expect_err("two intent sources must be refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    /// Either one alone is fine, and `--intent` takes prose containing anything —
+    /// it is a sentence a developer types, not a token.
+    #[test]
+    fn either_intent_source_alone_parses() {
+        let text = Args::try_parse_from([
+            "kaniscope",
+            "--local",
+            "--base",
+            "main",
+            "--intent",
+            "Retry 5xx with backoff; leave 4xx alone.",
+        ])
+        .expect("--intent alone is valid");
+        assert_eq!(
+            text.intent.as_deref(),
+            Some("Retry 5xx with backoff; leave 4xx alone.")
+        );
+        assert!(text.intent_file.is_none());
+
+        let file = Args::try_parse_from(["kaniscope", "--local", "--intent-file", "task.md"])
+            .expect("--intent-file alone is valid");
+        assert_eq!(file.intent_file.as_deref(), Some(Path::new("task.md")));
+        assert!(file.intent.is_none());
+    }
+
+    /// An unreadable `--intent-file` fails the run. Degrading to "no intent" would
+    /// return a review that looks complete and quietly checked the diff against
+    /// nothing — the one way of losing this input that a caller cannot see.
+    #[test]
+    fn an_unreadable_intent_file_is_an_error_not_a_silent_absence() {
+        let args = Args::try_parse_from([
+            "kaniscope",
+            "--local",
+            "--intent-file",
+            "/nonexistent/task.md",
+        ])
+        .expect("parses");
+        let err = change_intent(&args).expect_err("a missing intent file must fail the run");
+        assert!(
+            err.to_string().contains("/nonexistent/task.md"),
+            "the error should name the path: {err}"
+        );
+    }
+
+    /// An empty file is a legible way to say "no intent" — it is read, and the
+    /// blank text is dropped downstream rather than erroring here.
+    #[test]
+    fn an_empty_intent_file_is_read_not_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("task.md");
+        std::fs::write(&path, "   \n").expect("write");
+
+        let args = Args::try_parse_from([
+            "kaniscope",
+            "--local",
+            "--intent-file",
+            path.to_str().unwrap(),
+        ])
+        .expect("parses");
+        assert_eq!(
+            change_intent(&args).expect("reads"),
+            Some("   \n".to_string())
+        );
+    }
+
+    /// No intent given, nothing invented.
+    #[test]
+    fn no_intent_flag_means_no_intent() {
+        let args =
+            Args::try_parse_from(["kaniscope", "--local", "--base", "main"]).expect("parses");
+        assert_eq!(change_intent(&args).expect("no error"), None);
+    }
+
+    /// The npm and PyPI clients build these argv strings, and a bot in production
+    /// runs one of them. New flags must not change what the existing ones mean.
+    #[test]
+    fn the_invocations_the_wrapper_clients_build_still_parse() {
+        let pr = Args::try_parse_from([
+            "kaniscope",
+            "--json",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "12",
+            "--dry-run",
+        ])
+        .expect("the PR invocation still parses");
+        assert_eq!(pr.provider.as_deref(), Some("github"));
+        assert_eq!(pr.pr, Some(12));
+        assert!(pr.dry_run && pr.json && !pr.local);
+        assert!(pr.intent.is_none() && pr.intent_file.is_none());
+
+        let local = Args::try_parse_from([
+            "kaniscope",
+            "--json",
+            "--local",
+            "--base",
+            "main",
+            "--repo-root",
+            "/w",
+            "--label",
+            "feat/x",
+            "--json-out",
+            "out.json",
+        ])
+        .expect("the local invocation still parses");
+        assert!(local.local);
+        assert_eq!(local.base.as_deref(), Some("main"));
+        assert_eq!(local.label.as_deref(), Some("feat/x"));
+        assert_eq!(local.json_out.as_deref(), Some(Path::new("out.json")));
+
+        // The no-argument doors both clients also use.
+        for flag in ["--schema", "--config-json", "--config-docs", "--local"] {
+            Args::try_parse_from(["kaniscope", flag])
+                .unwrap_or_else(|e| panic!("{flag} must still parse: {e}"));
         }
     }
 }

@@ -274,10 +274,10 @@ pub async fn review_diff(
     diff: &str,
     omitted_note: Option<String>,
     structural_context: Option<&str>,
-    // The PR description, already fenced by `prompt::untrusted_pr_body_block`.
-    // Built once by the orchestrator and handed down — see
-    // `crate::backend::ReviewContext::pr_body`.
-    pr_body_block: Option<&str>,
+    // The PR description and/or the caller's stated intent, each already fenced
+    // by its own renderer. Built once by the orchestrator and handed down — see
+    // `crate::backend::ReviewContext::untrusted`.
+    untrusted: crate::prompt::UntrustedContext<'_>,
     system_prompt: &str,
 ) -> Result<ReviewResult> {
     require(&cfg.openrouter_api_key, "OPENROUTER_API_KEY")?;
@@ -308,7 +308,7 @@ pub async fn review_diff(
                     truncated,
                     omitted_note.as_deref(),
                     structural_context,
-                    pr_body_block,
+                    untrusted,
                 ),
             },
         ],
@@ -516,7 +516,14 @@ pub async fn answer_question(
     // No PR body: `/ask` is answering the asker's question, not checking the
     // author's claim, so the description buys nothing and would add a second
     // untrusted channel to a prompt that already takes free-form input.
-    let context = build_user_prompt(meta, &clipped, truncated, None, structural_context, None);
+    let context = build_user_prompt(
+        meta,
+        &clipped,
+        truncated,
+        None,
+        structural_context,
+        crate::prompt::UntrustedContext::default(),
+    );
     let user = format!("{context}\n\n--- QUESTION ---\n{}", question.trim());
     let system = if cfg.extra_system_prompt.is_empty() {
         ASK_SYSTEM_PROMPT.to_string()
@@ -543,7 +550,14 @@ pub async fn describe_pr(
     // No PR body, deliberately: this prompt WRITES the description. Handing it the
     // existing one makes the model restate it instead of describing the diff, and
     // `command::merge_description` already preserves the human-written parts.
-    let user = build_user_prompt(meta, &clipped, truncated, None, structural_context, None);
+    let user = build_user_prompt(
+        meta,
+        &clipped,
+        truncated,
+        None,
+        structural_context,
+        crate::prompt::UntrustedContext::default(),
+    );
     // The consumer's conventions and any `describe_instructions` are applied here
     // rather than at the call site, so every caller of `/describe` gets them —
     // this prompt was the one place in the crate that ignored both.

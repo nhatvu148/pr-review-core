@@ -99,6 +99,8 @@ _VALUE_FLAGS = {
     "base": "--base",
     "repo_root": "--repo-root",
     "label": "--label",
+    "intent": "--intent",
+    "intent_file": "--intent-file",
     "json_out": "--json-out",
 }
 
@@ -182,6 +184,8 @@ def review(
     base: Optional[str] = None,
     repo_root: Optional[str] = None,
     label: Optional[str] = None,
+    intent: Optional[str] = None,
+    intent_file: Optional[str] = None,
     json_out: Optional[str] = None,
     diff: Optional[str] = None,
     config: Optional[ReviewConfig] = None,
@@ -204,6 +208,12 @@ def review(
     wins. That ordering is deliberate: ``config`` cannot model everything and can
     model something wrongly, and an escape hatch is only an escape hatch if it
     wins. Both are merged over ``os.environ`` unless ``inherit_env=False``.
+
+    ``intent`` (or ``intent_file``, which is mutually exclusive with it) says
+    what a ``local=True`` change is MEANT to do, so the reviewer can check the
+    diff against it the way it checks a PR against its description. It is treated
+    as untrusted data: fenced and labelled before it reaches the model, and unable
+    to direct the review.
 
     Keyword-only on purpose: ``provider``/``repo``/``pr`` are three adjacent
     values of which two are strings, and a positional call that swapped them
@@ -256,6 +266,8 @@ async def review_async(
     base: Optional[str] = None,
     repo_root: Optional[str] = None,
     label: Optional[str] = None,
+    intent: Optional[str] = None,
+    intent_file: Optional[str] = None,
     json_out: Optional[str] = None,
     diff: Optional[str] = None,
     config: Optional[ReviewConfig] = None,

@@ -238,6 +238,41 @@ EOF`,
 }
 
 console.log();
+// The flags the engine gained for local review have to reach the argv, or the
+// option is accepted, does nothing, and the caller gets a review that silently
+// checked the diff against no stated intent at all. A value flag that is absent
+// from VALUE_FLAGS fails exactly that way — quietly.
+{
+  const binary = fakeBinary(
+    // Echo the argv back as the model name, so the client's own JSON parse is
+    // what reports what the child was actually given.
+    `args="$*"\ncat <<EOF\n{"model":"$args","findings":0,"inlinePosted":0,"posted":false,` +
+      `"pr":0,"provider":"p","recommendation":"r","repo":"r","summaryMarkdown":""}\nEOF`
+  );
+  const withIntent = await client.review({
+    binary,
+    local: true,
+    base: "main",
+    intent: "Retry 5xx with backoff",
+  });
+  check(
+    "intent reaches the argv",
+    withIntent.model.includes("--intent Retry 5xx with backoff"),
+    withIntent.model
+  );
+
+  const withFile = await client.review({ binary, local: true, intentFile: "task.md" });
+  check(
+    "intentFile reaches the argv",
+    withFile.model.includes("--intent-file task.md"),
+    withFile.model
+  );
+
+  // ...and neither is invented when the caller did not ask for one.
+  const without = await client.review({ binary, local: true, base: "main" });
+  check("no intent flag without an intent option", !without.model.includes("--intent"), without.model);
+}
+
 if (failures.length) {
   console.error(`${failures.length} failure(s): ${failures.join(", ")}`);
   process.exit(1);

@@ -121,6 +121,7 @@ cargo install pr-review-core --features cli     # the crate is pr-review-core; t
 kaniscope --provider github --repo me/app --pr 12 --dry-run
 kaniscope --provider github --repo me/app --pr 12 --json | jq .findingsDetail
 kaniscope --local --base main                   # review a diff that has no PR yet
+kaniscope --local --base main --intent "Retry 5xx with backoff; leave 4xx alone."
 kaniscope --schema                              # the JSON Schema of --json output
 ```
 
@@ -130,6 +131,8 @@ Prebuilt binaries ship through the registries the bots live in, so there is no t
 npm install -g kaniscope  # `kaniscope` on PATH; drop -g for a project-local install
 pip install kaniscope     # or: uv tool install kaniscope
 ```
+
+`--local` reviews a change before it is a pull request — a branch, a worktree, staged work — through the same pipeline, and reads the checkout's own `.prbot.toml`, so the rules that will apply on the PR apply now. `--intent` (or `--intent-file`) tells it what the change is *meant* to do, which is the one input a pre-PR review otherwise has no way to receive: a PR carries its description, a working tree carries nothing. The reviewer checks the diff against it and reports the mismatches. It is handled as untrusted data — fenced, labelled, capped by `CHANGE_INTENT_MAX_CHARS`, and unable to direct the review — which matters most when the text was written by a coding agent rather than typed by hand.
 
 A project-local `npm install kaniscope` does not put the command on `PATH` — use `npx kaniscope`, or `require("kaniscope")`, which is what a bot wants regardless.
 
@@ -261,6 +264,7 @@ The tables in this section and the next cover the knobs worth a paragraph. This 
 | `PRBOT_RUN_LOG` | *(unset)* | Path to append one JSON record per review to. `-` means stdout; empty means off, so a line in an env file can disable it without being deleted. |
 | `PR_BODY` | `true` | Give the reviewer the PR's own description as a statement of intent to check the diff against. Rendered inside an untrusted fence, so it can never direct the review. |
 | `PR_BODY_MAX_CHARS` | `12000` | Cap on the description handed to the reviewer. A clipped one is marked truncated, so absence is not read as out-of-scope. |
+| `CHANGE_INTENT_MAX_CHARS` | `12000` | Cap on the stated change intent handed to the reviewer on a local review. A clipped one is marked truncated, so absence is not read as out-of-scope. |
 | `REANCHOR_FINDINGS` | `true` | Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. |
 | `REVIEW_ON_UPDATE` | `false` | Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. |
 | `REVIEW_SAMPLES` | `1` | Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. |

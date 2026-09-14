@@ -171,6 +171,46 @@ def test_env_none_unsets() -> None:
     del os.environ["KANISCOPE_TEST_VAR"]
 
 
+def test_intent_reaches_the_argv() -> None:
+    """The local-review intent flags must actually be passed to the binary.
+
+    A value flag missing from ``_VALUE_FLAGS`` is accepted by the signature and
+    dropped on the way out, so the caller gets a review that silently checked the
+    diff against no stated intent. That failure is invisible from the result.
+    """
+    body = (
+        '{"model":"m","findings":0,"inlinePosted":0,"posted":false,"pr":0,'
+        '"provider":"p","recommendation":"%s","repo":"r","summaryMarkdown":""}'
+    )
+    echoes = fake_binary('A="$*"\ncat <<EOF\n' + (body % "[$A]") + "\nEOF")
+    try:
+        text = kaniscope.review(
+            binary=echoes, local=True, base="main", intent="Retry 5xx with backoff"
+        )
+        check(
+            "intent reaches the argv",
+            "--intent Retry 5xx with backoff" in text["recommendation"],
+            text["recommendation"],
+        )
+
+        via_file = kaniscope.review(binary=echoes, local=True, intent_file="task.md")
+        check(
+            "intent_file reaches the argv",
+            "--intent-file task.md" in via_file["recommendation"],
+            via_file["recommendation"],
+        )
+
+        # ...and neither is invented when the caller did not ask for one.
+        without = kaniscope.review(binary=echoes, local=True, base="main")
+        check(
+            "no intent flag without an intent argument",
+            "--intent" not in without["recommendation"],
+            without["recommendation"],
+        )
+    finally:
+        os.unlink(echoes)
+
+
 def test_diff_reaches_stdin() -> None:
     """``local=True`` with no ``base`` reads the diff from stdin.
 
@@ -266,6 +306,7 @@ if __name__ == "__main__":
     test_env_beats_config()
     test_unknown_config_key_is_rejected()
     test_diff_reaches_stdin()
+    test_intent_reaches_the_argv()
     test_nonzero_exit_carries_the_reason()
     print()
     if FAILURES:

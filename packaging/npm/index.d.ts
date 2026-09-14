@@ -49,6 +49,17 @@ export interface ReviewOptions extends SpawnOptions {
   repoRoot?: string;
   /** With {@link local}: what to call this change. Defaults to the branch name. */
   label?: string;
+  /**
+   * With {@link local}: what this change is MEANT to do — the task, or the
+   * instruction given to a coding agent. The reviewer checks the diff against
+   * it, the way it checks a PR against its description.
+   *
+   * Treated as untrusted data: fenced and labelled before it reaches the model,
+   * and unable to direct the review. Mutually exclusive with {@link intentFile}.
+   */
+  intent?: string;
+  /** With {@link local}: read {@link intent} from this file instead. */
+  intentFile?: string;
   /** Also write the result as JSON to this path, atomically. */
   jsonOut?: string;
   /**

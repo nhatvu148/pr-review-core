@@ -53,6 +53,14 @@ pub struct RepoConfig {
     /// the higher cap should be able to set it without an env change, a restart,
     /// or a conversation with whoever owns the service.
     pub pr_body_max_chars: Option<usize>,
+    /// Cap on the stated change intent handed to the reviewer on a local review,
+    /// for this repo.
+    ///
+    /// Per-repo for the same reason as `pr_body_max_chars`, and reachable on this
+    /// path because a local review now reads the working tree's `.prbot.toml` —
+    /// the whole point of which is that a change gets reviewed under its own
+    /// repository's rules before it is a PR.
+    pub change_intent_max_chars: Option<usize>,
     /// Let the agentic reviewer's `grep` return context lines around each match,
     /// for this repo.
     pub grep_context: Option<bool>,
@@ -100,6 +108,20 @@ mod tests {
         assert_eq!(bare.pr_body_max_chars, None);
         assert_eq!(bare.pr_body, None);
         assert_eq!(bare.grep_context, None);
+    }
+
+    /// The local review path reads this file too now, and its cap is the one knob
+    /// that only that path uses — so a repo must be able to set it without the
+    /// unknown-key rejection turning a valid file into no config at all.
+    #[test]
+    fn parses_the_change_intent_cap() {
+        let rc = parse("change_intent_max_chars = 4321").unwrap();
+        assert_eq!(rc.change_intent_max_chars, Some(4321));
+        // Absent stays absent, so it cannot clobber the env value.
+        assert!(parse("min_confidence = 60")
+            .unwrap()
+            .change_intent_max_chars
+            .is_none());
     }
 
     #[test]
