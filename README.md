@@ -171,11 +171,20 @@ Configure it **per project**, in the repository's own `.mcp.json` — never user
     "kaniscope": {
       "command": "kaniscope",
       "args": ["mcp"],
-      "env": { "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}" }
+      "env": {
+        "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}",
+        "GH_TOKEN": "${GH_TOKEN:-}"
+      }
     }
   }
 }
 ```
+
+Both values are **referenced from the environment, never written into the file** — `.mcp.json` is committed, and a key pasted into it is a key in your git history.
+
+`GH_TOKEN` is optional, hence the `:-` default: `review_local`, `review_file` on a local path and `get_rules` on a checkout need no provider token at all. The PR-scoped tools — `get_findings`, `resolve_findings`, `review_pr` — do, and without it they fail at the provider call rather than at startup. Use the variable your provider reads (`GH_TOKEN`, `GITLAB_TOKEN`, `BITBUCKET_TOKEN`).
+
+`command` assumes `kaniscope` is on `PATH` — see [Using it without Rust](#using-it-without-rust--cli-python-typescript) above. Point it at an absolute path instead if you keep the binary somewhere else.
 
 The tools are the operations above, and they are **read-only — narrower than the CLI on purpose**. Nothing exposed over MCP can post, edit or resolve anything; `review_pr` always runs dry, and there is no flag to change that. A CLI invocation is typed by someone who sees the flags, while an MCP tool call is composed by a model and issued without a human reading the arguments, and "comment on a colleague's pull request" does not belong on the second kind of surface. Posting stays on the CLI, behind `--post`.
 
