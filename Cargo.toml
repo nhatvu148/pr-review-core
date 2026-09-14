@@ -31,6 +31,20 @@ path = "src/bin/kaniscope.rs"
 # `--features cli`, so no end user ever types this.
 required-features = ["cli"]
 
+# This suite spawns the `kaniscope` binary, which is `required-features = ["cli"]`
+# — so without that feature the binary is never built and every test here fails at
+# runtime on a missing executable. Declaring the same requirement makes cargo SKIP
+# the target instead, so a plain `cargo test` stays green for a contributor who has
+# not opted into the CLI feature.
+#
+# Worth stating because the failure is not the one you would guess: cargo still
+# defines `CARGO_BIN_EXE_kaniscope` and the target still compiles. It points at a
+# path nothing wrote, so the breakage surfaces as seven confusing test failures
+# rather than a build error naming the cause.
+[[test]]
+name = "mcp_protocol"
+required-features = ["cli"]
+
 [features]
 default = []
 # Everything the `kaniscope` binary needs and the library does not.

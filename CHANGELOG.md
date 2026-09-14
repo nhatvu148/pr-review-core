@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+The protocol suite declares `required-features = ["cli"]`, so a plain `cargo test` skips it rather than failing. It spawns the `kaniscope` binary, which only exists with that feature — without the declaration, cargo still defines `CARGO_BIN_EXE_kaniscope` and still compiles the target, so the breakage surfaced as seven confusing runtime failures on a missing executable rather than a build error naming the cause.
+
 **The MCP server is tested over its real transport.** `tests/mcp_protocol.rs` spawns the built binary and speaks newline-delimited JSON-RPC to it, as a host would.
 
 Every existing test called the module's functions directly, which covers the decisions — which tool, which backend, what refusal — and cannot cover what those decisions travel over. Two bugs found by hand while building this, a client that hung when it sent a request mid-sampling and a parse error written but never flushed, were both invisible to the unit tests and are both caught here.

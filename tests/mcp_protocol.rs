@@ -224,24 +224,34 @@ fn a_notification_is_not_answered() {
 fn malformed_input_is_answered_rather_than_swallowed() {
     let mut host = Host::start(json!({}));
 
-    host.send(json!("this is valid JSON but not a JSON-RPC object"));
+    // Genuinely unparseable, both of them. An earlier version opened with a valid
+    // JSON string — which parses fine, carries no `id`, and is therefore dropped as
+    // a notification, so it never reached the -32700 path this test claims to
+    // check. The assertion passed on the second line alone and the first proved
+    // nothing. (That a valid-JSON message with no id is dropped is real behaviour,
+    // and `a_notification_is_not_answered` is where it belongs.)
     host.stdin.write_all(b"{ not json at all\n").expect("write");
+    host.stdin.write_all(b"}{ also not json\n").expect("write");
     host.stdin.flush().expect("flush");
 
     host.send(json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/list" }));
 
     // Parse errors may arrive first; the server must still reach our request.
-    let mut seen_parse_error = false;
+    let mut parse_errors = 0;
     loop {
         let message = host.read();
         if message["id"] == json!(9) {
             break;
         }
         if message["error"]["code"] == json!(-32700) {
-            seen_parse_error = true;
+            parse_errors += 1;
         }
     }
-    assert!(seen_parse_error, "the unparseable line was never reported");
+    assert_eq!(
+        parse_errors, 2,
+        "each unparseable line must be reported, and flushed — a written-but-buffered \
+         error is one a client on a pipe waits for forever"
+    );
 }
 
 /// `get_rules` answers with no model key and no sampling — that is its whole
