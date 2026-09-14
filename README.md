@@ -132,6 +132,24 @@ npm install -g kaniscope  # `kaniscope` on PATH; drop -g for a project-local ins
 pip install kaniscope     # or: uv tool install kaniscope
 ```
 
+### The toolbox operations
+
+Alongside the flat flags there is an explicit operation per subcommand, for callers that are programs — a coding agent, a CI step, a wrapper client. Each prints **exactly one JSON document on stdout**, with logs on stderr, and none of them posts anything unless told to:
+
+```sh
+kaniscope review-local --base main --intent "Retry 5xx with backoff"   # or --staged / --working-tree
+kaniscope review-pr --provider github --repo me/app --pr 12            # add --post to actually post
+kaniscope review-file --path src/auth.rs                               # one whole file, never posts
+kaniscope get-rules --repo-root .                                      # no model key needed
+kaniscope schema get-rules                                             # one operation's output schema
+```
+
+`get-rules` answers "why did it flag that, and why not this?" — the merged settings, which `.prbot.toml` was read and what it overrode, and the exact instructions injected into the reviewer's system prompt. It never includes credentials: the output is built from an explicit allowlist of review settings, so a secret added to the engine's configuration cannot appear in it by accident.
+
+The original flat flags (`--local`, `--provider/--repo/--pr`, `--schema`) keep working exactly as before; the subcommands are additive. The one difference worth knowing is the posting default: `--dry-run` is opt-*out* on the flat path, while `review-pr` posts only with `--post`.
+
+A ready-made agent skill for these lives in [`skills/kaniscope`](skills/kaniscope/SKILL.md) — copy it into your agent's skills directory.
+
 `--local` reviews a change before it is a pull request — a branch, a worktree, staged work — through the same pipeline, and reads the checkout's own `.prbot.toml`, so the rules that will apply on the PR apply now. `--intent` (or `--intent-file`) tells it what the change is *meant* to do, which is the one input a pre-PR review otherwise has no way to receive: a PR carries its description, a working tree carries nothing. The reviewer checks the diff against it and reports the mismatches. It is handled as untrusted data — fenced, labelled, capped by `CHANGE_INTENT_MAX_CHARS`, and unable to direct the review — which matters most when the text was written by a coding agent rather than typed by hand.
 
 A project-local `npm install kaniscope` does not put the command on `PATH` — use `npx kaniscope`, or `require("kaniscope")`, which is what a bot wants regardless.

@@ -42,6 +42,137 @@ use pr_review_core::review::{
     run_review, run_review_local, LocalReviewInput, RunReviewInput, RunReviewOutput,
 };
 
+/// The toolbox surface: one explicit operation per subcommand.
+///
+/// Added alongside the original flat flags rather than replacing them. Those
+/// flags are what the npm and PyPI clients build today and what runs in
+/// consumers' CI, so breaking them to tidy up an argv would break deployments to
+/// buy nothing. `kaniscope --local --base main` and `kaniscope review-local
+/// --base main` are the same review; the second says which operation it is
+/// without the reader having to know that `--local` selects a mode.
+///
+/// **Subcommands emit JSON on stdout by default**, because they exist to be
+/// called by a program — the handoff's rule that every machine-facing operation
+/// emits exactly one JSON document. `--human` opts back out. The flat flags keep
+/// the opposite default, human unless `--json`, because that is what they have
+/// always done.
+#[derive(clap::Subcommand)]
+enum Op {
+    /// Review a local diff — a branch, a worktree, staged work. Nothing is posted.
+    ReviewLocal(LocalArgs),
+    /// Review a pull request. Posts nothing unless `--post` is given.
+    ReviewPr(PrArgs),
+    /// Deep-review one complete file, locally or at a PR head. Never posts.
+    ReviewFile(FileArgs),
+    /// Print the effective review rules. No model call, so no model key.
+    GetRules(RulesArgs),
+    /// Print the JSON Schema of an operation's output.
+    Schema(SchemaArgs),
+}
+
+/// Where a local review's diff comes from.
+///
+/// Named modes rather than one `--base`-or-stdin guess, because "committed and
+/// uncommitted changes" is ambiguous in a way that loses work silently: a review
+/// that omitted staged changes would look like a clean review of everything.
+/// Each mode pins one git invocation, and the tests pin the invocations.
+#[derive(clap::Args)]
+struct LocalArgs {
+    /// Everything that differs from this ref, through the working tree.
+    /// `git diff <ref> --`.
+    #[arg(long, conflicts_with_all = ["staged", "working_tree"])]
+    base: Option<String>,
+    /// Staged changes only. `git diff --cached --`.
+    #[arg(long, conflicts_with_all = ["base", "working_tree"])]
+    staged: bool,
+    /// Unstaged working-tree changes only. `git diff --`.
+    #[arg(long = "working-tree", conflicts_with_all = ["base", "staged"])]
+    working_tree: bool,
+    /// The checkout to read files and repository rules from. Defaults to `.`.
+    #[arg(long = "repo-root")]
+    repo_root: Option<PathBuf>,
+    /// What to call this change in the output. Defaults to the branch name.
+    #[arg(long)]
+    label: Option<String>,
+    /// What this change is meant to do, for the reviewer to check it against.
+    #[arg(long, conflicts_with = "intent_file")]
+    intent: Option<String>,
+    /// Read `--intent` from a file.
+    #[arg(long = "intent-file", value_name = "PATH", conflicts_with = "intent")]
+    intent_file: Option<PathBuf>,
+    /// Also write the JSON result to this path, atomically.
+    #[arg(long = "json-out", value_name = "PATH")]
+    json_out: Option<PathBuf>,
+    /// Print the readable block instead of JSON.
+    #[arg(long, default_value_t = false)]
+    human: bool,
+}
+
+#[derive(clap::Args)]
+struct PrArgs {
+    #[arg(long)]
+    provider: String,
+    #[arg(long)]
+    repo: String,
+    #[arg(long)]
+    pr: u64,
+    /// Post the review to the pull request.
+    ///
+    /// Opt-in, which is the opposite of the flat `--dry-run` flag's default, and
+    /// deliberately so. This surface is driven by coding agents, where the cost
+    /// of a wrong default is asymmetric: not posting is a re-run, and posting is
+    /// a comment on someone's pull request that cannot be un-sent.
+    #[arg(long, default_value_t = false)]
+    post: bool,
+    /// Accepted and ignored — posting is already off unless `--post` is given.
+    /// Kept so a caller porting from the flat flags cannot be surprised by it
+    /// being rejected, or worse, by it being read as a request TO post.
+    #[arg(long = "dry-run", default_value_t = false)]
+    dry_run: bool,
+    #[arg(long = "json-out", value_name = "PATH")]
+    json_out: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    human: bool,
+}
+
+#[derive(clap::Args)]
+struct FileArgs {
+    /// Repository-relative path of the file to review.
+    #[arg(long)]
+    path: String,
+    /// Review the file in this checkout. Mutually exclusive with `--provider`.
+    #[arg(long = "repo-root", conflicts_with_all = ["provider", "repo", "pr"])]
+    repo_root: Option<PathBuf>,
+    #[arg(long, requires_all = ["repo", "pr"])]
+    provider: Option<String>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long)]
+    pr: Option<u64>,
+    #[arg(long, default_value_t = false)]
+    human: bool,
+}
+
+#[derive(clap::Args)]
+struct RulesArgs {
+    /// Resolve the rules for this checkout. Mutually exclusive with `--provider`.
+    #[arg(long = "repo-root", conflicts_with_all = ["provider", "repo", "pr"])]
+    repo_root: Option<PathBuf>,
+    #[arg(long, requires_all = ["repo", "pr"])]
+    provider: Option<String>,
+    #[arg(long)]
+    repo: Option<String>,
+    #[arg(long)]
+    pr: Option<u64>,
+}
+
+#[derive(clap::Args)]
+struct SchemaArgs {
+    /// Which operation's output to describe. Omit to list the names.
+    #[arg(value_name = "OPERATION")]
+    operation: Option<String>,
+}
+
 #[derive(Parser)]
 #[command(
     name = "kaniscope",
@@ -49,6 +180,10 @@ use pr_review_core::review::{
     about = "Review a pull request (or a local diff) with an AI reviewer and optionally post the comments"
 )]
 struct Args {
+    /// An explicit toolbox operation. When absent, the flat flags below select
+    /// the mode exactly as they always have.
+    #[command(subcommand)]
+    op: Option<Op>,
     /// Review a local diff instead of a PR: no provider, no fetch, nothing posted.
     /// The diff comes from `--base`, or from stdin when `--base` is absent.
     #[arg(long, default_value_t = false)]
@@ -177,6 +312,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = Config::from_env();
 
+    // An explicit operation short-circuits the flat-flag path entirely. The two
+    // never interleave: a subcommand carries its own arguments, so there is no
+    // case where a stray top-level flag silently changes what an operation does.
+    if let Some(op) = args.op {
+        return run_op(&cfg, op).await;
+    }
+
     // What this run will do, in one line, before the first network call. "Did it
     // write to the PR?" is the question a reader most needs when a run ends badly,
     // and it has no answer in a silent log.
@@ -260,8 +402,270 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The human-readable block: what would post, then the run's totals.
+/// Run one explicit operation and print exactly one JSON document on stdout.
+///
+/// Every arm ends in `emit` or `emit_human`, so the "one document, nothing else"
+/// promise is kept in one place rather than by each arm remembering to.
+async fn run_op(cfg: &Config, op: Op) -> anyhow::Result<()> {
+    match op {
+        Op::Schema(a) => {
+            print!("{}", operation_schema(a.operation.as_deref())?);
+            Ok(())
+        }
+        Op::GetRules(a) => {
+            // No model call anywhere on this path, so no key is required — the
+            // whole point of the operation. Say so if it turns out otherwise.
+            let rules = match (&a.provider, &a.repo, a.pr) {
+                (Some(p), Some(r), Some(n)) => pr_review_core::rules::remote(cfg, p, r, n).await?,
+                _ => {
+                    let root = a.repo_root.unwrap_or_else(|| PathBuf::from("."));
+                    pr_review_core::rules::local(cfg, Some(&root))
+                }
+            };
+            emit(&rules)
+        }
+        Op::ReviewFile(a) => {
+            let (out, _) = match (&a.provider, &a.repo, a.pr) {
+                (Some(p), Some(r), Some(n)) => {
+                    pr_review_core::filereview::review_pr_file(
+                        cfg,
+                        &OpenRouterBackend,
+                        p,
+                        r,
+                        n,
+                        &a.path,
+                    )
+                    .await?
+                }
+                _ => {
+                    let root = a.repo_root.unwrap_or_else(|| PathBuf::from("."));
+                    let out = pr_review_core::filereview::review_local(
+                        cfg,
+                        &OpenRouterBackend,
+                        &root,
+                        &a.path,
+                    )
+                    .await?;
+                    (out, cfg.clone())
+                }
+            };
+            if a.human {
+                println!("{}", out.summary_markdown);
+                return Ok(());
+            }
+            emit(&out)
+        }
+        Op::ReviewPr(a) => {
+            let out = run_review(
+                cfg,
+                RunReviewInput {
+                    provider: a.provider,
+                    repo: a.repo,
+                    pr: a.pr,
+                    // Inverted from the flat flag on purpose: this surface posts
+                    // only when asked. `--dry-run` is accepted for familiarity and
+                    // changes nothing, because it would already be a dry run.
+                    dry_run: !a.post,
+                    placeholder: false,
+                },
+            )
+            .await?;
+            finish_review_output(&out, a.human, false, !a.post, a.json_out.as_deref())
+        }
+        Op::ReviewLocal(a) => {
+            let root = a.repo_root.clone().unwrap_or_else(|| PathBuf::from("."));
+            let diff = local_diff(&root, &a)?;
+            let label = a.label.clone().unwrap_or_else(|| default_label(&root, &a));
+            let out = run_review_local(
+                cfg,
+                LocalReviewInput {
+                    diff,
+                    repo_root: Some(root),
+                    label,
+                    change_intent: local_intent(&a)?,
+                },
+                &OpenRouterBackend,
+            )
+            .await?;
+            // A local review has nowhere to post, so it is never a dry run.
+            finish_review_output(&out, a.human, true, false, a.json_out.as_deref())
+        }
+    }
+}
+
+/// Print a review result, honouring `--human` and `--json-out`.
+fn finish_review_output(
+    out: &RunReviewOutput,
+    human: bool,
+    local: bool,
+    dry_run: bool,
+    json_out: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    if human {
+        print_review(out, local, dry_run);
+    } else {
+        println!("{}", serde_json::to_string(out)?);
+    }
+    // Last, for the same reason as the flat path: a failed write must not destroy
+    // output already produced, and must still exit non-zero.
+    if let Some(path) = json_out {
+        write_json_out(path, out)?;
+    }
+    Ok(())
+}
+
+/// Serialize one value as the operation's single stdout document.
+fn emit<T: serde::Serialize>(value: &T) -> anyhow::Result<()> {
+    println!("{}", serde_json::to_string(value)?);
+    Ok(())
+}
+
+/// The diff for a `review-local` run, from exactly one named source.
+///
+/// Each mode is one pinned git invocation. `--base` keeps the flat flag's
+/// meaning — everything that differs from the ref, through the working tree — so
+/// migrating from `--local --base main` changes nothing about what is reviewed.
+fn local_diff(root: &std::path::Path, a: &LocalArgs) -> anyhow::Result<String> {
+    let diff = if let Some(base) = &a.base {
+        git_diff(root, &["diff", base, "--"], Some(base))?
+    } else if a.staged {
+        git_diff(root, &["diff", "--cached", "--"], None)?
+    } else if a.working_tree {
+        git_diff(root, &["diff", "--"], None)?
+    } else {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        buf
+    };
+    if diff.trim().is_empty() {
+        anyhow::bail!(
+            "empty diff — nothing to review. Pass --base <ref>, --staged or \
+             --working-tree, or pipe a diff in."
+        );
+    }
+    Ok(diff)
+}
+
+/// Run one `git diff` invocation in `root` and return its stdout.
+///
+/// `ref_arg`, when present, is refused if it starts with `-`: `Command` spawns no
+/// shell, so this is not shell injection, but a ref that git reads as an option
+/// (`--upload-pack=...`) is real once the value arrives from a hook, from CI, or
+/// through a wrapper package.
+fn git_diff(
+    root: &std::path::Path,
+    args: &[&str],
+    ref_arg: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(r) = ref_arg {
+        if r.starts_with('-') {
+            anyhow::bail!("--base must be a ref, not an option (got {r:?})");
+        }
+    }
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not run git: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The default label for a `review-local` run: the branch, or the diff mode when
+/// there is no usable branch name.
+fn default_label(root: &std::path::Path, a: &LocalArgs) -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| usable_branch(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_else(|| {
+            // Naming the mode beats "local changes" for a detached HEAD, which is
+            // the normal state during a rebase, a bisect, or a CI commit checkout.
+            if a.staged {
+                "staged changes".to_string()
+            } else if a.working_tree {
+                "working-tree changes".to_string()
+            } else {
+                "local changes".to_string()
+            }
+        })
+}
+
+/// `--intent` verbatim, `--intent-file` from disk, or `None`. Clap has already
+/// refused the pair; an unreadable file is an error rather than a silent absence,
+/// for the reason given on the flat path's `change_intent`.
+fn local_intent(a: &LocalArgs) -> anyhow::Result<Option<String>> {
+    use anyhow::Context;
+    if let Some(text) = &a.intent {
+        return Ok(Some(text.clone()));
+    }
+    match &a.intent_file {
+        Some(path) => {
+            Ok(Some(std::fs::read_to_string(path).with_context(|| {
+                format!("reading --intent-file {}", path.display())
+            })?))
+        }
+        None => Ok(None),
+    }
+}
+
+/// The JSON Schema of one operation's output, or the list of operation names.
+///
+/// Per-operation rather than one schema with every field optional: `get-rules`
+/// and `review-local` have nothing in common, and a union type would make every
+/// generated client's fields nullable, which is how a missing field becomes
+/// indistinguishable from a field that is legitimately absent.
+fn operation_schema(operation: Option<&str>) -> anyhow::Result<String> {
+    use pr_review_core::{filereview::FileReviewOutput, rules::EffectiveRules};
+
+    let schema = match operation {
+        None => {
+            return Ok(format!(
+                "{}\n",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "operations": SCHEMA_OPERATIONS,
+                }))?
+            ))
+        }
+        Some("review-local" | "review-pr") => {
+            serde_json::to_value(schemars::schema_for!(RunReviewOutput))?
+        }
+        Some("review-file") => serde_json::to_value(schemars::schema_for!(FileReviewOutput))?,
+        Some("get-rules") => serde_json::to_value(schemars::schema_for!(EffectiveRules))?,
+        Some(other) => anyhow::bail!(
+            "unknown operation {other:?} — known: {}",
+            SCHEMA_OPERATIONS.join(", ")
+        ),
+    };
+    Ok(format!("{}\n", serde_json::to_string_pretty(&schema)?))
+}
+
+/// Operations that have a schema. Named once so `kaniscope schema` with no
+/// argument, and the error for an unknown one, cannot disagree.
+const SCHEMA_OPERATIONS: &[&str] = &["review-local", "review-pr", "review-file", "get-rules"];
+
+/// The human-readable block for the flat-flag path.
 fn print_human(args: &Args, out: &RunReviewOutput) {
+    print_review(out, args.local, args.dry_run);
+}
+
+/// The human-readable block: what would post, then the run's totals.
+///
+/// Takes the two facts it actually uses rather than the whole `Args`, so the
+/// subcommand path can print exactly what the flat path prints. `local` and
+/// `dry_run` are distinct on purpose: a local review has nowhere to post, which
+/// is the mode, not a withheld action.
+fn print_review(out: &RunReviewOutput, local: bool, dry_run: bool) {
     let rule = "─".repeat(60);
     println!("\n{rule}\n{}\n{rule}", out.summary_markdown);
 
@@ -274,7 +678,7 @@ fn print_human(args: &Args, out: &RunReviewOutput) {
     //
     // Dry-run and local only: on a posting run these were just anchored onto the
     // PR, so reprinting them duplicates data that already has a durable home.
-    if (args.dry_run || args.local) && !out.findings_detail.is_empty() {
+    if (dry_run || local) && !out.findings_detail.is_empty() {
         println!(
             "\nAll {} finding(s), including inline-anchored:",
             out.findings
@@ -296,7 +700,7 @@ fn print_human(args: &Args, out: &RunReviewOutput) {
     // the *rendered* comment, which can carry a committable suggestion block —
     // code applied to the branch on one click. Printing the prose alone would show
     // a dry run of everything except the part with consequences.
-    if (args.dry_run || args.local) && !out.inline_detail.is_empty() {
+    if (dry_run || local) && !out.inline_detail.is_empty() {
         println!(
             "\nInline comment(s) as they would post ({}):",
             out.inline_detail.len()
@@ -323,7 +727,7 @@ fn print_human(args: &Args, out: &RunReviewOutput) {
         "posted: {}",
         if out.posted {
             out.comment_url.clone().unwrap_or_else(|| "yes".into())
-        } else if args.local {
+        } else if local {
             // A local review has no host to post to — that is the mode, not a
             // withheld action, so it must not read as "dry-run".
             "no (local review — nowhere to post)".into()
@@ -721,5 +1125,230 @@ mod tests {
             Args::try_parse_from(["kaniscope", flag])
                 .unwrap_or_else(|e| panic!("{flag} must still parse: {e}"));
         }
+    }
+
+    /// Build a repository with a committed file, one STAGED change and one
+    /// UNSTAGED change, so the three diff modes have to disagree.
+    fn repo_with_staged_and_unstaged() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {:?}", out);
+        };
+        run(&["init", "-q", "."]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("a.txt"), "one\n").expect("write");
+        run(&["add", "a.txt"]);
+        run(&["commit", "-qm", "init"]);
+
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").expect("write");
+        run(&["add", "a.txt"]); // `two` is now staged
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\n").expect("write");
+        dir // `three` is unstaged
+    }
+
+    fn local_args(argv: &[&str]) -> super::LocalArgs {
+        let parsed = Args::try_parse_from(argv).expect("parses");
+        match parsed.op {
+            Some(super::Op::ReviewLocal(a)) => a,
+            _ => panic!("expected review-local"),
+        }
+    }
+
+    /// "Committed and uncommitted changes" is ambiguous, and the ambiguity loses
+    /// work silently: a review that omitted staged changes returns a clean result
+    /// for a change it never read. Each mode is pinned to one git invocation here,
+    /// against a real repository, so the boundaries cannot drift.
+    #[test]
+    fn the_diff_modes_do_not_overlap_or_omit_changes() {
+        let dir = repo_with_staged_and_unstaged();
+        let root = dir.path();
+
+        let staged = super::local_diff(
+            root,
+            &local_args(["kaniscope", "review-local", "--staged"].as_ref()),
+        )
+        .expect("staged diff");
+        assert!(staged.contains("+two"), "{staged}");
+        assert!(
+            !staged.contains("+three"),
+            "staged must exclude unstaged work: {staged}"
+        );
+
+        let working = super::local_diff(
+            root,
+            &local_args(["kaniscope", "review-local", "--working-tree"].as_ref()),
+        )
+        .expect("working-tree diff");
+        assert!(working.contains("+three"), "{working}");
+        assert!(
+            !working.contains("+two"),
+            "unstaged must exclude staged work: {working}"
+        );
+
+        // The union mode. This is the one that must not silently drop staged
+        // changes — the failure the named modes exist to prevent.
+        let base = super::local_diff(
+            root,
+            &local_args(["kaniscope", "review-local", "--base", "HEAD"].as_ref()),
+        )
+        .expect("base diff");
+        assert!(
+            base.contains("+two"),
+            "--base must include staged work: {base}"
+        );
+        assert!(
+            base.contains("+three"),
+            "--base must include unstaged work: {base}"
+        );
+    }
+
+    /// Two diff sources is an ambiguity, not a preference order — refuse rather
+    /// than silently letting one win.
+    #[test]
+    fn conflicting_diff_modes_are_refused() {
+        for pair in [
+            ["--staged", "--working-tree"],
+            ["--base", "--staged"],
+            ["--base", "--working-tree"],
+        ] {
+            let argv = if pair[0] == "--base" {
+                vec!["kaniscope", "review-local", "--base", "main", pair[1]]
+            } else {
+                vec!["kaniscope", "review-local", pair[0], pair[1]]
+            };
+            let err = Args::try_parse_from(argv.clone())
+                .map(|_| ())
+                .expect_err(&format!("{argv:?} must be refused"));
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{argv:?} must be refused as a conflict, not something else"
+            );
+        }
+    }
+
+    /// A `--base` that git would read as an option, refused. Not shell injection
+    /// — `Command` spawns no shell — but argument injection is real once the ref
+    /// arrives from a hook, from CI, or through a wrapper package.
+    ///
+    /// Written with `--base=<value>` rather than a space, deliberately. Clap
+    /// rejects `--base --upload-pack=x` itself as an unknown argument, so that
+    /// spelling never reaches the guard and testing it would prove nothing. The
+    /// attached form hands the leading dash straight through as the value, which
+    /// is the case the guard exists for.
+    #[test]
+    fn a_base_that_looks_like_an_option_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = local_args(["kaniscope", "review-local", "--base=--upload-pack=x"].as_ref());
+        assert_eq!(
+            args.base.as_deref(),
+            Some("--upload-pack=x"),
+            "clap passed it through"
+        );
+
+        let err = super::local_diff(dir.path(), &args).expect_err("must refuse");
+        assert!(err.to_string().contains("must be a ref"), "{err}");
+    }
+
+    /// The subcommands are additive: every invocation the wrapper clients build,
+    /// and every one in the README, still parses to the same flat-flag mode.
+    #[test]
+    fn adding_subcommands_did_not_change_the_flat_flags() {
+        let local = Args::try_parse_from(["kaniscope", "--json", "--local", "--base", "main"])
+            .expect("flat local still parses");
+        assert!(local.op.is_none(), "no subcommand was given");
+        assert!(local.local && local.json);
+        assert_eq!(local.base.as_deref(), Some("main"));
+
+        let pr = Args::try_parse_from([
+            "kaniscope",
+            "--json",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "12",
+            "--dry-run",
+        ])
+        .expect("flat PR still parses");
+        assert!(pr.op.is_none());
+        assert_eq!(pr.pr, Some(12));
+        assert!(pr.dry_run);
+
+        for flag in ["--schema", "--config-json", "--config-docs"] {
+            let a = Args::try_parse_from(["kaniscope", flag]).expect("still parses");
+            assert!(a.op.is_none(), "{flag} must not be read as a subcommand");
+        }
+    }
+
+    /// `review-pr` posts only when asked. This is inverted from the flat
+    /// `--dry-run` flag, and it is the one default in this binary whose wrong
+    /// value cannot be undone — a comment on someone's pull request.
+    #[test]
+    fn review_pr_does_not_post_unless_told_to() {
+        let quiet = Args::try_parse_from([
+            "kaniscope",
+            "review-pr",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "1",
+        ])
+        .expect("parses");
+        match quiet.op {
+            Some(super::Op::ReviewPr(a)) => assert!(!a.post, "posting must be opt-in"),
+            _ => panic!("expected review-pr"),
+        }
+
+        let loud = Args::try_parse_from([
+            "kaniscope",
+            "review-pr",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "1",
+            "--post",
+        ])
+        .expect("parses");
+        match loud.op {
+            Some(super::Op::ReviewPr(a)) => assert!(a.post),
+            _ => panic!("expected review-pr"),
+        }
+    }
+
+    /// Every name `schema` advertises must actually resolve, or a client
+    /// generator follows the list into an error.
+    #[test]
+    fn every_advertised_operation_has_a_schema() {
+        for op in super::SCHEMA_OPERATIONS {
+            let out = super::operation_schema(Some(op)).unwrap_or_else(|e| panic!("{op}: {e}"));
+            let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+            assert!(
+                v.get("properties").is_some()
+                    || v.get("oneOf").is_some()
+                    || v.get("$ref").is_some(),
+                "{op} produced a schema with no shape: {out}"
+            );
+        }
+        // The bare listing names exactly those, so the two cannot drift.
+        let listed = super::operation_schema(None).expect("lists");
+        for op in super::SCHEMA_OPERATIONS {
+            assert!(
+                listed.contains(op),
+                "{op} missing from the listing: {listed}"
+            );
+        }
+        assert!(super::operation_schema(Some("not-an-op")).is_err());
     }
 }

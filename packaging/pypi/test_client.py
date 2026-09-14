@@ -211,6 +211,46 @@ def test_intent_reaches_the_argv() -> None:
         os.unlink(echoes)
 
 
+def test_toolbox_operations_send_their_argv() -> None:
+    """Each toolbox operation is a separate argv shape a flag can be dropped from.
+
+    ``get_rules`` reaching the binary without ``--repo-root`` would still succeed,
+    against the wrong directory, and no assertion on the return value would catch
+    it. So assert on what the child was actually given.
+    """
+    echoes = fake_binary('A="$*"\ncat <<EOF\n{"echoed":"$A"}\nEOF')
+    try:
+        local = kaniscope.get_rules(binary=echoes, repo_root="/w")
+        check(
+            "get_rules sends the local scope",
+            local["echoed"] == "get-rules --repo-root /w",
+            local["echoed"],
+        )
+
+        remote = kaniscope.get_rules(binary=echoes, provider="github", repo="o/r", pr=12)
+        check(
+            "get_rules sends the PR scope",
+            remote["echoed"] == "get-rules --provider github --repo o/r --pr 12",
+            remote["echoed"],
+        )
+
+        f = kaniscope.review_file(binary=echoes, path="src/a.rs", repo_root="/w")
+        check(
+            "review_file sends the path and scope",
+            f["echoed"] == "review-file --path src/a.rs --repo-root /w",
+            f["echoed"],
+        )
+
+        scoped = kaniscope.schema(binary=echoes, operation="get-rules")
+        check(
+            "schema selects an operation",
+            scoped["echoed"] == "schema get-rules",
+            scoped["echoed"],
+        )
+    finally:
+        os.unlink(echoes)
+
+
 def test_diff_reaches_stdin() -> None:
     """``local=True`` with no ``base`` reads the diff from stdin.
 
@@ -307,6 +347,7 @@ if __name__ == "__main__":
     test_unknown_config_key_is_rejected()
     test_diff_reaches_stdin()
     test_intent_reaches_the_argv()
+    test_toolbox_operations_send_their_argv()
     test_nonzero_exit_carries_the_reason()
     print()
     if FAILURES:

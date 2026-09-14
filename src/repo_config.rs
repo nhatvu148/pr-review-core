@@ -13,36 +13,55 @@
 /// config (see [`Config::with_repo_overrides`](crate::config::Config::with_repo_overrides)).
 /// Unknown keys are rejected so typos surface as a warning instead of silently
 /// doing nothing.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+/// `Serialize` alongside `Deserialize` so `kaniscope get-rules` can show a caller
+/// exactly which keys a repository set. `skip_serializing_if` on every field keeps
+/// that output to what the file actually chose to change, rather than forty nulls
+/// a reader has to scan past to find the two that matter.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model_explore: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub include_globs: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude_globs: Option<Vec<String>>,
     /// Globs marking vendored third-party source (`thirdparty/**`, `vendor/**`, …).
     /// Diff-hygiene findings are suppressed inside them and the reviewer is told not
     /// to propose edits there — the remedy for vendored code is an upstream patch or
     /// a version bump. Setting this REPLACES the conventional defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vendored: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_confidence: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_findings: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub self_critique: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agentic: Option<bool>,
     /// Toggle grouping related changed files (source + test, i18n siblings) when
     /// packing a large diff, for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub file_bundling: Option<bool>,
     /// Toggle fetching the head commit's CI results into the prompt for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ci_status: Option<bool>,
     /// Toggle the OSV.dev dependency vulnerability scan for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cve_scan: Option<bool>,
     /// Toggle re-anchoring a finding that drifted just off a diff line to the
     /// nearest matching diff line (else it folds to the summary), for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reanchor_findings: Option<bool>,
     /// Toggle committable suggestion blocks on findings, for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestions: Option<bool>,
     /// Pass this repo's PR descriptions to the reviewer as a statement of intent
     /// to check the diff against. Off suppresses it for this repo only.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_body: Option<bool>,
     /// Cap on the description handed to the reviewer, for this repo.
     ///
@@ -52,6 +71,7 @@ pub struct RepoConfig {
     /// reviewer assert the diff exceeds its stated scope — so the repo that needs
     /// the higher cap should be able to set it without an env change, a restart,
     /// or a conversation with whoever owns the service.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_body_max_chars: Option<usize>,
     /// Cap on the stated change intent handed to the reviewer on a local review,
     /// for this repo.
@@ -60,17 +80,21 @@ pub struct RepoConfig {
     /// path because a local review now reads the working tree's `.prbot.toml` —
     /// the whole point of which is that a change gets reviewed under its own
     /// repository's rules before it is a PR.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub change_intent_max_chars: Option<usize>,
     /// Let the agentic reviewer's `grep` return context lines around each match,
     /// for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub grep_context: Option<bool>,
     /// Extra review instructions in plain language, appended to the system prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     /// Instructions shaping the `/describe` output specifically — a house PR
     /// description layout, release-notes sections, a contributor table. Kept
     /// separate from `instructions` because that one governs what the reviewer
     /// looks for, and mixing "be strict about SQL" into a description prompt
     /// changes the wrong output.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub describe_instructions: Option<String>,
 }
 

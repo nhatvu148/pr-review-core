@@ -888,30 +888,77 @@ pub(crate) async fn run_agentic(
 /// finding in its own right — on BOTH paths, since the PR path is where the risk
 /// is real. That is a separate change, not a reason to make this one asymmetric.
 fn load_local_repo_config(base: &Config, repo_root: Option<&std::path::Path>) -> Config {
+    local_repo_config_source(base, repo_root).0
+}
+
+/// [`load_local_repo_config`], plus an account of what happened.
+///
+/// The review path wants only the merged config; `kaniscope get-rules` wants to
+/// say which file was read, or why none was. Both come from here so the answer a
+/// caller is given is the answer the review actually used — a second resolution
+/// written for the reporting path is a second thing to drift.
+pub(crate) fn local_repo_config_source(
+    base: &Config,
+    repo_root: Option<&std::path::Path>,
+) -> (Config, crate::rules::RepoConfigSource) {
+    use crate::rules::RepoConfigSource;
+
     // No checkout means no file to read. The diff may have come from stdin with no
     // repository behind it at all.
     let Some(root) = repo_root else {
-        return base.clone();
+        return (
+            base.clone(),
+            RepoConfigSource::Unavailable {
+                reason: "no repository root was supplied, so there is no \
+                         .prbot.toml to read"
+                    .to_string(),
+            },
+        );
     };
     let path = root.join(".prbot.toml");
+    let location = path.display().to_string();
     match std::fs::read_to_string(&path) {
         Ok(text) => match repo_config::parse(&text) {
             Ok(rc) => {
-                tracing::info!("applied {} overrides", path.display());
-                base.with_repo_overrides(&rc)
+                tracing::info!("applied {location} overrides");
+                let merged = base.with_repo_overrides(&rc);
+                (
+                    merged,
+                    RepoConfigSource::Applied {
+                        location,
+                        overrides: Box::new(rc),
+                    },
+                )
             }
             Err(e) => {
-                tracing::warn!("ignoring invalid {}: {e:#}", path.display());
-                base.clone()
+                tracing::warn!("ignoring invalid {location}: {e:#}");
+                (
+                    base.clone(),
+                    RepoConfigSource::Invalid {
+                        location,
+                        error: format!("{e}"),
+                    },
+                )
             }
         },
         // `NotFound` is the normal case for a repo that ships no config, so it is
         // not worth a warning; anything else (a permission error, a directory in
         // its place) is something the operator would want to know about.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => base.clone(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (base.clone(), RepoConfigSource::Absent { location })
+        }
         Err(e) => {
-            tracing::warn!("could not read {}: {e:#}", path.display());
-            base.clone()
+            tracing::warn!("could not read {location}: {e:#}");
+            (
+                base.clone(),
+                // Unreadable is not absent: the file is there and something is
+                // wrong with reading it, which is worth a warning rather than the
+                // silence a missing file deserves.
+                RepoConfigSource::Invalid {
+                    location,
+                    error: format!("{e}"),
+                },
+            )
         }
     }
 }
@@ -928,14 +975,43 @@ pub(crate) async fn load_repo_config(
     repo: &str,
     meta: &PrMeta,
 ) -> Config {
+    remote_repo_config_source(provider, client, base, repo, meta)
+        .await
+        .0
+}
+
+/// [`load_repo_config`], plus an account of what happened — the remote twin of
+/// [`local_repo_config_source`], and shared with `kaniscope get-rules` for the
+/// same reason.
+pub(crate) async fn remote_repo_config_source(
+    provider: &Provider,
+    client: &reqwest::Client,
+    base: &Config,
+    repo: &str,
+    meta: &PrMeta,
+) -> (Config, crate::rules::RepoConfigSource) {
+    use crate::rules::RepoConfigSource;
+
     // Prefer the exact head commit; fall back to the base branch when the provider
     // didn't give us a head SHA (e.g. Bitbucket meta). If neither is available,
     // there's nothing to fetch against — use the base config as-is.
     let git_ref = match (meta.head_sha.as_deref(), meta.base_branch.as_deref()) {
         (Some(sha), _) if !sha.is_empty() => sha,
         (_, Some(branch)) if !branch.is_empty() => branch,
-        _ => return base.clone(),
+        _ => {
+            return (
+                base.clone(),
+                RepoConfigSource::Unavailable {
+                    reason: format!(
+                        "{repo} reported neither a head commit nor a base branch, so \
+                         there is no ref to read .prbot.toml from"
+                    ),
+                },
+            )
+        }
     };
+    // Named for a reader: which ref this was read at is the whole trust question.
+    let location = format!("{repo}@{git_ref}:.prbot.toml");
 
     match provider
         .get_file_contents(client, base, repo, git_ref, ".prbot.toml")
@@ -944,18 +1020,40 @@ pub(crate) async fn load_repo_config(
         Ok(Some(text)) => match repo_config::parse(&text) {
             Ok(rc) => {
                 tracing::info!("applied .prbot.toml overrides for {repo}");
-                base.with_repo_overrides(&rc)
+                let merged = base.with_repo_overrides(&rc);
+                (
+                    merged,
+                    RepoConfigSource::Applied {
+                        location,
+                        overrides: Box::new(rc),
+                    },
+                )
             }
             Err(e) => {
                 tracing::warn!("ignoring invalid .prbot.toml for {repo}: {e:#}");
-                base.clone()
+                (
+                    base.clone(),
+                    RepoConfigSource::Invalid {
+                        location,
+                        error: format!("{e}"),
+                    },
+                )
             }
         },
         // No file, or any fetch error — proceed with the base config (fail-open).
-        Ok(None) => base.clone(),
+        Ok(None) => (base.clone(), RepoConfigSource::Absent { location }),
         Err(e) => {
             tracing::warn!("could not fetch .prbot.toml for {repo}: {e:#}");
-            base.clone()
+            (
+                base.clone(),
+                // A fetch failure is not an absent file: the repository may well
+                // have rules that this review did not apply, and saying "absent"
+                // would assert something this code cannot know.
+                RepoConfigSource::Invalid {
+                    location,
+                    error: format!("{e}"),
+                },
+            )
         }
     }
 }

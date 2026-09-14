@@ -46,3 +46,196 @@ export interface Usage {
   total_tokens?: number | null;
 }
 
+/** One file review. */
+export interface FileReviewOutput {
+  commentUrl?: string | null;
+  outcome: FileReviewOutcome;
+  path: string;
+  /** Always false here. */
+  posted: boolean;
+  source: FileSource;
+  /** The result as a comment body — what the PR command posts, and what a CLI caller prints. */
+  summaryMarkdown: string;
+}
+
+/** The file was read and reviewed. */
+export interface FileReviewOutcomeReviewed {
+  /** After the confidence floor, severity sort and cap — the same policy a diff review applies, so a finding here means what it means there. */
+  findings: Finding[];
+  recommendation: string;
+  status: "reviewed";
+  summary: string;
+}
+
+/** The path is excluded by this repository's review file filters. */
+export interface FileReviewOutcomeExcluded {
+  reason: string;
+  status: "excluded";
+}
+
+/** No such file at the resolved source. */
+export interface FileReviewOutcomeNotFound {
+  reason: string;
+  status: "notFound";
+}
+
+/** What came of the request. */
+export type FileReviewOutcome = FileReviewOutcomeReviewed | FileReviewOutcomeExcluded | FileReviewOutcomeNotFound;
+
+/** A checkout on disk. */
+export interface FileSourceLocal {
+  kind: "local";
+  repoRoot: string;
+}
+
+/** A host, at a specific ref — named, because "the file" is meaningless without saying which revision of it was read. */
+export interface FileSourcePr {
+  gitRef: string;
+  kind: "pr";
+  pr: number;
+  provider: string;
+  repo: string;
+}
+
+/** Where the reviewed file was read from. */
+export type FileSource = FileSourceLocal | FileSourcePr;
+
+/** Everything that shapes one review, resolved and redacted. */
+export interface EffectiveRules {
+  /** The exact text appended to the backend's system prompt — calibration rules, the suggestion rules when enabled, and the consumer's `EXTRA_PROMPT` with any repository `instructions` already merged in. */
+  injectedRules: string;
+  repoConfig: RepoConfigSource;
+  scope: RulesScope;
+  settings: ReviewSettings;
+  /** Anything that failed open on the way here. */
+  warnings: string[];
+}
+
+/** Per-repo review overrides parsed from a `.prbot.toml`. */
+export interface RepoConfig {
+  agentic?: boolean | null;
+  /** Cap on the stated change intent handed to the reviewer on a local review, for this repo. */
+  change_intent_max_chars?: number | null;
+  /** Toggle fetching the head commit's CI results into the prompt for this repo. */
+  ci_status?: boolean | null;
+  /** Toggle the OSV.dev dependency vulnerability scan for this repo. */
+  cve_scan?: boolean | null;
+  /** Instructions shaping the `/describe` output specifically — a house PR description layout, release-notes sections, a contributor table. */
+  describe_instructions?: string | null;
+  exclude_globs?: string[] | null;
+  /** Toggle grouping related changed files (source + test, i18n siblings) when packing a large diff, for this repo. */
+  file_bundling?: boolean | null;
+  /** Let the agentic reviewer's `grep` return context lines around each match, for this repo. */
+  grep_context?: boolean | null;
+  include_globs?: string[] | null;
+  /** Extra review instructions in plain language, appended to the system prompt. */
+  instructions?: string | null;
+  max_findings?: number | null;
+  min_confidence?: number | null;
+  model?: string | null;
+  model_explore?: string | null;
+  /** Pass this repo's PR descriptions to the reviewer as a statement of intent to check the diff against. */
+  pr_body?: boolean | null;
+  /** Cap on the description handed to the reviewer, for this repo. */
+  pr_body_max_chars?: number | null;
+  /** Toggle re-anchoring a finding that drifted just off a diff line to the nearest matching diff line (else it folds to the summary), for this repo. */
+  reanchor_findings?: boolean | null;
+  self_critique?: boolean | null;
+  /** Toggle committable suggestion blocks on findings, for this repo. */
+  suggestions?: boolean | null;
+  /** Globs marking vendored third-party source (`thirdparty/**`, `vendor/**`, …). */
+  vendored?: string[] | null;
+}
+
+/** Nothing to read against — no checkout, or a PR with no ref to fetch from. */
+export interface RepoConfigSourceUnavailable {
+  reason: string;
+  status: "unavailable";
+}
+
+/** Looked, and the repository ships no `.prbot.toml`. */
+export interface RepoConfigSourceAbsent {
+  location: string;
+  status: "absent";
+}
+
+/** Read, parsed, and merged over the environment config. */
+export interface RepoConfigSourceApplied {
+  location: string;
+  /** Exactly the keys the file set. */
+  overrides: RepoConfig;
+  status: "applied";
+}
+
+/** Read, but rejected — invalid TOML or an unknown key. */
+export interface RepoConfigSourceInvalid {
+  error: string;
+  location: string;
+  status: "invalid";
+}
+
+/** Where the per-repo configuration came from, and what it said. */
+export type RepoConfigSource = RepoConfigSourceUnavailable | RepoConfigSourceAbsent | RepoConfigSourceApplied | RepoConfigSourceInvalid;
+
+/** The review-relevant configuration, after merging repo overrides. */
+export interface ReviewSettings {
+  agentic: boolean;
+  blastMaxRefs: number;
+  blastMaxSymbols: number;
+  blastRadius: boolean;
+  changeIntentMaxChars: number;
+  ciStatus: boolean;
+  /** The signature appended to every comment this deployment posts. */
+  commentMarker: string;
+  complexityMetrics: boolean;
+  complexityMinCyclomatic: number;
+  cveMaxPackages: number;
+  cveScan: boolean;
+  diagram: boolean;
+  diagramMaxNodes: number;
+  excludeGlobs: string[];
+  fileBundling: boolean;
+  grepContext: boolean;
+  includeGlobs: string[];
+  maxDiffChars: number;
+  maxFindings: number;
+  maxHistoryChars: number;
+  maxTokens: number;
+  maxTurns: number;
+  minConfidence: number;
+  model: string;
+  modelExplore: string;
+  prBody: boolean;
+  prBodyMaxChars: number;
+  reanchorFindings: boolean;
+  reviewSamples: number;
+  sampleLineTolerance: number;
+  sampleMinAgreement: number;
+  selfCritique: boolean;
+  structuralContext: boolean;
+  structuralMaxFiles: number;
+  suggestions: boolean;
+  temperature: number;
+  vendoredGlobs: string[];
+  walkthrough: boolean;
+  walkthroughMaxSymbols: number;
+}
+
+/** A checkout on disk — the pre-PR path. */
+export interface RulesScopeLocal {
+  kind: "local";
+  /** The directory whose `.prbot.toml` was consulted. */
+  repoRoot: string;
+}
+
+/** A pull request on a host. */
+export interface RulesScopePr {
+  kind: "pr";
+  pr: number;
+  provider: string;
+  repo: string;
+}
+
+/** What the rules were resolved for. */
+export type RulesScope = RulesScopeLocal | RulesScopePr;
+

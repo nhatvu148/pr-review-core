@@ -31,11 +31,21 @@ import sysconfig
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from ._config import CONFIG_ENV, ReviewConfig, config_to_env
-from ._types import Finding, InlineComment, RunReviewOutput, Usage
+from ._types import (
+    EffectiveRules,
+    FileReviewOutput,
+    Finding,
+    InlineComment,
+    ReviewSettings,
+    RunReviewOutput,
+    Usage,
+)
 
 __all__ = [
     "review",
     "review_async",
+    "review_file",
+    "get_rules",
     "schema",
     "version",
     "binary_path",
@@ -44,6 +54,9 @@ __all__ = [
     "InlineComment",
     "RunReviewOutput",
     "Usage",
+    "EffectiveRules",
+    "FileReviewOutput",
+    "ReviewSettings",
     "ReviewConfig",
     "CONFIG_ENV",
 ]
@@ -172,6 +185,86 @@ def _parse(stdout: str, stderr: str, code: int) -> RunReviewOutput:
             exit_code=code,
             stderr=stderr,
         ) from exc
+
+
+def _run_operation(op: str, args: list, options: Mapping[str, Any]) -> Any:
+    """Run one explicit toolbox operation and parse its single JSON document.
+
+    Shared so the operations below cannot diverge in how they report a crash
+    versus a stdout that is not JSON — the two failures a caller most needs told
+    apart, and the two a bare ``JSONDecodeError`` conflates.
+    """
+    result = subprocess.run(
+        [options.get("binary") or binary_path(), op, *args],
+        capture_output=True,
+        text=True,
+        env=_environment(options.get("env"), options.get("inherit_env", True), options.get("config")),
+        timeout=options.get("timeout"),
+        stdin=subprocess.DEVNULL,
+    )
+    return _parse(result.stdout, result.stderr, result.returncode)
+
+
+def _scope_args(
+    repo_root: Optional[str],
+    provider: Optional[str],
+    repo: Optional[str],
+    pr: Optional[int],
+) -> list:
+    """Flags for the operations that take a checkout OR a pull request."""
+    if provider or repo or pr is not None:
+        return ["--provider", str(provider), "--repo", str(repo), "--pr", str(pr)]
+    return ["--repo-root", str(repo_root)] if repo_root else []
+
+
+def get_rules(
+    *,
+    repo_root: Optional[str] = None,
+    provider: Optional[str] = None,
+    repo: Optional[str] = None,
+    pr: Optional[int] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> EffectiveRules:
+    """The effective review rules for a checkout or a pull request.
+
+    Merged settings, which ``.prbot.toml`` was read (or why none was), what it
+    overrode, and the exact instructions injected into the system prompt.
+
+    Makes no model call, so it needs no ``OPENROUTER_API_KEY``. Credentials never
+    appear in the result: it is built from an explicit allowlist of settings, so
+    a secret added to the engine's configuration cannot leak into it by default.
+    """
+    return _run_operation("get-rules", _scope_args(repo_root, provider, repo, pr), locals())
+
+
+def review_file(
+    *,
+    path: str,
+    repo_root: Optional[str] = None,
+    provider: Optional[str] = None,
+    repo: Optional[str] = None,
+    pr: Optional[int] = None,
+    config: Optional[ReviewConfig] = None,
+    env: Optional[Mapping[str, str]] = None,
+    inherit_env: bool = True,
+    timeout: Optional[float] = None,
+    binary: Optional[str] = None,
+) -> FileReviewOutput:
+    """Deep-review one complete file, in a checkout or at a pull request's head.
+
+    Posts nothing. A path excluded by the repository's review filters comes back
+    as an ``excluded`` outcome rather than raising, so a caller can report it
+    without retrying it forever.
+    """
+    return _run_operation(
+        "review-file",
+        ["--path", str(path), *_scope_args(repo_root, provider, repo, pr)],
+        locals(),
+    )
 
 
 def review(
@@ -398,14 +491,22 @@ async def _terminate(proc: Any) -> None:
     await proc.wait()
 
 
-def schema(*, binary: Optional[str] = None) -> Dict[str, Any]:
-    """The JSON Schema of a :func:`review` result. Needs no key and no network."""
+def schema(
+    *, operation: Optional[str] = None, binary: Optional[str] = None
+) -> Dict[str, Any]:
+    """The JSON Schema of an operation's result. Needs no key and no network.
+
+    ``operation`` selects a per-operation schema (``review-file``, ``get-rules``,
+    ``review-local``, ``review-pr``); omit it for the review output's schema,
+    which is what this has always returned.
+    """
+    args = ["schema", operation] if operation else ["--schema"]
     result = subprocess.run(
-        [binary or binary_path(), "--schema"], capture_output=True, text=True
+        [binary or binary_path(), *args], capture_output=True, text=True
     )
     if result.returncode != 0:
         raise KaniscopeError(
-            f"kaniscope --schema failed\n{_tail(result.stderr)}",
+            f"kaniscope schema failed\n{_tail(result.stderr)}",
             exit_code=result.returncode,
             stderr=result.stderr,
         )

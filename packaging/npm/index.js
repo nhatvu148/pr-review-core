@@ -220,9 +220,66 @@ async function review(options = {}) {
 /** The JSON Schema of a {@link review} result. Needs no key and no network. */
 async function schema(options = {}) {
   const bin = options.binary || binaryPath();
-  const result = await run(bin, ["--schema"], options);
-  if (result.code !== 0) throw new Error(`kaniscope --schema failed\n${tail(result.stderr)}`);
+  // `operation` selects a per-operation schema; without it, the review output's,
+  // which is what this function has always returned.
+  const args = options.operation ? ["schema", options.operation] : ["--schema"];
+  const result = await run(bin, args, options);
+  if (result.code !== 0) throw new Error(`kaniscope schema failed\n${tail(result.stderr)}`);
   return JSON.parse(result.stdout);
+}
+
+/**
+ * Run one explicit toolbox operation and parse its single JSON document.
+ *
+ * Shared by the operations below so they cannot diverge in how they report a
+ * crash or a non-JSON stdout — the two failures a caller most needs told apart.
+ */
+async function runOperation(op, args, options) {
+  const bin = options.binary || binaryPath();
+  const result = await run(bin, [op, ...args], options);
+  if (result.code !== 0) {
+    const how = result.signal ? `killed by ${result.signal}` : `exited ${result.code}`;
+    const err = new Error(`kaniscope ${op} ${how}\n${tail(result.stderr)}`);
+    err.exitCode = result.code;
+    err.signal = result.signal;
+    err.stderr = result.stderr;
+    throw err;
+  }
+  try {
+    return JSON.parse(result.stdout);
+  } catch (cause) {
+    const err = new Error(
+      `kaniscope ${op} exited 0 but stdout was not JSON — is KANISCOPE_BINARY_PATH ` +
+        `pointing at a different program?\n${tail(result.stdout, 5)}`
+    );
+    err.cause = cause;
+    throw err;
+  }
+}
+
+/** Scope flags shared by the operations that take a checkout OR a pull request. */
+function scopeArgs(options) {
+  if (options.provider || options.repo || options.pr !== undefined) {
+    return ["--provider", String(options.provider), "--repo", String(options.repo), "--pr", String(options.pr)];
+  }
+  return options.repoRoot ? ["--repo-root", String(options.repoRoot)] : [];
+}
+
+/**
+ * The effective review rules — merged settings, the repository's `.prbot.toml`,
+ * and the exact injected instructions.
+ *
+ * Makes no model call, so it needs no `OPENROUTER_API_KEY`. Credentials are
+ * never included in the result.
+ */
+async function getRules(options = {}) {
+  return runOperation("get-rules", scopeArgs(options), options);
+}
+
+/** Deep-review one complete file, locally or at a PR head. Never posts. */
+async function reviewFile(options = {}) {
+  if (!options.path) throw new TypeError("kaniscope: reviewFile needs a `path`");
+  return runOperation("review-file", ["--path", String(options.path), ...scopeArgs(options)], options);
 }
 
 /** The engine version this package's binary was built from. */
@@ -233,4 +290,4 @@ async function version(options = {}) {
   return result.stdout.trim().replace(/^kaniscope\s+/, "");
 }
 
-module.exports = { review, schema, version, binaryPath };
+module.exports = { review, reviewFile, getRules, schema, version, binaryPath };

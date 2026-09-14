@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+**The engine has explicit operations, so a program can say what it wants.** `kaniscope review-local`, `review-pr`, `review-file`, `get-rules` and `schema` sit alongside the existing flat flags, each printing exactly one JSON document on stdout.
+
+The flat flags were a mode selector in disguise — `--local` means "this is a local review", and you had to know that. That was fine while the only callers were two wrapper packages written against it. It stops being fine once the caller is a coding agent choosing an operation by name, and it left no room for operations that are not reviews at all.
+
+Nothing was taken away. `kaniscope --local --base main`, the `--provider/--repo/--pr` form, `--schema`, `--config-json` and `--config-docs` all parse and behave exactly as before, and a test asserts each invocation the wrapper clients build still does. The one deliberate difference is the posting default: `--dry-run` is opt-out on the flat path, while `review-pr` posts only with `--post`. Inverted because this surface is driven by agents, where the two mistakes are not symmetric — not posting costs a re-run, and posting costs a comment on someone's pull request that cannot be un-sent.
+
+**A local review can name what it is reviewing.** `--base <ref>` (everything through the working tree), `--staged`, `--working-tree`, or a diff on stdin, and conflicting modes are refused rather than silently ordered.
+
+"Committed and uncommitted changes" is ambiguous in a way that loses work quietly: a review that omitted staged changes returns a clean result for code it never read. Each mode now pins one git invocation, and the tests pin them against a real repository with one staged and one unstaged edit — including that `--base` still covers both.
+
+**`get-rules` says what the reviewer is actually configured to do.** The merged review settings, which `.prbot.toml` was read (or why none was), exactly which keys it overrode, the full injected calibration text, and warnings for anything that failed open. No model call, so no `OPENROUTER_API_KEY`; the local scope needs no credentials at all.
+
+Until now this was answerable only by reading a deployment's environment and a repository's config side by side and merging them by hand — and the case that most needs answering was invisible, because an invalid `.prbot.toml` is applied as *nothing* and the review still looks normal. That now arrives as a `warnings` entry naming the file and the parse error.
+
+The output is an explicit allowlist of review-relevant settings, not a serialized `Config`. That is the difference between a redaction that holds and one that lasts until the next secret is added: `Config` carries four tokens and three webhook secrets today, and a serialize-everything DTO would publish the next one silently, on the day it landed, in output an agent is encouraged to print. A test sets every credential to a sentinel and asserts none of them survives into the JSON.
+
+**`review-file` returns a result instead of only posting one.** The `/review-file` PR command kept its whole implementation inside the posting path, so the only way to get a file reviewed was to have a pull request and be willing to write a comment on it. The stages — authorize the path against the repository's globs, read the file, review, apply the confidence floor and cap, render — are now shared, and `command.rs` is the posting adapter over them. A path the repository's filters exclude comes back as an `excluded` outcome rather than an error, so a caller can report it without retrying forever.
+
+The glob authorization moved to the front of the shared path rather than staying in the command that first needed it. It is what stops `/review-file .env` printing a repository's secrets into a PR comment, and it has to keep applying to every new caller.
+
+**The type generator understands tagged unions.** The new operations return discriminated unions (`FileSource`, `RepoConfigSource`, `FileReviewOutcome`, `RulesScope`), and both clients now get them as real narrowable types — a TypeScript union over literal discriminants, a Python `Union` of `TypedDict`s. Generated from the binary's own `kaniscope schema <operation>`, like everything else in `packaging/`, so a variant added in Rust and missed in a client is a diff CI fails on rather than a runtime surprise.
+
+**An agent skill ships in [`skills/kaniscope`](skills/kaniscope/SKILL.md).** One skill covering the operations rather than one per operation — the handoff this work came from warns against a set of near-identical skills, and an agent picking between four descriptions that all say "review something" picks badly.
+
 **A local review can be told what the change is meant to do.** `kaniscope --local --intent "Retry 5xx with backoff; leave 4xx alone."` (or `--intent-file`, and `change_intent` on `LocalReviewInput`) hands the reviewer a statement of intent to check the diff against, and reports where the two disagree.
 
 This is the one input a pre-PR review had no way to receive. A pull request carries its description, which `PR_BODY` has passed to the reviewer since 0.21.0 as the coverage spec's class B input — "here is what this is supposed to do, check it". A branch or a worktree carries nothing, so the same review of the same code was strictly less informed before the PR existed than after, which is backwards: earlier is when the finding is cheapest to act on. It matters more now that the caller is frequently a coding agent, which has a task statement to hand and no PR to put it in.

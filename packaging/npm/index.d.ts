@@ -1,6 +1,18 @@
-import type { RunReviewOutput } from "./types";
+import type { RunReviewOutput, FileReviewOutput, EffectiveRules } from "./types";
 
-export type { RunReviewOutput, Finding, InlineComment, Usage } from "./types";
+export type {
+  RunReviewOutput,
+  Finding,
+  InlineComment,
+  Usage,
+  FileReviewOutput,
+  FileReviewOutcome,
+  FileSource,
+  EffectiveRules,
+  ReviewSettings,
+  RepoConfigSource,
+  RulesScope,
+} from "./types";
 
 export type { ReviewConfig } from "./config";
 
@@ -82,8 +94,49 @@ export interface ReviewOptions extends SpawnOptions {
  */
 export function review(options?: ReviewOptions): Promise<RunReviewOutput>;
 
-/** The JSON Schema of a {@link review} result. Needs no key and no network. */
-export function schema(options?: SpawnOptions): Promise<Record<string, unknown>>;
+/** Selects a checkout, or a pull request. Give one or the other, not both. */
+export interface ScopeOptions extends SpawnOptions {
+  /** The checkout to resolve against. Defaults to the current directory. */
+  repoRoot?: string;
+  /** `github` | `gitlab` | `bitbucket`. With {@link repo} and {@link pr}. */
+  provider?: string;
+  repo?: string;
+  pr?: number;
+}
+
+export interface ReviewFileOptions extends ScopeOptions {
+  /** Repository-relative path of the file to review. Required. */
+  path: string;
+}
+
+/**
+ * The effective review rules: merged settings, which `.prbot.toml` was read,
+ * what it overrode, and the exact instructions injected into the system prompt.
+ *
+ * Makes no model call, so it needs no `OPENROUTER_API_KEY`. Never includes
+ * credentials — the result is built from an explicit allowlist of settings.
+ */
+export function getRules(options?: ScopeOptions): Promise<EffectiveRules>;
+
+/**
+ * Deep-review one complete file, in a checkout or at a PR head.
+ *
+ * Posts nothing. A path excluded by the repository's review filters comes back
+ * as an `excluded` outcome rather than an error, so it can be reported without
+ * being retried.
+ */
+export function reviewFile(options: ReviewFileOptions): Promise<FileReviewOutput>;
+
+export interface SchemaOptions extends SpawnOptions {
+  /**
+   * Which operation's output schema to fetch — `review-file`, `get-rules`,
+   * `review-local`, `review-pr`. Omit for the review output's schema.
+   */
+  operation?: string;
+}
+
+/** The JSON Schema of an operation's result. Needs no key and no network. */
+export function schema(options?: SchemaOptions): Promise<Record<string, unknown>>;
 
 /** The engine version this package's binary was built from. */
 export function version(options?: SpawnOptions): Promise<string>;
