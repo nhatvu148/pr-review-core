@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+**`explain-finding` could be pointed at any file on the host.** Found in review of this change. It checked the path against the repository's globs and nothing else — but a finding is a JSON object the caller supplies, so `"file": "/etc/passwd"` was reachable: `Path::join` discards the base when its argument is absolute, and the default filters exclude lockfiles, not the filesystem. The contents then go to a model, which makes it a disclosure rather than a read. It now uses the same resolver `review-file` does, so there is one place that decides what may be read rather than two that agree until one of them is edited.
+
+**`resolve-findings` on a provider that cannot track findings returns a reason instead of erroring.** Bailing there reintroduced as a hard crash exactly the ambiguity `get-findings` is designed to avoid, and a caller working through several pull requests would read one provider's limitation as a failed run. The bundle now carries `unsupported` with `handoffs` empty — and that emptiness means unknown, not "nothing to do".
+
 **A coding agent can read a pull request's open findings and work through them.** `kaniscope get-findings`, `resolve-findings` and `explain-finding`, all read-only.
 
 A review's findings live as provider comments once posted, and the only code that ever read them back was reconciliation — which needs them to decide what to resolve and discards the rest. So an agent asked to "fix what the bot found" had no way to ask what the bot found, short of scraping rendered comment markdown.

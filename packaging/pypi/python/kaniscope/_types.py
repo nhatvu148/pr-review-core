@@ -325,6 +325,7 @@ class ResolveOutput(_ResolveOutputRequired, total=False):
     """A bundle of findings handed over for investigation."""
 
     headSha: Optional[str]
+    unsupported: Optional[str]
 
 
 class _FindingHandoffRequired(TypedDict):

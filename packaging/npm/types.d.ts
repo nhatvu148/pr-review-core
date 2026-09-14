@@ -301,6 +301,8 @@ export interface ResolveOutput {
   pr: number;
   provider: string;
   repo: string;
+  /** Set when the provider cannot track findings at all, with the reason. */
+  unsupported?: string | null;
 }
 
 /** One finding, packaged for a coding agent to act on. */

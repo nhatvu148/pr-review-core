@@ -292,6 +292,15 @@ pub struct ResolveOutput {
     pub pr: u64,
     pub head_sha: Option<String>,
     pub handoffs: Vec<FindingHandoff>,
+    /// Set when the provider cannot track findings at all, with the reason.
+    ///
+    /// When this is present `handoffs` is empty, and that emptiness means
+    /// **unknown**, not "nothing to do". Reported the same way `get-findings`
+    /// reports it, rather than as an error — bailing here would have reintroduced
+    /// as a crash exactly the ambiguity that design avoids, and a caller working
+    /// through a list of PRs would see one provider's limitation as a failed run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unsupported: Option<String>,
     /// Stated in the payload, not left to the caller's memory.
     ///
     /// This operation is named `resolve-findings` and it resolves nothing. An
@@ -338,7 +347,15 @@ pub async fn resolve_findings(
             .cloned()
             .collect(),
         FindingsOutcome::Unsupported { reason } => {
-            anyhow::bail!("cannot select findings on this provider: {reason}")
+            return Ok(ResolveOutput {
+                provider: listed.provider,
+                repo: listed.repo,
+                pr: listed.pr,
+                head_sha: head,
+                handoffs: Vec::new(),
+                unsupported: Some(reason.clone()),
+                disclaimer: NOTHING_WAS_CHANGED.to_string(),
+            })
         }
     };
 
@@ -389,6 +406,7 @@ pub async fn resolve_findings(
         pr: listed.pr,
         head_sha: head,
         handoffs,
+        unsupported: None,
         disclaimer: NOTHING_WAS_CHANGED.to_string(),
     })
 }
@@ -405,6 +423,12 @@ fn classify(f: &OutstandingFinding, head: Option<&str>) -> (HandoffAction, Strin
              deliberately reopening it."
                 .to_string(),
         ),
+        // Not reachable through `resolve_findings` today: it selects by
+        // fingerprint, and an unparseable finding has none by definition — that
+        // is what makes it unparseable. Kept because `classify` is the one place
+        // that maps a state to an action, and a state it silently did not handle
+        // would be a worse bug than an arm that waits. `get-findings` is where
+        // these surface; see the note on the test below.
         FindingState::Unparseable => (
             HandoffAction::NeedsHumanJudgement,
             "This comment carries the bot marker but no fingerprint, so it cannot be matched to \
@@ -466,6 +490,10 @@ mod handoff_tests {
             classify(&f(FindingState::Resolved, Some("head")), Some("head")).0,
             HandoffAction::AlreadyResolved
         );
+        // Constructed with a fingerprint, which a real unparseable finding never
+        // has — this pins `classify`'s mapping, not a reachable `resolve_findings`
+        // path. Unparseable comments reach a caller through `get-findings`, where
+        // they are listed separately and never counted as open.
         assert_eq!(
             classify(&f(FindingState::Unparseable, None), Some("head")).0,
             HandoffAction::NeedsHumanJudgement
@@ -488,6 +516,39 @@ mod handoff_tests {
     fn a_stale_findings_rationale_names_both_commits() {
         let (_, why) = classify(&f(FindingState::Active, Some("old")), Some("head"));
         assert!(why.contains("old") && why.contains("head"), "{why}");
+    }
+
+    /// A provider that cannot track findings must not turn a handoff request
+    /// into a crash.
+    ///
+    /// Bailing would have reintroduced, as a hard error, exactly the ambiguity
+    /// `get-findings` is designed to avoid — and a caller working through several
+    /// pull requests would read one provider's limitation as a failed run.
+    #[test]
+    fn an_unsupported_provider_is_reported_in_the_bundle_not_raised() {
+        let out = ResolveOutput {
+            provider: "gitlab".into(),
+            repo: "o/r".into(),
+            pr: 1,
+            head_sha: None,
+            handoffs: Vec::new(),
+            unsupported: Some("GitLab reposts its discussions every run".into()),
+            disclaimer: NOTHING_WAS_CHANGED.to_string(),
+        };
+        let json = serde_json::to_value(&out).expect("serializes");
+        assert!(json.get("unsupported").is_some(), "{json}");
+        assert!(json["handoffs"].as_array().expect("array").is_empty());
+
+        // ...and a supported provider does not carry the field at all, so its
+        // absence is the normal case rather than a null a caller must interpret.
+        let ok = ResolveOutput {
+            unsupported: None,
+            ..out
+        };
+        assert!(serde_json::to_value(&ok)
+            .expect("serializes")
+            .get("unsupported")
+            .is_none());
     }
 
     /// The operation is called `resolve-findings` and resolves nothing. An agent
@@ -609,16 +670,20 @@ pub async fn explain_finding(
 ) -> anyhow::Result<ExplainOutput> {
     use anyhow::Context;
 
-    // The same authorization the file review takes. An explanation reads a whole
-    // file and returns its contents in prose, so a finding naming an excluded
-    // path must not become a way around the filters.
-    if !crate::filereview::path_is_reviewable(cfg, &finding.file) {
-        anyhow::bail!(
-            "`{}` is excluded by this repository's review file filters",
-            finding.file
-        );
-    }
-    let full = repo_root.join(&finding.file);
+    // The SAME resolver the file review uses — not a re-implementation of it.
+    //
+    // This path previously checked only `path_is_reviewable`, which is a glob
+    // test and nothing more. A finding is a JSON object supplied by the caller,
+    // so `"file": "/etc/passwd"` was reachable: `Path::join` DISCARDS the base
+    // when the argument is absolute, and the default filters exclude lockfiles
+    // rather than the filesystem. The contents then go to a model, so that was a
+    // disclosure, not merely a read. `review_local` had this guard; this function
+    // claimed "the same authorization" in a comment and did not have it.
+    let full = match crate::filereview::resolve_repo_file(cfg, repo_root, &finding.file) {
+        crate::filereview::ResolvedPath::File(p) => p,
+        crate::filereview::ResolvedPath::Excluded(reason)
+        | crate::filereview::ResolvedPath::NotFound(reason) => anyhow::bail!(reason),
+    };
     let content =
         std::fs::read_to_string(&full).with_context(|| format!("reading {}", full.display()))?;
 
@@ -729,6 +794,61 @@ impl<T> WithContextMsg<T> for Result<T, serde_json::Error> {
 #[cfg(test)]
 mod explain_tests {
     use super::*;
+
+    struct NeverCalled;
+
+    #[async_trait::async_trait]
+    impl crate::backend::ReviewBackend for NeverCalled {
+        async fn review(
+            &self,
+            _ctx: &crate::backend::ReviewContext<'_>,
+        ) -> anyhow::Result<crate::llm::ReviewResult> {
+            unimplemented!("not exercised")
+        }
+        async fn complete(
+            &self,
+            _cfg: &crate::config::Config,
+            _system: &str,
+            _user: &str,
+        ) -> anyhow::Result<String> {
+            panic!("the file must be refused BEFORE anything reaches a model")
+        }
+    }
+
+    /// A finding is a JSON object the caller supplies, so its `file` is
+    /// caller-controlled — and `Path::join` discards the base when that value is
+    /// absolute. This reached `/etc/passwd` and would have shipped its contents
+    /// to a model, which makes it a disclosure rather than a read.
+    ///
+    /// The backend panics if called, so a regression fails here rather than
+    /// quietly making a network request.
+    #[tokio::test]
+    async fn a_finding_cannot_name_a_file_outside_the_repository() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg = crate::config::Config::from_env();
+
+        for hostile in ["/etc/passwd", "../../../etc/passwd"] {
+            let err = explain_finding(
+                &cfg,
+                &NeverCalled,
+                dir.path(),
+                ExplainInput {
+                    file: hostile.to_string(),
+                    line: Some(1),
+                    body: "look at this".into(),
+                    severity: None,
+                    original_commit: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("must refuse");
+            assert!(
+                err.to_string().contains("inside the repository"),
+                "{hostile}: {err}"
+            );
+        }
+    }
 
     /// Models fence JSON and prepend prose. Discarding an otherwise-good answer
     /// over that throws away a billed call.
