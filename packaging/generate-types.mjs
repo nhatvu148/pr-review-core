@@ -299,6 +299,12 @@ function emitPy(defs) {
     }
     out += pyTypedDict(def.name, def.doc, def.fields);
   }
+  // `__all__`, so `__init__.py` can re-export the whole generated surface with a
+  // star import instead of a hand-kept list. The two clients had drifted to
+  // publishing different subsets — TypeScript 22 names, Python 10 — which makes
+  // the same type reachable in one language and private in the other.
+  const names = defs.map((d) => d.name).sort();
+  out += `\n__all__ = [\n${names.map((n) => `    "${n}",`).join("\n")}\n]\n`;
   return out.trimEnd() + "\n";
 }
 
@@ -458,12 +464,28 @@ const schema = loadSchema();
 // Every operation's defs in one list, deduplicated by name. `Finding` and `Usage`
 // appear in more than one operation's schema and are the same type in each; two
 // declarations of one name would not compile in TypeScript.
+//
+// A repeat that is NOT identical is a hard failure, not a first-one-wins. Keeping
+// whichever schema happened to be read first would publish one client type that
+// is quietly wrong for the other operation — a `Finding` that gains a field on
+// only one path, or two unrelated Rust types that happen to share an ident. That
+// is exactly the silent drift this generator exists to turn into a build error,
+// and `continue` here was a hole in it.
 const defs = [];
-const seen = new Set();
+const seen = new Map();
 for (const s of [schema, ...TYPED_OPERATIONS.map(loadOperationSchema)]) {
   for (const def of objects(s)) {
-    if (seen.has(def.name)) continue;
-    seen.add(def.name);
+    const previous = seen.get(def.name);
+    if (previous) {
+      if (JSON.stringify(previous) !== JSON.stringify(def)) {
+        throw new Error(
+          `${def.name} is declared differently by two operations — one client type ` +
+            `would be wrong for one of them. Rename one, or reconcile the Rust types.`
+        );
+      }
+      continue;
+    }
+    seen.set(def.name, def);
     defs.push(def);
   }
 }

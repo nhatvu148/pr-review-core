@@ -60,18 +60,13 @@ class Usage(_UsageRequired, total=False):
     total_tokens: Optional[int]
 
 
-class _FileReviewOutputRequired(TypedDict):
-    outcome: FileReviewOutcome
-    path: str
-    posted: bool
-    source: FileSource
-    summaryMarkdown: str
-
-
-class FileReviewOutput(_FileReviewOutputRequired, total=False):
+class FileReviewOutput(TypedDict):
     """One file review."""
 
-    commentUrl: Optional[str]
+    outcome: FileReviewOutcome
+    path: str
+    source: FileSource
+    summaryMarkdown: str
 
 
 class FileReviewOutcomeReviewed(TypedDict):
@@ -381,3 +376,31 @@ class Explanation(TypedDict):
 
 # What the investigation concluded.
 ExplanationVerdict = Literal["holds", "doesNotHold", "inconclusive"]
+
+
+
+__all__ = [
+    "EffectiveRules",
+    "ExplainInput",
+    "ExplainOutput",
+    "Explanation",
+    "ExplanationVerdict",
+    "FileReviewOutcome",
+    "FileReviewOutput",
+    "FileSource",
+    "Finding",
+    "FindingHandoff",
+    "FindingState",
+    "FindingsOutcome",
+    "FindingsOutput",
+    "HandoffAction",
+    "InlineComment",
+    "OutstandingFinding",
+    "RepoConfig",
+    "RepoConfigSource",
+    "ResolveOutput",
+    "ReviewSettings",
+    "RulesScope",
+    "RunReviewOutput",
+    "Usage",
+]

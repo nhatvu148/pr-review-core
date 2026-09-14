@@ -31,18 +31,12 @@ import sysconfig
 from typing import Any, Callable, Dict, Mapping, Optional
 
 from ._config import CONFIG_ENV, ReviewConfig, config_to_env
-from ._types import (
-    EffectiveRules,
-    ExplainOutput,
-    FindingsOutput,
-    ResolveOutput,
-    FileReviewOutput,
-    Finding,
-    InlineComment,
-    ReviewSettings,
-    RunReviewOutput,
-    Usage,
-)
+# The WHOLE generated surface, not a hand-kept subset. The two clients had
+# drifted to publishing different sets of the same generated types, which makes a
+# type public in TypeScript and private in Python for no reason anyone chose.
+# `_types` carries its own generated `__all__`, so this cannot fall behind again.
+from ._types import *  # noqa: F401,F403
+from ._types import __all__ as _TYPE_NAMES
 
 __all__ = [
     "review",
@@ -56,19 +50,9 @@ __all__ = [
     "version",
     "binary_path",
     "KaniscopeError",
-    "Finding",
-    "InlineComment",
-    "RunReviewOutput",
-    "Usage",
-    "EffectiveRules",
-    "ExplainOutput",
-    "FileReviewOutput",
-    "FindingsOutput",
-    "ResolveOutput",
-    "ReviewSettings",
     "ReviewConfig",
     "CONFIG_ENV",
-]
+] + list(_TYPE_NAMES)
 
 _EXE = "kaniscope.exe" if os.name == "nt" else "kaniscope"
 

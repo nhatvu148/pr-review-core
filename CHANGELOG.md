@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**Three fixes from a live review of this change through the Claude Code backend**, which is the check compile-and-test cannot make.
+
+The type generator deduplicated definitions across operations **by name alone**, keeping whichever schema was read first. Two operations publishing the same name with different shapes would have shipped one client type quietly wrong for the other — the precise silent drift this generator exists to turn into a build error. A non-identical repeat is now a hard failure.
+
+The two clients had drifted to publishing different subsets of the generated types — 22 names in TypeScript against 10 in Python — so the same type was public in one language and private in the other. Both now re-export the whole generated surface, driven from the generator, so they cannot diverge again.
+
+`FileReviewOutput` carried `posted` and `comment_url` hardcoded to `false` and `None`, with a doc comment claiming `command.rs` set them. It never did — it reads `summary_markdown`, posts, and returns its own `CommandOutcome`. Two dead fields in a published wire contract are worse than absent ones: a consumer reads `posted: false` as a fact rather than as a field nobody fills in. Removed.
+
 **A malformed pull-request scope in an MCP call is an error, not a quiet local answer.** Found in review of this change. `get_rules` and `review_file` fell back to the local checkout on *any* scope error, so a call with one field missing — or with `pr` sent as a string, which models do routinely — returned a confident answer about the server's own working directory instead of the pull request that was asked for. Absent now means local; present-but-wrong is reported.
 
 **`kaniscope mcp` serves the toolbox as MCP tools over stdio.** Seven tools — `review_local`, `review_pr`, `review_file`, `get_rules`, `get_findings`, `resolve_findings`, `explain_finding` — each calling the same library function the matching subcommand calls and returning the same serialized type. An adapter, not a second implementation: a second path to the same answer drifts, and the drift is invisible because both sides keep returning plausible reviews.

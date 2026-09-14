@@ -48,11 +48,8 @@ export interface Usage {
 
 /** One file review. */
 export interface FileReviewOutput {
-  commentUrl?: string | null;
   outcome: FileReviewOutcome;
   path: string;
-  /** Always false here. */
-  posted: boolean;
   source: FileSource;
   /** The result as a comment body — what the PR command posts, and what a CLI caller prints. */
   summaryMarkdown: string;

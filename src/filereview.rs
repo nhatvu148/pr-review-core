@@ -83,10 +83,15 @@ pub struct FileReviewOutput {
     /// The result as a comment body — what the PR command posts, and what a CLI
     /// caller prints. Rendered even when nothing is posted, so `--json` and a
     /// posted comment cannot say different things.
+    ///
+    /// There is deliberately no `posted` or `comment_url` here. This type carried
+    /// both, hardcoded to `false` and `None`, with a doc comment claiming
+    /// `crate::command` set them — it never did; it reads `summary_markdown`,
+    /// posts, and returns its own `CommandOutcome` with the URL on it. Two dead
+    /// fields in a published wire contract are worse than absent ones, because a
+    /// consumer reads `posted: false` as a fact rather than as a field nobody
+    /// fills in. A file review does not post; that is the operation, not a state.
     pub summary_markdown: String,
-    /// Always false here. Posting belongs to [`crate::command`], which sets it.
-    pub posted: bool,
-    pub comment_url: Option<String>,
 }
 
 /// Whether this repository's filters allow the path to be reviewed at all.
@@ -227,8 +232,6 @@ pub async fn review_content(
             findings,
         },
         summary_markdown,
-        posted: false,
-        comment_url: None,
     })
 }
 
@@ -382,8 +385,6 @@ fn refused(path: &str, source: FileSource, outcome: FileReviewOutcome) -> FileRe
         source,
         outcome,
         summary_markdown,
-        posted: false,
-        comment_url: None,
     }
 }
 

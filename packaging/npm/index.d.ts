@@ -8,30 +8,10 @@ import type {
   ExplainInput,
 } from "./types";
 
-export type {
-  RunReviewOutput,
-  Finding,
-  InlineComment,
-  Usage,
-  FileReviewOutput,
-  FileReviewOutcome,
-  FileSource,
-  EffectiveRules,
-  ReviewSettings,
-  RepoConfigSource,
-  RulesScope,
-  FindingsOutput,
-  FindingsOutcome,
-  OutstandingFinding,
-  FindingState,
-  ResolveOutput,
-  FindingHandoff,
-  HandoffAction,
-  ExplainOutput,
-  ExplainInput,
-  Explanation,
-  ExplanationVerdict,
-} from "./types";
+// The WHOLE generated surface. A hand-kept list drifted from the Python
+// client's — 22 names here against 10 there — so the same generated type was
+// public in one language and private in the other. `export *` cannot fall behind.
+export * from "./types";
 
 export type { ReviewConfig } from "./config";
 
