@@ -26,6 +26,7 @@ pub mod diff;
 pub mod filereview;
 pub mod findings;
 pub mod llm;
+pub mod mcp;
 pub mod prompt;
 pub mod providers;
 pub mod queue;

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+**`kaniscope mcp` serves the toolbox as MCP tools over stdio.** Seven tools — `review_local`, `review_pr`, `review_file`, `get_rules`, `get_findings`, `resolve_findings`, `explain_finding` — each calling the same library function the matching subcommand calls and returning the same serialized type. An adapter, not a second implementation: a second path to the same answer drifts, and the drift is invisible because both sides keep returning plausible reviews.
+
+**The MCP surface is read-only, and deliberately narrower than the CLI.** Nothing exposed here can post, edit or resolve anything; `review_pr` always runs dry and no argument changes that. The asymmetry is the point — a CLI invocation is typed by someone who sees the flags, while a tool call is composed by a model from a description and issued without a human reading the arguments. A capability whose worst case is a comment on a colleague's pull request does not belong on the second kind of surface. A test asserts no tool schema accepts `post`, `dryRun` or `resolve`, and that the server states its read-only nature in the `initialize` instructions where a model will read it.
+
+**No new dependency.** MCP over stdio is newline-delimited JSON-RPC 2.0 with three methods that matter, which is less code than the wiring an SDK would need. This is a library crate, so every dependency added here is imposed on every consumer, and a fast-moving protocol SDK is a poor thing to impose — the same reasoning `packaging/generate-types.mjs` gives for being dependency-free.
+
+Configured per project through the repository's own `.mcp.json`, never user-globally.
+
+`review_local` has no stdin diff mode, because stdin is the protocol stream — reading a diff from it would consume the session. Its default is `git diff HEAD`, the one mode that covers committed, staged and unstaged work at once, which is what "review my changes" means to someone who has not thought about the distinction.
+
 **`explain-finding` could be pointed at any file on the host.** Found in review of this change. It checked the path against the repository's globs and nothing else — but a finding is a JSON object the caller supplies, so `"file": "/etc/passwd"` was reachable: `Path::join` discards the base when its argument is absolute, and the default filters exclude lockfiles, not the filesystem. The contents then go to a model, which makes it a disclosure rather than a read. It now uses the same resolver `review-file` does, so there is one place that decides what may be read rather than two that agree until one of them is edited.
 
 **`resolve-findings` on a provider that cannot track findings returns a reason instead of erroring.** Bailing there reintroduced as a hard crash exactly the ambiguity `get-findings` is designed to avoid, and a caller working through several pull requests would read one provider's limitation as a failed run. The bundle now carries `unsupported` with `handoffs` empty — and that emptiness means unknown, not "nothing to do".

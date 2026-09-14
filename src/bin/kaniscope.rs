@@ -73,6 +73,12 @@ enum Op {
     ResolveFindings(ResolveArgs),
     /// Investigate one finding against a local checkout. Never posts.
     ExplainFinding(ExplainArgs),
+    /// Serve these operations as MCP tools over stdio.
+    ///
+    /// Configure it per project, never user-globally, by pointing an `.mcp.json`
+    /// at `kaniscope mcp`. The tools are read-only — this surface cannot post,
+    /// edit or resolve anything, whatever the CLI can do.
+    Mcp,
     /// Print the JSON Schema of an operation's output.
     Schema(SchemaArgs),
 }
@@ -514,6 +520,7 @@ async fn run_op(cfg: &Config, op: Op) -> anyhow::Result<()> {
             }
             emit(&out)
         }
+        Op::Mcp => pr_review_core::mcp::serve(cfg).await,
         Op::GetFindings(a) => {
             let out =
                 pr_review_core::findings::get_findings(cfg, &a.provider, &a.repo, a.pr).await?;

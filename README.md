@@ -157,6 +157,30 @@ The original flat flags (`--local`, `--provider/--repo/--pr`, `--schema`) keep w
 
 `explain-finding` investigates one finding against the real file and returns a verdict of `holds`, `doesNotHold` or `inconclusive` with its evidence and what it could not settle. A finding written against an older commit is reported as a revision mismatch rather than being silently assumed to still line up.
 
+### As an MCP server
+
+```sh
+kaniscope mcp        # newline-delimited JSON-RPC over stdio
+```
+
+Configure it **per project**, in the repository's own `.mcp.json` — never user-globally, so a checkout carries its own reviewer configuration:
+
+```json
+{
+  "mcpServers": {
+    "kaniscope": {
+      "command": "kaniscope",
+      "args": ["mcp"],
+      "env": { "OPENROUTER_API_KEY": "${OPENROUTER_API_KEY}" }
+    }
+  }
+}
+```
+
+The tools are the operations above, and they are **read-only — narrower than the CLI on purpose**. Nothing exposed over MCP can post, edit or resolve anything; `review_pr` always runs dry, and there is no flag to change that. A CLI invocation is typed by someone who sees the flags, while an MCP tool call is composed by a model and issued without a human reading the arguments, and "comment on a colleague's pull request" does not belong on the second kind of surface. Posting stays on the CLI, behind `--post`.
+
+Each tool calls the same library function the matching subcommand calls and returns the same serialized type — it is an adapter, not a second implementation, so the two cannot drift.
+
 A ready-made agent skill for these lives in [`skills/kaniscope`](skills/kaniscope/SKILL.md) — copy it into your agent's skills directory.
 
 `--local` reviews a change before it is a pull request — a branch, a worktree, staged work — through the same pipeline, and reads the checkout's own `.prbot.toml`, so the rules that will apply on the PR apply now. `--intent` (or `--intent-file`) tells it what the change is *meant* to do, which is the one input a pre-PR review otherwise has no way to receive: a PR carries its description, a working tree carries nothing. The reviewer checks the diff against it and reports the mismatches. It is handled as untrusted data — fenced, labelled, capped by `CHANGE_INTENT_MAX_CHARS`, and unable to direct the review — which matters most when the text was written by a coding agent rather than typed by hand.
