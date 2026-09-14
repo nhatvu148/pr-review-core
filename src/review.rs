@@ -865,12 +865,28 @@ pub(crate) async fn run_agentic(
 ///
 /// **Read from the working tree, not from a base ref.** That mirrors the PR path,
 /// which fetches `.prbot.toml` from the PR *head* — the version the change itself
-/// proposes. It does mean a change can relax the rules it is about to be reviewed
-/// under, but that is true of the PR path too, and deliberately: these rules are
-/// advisory configuration for an advisory reviewer, the file is in the diff where
-/// a human reviewer can see it, and matching the two paths is the entire point of
-/// this function. A local review that read the base ref would disagree with the
-/// PR review of the same commit precisely when the change edits `.prbot.toml`.
+/// proposes.
+///
+/// It does mean the change under review can weaken its own reviewer: exclude the
+/// files it touches, raise `min_confidence` past its own findings, or add
+/// `instructions` that talk the reviewer down. Raised in review on this function,
+/// and kept, because reading a base ref costs more than it buys here:
+///
+/// - It is not a new exposure. The PR path already reads the *head* commit, so a
+///   contribution can do exactly this to the remote bot today. Matching that is
+///   the point of this function; diverging would make a local review disagree
+///   with the PR review of the same commit precisely when the change edits
+///   `.prbot.toml` — the one case where you most want them to agree.
+/// - On this path the "attacker" is whoever is running the review, over their own
+///   checkout, with their own environment. Anyone who can write this file can
+///   already set `EXCLUDE_GLOBS`, lower the confidence floor, or simply not run
+///   the tool. A file is not a boundary against someone who owns the process.
+/// - The file is in the diff, where a human reviewer sees it, and the load is
+///   logged at INFO naming the path that was applied.
+///
+/// What would genuinely help is surfacing a proposed `.prbot.toml` change as a
+/// finding in its own right — on BOTH paths, since the PR path is where the risk
+/// is real. That is a separate change, not a reason to make this one asymmetric.
 fn load_local_repo_config(base: &Config, repo_root: Option<&std::path::Path>) -> Config {
     // No checkout means no file to read. The diff may have come from stdin with no
     // repository behind it at all.

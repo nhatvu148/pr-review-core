@@ -558,13 +558,6 @@ impl UntrustedContext<'_> {
         }
         out
     }
-
-    /// Whether any untrusted block is present — the cheap check a prompt builder
-    /// wants before inserting a separator it would otherwise leave dangling.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.pr_body.is_none() && self.change_intent.is_none()
-    }
 }
 
 /// Build the user message: PR metadata header + the (possibly truncated) diff.
@@ -1225,15 +1218,13 @@ mod change_intent_tests {
                 < rendered.find("## Stated intent").unwrap(),
             "{rendered}"
         );
-        assert!(!ctx.is_empty());
+        assert!(!rendered.is_empty());
     }
 
     /// The default carries nothing and renders nothing, so `/ask` and `/describe`
     /// — which pass it — are unchanged by this feature existing.
     #[test]
     fn an_empty_context_renders_nothing() {
-        let ctx = UntrustedContext::default();
-        assert!(ctx.is_empty());
-        assert_eq!(ctx.render(), "");
+        assert_eq!(UntrustedContext::default().render(), "");
     }
 }
