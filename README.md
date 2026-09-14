@@ -180,6 +180,14 @@ Configure it **per project**, in the repository's own `.mcp.json` — never user
 }
 ```
 
+#### Reviewing with no API key
+
+If you omit `OPENROUTER_API_KEY` entirely, the server asks **the calling agent** to run the model, through MCP's `sampling/createMessage`. The reviewer then runs on your agent's own model and credentials — no second key, no second subscription, no second bill for a model you already pay for. The host shows you the sampling request, so a review that spends your tokens is one you approved.
+
+It needs a client that advertises `sampling` in its `initialize` capabilities. When neither a key nor sampling is available, the review tools refuse at the call with a message naming both ways out, rather than failing deep inside a model call with a missing-key error you deliberately caused.
+
+`get-rules` never needs either — it makes no model call at all.
+
 Both values are **referenced from the environment, never written into the file** — `.mcp.json` is committed, and a key pasted into it is a key in your git history.
 
 `GH_TOKEN` is optional, hence the `:-` default: `review_local`, `review_file` on a local path and `get_rules` on a checkout need no provider token at all. The PR-scoped tools — `get_findings`, `resolve_findings`, `review_pr` — do, and without it they fail at the provider call rather than at startup. Use the variable your provider reads (`GH_TOKEN`, `GITLAB_TOKEN`, `BITBUCKET_TOKEN`).

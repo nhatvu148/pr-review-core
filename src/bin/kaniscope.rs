@@ -523,7 +523,15 @@ async fn run_op(cfg: &Config, op: Op) -> anyhow::Result<()> {
             }
             emit(&out)
         }
-        Op::Mcp => pr_review_core::mcp::serve(cfg).await,
+        Op::Mcp => {
+            // Supply the OpenRouter backend only when there is actually a key.
+            // With none, `serve` falls back to asking the MCP client to run the
+            // model — which is the point: a coding agent host already pays for
+            // one, and a second key for the same work is a second bill.
+            let backend: Option<&dyn pr_review_core::backend::ReviewBackend> =
+                (!cfg.openrouter_api_key.trim().is_empty()).then_some(&OpenRouterBackend);
+            pr_review_core::mcp::serve(cfg, backend).await
+        }
         Op::GetFindings(a) => {
             let out =
                 pr_review_core::findings::get_findings(cfg, &a.provider, &a.repo, a.pr).await?;
