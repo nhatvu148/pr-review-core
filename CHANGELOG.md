@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+A concurrent request during a sampling round trip no longer hangs the client, and the sampled review clamps an oversized diff. Both found in review of this change.
+
+The read loop that waits for a `sampling/createMessage` response dropped every message with a different id — including client *requests*, which then waited forever for a reply that was never coming. They are answered with an explicit "busy" error instead. Notifications are still dropped, which is legal, at one real cost: a `notifications/cancelled` arriving mid-sampling is not honoured, so a cancelled request runs to completion. Fixing that properly needs stdin owned by one dispatcher routing responses through a pending map, which is the right shape for a server handling concurrent tool calls and not yet worth its complexity for one that handles them serially.
+
+The sampled backend also passed the diff to the prompt builder unclamped with `truncated: false` hardcoded, where every other model-calling path applies `max_diff_chars` as a safety clamp for the residual case the packer cannot split. Skipping it mattered more here rather than less: this path bills the caller's own model, so an unbounded prompt is charged to someone who chose this backend to avoid paying twice.
+
 **The MCP server reviews through the caller's backend, and can review with no API key at all.**
 
 `mcp::serve` now takes a `ReviewBackend`. The first version hardcoded `OpenRouterBackend` at every tool that needed a model, which made the MCP surface the one part of this crate a consumer could not point at its own reviewer — in a module whose own documentation explains that a second path to the same answer is the thing to avoid. A consumer running an agent CLI could expose every operation over MCP except the ones that actually review.

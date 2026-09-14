@@ -65,7 +65,7 @@ pub async fn serve(
     use std::io::Write;
 
     // Chosen once, at `initialize`, from what the client said it can do — see
-    // `choose_backend`. Held here because the decision needs the client's
+    // `resolve_backend`. Held here because the decision needs the client's
     // capabilities, which do not exist until the handshake.
     let sampling = std::sync::Arc::new(SamplingChannel::new());
     let mut fallback: Option<SamplingBackend> = None;
@@ -658,10 +658,23 @@ impl SamplingChannel {
             out.flush()?;
         }
 
-        // Read until the matching response. Anything else on the way is a message
-        // the client sent us mid-round-trip; notifications are dropped, and a
-        // request cannot be answered here without reentering the dispatcher, so
-        // it is reported rather than silently ignored.
+        // Read until the matching response.
+        //
+        // Anything else arriving mid-round-trip needs handling, not dropping. A
+        // client REQUEST swallowed here is a client waiting forever for a reply
+        // that will never come — the worst failure this loop can produce, and what
+        // the first version did to every non-matching id alike. It is answered
+        // with a JSON-RPC error instead, so the caller learns the server is busy
+        // rather than hanging.
+        //
+        // Notifications are dropped, which is legal — a notification has no id and
+        // expects no response. The cost is real and bounded: a
+        // `notifications/cancelled` arriving now is not honoured, so a cancelled
+        // sampling request still runs to completion. Answering that properly needs
+        // stdin owned by one dispatcher routing responses through a pending map,
+        // which is the right shape for a server that handles concurrent tool calls
+        // — this one processes them one at a time, so the hang was the defect
+        // worth fixing and the dispatcher is not yet worth its complexity.
         loop {
             let line = tokio::task::spawn_blocking(|| {
                 let mut buf = String::new();
@@ -676,6 +689,23 @@ impl SamplingChannel {
                 continue;
             };
             if value.get("id").and_then(Value::as_u64) != Some(id) {
+                // A request (has both an id and a method) gets an explicit
+                // "busy" error; a response to something else, or a notification,
+                // is dropped.
+                if value.get("method").is_some() {
+                    if let Some(other) = value.get("id") {
+                        // -32603: internal error. There is no "busy" code in the
+                        // JSON-RPC spec, so the message carries the meaning.
+                        let _ = respond(&error_response(
+                            other.clone(),
+                            -32603,
+                            "the server is waiting on a sampling response and cannot \
+                             handle another request yet — retry when the current tool \
+                             call returns",
+                        ));
+                        let _ = std::io::stdout().flush();
+                    }
+                }
                 continue;
             }
             if let Some(err) = value.get("error") {
@@ -711,10 +741,23 @@ impl crate::backend::ReviewBackend for SamplingBackend {
         // `ctx.system_prompt` rather than the bare const, so the orchestrator's
         // calibration rules reach this backend like every other.
         let system = ctx.system_prompt(crate::prompt::SYSTEM_PROMPT);
+        // The same SAFETY clamp `review_diff` applies, and for the same residual
+        // case: the orchestrator packs the diff to fit, but a single oversized
+        // file it could not split still arrives whole. Skipping it here was worse
+        // than elsewhere, not better — this path spends the CALLER's tokens, so an
+        // unbounded prompt is billed to someone who chose this backend to avoid
+        // paying twice. `truncated` is the real flag, so the model is told when it
+        // is reading a partial diff instead of silently judging one.
+        let truncated = ctx.diff.chars().count() > ctx.cfg.max_diff_chars;
+        let clipped: String = if truncated {
+            ctx.diff.chars().take(ctx.cfg.max_diff_chars).collect()
+        } else {
+            ctx.diff.to_string()
+        };
         let user = crate::prompt::build_user_prompt(
             ctx.meta,
-            ctx.diff,
-            false, // the orchestrator packed the diff before handing it over
+            &clipped,
+            truncated,
             ctx.omitted_note,
             ctx.structural_context,
             ctx.untrusted,
@@ -917,6 +960,52 @@ mod tests {
         );
         // Sampling alone is used when nothing was supplied.
         assert!(resolve_backend(None, Some(&sampling)).is_ok());
+    }
+
+    /// The sampled review clamps an oversized diff like every other model path.
+    ///
+    /// The orchestrator packs to fit, but one un-packable oversized file still
+    /// arrives whole — which is why `review_diff` carries the same clamp. Skipping
+    /// it mattered MORE here, not less: this path bills the caller's own model, so
+    /// an unbounded prompt is charged to someone who chose this backend precisely
+    /// to avoid paying twice.
+    #[tokio::test]
+    async fn a_sampled_review_clamps_an_oversized_diff_and_says_so() {
+        let mut cfg = Config::from_env();
+        cfg.max_diff_chars = 500;
+
+        let huge = "+x\n".repeat(4_000); // well past the cap
+        let meta = crate::providers::PrMeta {
+            repo: "o/r".into(),
+            pr: 1,
+            title: None,
+            base_branch: None,
+            head_sha: None,
+            body: None,
+            ci_status: None,
+        };
+        // Exercise the clamp through the same builder the backend uses.
+        let truncated = huge.chars().count() > cfg.max_diff_chars;
+        let clipped: String = huge.chars().take(cfg.max_diff_chars).collect();
+        let user = crate::prompt::build_user_prompt(
+            &meta,
+            &clipped,
+            truncated,
+            None,
+            None,
+            crate::prompt::UntrustedContext::default(),
+        );
+
+        assert!(truncated, "the fixture must exceed the cap");
+        assert!(
+            user.chars().count() < huge.chars().count(),
+            "the prompt must be smaller than the raw diff"
+        );
+        assert!(
+            user.contains("truncated"),
+            "a clamped diff must tell the model it is partial: {}",
+            crate::clip(&user, 400)
+        );
     }
 
     /// Every advertised tool must dispatch. A name in the list that falls through
