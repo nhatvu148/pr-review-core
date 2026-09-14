@@ -1,4 +1,12 @@
-import type { RunReviewOutput, FileReviewOutput, EffectiveRules } from "./types";
+import type {
+  RunReviewOutput,
+  FileReviewOutput,
+  EffectiveRules,
+  FindingsOutput,
+  ResolveOutput,
+  ExplainOutput,
+  ExplainInput,
+} from "./types";
 
 export type {
   RunReviewOutput,
@@ -12,6 +20,17 @@ export type {
   ReviewSettings,
   RepoConfigSource,
   RulesScope,
+  FindingsOutput,
+  FindingsOutcome,
+  OutstandingFinding,
+  FindingState,
+  ResolveOutput,
+  FindingHandoff,
+  HandoffAction,
+  ExplainOutput,
+  ExplainInput,
+  Explanation,
+  ExplanationVerdict,
 } from "./types";
 
 export type { ReviewConfig } from "./config";
@@ -127,10 +146,52 @@ export function getRules(options?: ScopeOptions): Promise<EffectiveRules>;
  */
 export function reviewFile(options: ReviewFileOptions): Promise<FileReviewOutput>;
 
+/** PR coordinates. All three are required. */
+export interface PrOptions extends SpawnOptions {
+  provider: string;
+  repo: string;
+  pr: number;
+}
+
+/**
+ * The findings currently on a pull request, with lifecycle state.
+ *
+ * Read-only. Check `outcome.status`: a provider that cannot track findings
+ * returns `unsupported` rather than an empty list, because "no open findings" is
+ * a conclusion and must never come from a question that was never asked.
+ */
+export function getFindings(options: PrOptions): Promise<FindingsOutput>;
+
+export interface ResolveOptions extends PrOptions {
+  /** Fingerprints to hand over. Omit for every active finding. */
+  fingerprints?: string[];
+}
+
+/**
+ * Package findings for your own edit loop.
+ *
+ * Changes nothing — no edits, no posts, no thread resolution. The name is the
+ * operation's, and the returned `disclaimer` says so in the payload.
+ */
+export function resolveFindings(options: ResolveOptions): Promise<ResolveOutput>;
+
+export interface ExplainOptions extends SpawnOptions {
+  /** The finding to investigate. */
+  finding: ExplainInput;
+  /** The checkout to read the file from. Defaults to the current directory. */
+  repoRoot?: string;
+  /** The commit the checkout is at, so a revision mismatch can be reported. */
+  headSha?: string;
+}
+
+/** Investigate one finding against a local checkout. Never posts. */
+export function explainFinding(options: ExplainOptions): Promise<ExplainOutput>;
+
 export interface SchemaOptions extends SpawnOptions {
   /**
    * Which operation's output schema to fetch — `review-file`, `get-rules`,
-   * `review-local`, `review-pr`. Omit for the review output's schema.
+   * `get-findings`, `resolve-findings`, `explain-finding`, `review-local`,
+   * `review-pr`. Omit for the review output's schema.
    */
   operation?: string;
 }

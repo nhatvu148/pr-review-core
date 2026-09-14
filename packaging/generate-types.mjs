@@ -69,7 +69,13 @@ function loadOperationSchema(op) {
  * and forgotten here shows up as a missing export in a client, which is exactly
  * the silent-drift failure this generator exists to prevent.
  */
-const TYPED_OPERATIONS = ["review-file", "get-rules"];
+const TYPED_OPERATIONS = [
+  "review-file",
+  "get-rules",
+  "get-findings",
+  "resolve-findings",
+  "explain-finding",
+];
 
 /**
  * Split a schemars property into `{ types, nullable }`.
@@ -208,6 +214,21 @@ function objects(schema) {
       return { kind: "object", name, doc: summarize(node.description), fields: fieldsOf(name, node) };
     }
     const branches = node.oneOf;
+    // A unit-variant enum: `oneOf` of bare string consts, no properties anywhere.
+    // Emitted as a union of string literals, which is what makes a `state` field
+    // narrowable in an editor instead of just `string`.
+    if (
+      Array.isArray(branches) &&
+      branches.length > 0 &&
+      branches.every((b) => typeof b.const === "string" && !b.properties)
+    ) {
+      return {
+        kind: "stringEnum",
+        name,
+        doc: summarize(node.description),
+        values: branches.map((b) => b.const),
+      };
+    }
     if (Array.isArray(branches) && branches.every((b) => b.properties && tagOf(b))) {
       return {
         kind: "union",
@@ -244,6 +265,11 @@ function tsInterface(name, doc, fields) {
 function emitTs(defs) {
   let out = BANNER("node packaging/generate-types.mjs") + "\n";
   for (const def of defs) {
+    if (def.kind === "stringEnum") {
+      if (def.doc) out += `/** ${def.doc} */\n`;
+      out += `export type ${def.name} = ${def.values.map((v) => JSON.stringify(v)).join(" | ")};\n\n`;
+      continue;
+    }
     if (def.kind === "union") {
       for (const v of def.variants) out += tsInterface(v.name, v.doc, v.fields);
       if (def.doc) out += `/** ${def.doc} */\n`;
@@ -260,6 +286,11 @@ function emitPy(defs) {
     BANNER("node packaging/generate-types.mjs").replaceAll("//", "#") +
     "\nfrom __future__ import annotations\n\nfrom typing import List, Literal, Optional, TypedDict, Union\n\n";
   for (const def of defs) {
+    if (def.kind === "stringEnum") {
+      if (def.doc) out += `# ${def.doc}\n`;
+      out += `${def.name} = Literal[${def.values.map((v) => JSON.stringify(v)).join(", ")}]\n\n\n`;
+      continue;
+    }
     if (def.kind === "union") {
       for (const v of def.variants) out += pyTypedDict(v.name, v.doc, v.fields);
       if (def.doc) out += `# ${def.doc}\n`;

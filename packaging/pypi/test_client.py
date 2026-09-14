@@ -241,6 +241,51 @@ def test_toolbox_operations_send_their_argv() -> None:
             f["echoed"],
         )
 
+        # The findings operations. ``explain_finding`` carries its payload on
+        # stdin, and a finding that never reached the child would be explained
+        # against nothing, with only the child's own error as a clue.
+        io = fake_binary(
+            'A="$*"\nN=$(cat | wc -c | tr -d " ")\ncat <<EOF\n{"echoed":"$A","stdinBytes":$N}\nEOF'
+        )
+        try:
+            got = kaniscope.get_findings(binary=io, provider="github", repo="o/r", pr=1)
+            check(
+                "get_findings sends the PR coordinates",
+                got["echoed"] == "get-findings --provider github --repo o/r --pr 1",
+                got["echoed"],
+            )
+
+            res = kaniscope.resolve_findings(
+                binary=io, provider="github", repo="o/r", pr=1, fingerprints=["aa", "bb"]
+            )
+            check(
+                "resolve_findings repeats --fingerprint per selection",
+                res["echoed"].endswith("--fingerprint aa --fingerprint bb"),
+                res["echoed"],
+            )
+
+            exp = kaniscope.explain_finding(
+                binary=io,
+                finding={"file": "a.rs", "line": 3, "body": "x"},
+                repo_root="/w",
+                head_sha="abc",
+            )
+            check(
+                "explain_finding passes the finding on stdin, not the argv",
+                exp["echoed"] == "explain-finding --finding @- --repo-root /w --head-sha abc"
+                and exp["stdinBytes"] > 0,
+                f"{exp['echoed']} ({exp['stdinBytes']} bytes)",
+            )
+
+            raised = False
+            try:
+                kaniscope.get_findings(binary=io, repo="o/r")
+            except TypeError:
+                raised = True
+            check("get_findings without a provider is a TypeError", raised)
+        finally:
+            os.unlink(io)
+
                 # A partial PR scope is a caller error — it used to stringify the
         # missing pieces into the argv ("--provider None"), so the binary
         # complained about a provider named "None" and pointed at the wrong thing.

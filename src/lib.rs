@@ -24,6 +24,7 @@ pub mod config_spec;
 pub mod deps;
 pub mod diff;
 pub mod filereview;
+pub mod findings;
 pub mod llm;
 pub mod prompt;
 pub mod providers;

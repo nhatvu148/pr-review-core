@@ -141,12 +141,21 @@ kaniscope review-local --base main --intent "Retry 5xx with backoff"   # or --st
 kaniscope review-pr --provider github --repo me/app --pr 12            # add --post to actually post
 kaniscope review-file --path src/auth.rs                               # one whole file, never posts
 kaniscope get-rules --repo-root .                                      # no model key needed
+kaniscope get-findings --provider github --repo me/app --pr 12         # what is still open
+kaniscope resolve-findings --provider github --repo me/app --pr 12     # hand them to your edit loop
+kaniscope explain-finding --finding @- --repo-root .                   # investigate one finding
 kaniscope schema get-rules                                             # one operation's output schema
 ```
 
 `get-rules` answers "why did it flag that, and why not this?" — the merged settings, which `.prbot.toml` was read and what it overrode, and the exact instructions injected into the reviewer's system prompt. It never includes credentials: the output is built from an explicit allowlist of review settings, so a secret added to the engine's configuration cannot appear in it by accident.
 
 The original flat flags (`--local`, `--provider/--repo/--pr`, `--schema`) keep working exactly as before; the subcommands are additive. The one difference worth knowing is the posting default: `--dry-run` is opt-*out* on the flat path, while `review-pr` posts only with `--post`.
+
+`get-findings` reads the findings this bot has on a pull request with their lifecycle state — open, resolved, or unmatchable — using the same fingerprint semantics reconciliation uses, not "every comment with the marker in it". A provider that cannot track that returns an explicit `unsupported` rather than an empty list, because "no open findings" is a conclusion and must never come from a question that was never asked; today that means GitHub only, since GitLab reposts its inline discussions every run and Bitbucket never carries the marker.
+
+`resolve-findings` resolves nothing — it is a handoff. It returns the selected findings with an action (`investigate`, `reverifyAgainstHead`, `alreadyResolved`, `notFound`, `needsHumanJudgement`) and says in the payload that nothing was changed. The reviewer stays read-only; your agent owns every edit.
+
+`explain-finding` investigates one finding against the real file and returns a verdict of `holds`, `doesNotHold` or `inconclusive` with its evidence and what it could not settle. A finding written against an older commit is reported as a revision mismatch rather than being silently assumed to still line up.
 
 A ready-made agent skill for these lives in [`skills/kaniscope`](skills/kaniscope/SKILL.md) — copy it into your agent's skills directory.
 

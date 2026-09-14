@@ -66,8 +66,59 @@ enum Op {
     ReviewFile(FileArgs),
     /// Print the effective review rules. No model call, so no model key.
     GetRules(RulesArgs),
+    /// List the findings currently on a pull request. Read-only.
+    GetFindings(FindingsArgs),
+    /// Package selected findings for a coding agent to investigate. Changes
+    /// nothing: no edits, no posts, no thread resolution.
+    ResolveFindings(ResolveArgs),
+    /// Investigate one finding against a local checkout. Never posts.
+    ExplainFinding(ExplainArgs),
     /// Print the JSON Schema of an operation's output.
     Schema(SchemaArgs),
+}
+
+#[derive(clap::Args)]
+struct FindingsArgs {
+    #[arg(long)]
+    provider: String,
+    #[arg(long)]
+    repo: String,
+    #[arg(long)]
+    pr: u64,
+}
+
+#[derive(clap::Args)]
+struct ResolveArgs {
+    #[arg(long)]
+    provider: String,
+    #[arg(long)]
+    repo: String,
+    #[arg(long)]
+    pr: u64,
+    /// Fingerprints to hand over, repeatable. Omit to take every ACTIVE finding,
+    /// which is what "work through this PR's findings" means and saves a caller
+    /// round-tripping the list it just received.
+    #[arg(long = "fingerprint", value_name = "FP")]
+    fingerprints: Vec<String>,
+}
+
+#[derive(clap::Args)]
+struct ExplainArgs {
+    /// The finding as JSON — `{"file":...,"line":...,"body":...}`. Read from a
+    /// file with `@path`, or from stdin with `@-`.
+    ///
+    /// JSON rather than a flag per field because the input IS a finding, and a
+    /// caller almost always has one already: from a review's `findingsDetail`,
+    /// or from `get-findings`. Retyping it into five flags invites transcription
+    /// errors in the one field that matters, the body.
+    #[arg(long)]
+    finding: String,
+    /// The checkout to read the file from. Defaults to `.`.
+    #[arg(long = "repo-root")]
+    repo_root: Option<PathBuf>,
+    /// The commit the checkout is at, so a revision mismatch can be reported.
+    #[arg(long = "head-sha")]
+    head_sha: Option<String>,
 }
 
 /// Where a local review's diff comes from.
@@ -463,6 +514,37 @@ async fn run_op(cfg: &Config, op: Op) -> anyhow::Result<()> {
             }
             emit(&out)
         }
+        Op::GetFindings(a) => {
+            let out =
+                pr_review_core::findings::get_findings(cfg, &a.provider, &a.repo, a.pr).await?;
+            emit(&out)
+        }
+        Op::ResolveFindings(a) => {
+            let out = pr_review_core::findings::resolve_findings(
+                cfg,
+                &a.provider,
+                &a.repo,
+                a.pr,
+                &a.fingerprints,
+            )
+            .await?;
+            emit(&out)
+        }
+        Op::ExplainFinding(a) => {
+            let finding: pr_review_core::findings::ExplainInput =
+                serde_json::from_str(&read_arg(&a.finding)?)
+                    .map_err(|e| anyhow::anyhow!("--finding must be a finding JSON object: {e}"))?;
+            let root = a.repo_root.unwrap_or_else(|| PathBuf::from("."));
+            let out = pr_review_core::findings::explain_finding(
+                cfg,
+                &OpenRouterBackend,
+                &root,
+                finding,
+                a.head_sha.as_deref(),
+            )
+            .await?;
+            emit(&out)
+        }
         Op::ReviewPr(a) => {
             let out = run_review(
                 cfg,
@@ -520,6 +602,25 @@ fn finish_review_output(
         write_json_out(path, out)?;
     }
     Ok(())
+}
+
+/// A value given inline, or `@path` to read a file, or `@-` for stdin.
+///
+/// A finding body is multi-line prose containing quotes and backticks, which is
+/// exactly the kind of argument a shell mangles. `@-` is safe here because no
+/// operation taking this reads a diff from stdin, so the two cannot collide.
+fn read_arg(value: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+    match value.strip_prefix('@') {
+        None => Ok(value.to_string()),
+        Some("-") => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            Ok(buf)
+        }
+        Some(path) => std::fs::read_to_string(path).with_context(|| format!("reading {path}")),
+    }
 }
 
 /// Serialize one value as the operation's single stdout document.
@@ -650,6 +751,15 @@ fn operation_schema(operation: Option<&str>) -> anyhow::Result<String> {
         }
         Some("review-file") => serde_json::to_value(schemars::schema_for!(FileReviewOutput))?,
         Some("get-rules") => serde_json::to_value(schemars::schema_for!(EffectiveRules))?,
+        Some("get-findings") => serde_json::to_value(schemars::schema_for!(
+            pr_review_core::findings::FindingsOutput
+        ))?,
+        Some("resolve-findings") => serde_json::to_value(schemars::schema_for!(
+            pr_review_core::findings::ResolveOutput
+        ))?,
+        Some("explain-finding") => serde_json::to_value(schemars::schema_for!(
+            pr_review_core::findings::ExplainOutput
+        ))?,
         Some(other) => anyhow::bail!(
             "unknown operation {other:?} — known: {}",
             SCHEMA_OPERATIONS.join(", ")
@@ -660,7 +770,15 @@ fn operation_schema(operation: Option<&str>) -> anyhow::Result<String> {
 
 /// Operations that have a schema. Named once so `kaniscope schema` with no
 /// argument, and the error for an unknown one, cannot disagree.
-const SCHEMA_OPERATIONS: &[&str] = &["review-local", "review-pr", "review-file", "get-rules"];
+const SCHEMA_OPERATIONS: &[&str] = &[
+    "review-local",
+    "review-pr",
+    "review-file",
+    "get-rules",
+    "get-findings",
+    "resolve-findings",
+    "explain-finding",
+];
 
 /// The human-readable block for the flat-flag path.
 fn print_human(args: &Args, out: &RunReviewOutput) {

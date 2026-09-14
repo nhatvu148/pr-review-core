@@ -294,6 +294,59 @@ async function getRules(options = {}) {
   return runOperation("get-rules", scopeArgs(options), options);
 }
 
+/** PR coordinates, required by the findings operations. */
+function prArgs(options) {
+  for (const key of ["provider", "repo", "pr"]) {
+    if (options[key] === undefined || options[key] === null) {
+      throw new TypeError(`kaniscope: this operation needs \`${key}\``);
+    }
+  }
+  return ["--provider", String(options.provider), "--repo", String(options.repo), "--pr", String(options.pr)];
+}
+
+/**
+ * The findings currently on a pull request, with their lifecycle state.
+ *
+ * Read-only. Check `outcome.status` — a provider that cannot track findings
+ * returns `unsupported` rather than an empty list, because "no open findings" is
+ * a conclusion and must never come from a question that was never asked.
+ */
+async function getFindings(options = {}) {
+  return runOperation("get-findings", prArgs(options), options);
+}
+
+/**
+ * Package findings for your own edit loop. Changes nothing: Kaniscope does not
+ * edit code, post, or resolve provider threads.
+ *
+ * Omit `fingerprints` to take every active finding.
+ */
+async function resolveFindings(options = {}) {
+  const fps = (options.fingerprints || []).flatMap((fp) => ["--fingerprint", String(fp)]);
+  return runOperation("resolve-findings", [...prArgs(options), ...fps], options);
+}
+
+/**
+ * Investigate one finding against a local checkout. Never posts.
+ *
+ * The finding is passed as JSON on stdin rather than as a flag: a finding body
+ * is multi-line prose with quotes and backticks in it, which is exactly what an
+ * argv mangles.
+ */
+async function explainFinding(options = {}) {
+  if (!options.finding) throw new TypeError("kaniscope: explainFinding needs a `finding`");
+  const args = ["--finding", "@-"];
+  if (options.repoRoot) args.push("--repo-root", String(options.repoRoot));
+  if (options.headSha) args.push("--head-sha", String(options.headSha));
+  // `diff` is how `run` decides to open the child's stdin and what to write
+  // there; the name is historical and the content here is the finding, not a
+  // diff. The caller never sets it — `@-` above is what reads it.
+  return runOperation("explain-finding", args, {
+    ...options,
+    diff: JSON.stringify(options.finding),
+  });
+}
+
 /** Deep-review one complete file, locally or at a PR head. Never posts. */
 async function reviewFile(options = {}) {
   if (!options.path) throw new TypeError("kaniscope: reviewFile needs a `path`");
@@ -308,4 +361,14 @@ async function version(options = {}) {
   return result.stdout.trim().replace(/^kaniscope\s+/, "");
 }
 
-module.exports = { review, reviewFile, getRules, schema, version, binaryPath };
+module.exports = {
+  review,
+  reviewFile,
+  getRules,
+  getFindings,
+  resolveFindings,
+  explainFinding,
+  schema,
+  version,
+  binaryPath,
+};
