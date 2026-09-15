@@ -1,6 +1,38 @@
 # Changelog
 
-## Unreleased
+## 0.33.0
+
+**The MCP server reviews through whatever backend its caller supplies — including none at all.**
+
+### Migration
+
+`mcp::serve` gains a second argument:
+
+| before | after |
+|---|---|
+| `mcp::serve(&cfg)` | `mcp::serve(&cfg, Some(&backend))` |
+| | `mcp::serve(&cfg, None)` — ask the MCP client to run the model |
+
+Nothing else changed shape. `ReviewContext`, `ReviewBackend` and every review entry point are as they were in 0.32.0, so a consumer that does not serve MCP needs only a version bump. Four consumers were compiled and their own suites run against this candidate; none needed a code change.
+
+### Why the argument exists
+
+The 0.32.0 server hardcoded `OpenRouterBackend` at every tool that needed a model, which made the MCP surface the one part of this crate a consumer could not point at its own reviewer — in a module whose documentation explains that a second path to the same answer is the thing to avoid. A consumer running an agent CLI could expose every operation over MCP except the ones that actually review.
+
+### Reviewing with no API key
+
+With `None`, the server asks the **client** to run the model through MCP `sampling/createMessage`. When the host is a coding agent that means reviews run on the agent's own model and credentials — no second key, no second subscription, no second bill for a model the caller already pays for.
+
+Measured caveat, so nobody plans around it: **Claude Code does not advertise `sampling`** in its initialize capabilities, so this path is unavailable there today. The tools refuse with a message naming both ways out rather than failing inside a model call. A host that does support sampling gets reviews with no key at all.
+
+A sampled review costs **two** round trips on the host's model, not one — the self-critique pass runs on the same backend.
+
+### Also
+
+- `get-rules`, `get-findings` and `resolve-findings` keep working when no reviewer is available at all; they make no model call, and needing no key is the point of the first.
+- The sampled path applies the same `max_diff_chars` safety clamp every other model-calling path does. It matters more there, not less: an unbounded prompt is billed to the caller's own model.
+- `tests/mcp_protocol.rs` drives the built binary over real newline-delimited JSON-RPC — the repository's first integration suite. It is skipped without the `cli` feature rather than failing.
+- The documented `.mcp.json` sample now includes the provider token, and says which tools need it.
 
 The protocol suite declares `required-features = ["cli"]`, so a plain `cargo test` skips it rather than failing. It spawns the `kaniscope` binary, which only exists with that feature — without the declaration, cargo still defines `CARGO_BIN_EXE_kaniscope` and still compiles the target, so the breakage surfaced as seven confusing runtime failures on a missing executable rather than a build error naming the cause.
 
