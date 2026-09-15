@@ -21,44 +21,31 @@ The 0.32.0 server hardcoded `OpenRouterBackend` at every tool that needed a mode
 
 ### Reviewing with no API key
 
-With `None`, the server asks the **client** to run the model through MCP `sampling/createMessage`. When the host is a coding agent that means reviews run on the agent's own model and credentials — no second key, no second subscription, no second bill for a model the caller already pays for.
+With `None`, the server asks the **client** to run the model through MCP `sampling/createMessage`. When the host is a coding agent that means reviews run on the agent's own model and credentials — no second key, no second subscription, no second bill for a model the caller already pays for. Hosts surface sampling requests, so a review that spends the user's tokens is one they approved.
 
-Measured caveat, so nobody plans around it: **Claude Code does not advertise `sampling`** in its initialize capabilities, so this path is unavailable there today. The tools refuse with a message naming both ways out rather than failing inside a model call. A host that does support sampling gets reviews with no key at all.
+Measured, so nobody plans around it: **Claude Code does not advertise `sampling`** in its initialize capabilities, so this path is unavailable there today. The tools refuse with a message naming both ways out rather than failing inside a model call.
 
 A sampled review costs **two** round trips on the host's model, not one — the self-critique pass runs on the same backend.
 
+The sampled backend is not a shortcut past the rest of the pipeline. Its system prompt comes from `ctx.system_prompt`, so the orchestrator's calibration rules reach it like every other backend; the JSON repair pass routes back through the client, so a malformed review is salvaged on the host's model rather than suddenly needing the key this path exists to avoid; and it applies the same `max_diff_chars` safety clamp every other model-calling path does, which matters more here rather than less, because an unbounded prompt is billed to the caller's own model. It reports its model as `mcp-sampling (client's model)` and no usage, because the host chose the model and spent the tokens — naming one would attribute findings to a model that may never have run.
+
+### Backend resolution is per tool
+
+`get-rules`, `get-findings` and `resolve-findings` make no model call — needing no key is the whole point of the first — so they keep working when no reviewer is available at all. Only the four model-using tools refuse, and the refusal names both ways out rather than reporting a missing `OPENROUTER_API_KEY` to someone who deliberately did not set one.
+
+### The server is tested over its real transport
+
+`tests/mcp_protocol.rs` spawns the built binary and speaks newline-delimited JSON-RPC to it, as a host would — the repository's first integration suite. Every other test calls the module's functions directly, which covers the decisions and cannot cover what they travel over.
+
+Two bugs found by hand while building this were invisible to the unit tests and are both caught here: a client that hung when it sent a request mid-sampling, and a parse error written but never flushed.
+
+Offline and unbilled by construction: `OPENROUTER_API_KEY` is set to the **empty string** rather than unset, because the binary loads a `.env` through `dotenvy` and dotenvy does not override a variable that is already present. Unsetting it lets a developer's local `.env` supply a real key and turns the suite into a live, billed review — which happened once while writing it.
+
+The suite declares `required-features = ["cli"]`, so a plain `cargo test` skips it rather than failing. It spawns a binary that only exists with that feature; without the declaration, cargo still defines `CARGO_BIN_EXE_kaniscope` and still compiles the target, so the breakage surfaced as seven confusing runtime failures on a missing executable rather than a build error naming the cause.
+
 ### Also
 
-- `get-rules`, `get-findings` and `resolve-findings` keep working when no reviewer is available at all; they make no model call, and needing no key is the point of the first.
-- The sampled path applies the same `max_diff_chars` safety clamp every other model-calling path does. It matters more there, not less: an unbounded prompt is billed to the caller's own model.
-- `tests/mcp_protocol.rs` drives the built binary over real newline-delimited JSON-RPC — the repository's first integration suite. It is skipped without the `cli` feature rather than failing.
-- The documented `.mcp.json` sample now includes the provider token, and says which tools need it.
-
-The protocol suite declares `required-features = ["cli"]`, so a plain `cargo test` skips it rather than failing. It spawns the `kaniscope` binary, which only exists with that feature — without the declaration, cargo still defines `CARGO_BIN_EXE_kaniscope` and still compiles the target, so the breakage surfaced as seven confusing runtime failures on a missing executable rather than a build error naming the cause.
-
-**The MCP server is tested over its real transport.** `tests/mcp_protocol.rs` spawns the built binary and speaks newline-delimited JSON-RPC to it, as a host would.
-
-Every existing test called the module's functions directly, which covers the decisions — which tool, which backend, what refusal — and cannot cover what those decisions travel over. Two bugs found by hand while building this, a client that hung when it sent a request mid-sampling and a parse error written but never flushed, were both invisible to the unit tests and are both caught here.
-
-Offline and unbilled: `OPENROUTER_API_KEY` is set to the **empty string** rather than unset, because the binary loads a `.env` through `dotenvy` and dotenvy does not override a variable that is already present. Unsetting it lets a developer's local `.env` supply a real key and turns the suite into a live, billed review — which happened once while writing it.
-
-Writing the suite turned up behaviour worth pinning: a sampled review costs **two** round trips on the host's model, not one, because the self-critique pass runs on the same backend. That is now asserted rather than tolerated, so turning `SELF_CRITIQUE` off shows up as a changed expectation instead of silently.
-
-A concurrent request during a sampling round trip no longer hangs the client, and the sampled review clamps an oversized diff. Both found in review of this change.
-
-The read loop that waits for a `sampling/createMessage` response dropped every message with a different id — including client *requests*, which then waited forever for a reply that was never coming. They are answered with an explicit "busy" error instead. Notifications are still dropped, which is legal, at one real cost: a `notifications/cancelled` arriving mid-sampling is not honoured, so a cancelled request runs to completion. Fixing that properly needs stdin owned by one dispatcher routing responses through a pending map, which is the right shape for a server handling concurrent tool calls and not yet worth its complexity for one that handles them serially.
-
-The sampled backend also passed the diff to the prompt builder unclamped with `truncated: false` hardcoded, where every other model-calling path applies `max_diff_chars` as a safety clamp for the residual case the packer cannot split. Skipping it mattered more here rather than less: this path bills the caller's own model, so an unbounded prompt is charged to someone who chose this backend to avoid paying twice.
-
-**The MCP server reviews through the caller's backend, and can review with no API key at all.**
-
-`mcp::serve` now takes a `ReviewBackend`. The first version hardcoded `OpenRouterBackend` at every tool that needed a model, which made the MCP surface the one part of this crate a consumer could not point at its own reviewer — in a module whose own documentation explains that a second path to the same answer is the thing to avoid. A consumer running an agent CLI could expose every operation over MCP except the ones that actually review.
-
-**With no key, the server asks the calling agent to run the model.** MCP lets a server request a completion from its host through `sampling/createMessage`; when the host is a coding agent, the reviewer runs on the agent's own model and credentials. No second key, no second subscription, no second bill for a model the caller already pays for — and because hosts surface sampling requests, a review that spends the user's tokens is one they approved.
-
-The sampled backend is not a shortcut around the rest of the pipeline: it takes its system prompt from `ctx.system_prompt`, so the orchestrator's calibration rules reach it like every other backend, and it runs the same JSON repair pass — routed back through the client, so a malformed review is salvaged on the host's model rather than suddenly needing the key this path exists to avoid. It reports its model as `mcp-sampling (client's model)` and no usage, because the host chose the model and spent the tokens; naming one would attribute findings to a model that may never have run.
-
-Backend selection is per tool, not per call. `get-rules`, `get-findings` and `resolve-findings` make no model call — needing no key is the whole point of the first — so they keep working when no reviewer is available. Only the four tools that use a model refuse, and the refusal names both ways out rather than reporting a missing `OPENROUTER_API_KEY` to someone who deliberately did not set one.
+The documented `.mcp.json` sample now includes the provider token and says which tools need it. It passed only `OPENROUTER_API_KEY`, so anyone copying it got a server where the local-scoped tools worked and the PR-scoped ones failed at the provider call — with nothing pointing back at the config.
 
 ## 0.32.0
 
