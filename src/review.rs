@@ -1303,6 +1303,15 @@ struct Cluster {
     agreement: usize,
 }
 
+/// What merging the samples produced.
+struct SampleMerge {
+    /// The findings that cleared `min_agreement`, in first-sample order.
+    findings: Vec<Finding>,
+    /// How many samples backed each cluster the merge formed; see
+    /// [`crate::runlog::Funnel::sample_agreement`].
+    agreement: Vec<usize>,
+}
+
 /// Merge independent samples of the same review into one finding list.
 ///
 /// **Union, not intersection, by default.** A single review pass is a sample
@@ -1326,7 +1335,7 @@ struct Cluster {
 ///
 /// Order is the first sample's, then anything later samples added — so a run with
 /// `samples = 1` produces exactly what it produced before this existed.
-fn merge_samples(samples: &[Vec<Finding>], tolerance: u64, min_agreement: usize) -> Vec<Finding> {
+fn merge_samples(samples: &[Vec<Finding>], tolerance: u64, min_agreement: usize) -> SampleMerge {
     fn rank(severity: &str) -> u8 {
         match severity.to_ascii_uppercase().as_str() {
             "BLOCKING" => 0,
@@ -1376,16 +1385,39 @@ fn merge_samples(samples: &[Vec<Finding>], tolerance: u64, min_agreement: usize)
         }
     }
 
-    clusters
-        .into_iter()
-        .filter(|c| c.agreement >= min_agreement)
-        .map(|c| c.best)
-        .collect()
+    // Counted before `min_agreement` filters, so the histogram can answer what a
+    // stricter threshold would cost as well as what this one kept. A cluster is
+    // created with an agreement of 1 and each sample may claim it at most once,
+    // so the index is always in range.
+    let mut agreement = vec![0usize; samples.len()];
+    for c in &clusters {
+        if let Some(slot) = agreement.get_mut(c.agreement - 1) {
+            *slot += 1;
+        }
+    }
+
+    SampleMerge {
+        findings: clusters
+            .into_iter()
+            .filter(|c| c.agreement >= min_agreement)
+            .map(|c| c.best)
+            .collect(),
+        agreement,
+    }
 }
 
-/// Everything between the backend's answer and a postable review: self-critique,
-/// confidence floor, hygiene merge, CI demotion, burst collapse, severity sort,
-/// recommendation floor, cap, line anchoring, and the summary.
+/// One sampled review: the first sample's result carrying the merged findings,
+/// and the counts that price and shape the merge.
+struct Sampled {
+    result: ReviewResult,
+    /// Samples that actually came back, which can be fewer than `review_samples`.
+    samples: usize,
+    /// Findings across those samples, duplicates included.
+    total: usize,
+    /// The merge's agreement histogram; empty when only one sample was taken.
+    agreement: Vec<usize>,
+}
+
 /// Ask the backend for `cfg.review_samples` independent reviews and merge them.
 ///
 /// Sequential rather than concurrent, deliberately for now: the Claude Code
@@ -1402,17 +1434,29 @@ async fn sampled_review(
     cfg: &Config,
     backend: &dyn ReviewBackend,
     ctx: &ReviewContext<'_>,
-) -> Result<(ReviewResult, usize, usize)> {
+) -> Result<Sampled> {
     let mut result = backend.review(ctx).await?;
     if cfg.review_samples <= 1 {
         let n = result.review.findings.len();
-        return Ok((result, 1, n));
+        return Ok(Sampled {
+            result,
+            samples: 1,
+            total: n,
+            agreement: Vec::new(),
+        });
     }
 
     let mut samples = vec![result.review.findings.clone()];
     for n in 2..=cfg.review_samples {
         match backend.review(ctx).await {
-            Ok(extra) => samples.push(extra.review.findings),
+            Ok(extra) => {
+                // Every sample is billed, so every sample's tokens belong in the
+                // total. `result` is the first sample's, and reporting only its
+                // usage under-states a k-pass review by roughly k — the same trap
+                // `ReviewResult::usage` documents for the repair pass.
+                result.usage = crate::llm::add_usage(result.usage.take(), extra.usage);
+                samples.push(extra.review.findings);
+            }
             Err(e) => tracing::warn!(
                 "review sample {n}/{} failed ({e:#}); merging the {} that succeeded",
                 cfg.review_samples,
@@ -1426,6 +1470,8 @@ async fn sampled_review(
         cfg.sample_line_tolerance,
         cfg.sample_min_agreement,
     );
+    let agreement = merged.agreement;
+    let merged = merged.findings;
     tracing::info!(
         "merged {} sample(s): {total} finding(s) -> {} after union (tolerance ±{}, min agreement {})",
         samples.len(),
@@ -1437,9 +1483,17 @@ async fn sampled_review(
     // findings, so it can understate a union — the finding list is authoritative
     // and the summary is prose around it.
     result.review.findings = merged;
-    Ok((result, samples.len(), total))
+    Ok(Sampled {
+        result,
+        samples: samples.len(),
+        total,
+        agreement,
+    })
 }
 
+/// Everything between the backend's answer and a postable review: self-critique,
+/// confidence floor, hygiene merge, CI demotion, burst collapse, severity sort,
+/// recommendation floor, cap, line anchoring, and the summary.
 async fn finish_review(
     cfg: &Config,
     backend: &dyn ReviewBackend,
@@ -1766,7 +1820,12 @@ pub async fn run_review_with(
         },
         injected_rules: &injected_rules,
     };
-    let (result, samples, sample_total) = sampled_review(cfg, backend, &ctx).await?;
+    let Sampled {
+        result,
+        samples,
+        total: sample_total,
+        agreement,
+    } = sampled_review(cfg, backend, &ctx).await?;
     let truncated = result.review.summary.contains(crate::llm::TRUNCATED_NOTE);
     let mut finished = finish_review(
         cfg,
@@ -1780,6 +1839,7 @@ pub async fn run_review_with(
     .await;
     finished.funnel.samples = samples;
     finished.funnel.sample_total = sample_total;
+    finished.funnel.sample_agreement = agreement;
     if !advisories.is_empty() {
         finished.summary.push_str("\n\n");
         finished
@@ -2030,11 +2090,17 @@ pub async fn run_review_local(
         },
         injected_rules: &injected_rules,
     };
-    let (result, samples, sample_total) = sampled_review(cfg, backend, &ctx).await?;
+    let Sampled {
+        result,
+        samples,
+        total: sample_total,
+        agreement,
+    } = sampled_review(cfg, backend, &ctx).await?;
     let mut finished =
         finish_review(cfg, backend, LOCAL_PROVIDER, &meta, &diff, &result, hygiene).await;
     finished.funnel.samples = samples;
     finished.funnel.sample_total = sample_total;
+    finished.funnel.sample_agreement = agreement;
     // Same feature on this path: a local review's deliverable *is* its
     // `summary_markdown`, so leaving it unwired made WALKTHROUGH/DIAGRAM silently
     // a no-op for every caller of this entry point.
@@ -3031,6 +3097,139 @@ mod orchestrator_tests {
         assert!(findings[2]["anchored_line"].is_null());
     }
 
+    /// Three partly-overlapping samples, each billing the same tokens.
+    ///
+    /// One finding every sample reports, one two of them report, one only the
+    /// last reports — so the merge has a cluster at every agreement level, and a
+    /// caller summing the per-call usage can be checked against an exact figure.
+    struct SamplingBackend {
+        calls: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl ReviewBackend for SamplingBackend {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            let n = {
+                let mut c = self.calls.lock().unwrap();
+                *c += 1;
+                *c
+            };
+            let f = |file: &str, line: u64, body: &str| crate::llm::Finding {
+                severity: "MEDIUM".to_string(),
+                file: file.to_string(),
+                line: Some(line),
+                body: body.to_string(),
+                confidence: Some(80),
+                suggestion: None,
+            };
+            let findings = match n {
+                1 | 2 => vec![
+                    f("src/a.rs", 2, "every sample sees this"),
+                    f("src/b.rs", 40, "two samples see this"),
+                ],
+                _ => vec![
+                    f("src/a.rs", 2, "every sample sees this"),
+                    f("src/c.rs", 80, "only the last sample sees this"),
+                ],
+            };
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "sampled".to_string(),
+                    recommendation: "APPROVE WITH CHANGES".to_string(),
+                    findings,
+                },
+                model: "spy".to_string(),
+                usage: Some(crate::llm::Usage {
+                    prompt_tokens: Some(100),
+                    completion_tokens: Some(10),
+                    total_tokens: Some(110),
+                }),
+            })
+        }
+    }
+
+    /// Sampling bills k model calls, so the record has to report k calls' tokens.
+    ///
+    /// `sampled_review` returns the *first* sample's `ReviewResult`, and keeping
+    /// only its usage under-stated every sampled review by roughly k. That is not
+    /// hypothetical: it shipped, and for the whole first week of sampling in
+    /// production the run log priced three-pass reviews at one pass — a measured
+    /// recall gain with no denominator anyone could trust.
+    #[tokio::test]
+    async fn a_sampled_review_reports_every_samples_tokens_not_just_the_first() {
+        let srv = github_stub().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.review_samples = 3;
+        cfg.self_critique = false; // its own call, and it reports no usage
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
+
+        let calls = Arc::new(Mutex::new(0));
+        run_review_with(
+            &cfg,
+            input(),
+            &SamplingBackend {
+                calls: Arc::clone(&calls),
+            },
+        )
+        .await
+        .expect("the review runs");
+
+        assert_eq!(*calls.lock().unwrap(), 3, "three samples were taken");
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        let v: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("one parseable JSON line");
+        let u = &v["usage"];
+        assert_eq!(u["prompt_tokens"], 300, "3 samples x 100, not one sample's");
+        assert_eq!(u["completion_tokens"], 30, "3 samples x 10");
+        assert_eq!(u["total_tokens"], 330, "3 samples x 110");
+    }
+
+    /// The counts that say whether a fourth sample would still be worth taking.
+    ///
+    /// `samples` and `sample_total` give the merge its totals, which is enough to
+    /// compute a yield and not enough to know where that yield is heading. The
+    /// agreement histogram is the missing half, and it is free: the merge already
+    /// counts it per cluster and used to throw it away.
+    #[tokio::test]
+    async fn the_run_log_records_the_shape_of_the_sample_merge() {
+        let srv = github_stub().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.review_samples = 3;
+        cfg.self_critique = false;
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
+
+        run_review_with(
+            &cfg,
+            input(),
+            &SamplingBackend {
+                calls: Arc::new(Mutex::new(0)),
+            },
+        )
+        .await
+        .expect("the review runs");
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        let v: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("one parseable JSON line");
+
+        let f = &v["funnel"];
+        assert_eq!(f["samples"], 3);
+        assert_eq!(f["sample_total"], 6, "2 findings per sample, duplicates in");
+        assert_eq!(f["model_raw"], 3, "three distinct issues after the union");
+        assert_eq!(
+            f["sample_agreement"],
+            serde_json::json!([1, 1, 1]),
+            "one finding seen once, one twice, one by all three"
+        );
+    }
+
     /// New-side lines: 1 is context, 2 and 3 are added. A finding that names
     /// `calcTotal` but claims line 5 re-anchors onto line 3.
     const DRIFT_DIFF: &str = "diff --git a/src/order.ts b/src/order.ts\n--- a/src/order.ts\n+++ b/src/order.ts\n@@ -1,1 +1,3 @@\n const items = [];\n+const subtotal = sum(items);\n+return calcTotal(order, tax);\n";
@@ -3727,7 +3926,7 @@ mod tests {
             at("a.rs", Some(10), "HIGH", 80, "one"),
             at("a.rs", Some(12), "LOW", 30, "two"),
         ];
-        let merged = merge_samples(std::slice::from_ref(&s), 10, 1);
+        let merged = merge_samples(std::slice::from_ref(&s), 10, 1).findings;
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0].body, "one");
         assert_eq!(merged[1].body, "two");
@@ -3745,7 +3944,7 @@ mod tests {
             at("a.rs", Some(11), "MEDIUM", 60, "shared, reworded"),
             at("b.rs", Some(90), "HIGH", 78, "only b saw this"),
         ];
-        let merged = merge_samples(&[a, b], 10, 1);
+        let merged = merge_samples(&[a, b], 10, 1).findings;
         assert_eq!(
             merged.len(),
             2,
@@ -3759,10 +3958,13 @@ mod tests {
     fn samples_that_drift_within_tolerance_merge() {
         let a = vec![at("a.rs", Some(40), "MEDIUM", 60, "first wording")];
         let b = vec![at("a.rs", Some(48), "MEDIUM", 55, "second wording")];
-        assert_eq!(merge_samples(&[a.clone(), b.clone()], 10, 1).len(), 1);
+        assert_eq!(
+            merge_samples(&[a.clone(), b.clone()], 10, 1).findings.len(),
+            1
+        );
         // ...and outside it they are treated as distinct, which is the honest
         // answer when the only evidence is position.
-        assert_eq!(merge_samples(&[a, b], 3, 1).len(), 2);
+        assert_eq!(merge_samples(&[a, b], 3, 1).findings.len(), 2);
     }
 
     /// The surviving description is the best-argued one, not the first seen.
@@ -3770,7 +3972,7 @@ mod tests {
     fn the_merged_finding_keeps_the_strongest_description() {
         let weak = vec![at("a.rs", Some(40), "LOW", 30, "vague")];
         let strong = vec![at("a.rs", Some(41), "HIGH", 90, "precise and severe")];
-        let merged = merge_samples(&[weak, strong], 10, 1);
+        let merged = merge_samples(&[weak, strong], 10, 1).findings;
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].body, "precise and severe");
         assert_eq!(merged[0].severity, "HIGH");
@@ -3789,7 +3991,7 @@ mod tests {
             at("a.rs", Some(42), "LOW", 30, "second, nearly the same place"),
         ];
         assert!(
-            merge_samples(&[chatty], 10, 2).is_empty(),
+            merge_samples(&[chatty], 10, 2).findings.is_empty(),
             "two findings from one sample are not two samples agreeing"
         );
     }
@@ -3802,9 +4004,47 @@ mod tests {
             at("a.rs", Some(10), "MEDIUM", 60, "shared"),
             at("b.rs", Some(1), "LOW", 20, "lone"),
         ];
-        let merged = merge_samples(&[a, b], 10, 2);
+        let merged = merge_samples(&[a, b], 10, 2).findings;
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].body, "shared");
+    }
+
+    /// The merge knows how many samples backed each finding, and says so.
+    ///
+    /// This is the only record of the merge's *shape* rather than its totals, and
+    /// the shape is what says whether another sample would still be finding new
+    /// things: a run whose findings are nearly all agreement-1 has not converged,
+    /// one where they are nearly all agreement-k has. Counted before
+    /// `min_agreement` filters, so it also prices a threshold not yet in use.
+    #[test]
+    fn the_merge_reports_how_many_samples_backed_each_finding() {
+        let all = at("a.rs", Some(10), "HIGH", 80, "everyone saw this");
+        let two = at("b.rs", Some(40), "MEDIUM", 60, "two saw this");
+        let one = at("c.rs", Some(80), "LOW", 30, "only the last saw this");
+        let samples = [
+            vec![all.clone(), two.clone()],
+            vec![all.clone(), two],
+            vec![all, one],
+        ];
+
+        let merged = merge_samples(&samples, 10, 1);
+        assert_eq!(
+            merged.agreement,
+            vec![1, 1, 1],
+            "one finding at each agreement level, indexed from agreement 1"
+        );
+        assert_eq!(merged.findings.len(), 3, "union keeps all three");
+
+        // Raising the threshold changes what survives and NOT what was counted:
+        // the histogram has to keep pricing the findings the filter just dropped,
+        // or it cannot answer what the threshold cost.
+        let strict = merge_samples(&samples, 10, 2);
+        assert_eq!(strict.findings.len(), 2, "the lone finding is filtered out");
+        assert_eq!(
+            strict.agreement,
+            vec![1, 1, 1],
+            "still counted, so the cost of min_agreement stays visible"
+        );
     }
 
     /// Unanchored findings match on file alone, and never on a line they lack.
@@ -3812,11 +4052,11 @@ mod tests {
     fn unanchored_findings_merge_by_file_only() {
         let a = vec![at("a.rs", None, "MEDIUM", 50, "no line")];
         let b = vec![at("a.rs", None, "MEDIUM", 60, "no line either")];
-        assert_eq!(merge_samples(&[a.clone(), b], 10, 1).len(), 1);
+        assert_eq!(merge_samples(&[a.clone(), b], 10, 1).findings.len(), 1);
         // An anchored finding is not the same issue as an unanchored one just
         // because they share a file — there is no evidence that they are.
         let anchored = vec![at("a.rs", Some(5), "MEDIUM", 50, "anchored")];
-        assert_eq!(merge_samples(&[a, anchored], 10, 1).len(), 2);
+        assert_eq!(merge_samples(&[a, anchored], 10, 1).findings.len(), 2);
     }
 
     fn finding(severity: &str) -> Finding {
