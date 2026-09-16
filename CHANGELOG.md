@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+**A sampled review reports what all its samples cost, and records how many of them backed each finding.**
+
+### `usage` under-stated every sampled review by roughly `REVIEW_SAMPLES`
+
+`sampled_review` takes `k` independent reviews and returns the **first** one's `ReviewResult`. Samples 2..k contributed their findings and their tokens were dropped on the floor, so a three-pass review logged one pass's `prompt_tokens`. `llm::add_usage` has existed since the JSON-repair pass for exactly this reason — the doc comment on `ReviewResult::usage` already warned that reporting only the first call's tokens under-states what a review cost — and the sampling path simply never called it.
+
+The consequence was not theoretical. A deployment running `REVIEW_SAMPLES=3` for a week showed a measured recall gain against a token figure that was about a third of the real one, which is a benefit with no denominator anyone can trust. Wall clock was never affected: `duration_ms` wraps the whole run, so it stayed honest throughout, and it is the signal to lean on for any run logged before this fix.
+
+**Records written before this change cannot be corrected.** Their `usage` is one sample's, and nothing in the record says how many samples it should have been multiplied by beyond `funnel.samples` itself. Treat a pre-fix sampled review's token counts as a lower bound, not a figure.
+
+### `funnel.sample_agreement`
+
+The merge already counts how many samples reported each finding, and used to discard it. That count is now logged as a histogram: index `i` holds the number of findings exactly `i + 1` samples agreed on, and the array is empty on a single-pass run.
+
+`samples` and `sample_total` give the merge its totals, which is enough to compute a recall gain and not enough to know where that gain is heading. A run whose findings are nearly all agreement-1 has not converged and another sample would still be finding new things; one where they cluster at agreement-`k` has. Without the shape, the only way to answer "is `REVIEW_SAMPLES=3` the right number" is to model it from the totals and hope the assumptions hold.
+
+It is counted over every cluster the merge formed, **before** `sample_min_agreement` filters any out, so it also prices a threshold that is not in use: raising `SAMPLE_MIN_AGREEMENT` to 2 discards everything in index 0, and the histogram says in advance how much that is.
+
+This is a run-log field, not a wire type. `RunReviewOutput` and the generated Node and Python client types are unchanged, so a consumer that does not read the run log needs no change at all.
+
 ## 0.33.0
 
 **The MCP server reviews through whatever backend its caller supplies — including none at all.**
