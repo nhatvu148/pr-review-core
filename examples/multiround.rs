@@ -1,3 +1,10 @@
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "an example is a demo program: it aborts on bad input rather than carrying error plumbing that would obscure what it is demonstrating"
+)]
+
 //! **Phase A of the convergence experiment.** Does re-reviewing the same diff add
 //! recall, or only add diff?
 //!

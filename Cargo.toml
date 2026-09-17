@@ -14,6 +14,41 @@ categories = ["development-tools"]
 # the library actually is.
 exclude = ["packaging/"]
 
+# Lints clippy leaves at `allow` by default, denied here rather than passed on the
+# command line so `cargo clippy` says the same thing locally, in CI, and to an
+# agent editing this crate. Every one of them was at zero when the table was
+# added, so this constrains new code only.
+#
+# `deny` rather than `warn` on purpose: the clippy invocations across these repos
+# are not uniform (vexar's root job has no `-D warnings`), and a denied lint is an
+# error regardless of how clippy was called.
+[lints.clippy]
+# Panic and placeholder paths that must not reach a release build.
+panic = "deny"
+panic_in_result_fn = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+unreachable = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+exit = "deny"
+# NOT print_stdout / print_stderr: this package is both the library and the
+# `kaniscope` binary, whose 32 `println!`s are its documented output contract
+# ("set env, pass five flags, read one JSON object off stdout"). `[lints]` has no
+# per-target scoping, so the rule cannot be stated here without exempting the bin
+# that exists to print.
+# Ownership and sharing mistakes clippy does not warn on by default.
+mem_forget = "deny"
+non_send_fields_in_send_ty = "deny"
+rc_mutex = "deny"
+rc_buffer = "deny"
+# Cheap performance wins.
+large_types_passed_by_value = "deny"
+stable_sort_primitive = "deny"
+format_collect = "deny"
+unused_async = "deny"
+
 [lib]
 name = "pr_review_core"
 path = "src/lib.rs"

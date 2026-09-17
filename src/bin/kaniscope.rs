@@ -1,3 +1,18 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unimplemented,
+        clippy::todo,
+        clippy::format_collect,
+        clippy::print_stdout,
+        clippy::print_stderr,
+        reason = "a test asserts by panicking, stubs unreached trait methods, and builds fixtures the cheap way; the denials above are for production paths"
+    )
+)]
+
 //! `kaniscope` — the review engine as one command, so a bot does not have to be
 //! written in Rust to use it.
 //!
