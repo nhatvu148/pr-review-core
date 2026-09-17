@@ -378,6 +378,10 @@ fn refused(path: &str, source: FileSource, outcome: FileReviewOutcome) -> FileRe
         FileReviewOutcome::Excluded { reason } | FileReviewOutcome::NotFound { reason } => {
             format!("🔍 **File review — `{path}`**\n\n{reason}")
         }
+        #[allow(
+            clippy::unreachable,
+            reason = "`refused` is only ever called on the two refusal variants; a Reviewed outcome here is a caller bug, not input"
+        )]
         FileReviewOutcome::Reviewed { .. } => unreachable!("a refusal is not a review"),
     };
     FileReviewOutput {

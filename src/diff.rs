@@ -451,7 +451,10 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> (String, Vec<String>
     // within a unit, sections in diff order. (Non-bundle units are singletons in
     // index order → the original ordering, unchanged.)
     let mut unit_order: Vec<usize> = (0..units.len()).collect();
-    unit_order.sort_by_key(|&ui| *units[ui].iter().min().unwrap());
+    // `unwrap_or(usize::MAX)`, not `unwrap`: units are built non-empty, so the
+    // fallback is unreachable in practice — and sorting a hypothetical empty unit
+    // last is a total answer where a panic used to be.
+    unit_order.sort_by_key(|&ui| units[ui].iter().min().copied().unwrap_or(usize::MAX));
 
     let mut out = String::new();
     let mut dropped: Vec<String> = Vec::new();

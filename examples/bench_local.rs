@@ -1,3 +1,10 @@
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "an example is a demo program: it aborts on bad input rather than carrying error plumbing that would obscure what it is demonstrating"
+)]
+
 //! Local benchmark harness: score the reviewer against a corpus of **raw diffs**
 //! with known ground-truth issue lines — no GitHub, no live PRs. Reviews each diff
 //! with [`llm::review_diff`] and reports precision / recall / F1 (overall and

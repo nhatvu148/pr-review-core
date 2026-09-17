@@ -1,3 +1,10 @@
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "an example is a demo program: it aborts on bad input rather than carrying error plumbing that would obscure what it is demonstrating"
+)]
+
 //! A/B harness: run the SAME pull request through the agentic reviewer twice —
 //! once with the blast radius OFF, once ON — in dry-run (nothing is posted), and
 //! diff the findings + token cost. Use it to judge whether precomputed
