@@ -22,6 +22,14 @@ It is counted over every cluster the merge formed, **before** `sample_min_agreem
 
 This is a run-log field, not a wire type. `RunReviewOutput` and the generated Node and Python client types are unchanged, so a consumer that does not read the run log needs no change at all.
 
+### The clone path returns an error where it used to panic the process
+
+Denying `clippy::unwrap_used` and `expect_used` turned up two of them in `repo.rs`, and both were on the agentic clone path: `root.to_str().unwrap()` for a clone destination that is not valid UTF-8, and `.expect("stderr piped above")` for the `git` child's stderr handle. Neither state is reachable in practice — the destination is a directory this crate creates under a temp root, and the handle was piped three lines above.
+
+They are called out because the fix is not cosmetic. An unreachable state that aborts the process takes down everything sharing it: in a bot serving webhooks, one impossible clone path ends every review in flight, not the one that hit it. Both now return an `Err` that the review reports and the server survives.
+
+The rest of the change is a `[lints.clippy]` table denying lints clippy leaves at `allow` by default, all of which were already at zero, so it constrains new code and changes no behaviour.
+
 ## 0.33.0
 
 **The MCP server reviews through whatever backend its caller supplies — including none at all.**
