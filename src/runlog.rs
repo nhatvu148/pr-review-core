@@ -125,6 +125,16 @@ pub struct Funnel {
     /// Equal to `model_raw` when a single sample was taken.
     #[serde(default)]
     pub sample_total: usize,
+    /// How many samples backed each merged finding: index `i` counts the
+    /// findings exactly `i + 1` samples agreed on. Empty on a single pass.
+    ///
+    /// Counted over every cluster the merge formed, *before* `min_agreement`
+    /// filters any out, so the histogram also shows what a stricter threshold
+    /// would have discarded rather than only what survived one. `sample_total`
+    /// and `model_raw` give the merge its totals; this gives it a shape, which
+    /// is what says whether another sample would still be finding new things.
+    #[serde(default)]
+    pub sample_agreement: Vec<usize>,
     /// Findings the backend returned, before any post-processing. After merging
     /// when more than one sample was taken, so the rest of the funnel reads the
     /// same either way.
@@ -403,6 +413,7 @@ mod tests {
             funnel: Funnel {
                 samples: 1,
                 sample_total: 5,
+                sample_agreement: Vec::new(),
                 model_raw: 5,
                 after_critique: 4,
                 after_confidence: 3,
