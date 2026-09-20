@@ -1,3 +1,10 @@
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "an example is a demo program: it aborts on bad input rather than carrying error plumbing that would obscure what it is demonstrating"
+)]
+
 //! Benchmark harness: score the reviewer against a corpus of PRs with **known**
 //! issues, and report precision / recall / F1 + token cost. Method borrowed from
 //! alibaba/open-code-review's evaluation approach.

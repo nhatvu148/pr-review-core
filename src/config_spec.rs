@@ -574,6 +574,10 @@ pub fn as_json() -> String {
             })
         })
         .collect();
+    #[allow(
+        clippy::expect_used,
+        reason = "SPEC is a const of plain scalars; a serializer failure here is not a runtime condition a caller could act on"
+    )]
     serde_json::to_string_pretty(&serde_json::json!({ "vars": vars }))
         .expect("SPEC is plain data and always serializes")
 }
@@ -599,10 +603,12 @@ pub fn markdown_table() -> String {
             format!(
                 "`{}`{}",
                 v.env,
-                v.aliases
-                    .iter()
-                    .map(|a| format!(" / `{a}`"))
-                    .collect::<String>()
+                v.aliases.iter().fold(String::new(), |mut acc, a| {
+                    acc.push_str(" / `");
+                    acc.push_str(a);
+                    acc.push('`');
+                    acc
+                })
             )
         };
         let default = match (v.kind, v.default) {

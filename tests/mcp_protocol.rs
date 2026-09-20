@@ -1,3 +1,10 @@
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "a test asserts by panicking"
+)]
+
 //! The MCP server, driven over its real transport.
 //!
 //! Every other test of [`pr_review_core::mcp`] calls its functions directly, which

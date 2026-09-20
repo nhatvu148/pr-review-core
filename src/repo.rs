@@ -291,6 +291,11 @@ const CLONE_ATTEMPTS: u32 = 3;
 /// spawns `git-remote-https`, and killing the parent can leave the child holding
 /// the socket, so the whole process group goes.
 fn clone_with_retry(clone_url: &str, root: &Path) -> Result<()> {
+    // `git` takes the destination as a string, so a path that is not UTF-8 cannot
+    // be passed at all. Reported once here rather than panicked at on every attempt.
+    let root_arg = root
+        .to_str()
+        .context("clone destination path is not valid UTF-8")?;
     let mut last: Option<String> = None;
 
     for attempt in 1..=CLONE_ATTEMPTS {
@@ -307,14 +312,7 @@ fn clone_with_retry(clone_url: &str, root: &Path) -> Result<()> {
         create_private_dir(root).context("recreate the clone dir")?;
 
         match run_git_bounded(
-            &[
-                "clone",
-                "--depth",
-                "1",
-                "--quiet",
-                clone_url,
-                root.to_str().unwrap(),
-            ],
+            &["clone", "--depth", "1", "--quiet", clone_url, root_arg],
             None,
             CLONE_ATTEMPT_TIMEOUT,
         ) {
@@ -449,7 +447,10 @@ fn run_git_bounded(args: &[&str], cwd: Option<&Path>, timeout: Duration) -> Resu
 
     // stderr is drained on its own thread for the same reason, and because the
     // message it carries is the only diagnosis a failure leaves behind.
-    let mut pipe = child.stderr.take().expect("stderr piped above");
+    let mut pipe = child
+        .stderr
+        .take()
+        .context("git stderr was piped above but is missing")?;
     let drain = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);

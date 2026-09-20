@@ -1,3 +1,10 @@
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::unwrap_used,
+    reason = "an example is a demo program: it aborts on bad input rather than carrying error plumbing that would obscure what it is demonstrating"
+)]
+
 //! Render the walkthrough table and change diagram for a local diff, so both can
 //! be eyeballed before they are ever posted on someone's PR.
 //!
