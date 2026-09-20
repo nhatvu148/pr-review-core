@@ -30,6 +30,12 @@ They are called out because the fix is not cosmetic. An unreachable state that a
 
 The rest of the change is a `[lints.clippy]` table denying lints clippy leaves at `allow` by default, all of which were already at zero, so it constrains new code and changes no behaviour.
 
+### `toml` moves to 1.x
+
+The dependency, not the format: `toml = "0.8"` became `toml = "1.1"`, which pulls `toml_parser` / `toml_writer` in place of `toml_edit` and moves `winnow` to 1.0. The crate parses `.prbot.toml` through a single `toml::from_str` call whose signature is unchanged, and no `toml` type appears in this crate's public API, so nothing a consumer writes has to change.
+
+It is recorded because a major bump of a shared dependency is visible in a consumer's own tree: a bot already on `toml` 1.x stops carrying two copies, and one still pinned to 0.8 will carry both until it moves.
+
 ## 0.33.0
 
 **The MCP server reviews through whatever backend its caller supplies — including none at all.**
