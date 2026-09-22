@@ -78,7 +78,7 @@ impl Workspace {
         let candidate = self.root.join(rel.trim_start_matches('/'));
         let canon = candidate
             .canonicalize()
-            .with_context(|| format!("path not found: {rel}"))?;
+            .with_context(|| not_found_reason(rel))?;
         let root = self.root.canonicalize()?;
         if !canon.starts_with(&root) {
             bail!("path escapes the repository: {rel}");
@@ -364,6 +364,34 @@ fn is_capability_failure(err: &anyhow::Error) -> bool {
         return false;
     }
     CAPABILITY_REFUSALS.iter().any(|sig| msg.contains(sig))
+}
+
+/// Why a path is not in the workspace: genuinely absent, or deliberately skipped.
+///
+/// The clone excludes media it cannot read, so those files are missing from the
+/// worktree while being perfectly present in the repository. Reporting both as
+/// `path not found` tells the model something false — and the model acts on it.
+/// A diff touching `assets/logo.png` could draw a confident, wrong finding that
+/// the asset does not exist, which is worse than no answer because it reads like
+/// a real one.
+///
+/// This distinguishes them by extension rather than by asking the filesystem,
+/// because there is nothing to ask: the blob was never fetched.
+fn not_found_reason(rel: &str) -> String {
+    let excluded = std::path::Path::new(rel)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| UNREADABLE_EXTENSIONS.contains(&e.as_str()));
+
+    if excluded {
+        format!(
+            "{rel} is excluded from this workspace: the clone skips media it cannot read. \
+             The file may well exist in the repository — do not conclude that it is missing."
+        )
+    } else {
+        format!("path not found: {rel}")
+    }
 }
 
 /// Empty the clone destination so `git clone` will accept it.
@@ -1256,6 +1284,49 @@ mod lean_clone_tests {
             !root.join("clip.mp4").exists(),
             "the sparse checkout applies even when the filter was ignored, so the \
              worktree stays the same shape on every server"
+        );
+    }
+
+    /// An excluded file must not be reported as a missing one.
+    ///
+    /// The clone skips media, so those paths are absent from the worktree while
+    /// present in the repository. `path not found` is then a false statement the
+    /// model acts on: a diff touching `assets/logo.png` can draw a confident,
+    /// wrong finding that the asset does not exist. Caught by a reviewer on the
+    /// bump PR, after the end-to-end run had missed it — that run's diff touched
+    /// no media, so the agent never reached for an excluded path.
+    #[test]
+    fn an_excluded_path_says_so_instead_of_claiming_it_is_missing() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = Workspace::from_dir(d.path());
+
+        let err = ws
+            .read_file("assets/logo.png", None, None)
+            .expect_err("an excluded file is not in the worktree");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("excluded from this workspace"),
+            "must name the real reason: {msg}"
+        );
+        assert!(
+            !msg.contains("path not found"),
+            "must not claim the file is missing from the repository: {msg}"
+        );
+
+        // Upper case reaches the same answer, since the clone excludes it too.
+        let upper = ws
+            .read_file("assets/LOGO.PNG", None, None)
+            .expect_err("still not in the worktree");
+        assert!(upper.to_string().contains("excluded from this workspace"));
+
+        // A readable path that genuinely is not there keeps the plain message —
+        // over-reporting "excluded" would hide a real typo in a path.
+        let missing = ws
+            .read_file("src/nope.rs", None, None)
+            .expect_err("genuinely absent");
+        assert!(
+            missing.to_string().contains("path not found"),
+            "a readable extension keeps the plain message: {missing}"
         );
     }
 }

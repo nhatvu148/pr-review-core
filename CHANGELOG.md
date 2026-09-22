@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### An excluded file no longer claims it is missing from the repository
+
+0.34.0 stopped checking out media the reviewer cannot read. `Workspace::resolve` still answered `path not found` for those paths, which is a false statement rather than an incomplete one: the file is present in the repository and absent only from the workspace. The model acts on that answer — a diff touching `assets/logo.png` could draw a confident, wrong finding that the asset does not exist, which is worse than no answer because it reads like a real one.
+
+`read_file` on a path whose extension is excluded now says so, and says the file may well exist in the repository. A path with a readable extension keeps the plain `path not found`, because over-reporting "excluded" would hide a genuine typo in a path.
+
+Found by a reviewer on the consumer's version-bump PR. The 0.34.0 end-to-end run missed it for a mundane reason worth recording: that diff touched no media, so the agent never reached for an excluded path.
+
 ## 0.34.0
 
 **A repo the agentic reviewer could not clone at all is now cloned in 13 seconds, and a sampled review reports what all its samples cost.**
