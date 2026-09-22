@@ -1266,7 +1266,7 @@ fn name_some(paths: &[String]) -> String {
 /// The glob clause says explicitly not to infer anything from the absence,
 /// because the failure mode is not the model lacking the file — it is the model
 /// drawing a conclusion from a gap it cannot see the edges of.
-fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) -> Option<String> {
+pub(crate) fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) -> Option<String> {
     let mut parts = Vec::new();
 
     if !glob_dropped.is_empty() {

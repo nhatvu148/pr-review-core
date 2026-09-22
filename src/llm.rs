@@ -509,6 +509,7 @@ pub async fn answer_question(
     meta: &PrMeta,
     diff: &str,
     question: &str,
+    omitted_note: Option<&str>,
     structural_context: Option<&str>,
 ) -> Result<String> {
     let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
@@ -520,7 +521,7 @@ pub async fn answer_question(
         meta,
         &clipped,
         truncated,
-        None,
+        omitted_note,
         structural_context,
         crate::prompt::UntrustedContext::default(),
     );
@@ -543,6 +544,7 @@ pub async fn describe_pr(
     backend: &dyn crate::backend::ReviewBackend,
     meta: &PrMeta,
     diff: &str,
+    omitted_note: Option<&str>,
     structural_context: Option<&str>,
 ) -> Result<String> {
     let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
@@ -554,7 +556,7 @@ pub async fn describe_pr(
         meta,
         &clipped,
         truncated,
-        None,
+        omitted_note,
         structural_context,
         crate::prompt::UntrustedContext::default(),
     );

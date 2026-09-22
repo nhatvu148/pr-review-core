@@ -191,26 +191,67 @@ async fn run_review_file(
     })
 }
 
+/// What to say when the filters left nothing to reason over.
+///
+/// "There are no reviewable source changes" is true of the diff and false of the
+/// pull request. On a lockfile-only PR every file is removed by `EXCLUDE_GLOBS`,
+/// so `/ask "was the lockfile updated?"` answered that nothing changed — about a
+/// change that consisted entirely of the file being asked about. That is the
+/// same false statement this branch exists to stop, arriving in the reply a
+/// human reads directly rather than in a prompt.
+///
+/// Naming the withheld files turns it into an answer: nothing was *reviewed*,
+/// and here is what was set aside.
+fn nothing_to_review_body(omitted_note: Option<&str>) -> String {
+    match omitted_note {
+        Some(note) => format!(
+            "There are no reviewable source changes in this PR — every changed file was \
+             withheld from the diff.\n\n{note}"
+        ),
+        None => "There are no reviewable source changes in this PR.".to_string(),
+    }
+}
+
+/// What `/ask` and `/describe` reason over.
+///
+/// `omitted_note` exists because the parity this function claims was not real:
+/// both dropped lists were discarded here (`let (diff, _dropped) = ...`), so a
+/// command could be asked "was the lockfile updated?" about a diff the lockfile
+/// had been filtered out of, and answer from the gap. The review path was given
+/// the note in the previous release; these two were left behind.
+struct CommandDiff {
+    diff: String,
+    structural: String,
+    /// Names the files withheld from `diff`, and why. `None` when nothing was.
+    omitted_note: Option<String>,
+}
+
 /// Fetch the PR diff and prepare it exactly as the review path does — glob
-/// filter, size packing, and (optionally) structural context — so `/ask` and
-/// `/describe` reason over the same trimmed, budgeted diff the reviewer sees.
+/// filter, size packing, omission note, and (optionally) structural context — so
+/// `/ask` and `/describe` reason over the same trimmed, budgeted diff the
+/// reviewer sees, and are told the same things about what is missing from it.
 async fn prepared_diff(
     provider: &Provider,
     client: &reqwest::Client,
     cfg: &Config,
     repo: &str,
     meta: &PrMeta,
-) -> Result<(String, String)> {
+) -> Result<CommandDiff> {
     let raw = provider.get_diff(client, cfg, repo, meta.pr).await?;
-    let (diff, _dropped) =
+    let (diff, glob_dropped) =
         crate::diff::filter_diff_by_globs(&raw, &cfg.include_globs, &cfg.exclude_globs);
-    let (diff, _packed) = crate::diff::pack_diff(&diff, cfg.max_diff_chars);
+    let (diff, packed_dropped) = crate::diff::pack_diff(&diff, cfg.max_diff_chars);
+    let omitted_note = crate::review::omission_note(&glob_dropped, &packed_dropped);
     let structural = if cfg.structural_context && !diff.trim().is_empty() {
         crate::structure::structural_context(provider, client, cfg, repo, meta, &diff).await
     } else {
         String::new()
     };
-    Ok((diff, structural))
+    Ok(CommandDiff {
+        diff,
+        structural,
+        omitted_note,
+    })
 }
 
 /// `/ask`: answer a question about the PR and post it as a reply comment.
@@ -228,10 +269,15 @@ async fn run_ask(
     let effective = load_repo_config(&provider, &client, cfg, repo, &meta).await;
     let cfg = &effective;
 
-    let (diff, structural) = prepared_diff(&provider, &client, cfg, repo, &meta).await?;
+    let CommandDiff {
+        diff,
+        structural,
+        omitted_note,
+    } = prepared_diff(&provider, &client, cfg, repo, &meta).await?;
     if diff.trim().is_empty() {
         let body = format!(
-            "> **/ask** {question}\n\nThere are no reviewable source changes in this PR to answer against."
+            "> **/ask** {question}\n\n{}",
+            nothing_to_review_body(omitted_note.as_deref())
         );
         let url = provider.post_comment(&client, cfg, repo, pr, &body).await?;
         return Ok(CommandOutcome {
@@ -241,8 +287,16 @@ async fn run_ask(
     }
 
     let structural_opt = (!structural.is_empty()).then_some(structural.as_str());
-    let answer =
-        crate::llm::answer_question(cfg, backend, &meta, &diff, question, structural_opt).await?;
+    let answer = crate::llm::answer_question(
+        cfg,
+        backend,
+        &meta,
+        &diff,
+        question,
+        omitted_note.as_deref(),
+        structural_opt,
+    )
+    .await?;
     // Echo the question so the thread reads as a Q&A exchange.
     let body = format!("> **/ask** {question}\n\n{answer}");
     let url = provider.post_comment(&client, cfg, repo, pr, &body).await?;
@@ -267,7 +321,11 @@ async fn run_describe(
     let effective = load_repo_config(&provider, &client, cfg, repo, &meta).await;
     let cfg = &effective;
 
-    let (diff, structural) = prepared_diff(&provider, &client, cfg, repo, &meta).await?;
+    let CommandDiff {
+        diff,
+        structural,
+        omitted_note,
+    } = prepared_diff(&provider, &client, cfg, repo, &meta).await?;
     if diff.trim().is_empty() {
         let url = provider
             .post_comment(
@@ -275,7 +333,7 @@ async fn run_describe(
                 cfg,
                 repo,
                 pr,
-                "No reviewable source changes to describe.",
+                &nothing_to_review_body(omitted_note.as_deref()),
             )
             .await?;
         return Ok(CommandOutcome {
@@ -285,7 +343,15 @@ async fn run_describe(
     }
 
     let structural_opt = (!structural.is_empty()).then_some(structural.as_str());
-    let generated = crate::llm::describe_pr(cfg, backend, &meta, &diff, structural_opt).await?;
+    let generated = crate::llm::describe_pr(
+        cfg,
+        backend,
+        &meta,
+        &diff,
+        omitted_note.as_deref(),
+        structural_opt,
+    )
+    .await?;
     let merged = merge_description(meta.body.as_deref().unwrap_or(""), &generated);
     provider
         .update_pr_description(&client, cfg, &meta, &merged)
@@ -416,5 +482,108 @@ mod tests {
         assert!(again.starts_with("PREFIX"));
         assert!(again.ends_with("SUFFIX"));
         assert!(again.contains("Keep me."));
+    }
+}
+
+#[cfg(test)]
+mod command_omission_tests {
+    use super::*;
+
+    /// `/ask` and `/describe` must be told what was withheld from their diff.
+    ///
+    /// They used to discard both dropped lists (`let (diff, _dropped) = ...`)
+    /// and pass `None` for `omitted_note`, while claiming in a doc comment to
+    /// prepare the diff "exactly as the review path does". So `/ask "was the
+    /// lockfile updated?"` reasoned over a diff the lockfile had been filtered
+    /// out of, with nothing saying so — the same gap that made the reviewer
+    /// report a committed lockfile as missing, on the two commands whose whole
+    /// job is answering questions about the change.
+    #[test]
+    fn the_note_reaches_the_ask_and_describe_prompts() {
+        let meta = PrMeta {
+            repo: "o/r".to_string(),
+            pr: 1,
+            title: None,
+            base_branch: None,
+            head_sha: None,
+            body: None,
+            ci_status: None,
+        };
+        let note = "1 file(s) are excluded from the diff by this repository's \
+                    configuration and are NOT shown: Cargo.lock.";
+
+        let with = crate::prompt::build_user_prompt(
+            &meta,
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            false,
+            Some(note),
+            None,
+            crate::prompt::UntrustedContext::default(),
+        );
+        assert!(
+            with.contains("Cargo.lock"),
+            "the prompt must name the withheld file: {with}"
+        );
+
+        let without = crate::prompt::build_user_prompt(
+            &meta,
+            "diff --git a/src/lib.rs b/src/lib.rs\n",
+            false,
+            None,
+            None,
+            crate::prompt::UntrustedContext::default(),
+        );
+        assert!(
+            !without.contains("Cargo.lock"),
+            "and must not invent one when nothing was withheld: {without}"
+        );
+    }
+
+    /// A lockfile-only PR must not be told that nothing changed.
+    ///
+    /// Every file is removed by `EXCLUDE_GLOBS`, so the diff is empty and both
+    /// commands took an early return reading "There are no reviewable source
+    /// changes in this PR". Asked `/ask "was the lockfile updated?"` on a PR
+    /// that is nothing but that lockfile, the honest answer is "it was withheld
+    /// from review", not "nothing changed" — the same false statement this
+    /// branch exists to stop, arriving in the reply a human reads directly.
+    /// Caught by the pre-push review at 94 confidence.
+    #[test]
+    fn an_all_filtered_pr_says_what_was_withheld_not_that_nothing_changed() {
+        let note = crate::review::omission_note(&["Cargo.lock".to_string()], &[]).unwrap();
+        let body = nothing_to_review_body(Some(&note));
+
+        assert!(
+            body.contains("Cargo.lock"),
+            "must name what was set aside: {body}"
+        );
+        assert!(
+            body.contains("withheld"),
+            "must say the files were withheld, not absent: {body}"
+        );
+
+        // A genuinely empty change keeps the plain sentence — claiming files
+        // were withheld when none were is the mirror-image lie.
+        let empty = nothing_to_review_body(None);
+        assert!(!empty.contains("withheld"), "{empty}");
+        assert!(empty.contains("no reviewable source changes"), "{empty}");
+    }
+
+    /// The note is built from BOTH drop routes, exactly as the review path
+    /// builds it — the two must not drift apart again.
+    #[test]
+    fn the_command_note_is_the_same_function_the_review_path_uses() {
+        let globbed = vec!["Cargo.lock".to_string()];
+        let packed = vec!["big/generated.rs".to_string()];
+
+        let note =
+            crate::review::omission_note(&globbed, &packed).expect("both routes dropped something");
+        assert!(note.contains("configuration") && note.contains("Cargo.lock"));
+        assert!(note.contains("size limit") && note.contains("big/generated.rs"));
+
+        assert!(
+            crate::review::omission_note(&[], &[]).is_none(),
+            "nothing withheld, nothing said"
+        );
     }
 }

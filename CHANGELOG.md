@@ -14,7 +14,13 @@ Long lists are capped at ten names plus a count, so a vendoring PR excluding hun
 
 `diff_truncated` in the run log is unaffected, and that took a fix of its own. It was derived from `omitted_note.is_some()`, so widening the note would have made essentially every dependency bump report a budget overrun it never had — the same conflation of "excluded by configuration" and "dropped for size" this entry argues against, landing in a durable record rather than a prompt. It now tracks the size drop alone. Caught in review of this change.
 
-**Known limit:** `/ask` and `/describe` still do not carry this note. `command::prepared_diff` discards both dropped lists and has no note channel to put them in, so those commands can still reason from a gap. Its doc comment claims parity with the review path; that claim is now narrower than it reads, and closing it is a separate change.
+### `/ask` and `/describe` are told what was withheld too
+
+`command::prepared_diff` discarded both dropped lists (`let (diff, _dropped) = ...`) and passed `None` for the note, while its doc comment claimed it prepared the diff "exactly as the review path does". So `/ask "was the lockfile updated?"` reasoned over a diff the lockfile had been filtered out of, with nothing saying so — the same gap that made the reviewer report a committed lockfile as missing, on the two commands whose whole job is answering questions about a change. They now build the note with the same `omission_note` the review path uses, so the two cannot drift apart again.
+
+The empty-diff replies carry it too. When every changed file is filtered out, both commands used to answer "There are no reviewable source changes in this PR" — true of the diff and false of the pull request. On a lockfile-only PR that is every file, so `/ask "was the lockfile updated?"` reported that nothing changed, about a change consisting entirely of the file being asked about. They now name what was withheld. A genuinely empty change keeps the plain sentence, since claiming files were withheld when none were is the mirror-image lie.
+
+**API break.** `llm::answer_question` and `llm::describe_pr` each take a new `omitted_note: Option<&str>` before `structural_context`. **Both consumers were checked and neither calls these functions** — `pr-review-bot` and `simcel-pr-bot` reach them only through `/ask` and `/describe`, which are inside this crate. An external caller passes `None` to keep the previous behaviour, though passing the note is the point. This is why the release is a minor bump rather than a patch; a duplicate `_with_omissions` entry point would have avoided it at the cost of two code paths doing one job.
 
 ## 0.34.1
 
