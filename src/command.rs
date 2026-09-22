@@ -191,6 +191,27 @@ async fn run_review_file(
     })
 }
 
+/// What to say when the filters left nothing to reason over.
+///
+/// "There are no reviewable source changes" is true of the diff and false of the
+/// pull request. On a lockfile-only PR every file is removed by `EXCLUDE_GLOBS`,
+/// so `/ask "was the lockfile updated?"` answered that nothing changed — about a
+/// change that consisted entirely of the file being asked about. That is the
+/// same false statement this branch exists to stop, arriving in the reply a
+/// human reads directly rather than in a prompt.
+///
+/// Naming the withheld files turns it into an answer: nothing was *reviewed*,
+/// and here is what was set aside.
+fn nothing_to_review_body(omitted_note: Option<&str>) -> String {
+    match omitted_note {
+        Some(note) => format!(
+            "There are no reviewable source changes in this PR — every changed file was \
+             withheld from the diff.\n\n{note}"
+        ),
+        None => "There are no reviewable source changes in this PR.".to_string(),
+    }
+}
+
 /// What `/ask` and `/describe` reason over.
 ///
 /// `omitted_note` exists because the parity this function claims was not real:
@@ -255,7 +276,8 @@ async fn run_ask(
     } = prepared_diff(&provider, &client, cfg, repo, &meta).await?;
     if diff.trim().is_empty() {
         let body = format!(
-            "> **/ask** {question}\n\nThere are no reviewable source changes in this PR to answer against."
+            "> **/ask** {question}\n\n{}",
+            nothing_to_review_body(omitted_note.as_deref())
         );
         let url = provider.post_comment(&client, cfg, repo, pr, &body).await?;
         return Ok(CommandOutcome {
@@ -311,7 +333,7 @@ async fn run_describe(
                 cfg,
                 repo,
                 pr,
-                "No reviewable source changes to describe.",
+                &nothing_to_review_body(omitted_note.as_deref()),
             )
             .await?;
         return Ok(CommandOutcome {
@@ -515,6 +537,36 @@ mod command_omission_tests {
             !without.contains("Cargo.lock"),
             "and must not invent one when nothing was withheld: {without}"
         );
+    }
+
+    /// A lockfile-only PR must not be told that nothing changed.
+    ///
+    /// Every file is removed by `EXCLUDE_GLOBS`, so the diff is empty and both
+    /// commands took an early return reading "There are no reviewable source
+    /// changes in this PR". Asked `/ask "was the lockfile updated?"` on a PR
+    /// that is nothing but that lockfile, the honest answer is "it was withheld
+    /// from review", not "nothing changed" — the same false statement this
+    /// branch exists to stop, arriving in the reply a human reads directly.
+    /// Caught by the pre-push review at 94 confidence.
+    #[test]
+    fn an_all_filtered_pr_says_what_was_withheld_not_that_nothing_changed() {
+        let note = crate::review::omission_note(&["Cargo.lock".to_string()], &[]).unwrap();
+        let body = nothing_to_review_body(Some(&note));
+
+        assert!(
+            body.contains("Cargo.lock"),
+            "must name what was set aside: {body}"
+        );
+        assert!(
+            body.contains("withheld"),
+            "must say the files were withheld, not absent: {body}"
+        );
+
+        // A genuinely empty change keeps the plain sentence — claiming files
+        // were withheld when none were is the mirror-image lie.
+        let empty = nothing_to_review_body(None);
+        assert!(!empty.contains("withheld"), "{empty}");
+        assert!(empty.contains("no reviewable source changes"), "{empty}");
     }
 
     /// The note is built from BOTH drop routes, exactly as the review path
