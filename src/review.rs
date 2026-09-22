@@ -1211,6 +1211,17 @@ struct PreparedDiff {
     /// and those packed out to fit the budget. The two reasons are reported
     /// separately because they are not the same fact about the repository.
     omitted_note: Option<String>,
+    /// Whether the SIZE BUDGET dropped whole files — not whether anything was
+    /// withheld at all.
+    ///
+    /// Kept apart from `omitted_note.is_some()` on purpose. The run log's
+    /// `diff_truncated` means "part of this change went unreviewed because it
+    /// did not fit", and a glob-excluded lockfile is neither of those things:
+    /// it was withheld deliberately and nothing was lost. Deriving the flag
+    /// from the note made every dependency bump report a budget overrun,
+    /// because `EXCLUDE_GLOBS` defaults to `**/*.lock` — the exact conflation
+    /// of "budget" and "configuration" the note itself is written to avoid.
+    size_dropped: bool,
 }
 
 /// Name at most `MAX` paths, then say how many more there were.
@@ -1312,6 +1323,7 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
             diff,
             hygiene,
             omitted_note: None,
+            size_dropped: false,
         };
     }
 
@@ -1332,11 +1344,13 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
     }
     // Surfaced to the model so it knows these files were NOT reviewed.
     let omitted_note = omission_note(&glob_dropped, &packed_dropped);
+    let size_dropped = !packed_dropped.is_empty();
 
     PreparedDiff {
         diff,
         hygiene,
         omitted_note,
+        size_dropped,
     }
 }
 
@@ -1811,12 +1825,17 @@ pub async fn run_review_with(
         diff,
         hygiene,
         omitted_note,
+        size_dropped,
     } = prepared;
     // Recorded now: `diff` is what the backend is about to see (post-filter,
-    // post-pack), and an `omitted_note` means whole files were dropped to fit the
-    // budget — i.e. part of this change is going unreviewed.
+    // post-pack).
+    //
+    // `diff_truncated` tracks the SIZE drop alone, not `omitted_note.is_some()`.
+    // The note also names glob-excluded files, and those were withheld on
+    // purpose with nothing lost — reading the flag off the note made every PR
+    // touching a lockfile report a budget overrun it never had.
     let diff_bytes = diff.len();
-    let diff_truncated = omitted_note.is_some();
+    let diff_truncated = size_dropped;
 
     // Structural context: name the enclosing function/symbol of each changed line
     // so the model knows every change's scope. Tier B (tree-sitter over fetched
@@ -2104,6 +2123,8 @@ pub async fn run_review_local(
         diff,
         hygiene,
         omitted_note,
+        // The local path writes no run-log row, so it records no `diff_truncated`.
+        size_dropped: _,
     } = prepared;
 
     // Structural context from the checkout when there is one; hunk headers (Tier A)
@@ -2210,7 +2231,7 @@ mod local_review_tests {
     use anyhow::Result;
     use async_trait::async_trait;
 
-    use super::{run_review_local, LocalReviewInput, LOCAL_PROVIDER};
+    use super::{prepare_diff, run_review_local, LocalReviewInput, LOCAL_PROVIDER};
     use crate::backend::{ReviewBackend, ReviewContext};
     use crate::config::Config;
     use crate::llm::{Finding, Review, ReviewResult};
@@ -2295,6 +2316,47 @@ mod local_review_tests {
         c.min_confidence = 0;
         c.extra_system_prompt = String::new();
         c
+    }
+
+    /// A glob-excluded file must be named to the model without the run log
+    /// claiming the diff was truncated.
+    ///
+    /// `diff_truncated` means "part of this change went unreviewed because it
+    /// did not fit". A lockfile removed by `EXCLUDE_GLOBS` is neither: it was
+    /// withheld deliberately and nothing was lost. Deriving the flag from
+    /// `omitted_note.is_some()` — which this PR made true for glob drops too —
+    /// would mark essentially every dependency bump as a budget overrun, since
+    /// the default globs include `**/*.lock`. Caught in review.
+    #[test]
+    fn a_glob_excluded_file_does_not_mark_the_diff_truncated() {
+        let mut c = cfg();
+        c.exclude_globs = vec!["**/*.lock".to_string()];
+        c.max_diff_chars = 100_000; // nothing can be dropped for size here
+
+        let raw = "diff --git a/Cargo.lock b/Cargo.lock\n\
+                   --- a/Cargo.lock\n+++ b/Cargo.lock\n@@ -1 +1 @@\n-old\n+new\n\
+                   diff --git a/src/lib.rs b/src/lib.rs\n\
+                   --- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+
+        let p = prepare_diff(&c, raw);
+
+        assert!(
+            p.omitted_note
+                .as_deref()
+                .is_some_and(|n| n.contains("Cargo.lock")),
+            "the model must be told the lockfile was withheld: {:?}",
+            p.omitted_note
+        );
+        assert!(
+            !p.size_dropped,
+            "nothing was dropped for size — the run log must not record a budget \
+             overrun for a file the configuration removed on purpose"
+        );
+        assert!(
+            p.diff.contains("src/lib.rs") && !p.diff.contains("-old"),
+            "the lockfile is filtered out of the reviewed diff: {}",
+            p.diff
+        );
     }
 
     fn spy() -> (LocalSpy, Seen) {

@@ -12,6 +12,8 @@ The two reasons are reported **separately** rather than merged. "Omitted to fit 
 
 Long lists are capped at ten names plus a count, so a vendoring PR excluding hundreds of files does not spend the budget the filter exists to save.
 
+`diff_truncated` in the run log is unaffected, and that took a fix of its own. It was derived from `omitted_note.is_some()`, so widening the note would have made essentially every dependency bump report a budget overrun it never had — the same conflation of "excluded by configuration" and "dropped for size" this entry argues against, landing in a durable record rather than a prompt. It now tracks the size drop alone. Caught in review of this change.
+
 **Known limit:** `/ask` and `/describe` still do not carry this note. `command::prepared_diff` discards both dropped lists and has no note channel to put them in, so those commands can still reason from a gap. Its doc comment claims parity with the review path; that claim is now narrower than it reads, and closing it is a separate change.
 
 ## 0.34.1
