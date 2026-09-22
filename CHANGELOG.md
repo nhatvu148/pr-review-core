@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.35.0
+
+**The model is told what it cannot see — in the review, in `/ask`, in `/describe`, and in the reply when everything was filtered out.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — `pr-review-bot` (138 tests) and `simcel-pr-bot` (104 tests). Neither needed a change. Neither is reachable by CI's `downstream compiles (public consumers)` job.
+
+### Migration
+
+| change | who it touches |
+| --- | --- |
+| `llm::answer_question` and `llm::describe_pr` each take a new `omitted_note: Option<&str>` before `structural_context` | **No known consumer.** `pr-review-bot` and `simcel-pr-bot` were both checked: neither calls these functions, reaching them only through `/ask` and `/describe`, which are inside this crate. An external caller passes `None` to keep the previous behaviour, though passing the note is the point. |
+
+This one break is why the release is minor rather than a patch. The alternative — a second `_with_omissions` entry point — would have kept the patch at the cost of two code paths doing one job.
+
+### Behaviour changes — these ship silently
+
+Flagged separately per [Releasing](README.md#releasing) step 3.
+
+- **A glob-excluded file is now named to the model.** Reviews of any PR touching a lockfile (or anything else in `EXCLUDE_GLOBS`) will include an extra note in the prompt. This removes a false-positive class, but it is a prompt change, so findings can shift on those PRs.
+- **`/ask` and `/describe` see that note too**, so their answers on such PRs can differ from before.
+- **The "nothing to review" reply changed wording** when files were withheld: it now names them instead of saying there are no source changes.
+- **`diff_truncated` in the run log is unchanged in meaning** — deliberately. See below.
+
 
 ### The model is told which files the globs removed, not just which ones the packer dropped
 
