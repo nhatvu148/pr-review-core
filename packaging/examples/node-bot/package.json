@@ -9,8 +9,10 @@
     "start": "node server.js",
     "test": "node test.js"
   },
-  "engines": { "node": ">=18" },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
-    "kaniscope": "^0.32.0"
+    "kaniscope": "^0.35.0"
   }
 }
