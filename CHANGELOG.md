@@ -4,6 +4,18 @@
 
 **A sampled review reports what all its samples cost, and records how many of them backed each finding.**
 
+### The agentic clone skips files the reviewer cannot read
+
+`Workspace::clone` fetched every blob at HEAD. On a repo whose bulk is media that no tool in this crate can open, that is the entire cost of the clone and none of its value — and past a point it is not slow, it is fatal: `CLONE_ATTEMPT_TIMEOUT` kills an attempt at 90s, so a large enough repo could not be reviewed by an agentic backend at all, on any machine, at any network speed.
+
+Measured on a 4.0 GB Docusaurus site (`.mp4`s, multi-MB `.gif`s, 2.3 GB of versioned docs): `--depth 1` took **115s** and blew the deadline on all three attempts. The clone now runs `--filter=blob:none --no-checkout`, sets a non-cone `sparse-checkout` excluding unreadable extensions, and only then checks out — which fetches just the blobs the remaining paths need. Same repo: **13s and 400 MB**, with all 29,939 markdown files present.
+
+`--filter=blob:none` on its own is not the fix and was measured too: it still materialises the full worktree at checkout, so it took 87s and produced the same 4.0 GB. The saving comes from never checking the files out, not from the filter alone.
+
+The exclusion list is by extension, not by size, because size is not obtainable. Blob sizes live in the blobs: asking for them in a blobless clone (`git ls-tree --long`) lazily fetches every object in the tree, which on the repo above refilled `.git` from 32 MB to 237 MB and was still climbing when it was killed. A size threshold would have to download exactly what it exists to avoid. `.svg` is deliberately kept — it is XML, hand-edited, and reviewable — as are all data formats.
+
+**Two limits.** A file with an excluded extension is now absent from the workspace, so `read_file` on one fails rather than returning bytes the model could not use anyway; the diff still reports that it changed. And a server with `uploadpack.allowFilter` off — which is the **default** — silently ignores the filter and sends everything, so it keeps the lean worktree and the 90s-deadline fix but not the bandwidth saving. A genuine capability error, such as a local git too old for `sparse-checkout`, falls back to the previous full shallow clone within the same attempt; a timeout does not, because falling back there would spend a second 90s budget on an attempt the network had already lost.
+
 ### `usage` under-stated every sampled review by roughly `REVIEW_SAMPLES`
 
 `sampled_review` takes `k` independent reviews and returns the **first** one's `ReviewResult`. Samples 2..k contributed their findings and their tokens were dropped on the floor, so a three-pass review logged one pass's `prompt_tokens`. `llm::add_usage` has existed since the JSON-repair pass for exactly this reason — the doc comment on `ReviewResult::usage` already warned that reporting only the first call's tokens under-states what a review cost — and the sampling path simply never called it.

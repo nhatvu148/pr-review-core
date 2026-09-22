@@ -260,6 +260,116 @@ const CLONE_ATTEMPTS: u32 = 3;
 // below became dead code the moment the fetch was bounded too, and clippy said so;
 // deleting it rather than silencing that is what keeps the property true.
 
+/// Extensions whose contents the reviewer can never read, and which are
+/// therefore not worth downloading or checking out.
+///
+/// The agent's tools are `read_file`, `list_dir` and `grep` — all text. A `.mp4`
+/// in the workspace can only ever cost bytes: the diff already reports that the
+/// file changed, and that is the whole of what a reviewer could say about it.
+///
+/// Deliberately **not** here: `.svg` (XML, and frequently hand-edited), and no
+/// data format — `.json`, `.csv`, `.yaml` and friends are all readable and are
+/// often the actual subject of a review.
+///
+/// This is an extension list rather than a size threshold because a size
+/// threshold is not obtainable. Blob sizes live in the blobs, so asking for them
+/// in a blobless clone (`git ls-tree --long`) lazily fetches every object in the
+/// tree — measured on a 4 GB repo, that refilled `.git` from 32 MB to 237 MB and
+/// was still climbing when it was killed. Filtering by size would have to
+/// download exactly what the filter exists to avoid.
+const UNREADABLE_EXTENSIONS: &[&str] = &[
+    // Raster images. `.svg` is absent on purpose — see above.
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tif", "tiff", "psd", "ai",
+    // Video and audio. The bulk of a docs site, and unreadable to a line-based tool.
+    "mp4", "mov", "avi", "mkv", "webm", "m4v", "mp3", "wav", "ogg", "flac", "m4a",
+    // Archives: opaque until extracted, and nothing here extracts them.
+    "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar",
+    // Compiled and packaged artefacts.
+    "pdf", "exe", "dll", "so", "dylib", "bin", "dmg", "iso", "jar", "wasm", // Fonts.
+    "woff", "woff2", "ttf", "otf", "eot",
+];
+
+/// Gitignore-style patterns for `sparse-checkout --no-cone`: everything, minus
+/// the extensions above.
+///
+/// Cone mode cannot express this — it matches directory prefixes, and the files
+/// being skipped are scattered through every directory of a docs tree.
+fn sparse_patterns() -> Vec<String> {
+    let mut patterns = Vec::with_capacity(UNREADABLE_EXTENSIONS.len() + 1);
+    patterns.push("/*".to_string());
+    patterns.extend(UNREADABLE_EXTENSIONS.iter().map(|ext| format!("!*.{ext}")));
+    patterns
+}
+
+/// Whether a failure says the *strategy* is unavailable rather than that the
+/// network is having a bad minute.
+///
+/// A timeout is the second kind: the server understood the request perfectly and
+/// the packets did not arrive. Falling back on a timeout would buy a second
+/// 90-second wait for an attempt that was already doomed, turning the bounded
+/// clone this module exists to guarantee back into an unbounded one.
+fn is_capability_failure(err: &anyhow::Error) -> bool {
+    !err.to_string().contains("timed out")
+}
+
+/// Empty the clone destination so `git clone` will accept it.
+///
+/// A previous attempt may have left a partial tree behind, and `git clone`
+/// refuses a non-empty destination — so a retry into it would fail for a reason
+/// that has nothing to do with the network.
+///
+/// Errors here are propagated rather than swallowed. A real filesystem failure —
+/// permissions, ENOSPC — used to fall through to a confusing git error *and*
+/// burn the remaining attempts on sleeps first, which reports a network fault
+/// for a full disk.
+fn reset_clone_dir(root: &Path) -> Result<()> {
+    if root.exists() {
+        std::fs::remove_dir_all(root).context("clear the previous clone attempt")?;
+    }
+    create_private_dir(root).context("recreate the clone dir")
+}
+
+/// Clone without the blobs, then check out only what is readable.
+///
+/// Three steps, and the order is the point:
+///
+/// 1. `--filter=blob:none --no-checkout` — fetch the history and trees, no file
+///    contents at all.
+/// 2. `sparse-checkout set` — declare which paths the worktree will contain.
+/// 3. `checkout` — git now fetches, in one batch, exactly the blobs those paths
+///    need. The excluded ones are never requested.
+///
+/// Doing (1) alone does not help: a plain `--filter=blob:none` still materialises
+/// the full worktree at checkout, so every blob comes down anyway. Measured on
+/// `psj/docs/website` (4.0 GB, a Docusaurus site of `.mp4`s and multi-MB `.gif`s):
+/// `--depth 1` took 115s, `--depth 1 --filter=blob:none` took 87s and both
+/// produced 4.0 GB. This sequence takes **13s and 400 MB**, with all 29,939
+/// markdown files present. The first two both blew the 90s deadline; a review of
+/// that repo was simply impossible before.
+fn run_lean_clone(clone_url: &str, root_arg: &str, root: &Path) -> Result<()> {
+    run_git_bounded(
+        &[
+            "clone",
+            "--depth",
+            "1",
+            "--filter=blob:none",
+            "--no-checkout",
+            "--quiet",
+            clone_url,
+            root_arg,
+        ],
+        None,
+        CLONE_ATTEMPT_TIMEOUT,
+    )?;
+
+    let patterns = sparse_patterns();
+    let mut args = vec!["sparse-checkout", "set", "--no-cone"];
+    args.extend(patterns.iter().map(String::as_str));
+    run_git_bounded(&args, Some(root), CLONE_ATTEMPT_TIMEOUT)?;
+
+    run_git_bounded(&["checkout", "--quiet"], Some(root), CLONE_ATTEMPT_TIMEOUT)
+}
+
 /// Shallow-clone `clone_url` into `root`, bounding each attempt and retrying.
 ///
 /// ## Why this is not just `git clone`
@@ -297,25 +407,45 @@ fn clone_with_retry(clone_url: &str, root: &Path) -> Result<()> {
         .to_str()
         .context("clone destination path is not valid UTF-8")?;
     let mut last: Option<String> = None;
+    // Latched, not re-tested per attempt: a server that refuses `--filter` will
+    // refuse it every time, and re-probing would spend one doomed round-trip per
+    // attempt for an answer that cannot change mid-clone.
+    let mut lean_available = true;
 
     for attempt in 1..=CLONE_ATTEMPTS {
-        // A previous attempt may have left a partial tree behind; `git clone`
-        // refuses a non-empty destination, so a retry into it would fail for a
-        // reason that has nothing to do with the network.
-        // Errors here are propagated rather than swallowed. A real filesystem
-        // failure — permissions, ENOSPC — used to fall through to a confusing
-        // git error *and* burn the remaining attempts on sleeps first, which
-        // reports a network fault for a full disk.
-        if root.exists() {
-            std::fs::remove_dir_all(root).context("clear the previous clone attempt")?;
-        }
-        create_private_dir(root).context("recreate the clone dir")?;
+        reset_clone_dir(root)?;
 
-        match run_git_bounded(
-            &["clone", "--depth", "1", "--quiet", clone_url, root_arg],
-            None,
-            CLONE_ATTEMPT_TIMEOUT,
-        ) {
+        let mut outcome = if lean_available {
+            run_lean_clone(clone_url, root_arg, root)
+        } else {
+            run_git_bounded(
+                &["clone", "--depth", "1", "--quiet", clone_url, root_arg],
+                None,
+                CLONE_ATTEMPT_TIMEOUT,
+            )
+        };
+
+        // Partial clone needs `uploadpack.allowFilter` on the server, and
+        // `sparse-checkout` needs git >= 2.25 locally. Neither is universal, and
+        // a self-hosted instance is exactly where they are missing. Rather than
+        // making the whole clone conditional on probing for them, treat any
+        // non-timeout failure of the lean path as proof it is unavailable and
+        // finish this same attempt the old way — so a server without partial
+        // clone loses a fast round-trip, not a review.
+        let lean_lacks_support =
+            lean_available && outcome.as_ref().err().is_some_and(is_capability_failure);
+        if lean_lacks_support {
+            lean_available = false;
+            tracing::info!("partial clone unavailable — falling back to a full shallow clone");
+            reset_clone_dir(root)?;
+            outcome = run_git_bounded(
+                &["clone", "--depth", "1", "--quiet", clone_url, root_arg],
+                None,
+                CLONE_ATTEMPT_TIMEOUT,
+            );
+        }
+
+        match outcome {
             Ok(()) => {
                 if attempt > 1 {
                     tracing::info!("git clone succeeded on attempt {attempt}");
@@ -793,6 +923,182 @@ mod clone_timeout_tests {
             started.elapsed() < Duration::from_secs(15),
             "took {:?} — it blocked on a full pipe",
             started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod lean_clone_tests {
+    use super::*;
+
+    /// The pattern list must be an allow-everything followed by negations only.
+    ///
+    /// A missing leading `/*` inverts the whole thing — non-cone sparse-checkout
+    /// with only negative patterns matches nothing, which would produce an empty
+    /// worktree and a review with no context rather than a visible failure.
+    #[test]
+    fn sparse_patterns_include_everything_then_subtract() {
+        let patterns = sparse_patterns();
+        assert_eq!(patterns[0], "/*", "the first pattern must include the tree");
+        assert!(
+            patterns[1..].iter().all(|p| p.starts_with("!*.")),
+            "every later pattern must be an extension negation: {patterns:?}"
+        );
+    }
+
+    /// Formats the reviewer can actually read must never be skipped.
+    ///
+    /// `.svg` is the trap: it sits among image extensions in every mental list,
+    /// but it is XML, it is hand-edited, and a diff that touches one is
+    /// reviewable.
+    #[test]
+    fn readable_formats_are_not_excluded() {
+        for readable in ["svg", "md", "json", "csv", "yaml", "toml", "rs", "ts"] {
+            assert!(
+                !UNREADABLE_EXTENSIONS.contains(&readable),
+                ".{readable} is readable and must stay in the checkout"
+            );
+        }
+    }
+
+    /// A timeout must not be mistaken for a missing capability.
+    ///
+    /// Falling back on a timeout would spend a second 90-second budget on an
+    /// attempt the network had already lost, which is precisely the unbounded
+    /// clone `CLONE_ATTEMPT_TIMEOUT` exists to prevent.
+    #[test]
+    fn a_timeout_is_not_treated_as_a_missing_capability() {
+        let timed_out = anyhow::anyhow!("git [\"clone\"] timed out after 90s");
+        assert!(!is_capability_failure(&timed_out));
+
+        let refused = anyhow::anyhow!("git [\"clone\"] failed: fatal: filtering not recognized");
+        assert!(is_capability_failure(&refused));
+    }
+
+    /// End to end over `file://`, which is the only way to see the thing that
+    /// matters: that the excluded blob is *never fetched*, not merely hidden.
+    ///
+    /// Asserting on the worktree alone would pass for a plain clone that checked
+    /// the file out and deleted it, so this also asserts the object is absent
+    /// from `.git` — that is the bandwidth claim, and it is the whole point.
+    #[test]
+    fn a_lean_clone_omits_unreadable_blobs_and_keeps_the_rest() {
+        let src = tempfile::tempdir().unwrap();
+        let s = src.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(s)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        // Partial clone is opt-in on the serving side, including for file://.
+        git(&["config", "uploadpack.allowFilter", "true"]);
+
+        std::fs::write(s.join("README.md"), "# readable\n").unwrap();
+        std::fs::create_dir(s.join("assets")).unwrap();
+        // Distinctive and incompressible enough that its absence is meaningful.
+        let blob: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        std::fs::write(s.join("assets/clip.mp4"), &blob).unwrap();
+        std::fs::write(s.join("assets/diagram.svg"), "<svg></svg>\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "seed"]);
+
+        let mp4_oid = {
+            let out = Command::new("git")
+                .args(["rev-parse", "HEAD:assets/clip.mp4"])
+                .current_dir(s)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        let dst = tempfile::tempdir().unwrap();
+        let root = dst.path().join("checkout");
+        let url = format!("file://{}", s.display());
+        clone_with_retry(&url, &root).expect("the lean clone must succeed over file://");
+
+        assert!(
+            root.join("README.md").is_file(),
+            "readable text must be present"
+        );
+        assert!(
+            root.join("assets/diagram.svg").is_file(),
+            "svg is text and must survive the filter"
+        );
+        assert!(
+            !root.join("assets/clip.mp4").exists(),
+            "the excluded file must not be in the worktree"
+        );
+
+        // The claim under test: not downloaded, not merely not checked out.
+        let present = Command::new("git")
+            .args(["cat-file", "-e", &mp4_oid])
+            .current_dir(&root)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .status()
+            .unwrap();
+        assert!(
+            !present.success(),
+            "the excluded blob was fetched anyway — the filter bought nothing"
+        );
+    }
+    /// A server without partial clone degrades, it does not fail.
+    ///
+    /// Written expecting the opposite, and the test was wrong: with
+    /// `uploadpack.allowFilter` off — which is the **default** — the server does
+    /// not reject `--filter`, it silently ignores it and sends every object. The
+    /// clone therefore succeeds, and only the bandwidth saving is lost; the
+    /// sparse checkout still applies, so the worktree is lean either way.
+    ///
+    /// That is worth pinning down, because it means the capability fallback is
+    /// not the common path for old servers — it is reserved for a genuine error,
+    /// such as a local git too old for `sparse-checkout`. It also means the
+    /// worktree the reviewer sees is the same shape everywhere, which is the
+    /// property the rest of the agent is entitled to assume.
+    #[test]
+    fn a_server_without_partial_clone_still_gets_a_lean_checkout() {
+        let src = tempfile::tempdir().unwrap();
+        let s = src.path();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(s)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "--quiet", "--initial-branch=main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        // Deliberately NOT enabling uploadpack.allowFilter: this is the default
+        // server, and the lean clone must be refused by it.
+        git(&["config", "uploadpack.allowFilter", "false"]);
+
+        std::fs::write(s.join("README.md"), "# readable\n").unwrap();
+        std::fs::write(s.join("clip.mp4"), vec![7u8; 1024]).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "--quiet", "-m", "seed"]);
+
+        let dst = tempfile::tempdir().unwrap();
+        let root = dst.path().join("checkout");
+        let url = format!("file://{}", s.display());
+        clone_with_retry(&url, &root).expect("an ignored filter must not fail the clone");
+
+        assert!(
+            root.join("README.md").is_file(),
+            "readable text must be checked out"
+        );
+        assert!(
+            !root.join("clip.mp4").exists(),
+            "the sparse checkout applies even when the filter was ignored, so the \
+             worktree stays the same shape on every server"
         );
     }
 }
