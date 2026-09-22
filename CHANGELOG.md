@@ -1,8 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.34.0
 
-**A sampled review reports what all its samples cost, and records how many of them backed each finding.**
+**A repo the agentic reviewer could not clone at all is now cloned in 13 seconds, and a sampled review reports what all its samples cost.**
+
+Two consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — `pr-review-bot` (138 tests) and `simcel-pr-bot` (104 tests). Neither needed a change: there is no API break in this release. Neither is reachable by CI's `downstream compiles (public consumers)` job.
+
+### Behaviour changes — these ship silently
+
+Flagged separately per [Releasing](README.md#releasing) step 3: an API break fails a build and announces itself; this does not.
+
+- **The agentic workspace no longer contains media files.** `Workspace::clone` now skips images, video, audio, archives, fonts and compiled artefacts, so `read_file` on a `.png` in a clone fails where it previously returned bytes the model could not use. Nothing in this crate could ever read them, and the diff still reports that such a file changed — but a consumer that reached into the clone for one itself will now find it absent. `.svg` and every data format are kept.
+- **A review of a media-heavy repo that used to fail now succeeds.** That is the point of the change, and it is still a change: a consumer whose repo previously failed at the clone will start producing reviews, and billing for them.
 
 ### The agentic clone skips files the reviewer cannot read
 
