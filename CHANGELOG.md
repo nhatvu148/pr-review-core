@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.34.1
+
+**An excluded file no longer claims it is missing from the repository.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — `pr-review-bot` (138 tests) and `simcel-pr-bot` (104 tests). Neither needed a change. Neither is reachable by CI's `downstream compiles (public consumers)` job.
+
+Patch release: no API change. The change is to the error text `read_file` returns for a path the clone skipped, which is a behaviour change only in the sense that the model now reads something true where it previously read something false.
 
 ### An excluded file no longer claims it is missing from the repository
 
