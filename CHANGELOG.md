@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### The model is told which files the globs removed, not just which ones the packer dropped
+
+Files leave the diff by two routes and only one of them was reported. `pack_diff` drops low-priority files to fit the budget, and its list became the `[NOTE: …]` the model reads. `filter_diff_by_globs` drops configured paths, and its list went to a `tracing::info!` line the model never sees.
+
+`EXCLUDE_GLOBS` defaults to `**/*.lock` and friends, so on a dependency-bump PR the lockfile always leaves by the second route — and on a small diff the packer drops nothing, so there was no note at all. The model saw a diff containing only `Cargo.toml` and reported, with confidence, that the lockfile had not been updated. Observed twice on real bump PRs, each time against a lockfile that was committed, tracked, and pinned to the correct version. It is a false positive the reviewer had no way to avoid: it was reasoning correctly about a diff whose edges it could not see.
+
+The two reasons are reported **separately** rather than merged. "Omitted to fit the size limit" and "excluded by configuration" are different facts about a repository, and folding the globbed files into the budget wording would trade one false statement for another — a reviewer told a file was dropped for size may reasonably suggest raising the limit, which would not bring it back. The glob clause also says explicitly not to infer anything from the absence, because the failure mode is not the model lacking a file, it is the model drawing a conclusion from a gap it cannot see the edges of.
+
+Long lists are capped at ten names plus a count, so a vendoring PR excluding hundreds of files does not spend the budget the filter exists to save.
+
+**Known limit:** `/ask` and `/describe` still do not carry this note. `command::prepared_diff` discards both dropped lists and has no note channel to put them in, so those commands can still reason from a gap. Its doc comment claims parity with the review path; that claim is now narrower than it reads, and closing it is a separate change.
+
 ## 0.34.1
 
 **An excluded file no longer claims it is missing from the repository.**

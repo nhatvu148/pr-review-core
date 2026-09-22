@@ -1207,18 +1207,90 @@ struct PreparedDiff {
     /// Deterministic diff-hygiene findings (class D), computed from the RAW diff so
     /// a glob-excluded file (a vendored tree, a swept-in binary) is still seen.
     hygiene: Vec<Finding>,
-    /// Note naming whole files packed out to fit the budget (NOT reviewed).
+    /// Note naming files the model cannot see — those removed by the glob filter
+    /// and those packed out to fit the budget. The two reasons are reported
+    /// separately because they are not the same fact about the repository.
     omitted_note: Option<String>,
+}
+
+/// Name at most `MAX` paths, then say how many more there were.
+///
+/// A vendoring repo can exclude hundreds of files; pasting all of them into the
+/// prompt would spend the budget this filter exists to save.
+fn name_some(paths: &[String]) -> String {
+    const MAX: usize = 10;
+    if paths.len() <= MAX {
+        return paths.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        paths[..MAX].join(", "),
+        paths.len() - MAX
+    )
+}
+
+/// Tell the model which files it cannot see, and why.
+///
+/// ## The bug this fixes
+///
+/// Files leave the diff by two routes, and only one of them used to be reported.
+/// `pack_diff` drops low-priority files to fit the budget and its list became
+/// this note; `filter_diff_by_globs` drops configured paths and its list went to
+/// a log line the model never sees.
+///
+/// `EXCLUDE_GLOBS` defaults to `**/*.lock` and friends, so on a dependency-bump
+/// PR the lockfile is always removed by the second route — and on a small diff
+/// the first route drops nothing, so there was no note at all. The model then
+/// saw a diff containing only `Cargo.toml` and reported, with confidence, that
+/// the lockfile had not been updated. Observed twice on real bump PRs, against a
+/// lockfile that was committed, tracked, and pinned to the right version.
+///
+/// ## Why the two reasons stay separate
+///
+/// "Omitted to fit the size limit" and "excluded by configuration" are different
+/// facts. Folding the globbed files into the budget wording would trade one
+/// false statement for another — and a reviewer told a file was dropped for size
+/// may reasonably suggest raising the limit, which would not bring it back.
+///
+/// The glob clause says explicitly not to infer anything from the absence,
+/// because the failure mode is not the model lacking the file — it is the model
+/// drawing a conclusion from a gap it cannot see the edges of.
+fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) -> Option<String> {
+    let mut parts = Vec::new();
+
+    if !glob_dropped.is_empty() {
+        parts.push(format!(
+            "{} file(s) are excluded from the diff by this repository's configuration and are NOT shown: {}. \
+             They may well have been changed — do not infer from their absence that they were not updated, \
+             and do not report them as missing.",
+            glob_dropped.len(),
+            name_some(glob_dropped)
+        ));
+    }
+
+    if !packed_dropped.is_empty() {
+        parts.push(format!(
+            "{} file(s) were omitted to fit the size limit and were NOT reviewed: {}",
+            packed_dropped.len(),
+            name_some(packed_dropped)
+        ));
+    }
+
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 /// Glob-filter, hygiene-scan, and size-pack a raw diff.
 fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
     // Drop noisy files (lockfiles, generated, vendored, minified) before the LLM
     // sees the diff — saves tokens and noise. Fail-open: never loses the review.
-    let (diff, dropped) =
+    let (diff, glob_dropped) =
         crate::diff::filter_diff_by_globs(raw_diff, &cfg.include_globs, &cfg.exclude_globs);
-    if !dropped.is_empty() {
-        tracing::info!("skipped {} file(s) by glob: {:?}", dropped.len(), dropped);
+    if !glob_dropped.is_empty() {
+        tracing::info!(
+            "skipped {} file(s) by glob: {:?}",
+            glob_dropped.len(),
+            glob_dropped
+        );
     }
 
     // Computed from the RAW diff, and BEFORE the caller's empty-diff short-circuit,
@@ -1259,13 +1331,7 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
         );
     }
     // Surfaced to the model so it knows these files were NOT reviewed.
-    let omitted_note = (!packed_dropped.is_empty()).then(|| {
-        format!(
-            "{} file(s) were omitted to fit the size limit and were NOT reviewed: {}",
-            packed_dropped.len(),
-            packed_dropped.join(", ")
-        )
-    });
+    let omitted_note = omission_note(&glob_dropped, &packed_dropped);
 
     PreparedDiff {
         diff,
@@ -4410,6 +4476,83 @@ mod placeholder_tests {
         assert!(
             !body.contains("update shortly"),
             "no longer promises an update"
+        );
+    }
+}
+
+#[cfg(test)]
+mod omission_note_tests {
+    use super::*;
+
+    /// A glob-excluded file must be named to the model, not only to the log.
+    ///
+    /// The regression: `EXCLUDE_GLOBS` defaults to `**/*.lock`, so a dependency
+    /// bump's lockfile always leaves the diff this way. On a small diff the
+    /// packer drops nothing, so there was no note at all, and the model reported
+    /// with confidence that the lockfile had not been updated — twice, on real
+    /// PRs, against a lockfile that was committed and pinned correctly.
+    #[test]
+    fn a_glob_excluded_file_is_named_to_the_model() {
+        let note = omission_note(&["Cargo.lock".to_string()], &[])
+            .expect("a glob-excluded file must produce a note");
+        assert!(note.contains("Cargo.lock"), "{note}");
+        assert!(
+            note.contains("configuration"),
+            "must give the real reason: {note}"
+        );
+        assert!(
+            note.contains("do not infer"),
+            "must forbid the inference that produced the false positive: {note}"
+        );
+        assert!(
+            !note.contains("size limit"),
+            "a globbed file was not dropped for size — saying so trades one false \
+             statement for another: {note}"
+        );
+    }
+
+    /// The budget wording is untouched when only the packer dropped something.
+    #[test]
+    fn a_packed_out_file_keeps_the_size_wording() {
+        let note = omission_note(&[], &["big/generated.rs".to_string()]).unwrap();
+        assert!(note.contains("size limit"), "{note}");
+        assert!(note.contains("big/generated.rs"), "{note}");
+        assert!(
+            !note.contains("configuration"),
+            "nothing was globbed here: {note}"
+        );
+    }
+
+    /// Both routes at once report both reasons, separately.
+    #[test]
+    fn the_two_reasons_are_reported_separately() {
+        let note = omission_note(&["Cargo.lock".to_string()], &["huge.rs".to_string()]).unwrap();
+        assert!(
+            note.contains("configuration") && note.contains("size limit"),
+            "{note}"
+        );
+        assert!(
+            note.contains("Cargo.lock") && note.contains("huge.rs"),
+            "{note}"
+        );
+    }
+
+    /// Nothing dropped, nothing said.
+    #[test]
+    fn no_omissions_produce_no_note() {
+        assert!(omission_note(&[], &[]).is_none());
+    }
+
+    /// A vendoring PR must not paste hundreds of paths into the prompt.
+    #[test]
+    fn a_long_list_is_capped_and_says_how_many_it_hid() {
+        let many: Vec<String> = (0..25).map(|i| format!("vendor/f{i}.js")).collect();
+        let note = omission_note(&many, &[]).unwrap();
+        assert!(note.contains("25 file(s)"), "the count stays exact: {note}");
+        assert!(note.contains("and 15 more"), "the list is capped: {note}");
+        assert!(
+            !note.contains("vendor/f24.js"),
+            "beyond the cap must not be listed: {note}"
         );
     }
 }
