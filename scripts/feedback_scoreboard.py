@@ -9,7 +9,9 @@ can only be answered by re-reading eight files and trusting the reader's memory.
 This reads the verdict lines and writes `docs/SCOREBOARD.md`: one row per PR-round,
 a running precision figure, and the worst severity any false positive was filed at
 (the number that matters most, since a false BLOCKING stops a merge and a false
-MEDIUM moves the recommendation).
+MEDIUM moves the recommendation). The "where the false positives landed" rollup
+is counted per finding from each entry's findings table, not from the verdict
+line's single severity tag — see `fp_rollup`.
 
 Deliberately tolerant: entries are written by hand and their headers vary. A file
 whose verdict cannot be parsed is REPORTED, never skipped silently — an entry that
@@ -58,6 +60,9 @@ class Row:
 class Parsed:
     rows: list[Row] = field(default_factory=list)
     unparsed: list[tuple[str, str]] = field(default_factory=list)  # (file, why)
+    # Per file, the filed severity of every FALSE_POSITIVE row in its findings
+    # tables ("" where the severity cell names none). Read by the rollup only.
+    table_fps: dict[str, list[str]] = field(default_factory=dict)
 
 
 def strip_md(text: str) -> str:
@@ -103,8 +108,9 @@ def fp_severity(line: str) -> str:
     return ""
 
 
-def parse_entry(path: Path) -> tuple[list[Row], str | None]:
-    text = path.read_text(encoding="utf-8")
+def parse_entry(path: Path, text: str | None = None) -> tuple[list[Row], str | None]:
+    if text is None:
+        text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
 
     title = next((TITLE.match(l) for l in lines if TITLE.match(l)), None)
@@ -136,6 +142,116 @@ def parse_entry(path: Path) -> tuple[list[Row], str | None]:
     if not rows:
         return [], "no parseable verdict line"
     return rows, None
+
+
+def split_cells(line: str) -> list[str]:
+    r"""Cells of one table row. An escaped pipe (`\|`, e.g. inside a quoted regex)
+    stays in its cell.
+
+    >>> split_cells(r"| HIGH | `a \| b` | x |")
+    ['HIGH', '`a \\| b`', 'x']
+    """
+    return [c.strip() for c in re.split(r"(?<!\\)\|", line.strip())[1:-1]]
+
+
+def is_separator(line: str) -> bool:
+    """`|---|:--:|` — the row that makes the row above it a header."""
+    s = line.strip()
+    return s.startswith("|") and "-" in s and set(s) <= set("|-: ")
+
+
+def filed_severity(cell: str) -> str:
+    """The severity a finding was filed at, from its table cell.
+
+    The FIRST severity named, not the worst: a miscalibrated finding is written
+    `LOW → **MEDIUM**` (filed, then warranted), and the rollup is about what the
+    reviewer said.
+
+    >>> filed_severity("LOW → **MEDIUM**")
+    'LOW'
+    >>> filed_severity("**BLOCKING**")
+    'BLOCKING'
+    >>> filed_severity("—")
+    ''
+    """
+    up = strip_md(cell).upper()
+    hits = [(up.find(s), s) for s in SEVERITIES if s in up]
+    return min(hits)[1] if hits else ""
+
+
+def table_fp_severities(lines: list[str]) -> list[str]:
+    """Filed severity of every FALSE_POSITIVE row in the entry's findings tables.
+
+    Only tables whose header names both a `severity` and a `verdict` column
+    count, which skips the misses and regression tables that share the page.
+    A header is the row directly above a separator, as Markdown defines it, so a
+    second table's rows are never read against the first table's columns.
+
+    >>> table_fp_severities([
+    ...     "| severity | verdict | finding |",
+    ...     "|---|---|---|",
+    ...     "| HIGH | **FALSE_POSITIVE** | a |",
+    ...     "| LOW | CONFIRMED | b |",
+    ...     "| defect | verdict |",
+    ...     "|---|---|",
+    ...     "| MEDIUM | FALSE_POSITIVE |",
+    ... ])
+    ['HIGH']
+    """
+    out: list[str] = []
+    header: list[str] | None = None
+    for i, raw in enumerate(lines):
+        if not raw.startswith("|"):
+            header = None
+            continue
+        if is_separator(raw):
+            continue
+        cells = split_cells(raw)
+        if i + 1 < len(lines) and is_separator(lines[i + 1]):
+            low = [c.lower() for c in cells]
+            header = low if "severity" in low and "verdict" in low else None
+            continue
+        if header is None:
+            continue
+        row = dict(zip(header, cells))
+        verdict = re.sub(r"[\s*`]+", "_", row.get("verdict", "").upper())
+        if "FALSE_POSITIVE" in verdict:
+            out.append(filed_severity(row.get("severity", "")))
+    return out
+
+
+def fp_rollup(parsed: Parsed) -> tuple[dict[str, int], list[str]]:
+    """False positives by the severity each one was filed at.
+
+    Itemised from the findings tables, one count per row, wherever a file's
+    tables hold exactly as many FALSE_POSITIVE rows as its verdict lines claim.
+    Where they disagree — a false positive described only in prose, or one note
+    whose table covers a second PR scored in its own entry — the file falls back
+    to crediting each verdict line's whole count to its one severity tag, and is
+    returned in the second value so the output can say so.
+
+    The fallback is the old behaviour everywhere, and it is wrong for a line
+    whose false positives were filed at different severities: tagged, they all
+    land on the tag; untagged, they all land on "unlabelled". Itemising is what
+    lets an entry state its counts plainly instead of working around that.
+    """
+    counts = {s: 0 for s in (*SEVERITIES, "")}
+    fallback: list[str] = []
+    by_file: dict[str, list[Row]] = {}
+    for r in parsed.rows:
+        by_file.setdefault(r.source, []).append(r)
+    for name, rows in by_file.items():
+        claimed = sum(r.false_positive for r in rows)
+        itemised = parsed.table_fps.get(name, [])
+        if len(itemised) == claimed:
+            for sev in itemised:
+                counts[sev] += 1
+            continue
+        for r in rows:
+            counts[r.worst_fp_severity] += r.false_positive
+        if claimed or itemised:
+            fallback.append(f"{name} — verdict lines claim {claimed}, tables list {len(itemised)}")
+    return counts, fallback
 
 
 def sort_key(r: Row):
@@ -189,15 +305,23 @@ def render(parsed: Parsed) -> str:
         "",
     ]
 
-    by_sev = {s: sum(r.false_positive for r in rows if r.worst_fp_severity == s) for s in SEVERITIES}
-    unlabelled = sum(r.false_positive for r in rows if not r.worst_fp_severity)
+    by_sev, fallback = fp_rollup(parsed)
     for sev in SEVERITIES:
         if by_sev[sev]:
             out.append(f"- **{sev}**: {by_sev[sev]}")
-    if unlabelled:
-        out.append(f"- unlabelled: {unlabelled}")
-    if not any(by_sev.values()) and not unlabelled:
+    if by_sev[""]:
+        out.append(f"- unlabelled: {by_sev['']}")
+    if not any(by_sev.values()):
         out.append("- none recorded")
+    if fallback:
+        out += [
+            "",
+            "Counted per finding from each entry's findings table. These entries' tables",
+            "do not match their verdict lines, so their verdict-line counts are used",
+            "instead, credited to the line's severity tag:",
+            "",
+        ]
+        out += [f"- `{f}`" for f in fallback]
 
     # Scored, but the heading didn't parse — say so rather than let a row with a
     # bare "?" for its PR pass as ordinary.
@@ -241,8 +365,10 @@ def main() -> int:
 
     parsed = Parsed()
     for path in sorted(args.feedback_dir.glob("*.md")):
-        rows, why = parse_entry(path)
+        text = path.read_text(encoding="utf-8")
+        rows, why = parse_entry(path, text)
         parsed.rows.extend(rows)
+        parsed.table_fps[path.name] = table_fp_severities(text.splitlines())
         if why:
             parsed.unparsed.append((path.name, why))
 
