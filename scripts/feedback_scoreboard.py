@@ -108,8 +108,9 @@ def fp_severity(line: str) -> str:
     return ""
 
 
-def parse_entry(path: Path) -> tuple[list[Row], str | None]:
-    text = path.read_text(encoding="utf-8")
+def parse_entry(path: Path, text: str | None = None) -> tuple[list[Row], str | None]:
+    if text is None:
+        text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
 
     title = next((TITLE.match(l) for l in lines if TITLE.match(l)), None)
@@ -144,8 +145,19 @@ def parse_entry(path: Path) -> tuple[list[Row], str | None]:
 
 
 def split_cells(line: str) -> list[str]:
-    # A cell may carry an escaped pipe (`\|` inside a quoted regex); keep it in.
+    r"""Cells of one table row. An escaped pipe (`\|`, e.g. inside a quoted regex)
+    stays in its cell.
+
+    >>> split_cells(r"| HIGH | `a \| b` | x |")
+    ['HIGH', '`a \\| b`', 'x']
+    """
     return [c.strip() for c in re.split(r"(?<!\\)\|", line.strip())[1:-1]]
+
+
+def is_separator(line: str) -> bool:
+    """`|---|:--:|` — the row that makes the row above it a header."""
+    s = line.strip()
+    return s.startswith("|") and "-" in s and set(s) <= set("|-: ")
 
 
 def filed_severity(cell: str) -> str:
@@ -154,6 +166,13 @@ def filed_severity(cell: str) -> str:
     The FIRST severity named, not the worst: a miscalibrated finding is written
     `LOW → **MEDIUM**` (filed, then warranted), and the rollup is about what the
     reviewer said.
+
+    >>> filed_severity("LOW → **MEDIUM**")
+    'LOW'
+    >>> filed_severity("**BLOCKING**")
+    'BLOCKING'
+    >>> filed_severity("—")
+    ''
     """
     up = strip_md(cell).upper()
     hits = [(up.find(s), s) for s in SEVERITIES if s in up]
@@ -165,19 +184,34 @@ def table_fp_severities(lines: list[str]) -> list[str]:
 
     Only tables whose header names both a `severity` and a `verdict` column
     count, which skips the misses and regression tables that share the page.
+    A header is the row directly above a separator, as Markdown defines it, so a
+    second table's rows are never read against the first table's columns.
+
+    >>> table_fp_severities([
+    ...     "| severity | verdict | finding |",
+    ...     "|---|---|---|",
+    ...     "| HIGH | **FALSE_POSITIVE** | a |",
+    ...     "| LOW | CONFIRMED | b |",
+    ...     "| defect | verdict |",
+    ...     "|---|---|",
+    ...     "| MEDIUM | FALSE_POSITIVE |",
+    ... ])
+    ['HIGH']
     """
     out: list[str] = []
     header: list[str] | None = None
-    for raw in lines:
+    for i, raw in enumerate(lines):
         if not raw.startswith("|"):
             header = None
             continue
-        cells = split_cells(raw)
-        low = [c.lower() for c in cells]
-        if "severity" in low and "verdict" in low:
-            header = low
+        if is_separator(raw):
             continue
-        if header is None or set(raw.strip()) <= set("|-: "):
+        cells = split_cells(raw)
+        if i + 1 < len(lines) and is_separator(lines[i + 1]):
+            low = [c.lower() for c in cells]
+            header = low if "severity" in low and "verdict" in low else None
+            continue
+        if header is None:
             continue
         row = dict(zip(header, cells))
         verdict = re.sub(r"[\s*`]+", "_", row.get("verdict", "").upper())
@@ -331,11 +365,10 @@ def main() -> int:
 
     parsed = Parsed()
     for path in sorted(args.feedback_dir.glob("*.md")):
-        rows, why = parse_entry(path)
+        text = path.read_text(encoding="utf-8")
+        rows, why = parse_entry(path, text)
         parsed.rows.extend(rows)
-        parsed.table_fps[path.name] = table_fp_severities(
-            path.read_text(encoding="utf-8").splitlines()
-        )
+        parsed.table_fps[path.name] = table_fp_severities(text.splitlines())
         if why:
             parsed.unparsed.append((path.name, why))
 
