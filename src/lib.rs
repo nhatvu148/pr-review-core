@@ -59,3 +59,39 @@ pub mod webhook;
 pub fn clip(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
+
+#[cfg(test)]
+mod clip_tests {
+    use super::clip;
+
+    #[test]
+    fn a_string_longer_than_the_limit_is_cut_to_it() {
+        assert_eq!(clip("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn a_string_no_longer_than_the_limit_is_unchanged() {
+        assert_eq!(clip("hi", 5), "hi");
+        assert_eq!(clip("hi", 2), "hi");
+    }
+
+    #[test]
+    fn zero_always_clips_to_empty() {
+        assert_eq!(clip("anything", 0), "");
+    }
+
+    #[test]
+    fn empty_input_stays_empty_regardless_of_limit() {
+        assert_eq!(clip("", 10), "");
+    }
+
+    /// The limit counts chars, not bytes — multi-byte codepoints must never be
+    /// split, which a byte-slice `&s[..n]` would do and panic on.
+    #[test]
+    fn the_limit_counts_chars_not_bytes_and_never_splits_one() {
+        // Each of these is a multi-byte UTF-8 codepoint.
+        assert_eq!(clip("日本語", 2), "日本");
+        assert_eq!(clip("日本語", 3), "日本語");
+        assert_eq!(clip("日本語", 10), "日本語");
+    }
+}
