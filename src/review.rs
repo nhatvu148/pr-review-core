@@ -100,6 +100,60 @@ pub(crate) fn recommendation_rank(rec: &str) -> u8 {
     }
 }
 
+#[cfg(test)]
+mod severity_and_recommendation_tests {
+    //! These three mappings are the ordering `crate::queue` and every findings
+    //! table rely on; only tested before now through the larger fixtures that
+    //! happen to exercise them (`effective_recommendation`, `collapse_bursts`).
+    //! A typo in a match arm here (e.g. "BLOKCING") would silently rank a finding
+    //! as unknown/LOW rather than fail loudly, so it earns its own direct test.
+    use super::{recommendation_rank, severity_emoji, severity_rank};
+
+    #[test]
+    fn severity_rank_orders_known_severities_by_urgency() {
+        assert_eq!(severity_rank("BLOCKING"), 3);
+        assert_eq!(severity_rank("HIGH"), 2);
+        assert_eq!(severity_rank("MEDIUM"), 1);
+        assert_eq!(severity_rank("LOW"), 0);
+    }
+
+    #[test]
+    fn severity_rank_is_case_insensitive() {
+        assert_eq!(severity_rank("blocking"), severity_rank("BLOCKING"));
+        assert_eq!(severity_rank("High"), severity_rank("HIGH"));
+    }
+
+    #[test]
+    fn an_unknown_severity_ranks_as_low_as_low() {
+        assert_eq!(severity_rank("WHATEVER"), severity_rank("LOW"));
+        assert_eq!(severity_rank(""), 0);
+    }
+
+    #[test]
+    fn severity_emoji_has_a_distinct_symbol_per_known_severity() {
+        let known = ["BLOCKING", "HIGH", "MEDIUM", "LOW"];
+        let emojis: Vec<_> = known.iter().map(|s| severity_emoji(s)).collect();
+        let unique: std::collections::HashSet<_> = emojis.iter().collect();
+        assert_eq!(unique.len(), emojis.len(), "each severity reads distinctly");
+        assert_eq!(severity_emoji("unknown"), "•");
+    }
+
+    #[test]
+    fn recommendation_rank_orders_block_above_changes_above_approve() {
+        assert!(recommendation_rank("BLOCK") > recommendation_rank("APPROVE WITH CHANGES"));
+        assert!(recommendation_rank("APPROVE WITH CHANGES") > recommendation_rank("APPROVE"));
+    }
+
+    #[test]
+    fn recommendation_rank_matches_by_substring_not_exact_string() {
+        // The model's own prose varies ("I recommend we BLOCK this PR"); the rank
+        // must not require an exact match against the canonical verdict strings.
+        assert_eq!(recommendation_rank("we should BLOCK this"), 2);
+        assert_eq!(recommendation_rank("approve with minor changes"), 1);
+        assert_eq!(recommendation_rank("looks good, APPROVE"), 0);
+    }
+}
+
 /// The recommendation actually posted: the **stronger** of the model's own verdict
 /// and the floor implied by the merged findings' max severity. Deterministic hygiene
 /// findings are added after the model decides, so without this a MEDIUM "swept-in
