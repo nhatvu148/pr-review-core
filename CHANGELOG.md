@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **A finding whose quote spans several lines posts as one multi-line comment.** 0.36 resolved a quote to a range but still commented on its first line only. On GitHub the comment now covers `start_line` to `line`, in both the batched review and the per-comment fallback. On GitLab the note carries a `line_range`, built from GitLab's own `line_code` (the path's SHA-1 plus the old- and new-side line) at each end. The diff is fetched once, and only when a review has a range. Bitbucket cannot post a range and comments on the last line.
+- `InlineComment` gains `start_line`, and `line` is now documented as the line the comment attaches to, which for a range is its last line. That is how GitHub reports a thread's line, so the reconciler still compares like with like. `inline_detail` in `--json` output carries it, and the generated Node and Python types include it.
+
+### Behaviour changes — these ship silently
+
+- **A ranged comment attaches to the range's last line, and the run log's `anchored_line` records that line.** It used to be the first line. Only findings whose quote resolved to several lines are affected.
+- **GitLab's multi-line notes are untested against a live server.** The `line_code` follows GitLab's documented format, and a note GitLab rejects is retried once on a single line, in both the draft-note and discussion paths, so a wrong code costs the range, never the finding.
+
+### Migration
+
+| change | who it touches |
+| --- | --- |
+| `InlineComment` has a new public field, `start_line: Option<u64>` | Code that builds one with a struct literal adds `start_line: None`. Neither `pr-review-bot` nor `simcel-pr-bot` does. JSON consumers are unaffected: the field is omitted when empty. |
+
+A new dependency, `sha1` 0.10, from the same RustCrypto family as the `sha2` already used; it shares its `digest` dependency.
+
 ## 0.36.0
 
 **A finding is placed by the code it quotes rather than the line number the model typed, and can span several lines.**

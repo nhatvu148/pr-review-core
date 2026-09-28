@@ -437,15 +437,53 @@ async fn delete_prior_inline(client: &Client, cfg: &Config, repo: &str, pr: u64)
 /// Shared by the draft-note and discussion paths so the two cannot drift: a
 /// finding published one way must land on exactly the line it would have landed
 /// on the other way, or the fallback below changes where comments appear.
-fn inline_position(refs: &DiffRefs, c: &InlineComment) -> serde_json::Value {
-    serde_json::json!({
+fn inline_position(
+    refs: &DiffRefs,
+    c: &InlineComment,
+    olds: Option<&FilePositions>,
+) -> serde_json::Value {
+    let mut pos = serde_json::json!({
         "position_type": "text",
         "base_sha": refs.base_sha,
         "start_sha": refs.start_sha,
         "head_sha": refs.head_sha,
         "new_path": c.path,
         "new_line": c.line,
-    })
+    });
+    // A range needs a `line_code` at each end, and a line code needs the line's
+    // old-side position. Without both ends known this stays a single-line note
+    // on `line` rather than guessing a code GitLab would reject.
+    let range = c.start_line.filter(|&s| s < c.line).and_then(|start| {
+        let lines = olds?.get(&c.path)?;
+        Some((
+            range_end(&c.path, start, *lines.get(&start)?),
+            range_end(&c.path, c.line, *lines.get(&c.line)?),
+        ))
+    });
+    if let Some((start, end)) = range {
+        pos["line_range"] = serde_json::json!({ "start": start, "end": end });
+    }
+    pos
+}
+
+/// Old-side position and added-ness of each new-side line, per file — see
+/// [`crate::diff::old_positions`].
+type FilePositions = std::collections::HashMap<String, std::collections::HashMap<u64, (u64, bool)>>;
+
+/// One end of a GitLab `line_range`. The `line_code` is GitLab's own:
+/// `sha1(path)_old_new`. An added line is typed `new`; an unchanged one carries
+/// no type.
+fn range_end(path: &str, new_line: u64, (old_line, added): (u64, bool)) -> serde_json::Value {
+    use sha1::Digest;
+    let code = format!(
+        "{}_{old_line}_{new_line}",
+        hex::encode(sha1::Sha1::digest(path.as_bytes()))
+    );
+    let mut end = serde_json::json!({ "line_code": code, "new_line": new_line });
+    if added {
+        end["type"] = "new".into();
+    }
+    end
 }
 
 /// Stage one finding as a draft note, to be published with the rest in one call.
@@ -460,15 +498,30 @@ async fn stage_draft(
     pr: u64,
     refs: &DiffRefs,
     c: &InlineComment,
+    olds: Option<&FilePositions>,
 ) -> Result<()> {
     let body = format!("{}\n\n_{}_", c.body, cfg.comment_marker);
-    let res = gl(
-        client.post(format!("{}/draft_notes", mr_base(cfg, repo, pr))),
-        cfg,
-    )
-    .json(&serde_json::json!({ "note": body, "position": inline_position(refs, c) }))
-    .send()
-    .await?;
+    let post = |position: serde_json::Value| {
+        gl(
+            client.post(format!("{}/draft_notes", mr_base(cfg, repo, pr))),
+            cfg,
+        )
+        .json(&serde_json::json!({ "note": body, "position": position }))
+        .send()
+    };
+    let ranged = inline_position(refs, c, olds);
+    let mut res = post(ranged.clone()).await?;
+    if !res.status().is_success() && ranged.get("line_range").is_some() {
+        // A range GitLab would not take still has a line it will: fall back to
+        // commenting on the last line rather than losing the finding.
+        tracing::warn!(
+            "GitLab rejected a multi-line draft note ({}) on {}:{}; staging it on one line",
+            res.status(),
+            c.path,
+            c.line
+        );
+        res = post(inline_position(refs, c, None)).await?;
+    }
     let status = res.status();
     if !status.is_success() {
         anyhow::bail!(
@@ -607,15 +660,28 @@ async fn post_inline(
     pr: u64,
     refs: &DiffRefs,
     c: &InlineComment,
+    olds: Option<&FilePositions>,
 ) -> Result<()> {
     let body = format!("{}\n\n_{}_", c.body, cfg.comment_marker);
-    let res = gl(
-        client.post(format!("{}/discussions", mr_base(cfg, repo, pr))),
-        cfg,
-    )
-    .json(&serde_json::json!({ "body": body, "position": inline_position(refs, c) }))
-    .send()
-    .await?;
+    let post = |position: serde_json::Value| {
+        gl(
+            client.post(format!("{}/discussions", mr_base(cfg, repo, pr))),
+            cfg,
+        )
+        .json(&serde_json::json!({ "body": body, "position": position }))
+        .send()
+    };
+    let ranged = inline_position(refs, c, olds);
+    let mut res = post(ranged.clone()).await?;
+    if !res.status().is_success() && ranged.get("line_range").is_some() {
+        tracing::warn!(
+            "GitLab rejected a multi-line comment ({}) on {}:{}; posting it on one line",
+            res.status(),
+            c.path,
+            c.line
+        );
+        res = post(inline_position(refs, c, None)).await?;
+    }
     if !res.status().is_success() {
         let status = res.status();
         // Don't abort the whole run on one bad anchor — log and move on.
@@ -646,13 +712,14 @@ async fn publish_as_one_review(
     pr: u64,
     refs: &DiffRefs,
     inline: &[InlineComment],
+    olds: Option<&FilePositions>,
 ) -> Result<()> {
     if !clear_our_drafts(client, cfg, repo, pr).await? {
         anyhow::bail!("draft notes from another author are pending");
     }
 
     for c in inline {
-        if let Err(e) = stage_draft(client, cfg, repo, pr, refs, c).await {
+        if let Err(e) = stage_draft(client, cfg, repo, pr, refs, c, olds).await {
             let _ = clear_our_drafts(client, cfg, repo, pr).await;
             return Err(e);
         }
@@ -711,9 +778,34 @@ pub async fn post_review(
     if !review.inline.is_empty() {
         match get_diff_refs(client, cfg, repo, pr).await {
             Ok(refs) => {
+                // Only a multi-line comment needs old-side positions, and they
+                // cost a diff fetch, so fetch only when there is one. A failed
+                // fetch downgrades ranges to single lines rather than failing.
+                let olds = if review.inline.iter().any(|c| c.start_line.is_some()) {
+                    match get_diff(client, cfg, repo, pr).await {
+                        Ok(d) => Some(crate::diff::old_positions(&d)),
+                        Err(e) => {
+                            tracing::warn!(
+                                "no diff for {repo}!{pr} line codes ({e:#}); posting ranges \
+                                 on one line"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 delete_prior_inline(client, cfg, repo, pr).await?;
-                if let Err(e) =
-                    publish_as_one_review(client, cfg, repo, pr, &refs, &review.inline).await
+                if let Err(e) = publish_as_one_review(
+                    client,
+                    cfg,
+                    repo,
+                    pr,
+                    &refs,
+                    &review.inline,
+                    olds.as_ref(),
+                )
+                .await
                 {
                     // Fall back to one discussion per finding — the path this
                     // provider used before draft notes existed here. Safe to
@@ -726,7 +818,7 @@ pub async fn post_review(
                         review.inline.len()
                     );
                     for c in &review.inline {
-                        post_inline(client, cfg, repo, pr, &refs, c).await?;
+                        post_inline(client, cfg, repo, pr, &refs, c, olds.as_ref()).await?;
                     }
                 }
             }
@@ -793,14 +885,58 @@ mod tests {
         let c = InlineComment {
             path: "src/a.py".into(),
             line: 42,
+            start_line: None,
             body: "x".into(),
         };
-        let pos = inline_position(&refs(), &c);
+        let pos = inline_position(&refs(), &c, None);
         assert_eq!(pos["position_type"], "text");
         assert_eq!(pos["new_path"], "src/a.py");
         assert_eq!(pos["new_line"], 42);
         assert_eq!(pos["base_sha"], "base");
         assert_eq!(pos["start_sha"], "start");
         assert_eq!(pos["head_sha"], "head");
+    }
+
+    fn ranged(start: u64, end: u64) -> InlineComment {
+        InlineComment {
+            path: "src/a.py".into(),
+            line: end,
+            start_line: Some(start),
+            body: "x".into(),
+        }
+    }
+
+    /// New-side 10 is context (old 10), 11 is added (next old line is 12).
+    fn olds() -> super::FilePositions {
+        let diff = "+++ b/src/a.py\n@@ -10,3 +10,3 @@\n ctx\n-gone\n+added\n ctx2\n";
+        crate::diff::old_positions(diff)
+    }
+
+    #[test]
+    fn a_range_carries_gitlab_line_codes_at_both_ends() {
+        let pos = inline_position(&refs(), &ranged(10, 11), Some(&olds()));
+        assert_eq!(pos["new_line"], 11, "the note still sits on the last line");
+        let sha = "371f574bcfd6f16d2b8277d407f9db09f24ab634"; // sha1("src/a.py")
+        let r = &pos["line_range"];
+        assert_eq!(r["start"]["line_code"], format!("{sha}_10_10"));
+        assert!(
+            r["start"].get("type").is_none(),
+            "context lines carry no type"
+        );
+        assert_eq!(r["end"]["line_code"], format!("{sha}_12_11"));
+        assert_eq!(r["end"]["type"], "new");
+    }
+
+    #[test]
+    fn a_range_without_known_positions_stays_on_one_line() {
+        let c = ranged(10, 11);
+        assert!(inline_position(&refs(), &c, None)
+            .get("line_range")
+            .is_none());
+        // A line the diff does not cover has no old position to code.
+        let beyond = ranged(10, 40);
+        assert!(inline_position(&refs(), &beyond, Some(&olds()))
+            .get("line_range")
+            .is_none());
     }
 }

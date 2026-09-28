@@ -39,8 +39,11 @@ export interface Finding {
 /** One inline comment anchored to a file + line on the new side of the diff. */
 export interface InlineComment {
   body: string;
+  /** The line the comment attaches to. */
   line: number;
   path: string;
+  /** First line of a multi-line comment; `None` for a single line. */
+  start_line?: number | null;
 }
 
 /** Token accounting echoed back by OpenRouter. */

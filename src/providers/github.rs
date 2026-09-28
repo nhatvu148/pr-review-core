@@ -692,6 +692,17 @@ fn inline_body(marker: &str, c: &InlineComment, fp: &str) -> String {
     format!("{}\n\n_{}_\n{}", c.body, marker, fp_marker(fp))
 }
 
+/// Turn a single-line comment payload into a multi-line one when the comment
+/// spans a range: `start_line` is the first line and `line`, already set, the
+/// last. Shared by the batched review and the per-comment fallback, so a
+/// finding covers the same lines whichever way it is delivered.
+fn add_range(payload: &mut serde_json::Value, c: &InlineComment) {
+    if let Some(start) = c.start_line.filter(|&s| s < c.line) {
+        payload["start_line"] = start.into();
+        payload["start_side"] = "RIGHT".into();
+    }
+}
+
 /// The `POST /pulls/{pr}/reviews` payload for a round's new findings.
 ///
 /// Pure, so the shape can be asserted without a network: every finding present
@@ -724,12 +735,14 @@ fn review_payload(
     let comments: Vec<serde_json::Value> = pending
         .iter()
         .map(|(c, fp)| {
-            serde_json::json!({
+            let mut comment = serde_json::json!({
                 "path": c.path,
                 "line": c.line,
                 "side": "RIGHT",
                 "body": inline_body(marker, c, fp),
-            })
+            });
+            add_range(&mut comment, c);
+            comment
         })
         .collect();
     serde_json::json!({
@@ -863,12 +876,11 @@ async fn post_inline(
 ) -> Result<()> {
     let url = format!("{}/repos/{repo}/pulls/{pr}/comments", cfg.github_api_base);
     let body = inline_body(&cfg.comment_marker, c, fp);
-    let res = gh(client.post(url), cfg)
-        .json(&serde_json::json!({
-            "body": body, "commit_id": commit_id, "path": c.path, "line": c.line, "side": "RIGHT"
-        }))
-        .send()
-        .await?;
+    let mut payload = serde_json::json!({
+        "body": body, "commit_id": commit_id, "path": c.path, "line": c.line, "side": "RIGHT"
+    });
+    add_range(&mut payload, c);
+    let res = gh(client.post(url), cfg).json(&payload).send().await?;
     if !res.status().is_success() {
         let status = res.status();
         // Don't abort the whole run on one bad anchor — log and move on.
@@ -1395,6 +1407,7 @@ mod tests {
         InlineComment {
             path: path.to_string(),
             line,
+            start_line: None,
             body: body.to_string(),
         }
     }
@@ -1413,6 +1426,29 @@ mod tests {
             payload["comments"][0]["body"].as_str().unwrap(),
             inline_body("🤖 mark", &c, "abc123"),
         );
+    }
+
+    /// A range is one comment from `start_line` to `line`, both on the new side;
+    /// a single line carries neither range field, as before ranges existed.
+    #[test]
+    fn a_range_posts_as_one_multi_line_comment() {
+        let mut ranged = inline("src/a.rs", 14, "spans three lines");
+        ranged.start_line = Some(12);
+        let single = inline("src/b.rs", 40, "one line");
+        let payload = review_payload(
+            "🤖 mark",
+            "deadbeef",
+            &[
+                (&ranged, "aaaaaaaaaaaa".to_string()),
+                (&single, "bbbbbbbbbbbb".to_string()),
+            ],
+        );
+        let comments = payload["comments"].as_array().unwrap();
+        assert_eq!(comments[0]["start_line"], 12);
+        assert_eq!(comments[0]["line"], 14);
+        assert_eq!(comments[0]["start_side"], "RIGHT");
+        assert!(comments[1].get("start_line").is_none());
+        assert!(comments[1].get("start_side").is_none());
     }
 
     /// Every pending finding appears exactly once, anchored on the new side, and

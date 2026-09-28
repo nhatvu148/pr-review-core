@@ -25,6 +25,70 @@ pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
     map
 }
 
+/// For each new-side line of each file (added or context), the old-side
+/// position GitLab pairs it with in a `line_code`, and whether the line was added.
+///
+/// A context line has a real old line. An added line has none, and GitLab's
+/// diff parser gives it the old counter's current value — the number of the next
+/// old line — so that is what this records; a `line_code` built any other way is
+/// rejected. Removed lines advance only the old counter. Kept apart from
+/// [`for_each_new_side_line`], which is deliberately new-side only.
+///
+/// # Examples
+/// ```
+/// # use pr_review_core::diff::old_positions;
+/// let d = "+++ b/a.rs\n@@ -10,3 +10,3 @@\n ctx\n-gone\n+added\n ctx2\n";
+/// let m = &old_positions(d)["a.rs"];
+/// assert_eq!(m[&10], (10, false)); // context: old 10 is new 10
+/// assert_eq!(m[&11], (12, true)); // added after a removal: the next old line is 12
+/// assert_eq!(m[&12], (12, false)); // context after it: old 12 is new 12
+/// ```
+pub fn old_positions(diff: &str) -> HashMap<String, HashMap<u64, (u64, bool)>> {
+    let mut map: HashMap<String, HashMap<u64, (u64, bool)>> = HashMap::new();
+    let mut cur_path: Option<String> = None;
+    let (mut old, mut new) = (0u64, 0u64);
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let p = rest.trim();
+            let p = p.strip_prefix("b/").unwrap_or(p);
+            cur_path = (p != "/dev/null").then(|| p.to_string());
+        } else if line.starts_with("@@") {
+            // @@ -old,n +new,m @@
+            let num = |after: char| -> u64 {
+                line.split(after)
+                    .nth(1)
+                    .map(|s| {
+                        s.chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                    })
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            old = num('-');
+            new = num('+');
+        } else if let Some(path) = &cur_path {
+            if line.starts_with('+') {
+                map.entry(path.clone())
+                    .or_default()
+                    .insert(new, (old, true));
+                new += 1;
+            } else if line.starts_with(' ') {
+                map.entry(path.clone())
+                    .or_default()
+                    .insert(new, (old, false));
+                old += 1;
+                new += 1;
+            } else if line.starts_with('-') {
+                // Also catches the next file's `--- a/…` header, which only
+                // bumps a counter the following `@@` resets.
+                old += 1;
+            }
+        }
+    }
+    map
+}
+
 /// Walk a unified diff's new side, invoking `f(path, line_number, text)` for each
 /// added or context line (the leading `+`/space stripped), in order. This is the
 /// single place the `+++`/`@@`/line-marker state machine lives, so

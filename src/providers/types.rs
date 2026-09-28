@@ -37,7 +37,16 @@ pub struct PrMeta {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct InlineComment {
     pub path: String,
+    /// The line the comment attaches to. For a multi-line comment this is the
+    /// *last* line of the range, which is how GitHub reports a thread's `line`
+    /// — so the reconciler, matching new comments against old threads by line,
+    /// compares like with like.
     pub line: u64,
+    /// First line of a multi-line comment; `None` for a single line. Set only
+    /// when a finding's quoted code resolved to several lines. Providers that
+    /// cannot post a range (Bitbucket) ignore it and comment on `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u64>,
     pub body: String,
 }
 
