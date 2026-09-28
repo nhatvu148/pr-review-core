@@ -25,21 +25,57 @@ pub fn parse_valid_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
     map
 }
 
+/// For each new-side line of each file (added or context), the old-side
+/// position GitLab pairs it with in a `line_code`, and whether the line was added.
+///
+/// A context line has a real old line. An added line has none, and GitLab's
+/// diff parser gives it the old counter's current value — the number of the next
+/// old line — so that is what this records; a `line_code` built any other way is
+/// rejected. Walks the diff with the same state machine as [`parse_valid_lines`],
+/// so the lines GitLab is given codes for are exactly the lines a comment may
+/// anchor to.
+///
+/// # Examples
+/// ```
+/// # use pr_review_core::diff::old_positions;
+/// let d = "+++ b/a.rs\n@@ -10,3 +10,3 @@\n ctx\n-gone\n+added\n ctx2\n";
+/// let m = &old_positions(d)["a.rs"];
+/// assert_eq!(m[&10], (10, false)); // context: old 10 is new 10
+/// assert_eq!(m[&11], (12, true)); // added after a removal: the next old line is 12
+/// assert_eq!(m[&12], (12, false)); // context after it: old 12 is new 12
+/// ```
+pub fn old_positions(diff: &str) -> HashMap<String, HashMap<u64, (u64, bool)>> {
+    let mut map: HashMap<String, HashMap<u64, (u64, bool)>> = HashMap::new();
+    for_each_new_side_line_kind(diff, |path, new_line, old_line, _text, added| {
+        map.entry(path.to_string())
+            .or_default()
+            .insert(new_line, (old_line, added));
+    });
+    map
+}
+
 /// Walk a unified diff's new side, invoking `f(path, line_number, text)` for each
 /// added or context line (the leading `+`/space stripped), in order. This is the
-/// single place the `+++`/`@@`/line-marker state machine lives, so
-/// [`parse_valid_lines`] and [`diff_line_texts`] can't drift apart. Removed (`-`)
+/// single place the `+++`/`@@`/line-marker state machine lives (in
+/// [`for_each_new_side_line_kind`]), so [`parse_valid_lines`], [`diff_line_texts`]
+/// and [`old_positions`] can't drift apart. Removed (`-`)
 /// lines don't advance the new-side counter; `/dev/null` targets are skipped.
 fn for_each_new_side_line(diff: &str, mut f: impl FnMut(&str, u64, &str)) {
-    for_each_new_side_line_kind(diff, |path, line, text, _added| f(path, line, text));
+    for_each_new_side_line_kind(diff, |path, line, _old, text, _added| f(path, line, text));
 }
 
 /// [`for_each_new_side_line`] that also says whether the line was **added** (`+`)
-/// rather than carried over as context. Callers that need "what this diff edited"
-/// rather than "what this diff showed" need the distinction.
-fn for_each_new_side_line_kind(diff: &str, mut f: impl FnMut(&str, u64, &str, bool)) {
+/// rather than carried over as context, and gives its old-side position:
+/// `f(path, new_line, old_position, text, added)`. Callers that need "what this
+/// diff edited" rather than "what this diff showed" need the distinction, and
+/// [`old_positions`] needs the old side.
+///
+/// An added line has no old line of its own; it is given the old counter's
+/// current value — the number of the next old line — which is how GitLab's diff
+/// parser pairs it in a `line_code`.
+fn for_each_new_side_line_kind(diff: &str, mut f: impl FnMut(&str, u64, u64, &str, bool)) {
     let mut cur_path: Option<String> = None;
-    let mut new_line: u64 = 0;
+    let (mut old_line, mut new_line): (u64, u64) = (0, 0);
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("+++ ") {
@@ -47,20 +83,34 @@ fn for_each_new_side_line_kind(diff: &str, mut f: impl FnMut(&str, u64, &str, bo
             let p = p.strip_prefix("b/").unwrap_or(p);
             cur_path = (p != "/dev/null").then(|| p.to_string());
         } else if line.starts_with("@@") {
-            // @@ -old,n +new,m @@  — grab the start of the new-side range.
-            if let Some(plus) = line.split('+').nth(1) {
-                let num: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
-                new_line = num.parse().unwrap_or(0);
-            }
+            // @@ -old,n +new,m @@  — grab the start of each side's range.
+            let start = |sep: char| -> u64 {
+                line.split(sep)
+                    .nth(1)
+                    .map(|s| {
+                        s.chars()
+                            .take_while(|c| c.is_ascii_digit())
+                            .collect::<String>()
+                    })
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0)
+            };
+            old_line = start('-');
+            new_line = start('+');
         } else if let Some(path) = &cur_path {
             if let Some(text) = line.strip_prefix('+') {
-                f(path, new_line, text, true);
+                f(path, new_line, old_line, text, true);
                 new_line += 1;
             } else if let Some(text) = line.strip_prefix(' ') {
-                f(path, new_line, text, false);
+                f(path, new_line, old_line, text, false);
+                old_line += 1;
                 new_line += 1;
+            } else if line.starts_with('-') {
+                // A removed line advances only the old side. This also catches
+                // the next file's `--- a/…` header, which the `@@` after it resets.
+                old_line += 1;
             }
-            // '-' removed line: new side doesn't advance. Other markers ignored.
+            // Other markers (`\ No newline at end of file`) are ignored.
         }
     }
 }
@@ -86,7 +136,7 @@ fn for_each_new_side_line_kind(diff: &str, mut f: impl FnMut(&str, u64, &str, bo
 /// ```
 pub fn parse_added_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
     let mut map: HashMap<String, HashSet<u64>> = HashMap::new();
-    for_each_new_side_line_kind(diff, |path, new_line, _text, added| {
+    for_each_new_side_line_kind(diff, |path, new_line, _old, _text, added| {
         if added {
             map.entry(path.to_string()).or_default().insert(new_line);
         }

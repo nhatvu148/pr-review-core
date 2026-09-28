@@ -42,12 +42,16 @@ class Finding(_FindingRequired, total=False):
     suggestion: Optional[str]
 
 
-class InlineComment(TypedDict):
-    """One inline comment anchored to a file + line on the new side of the diff."""
-
+class _InlineCommentRequired(TypedDict):
     body: str
     line: int
     path: str
+
+
+class InlineComment(_InlineCommentRequired, total=False):
+    """One inline comment anchored to a file + line on the new side of the diff."""
+
+    start_line: Optional[int]
 
 
 class _UsageRequired(TypedDict):

@@ -153,12 +153,22 @@
           "type": "string"
         },
         "line": {
+          "description": "The line the comment attaches to. For a multi-line comment this is the\n*last* line of the range, which is how GitHub reports a thread's `line`\n— so the reconciler, matching new comments against old threads by line,\ncompares like with like.",
           "type": "integer",
           "format": "uint64",
           "minimum": 0
         },
         "path": {
           "type": "string"
+        },
+        "start_line": {
+          "description": "First line of a multi-line comment; `None` for a single line. Set only\nwhen a finding's quoted code resolved to several lines. Providers that\ncannot post a range (Bitbucket) ignore it and comment on `line`.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
         }
       },
       "required": [

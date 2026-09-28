@@ -1840,7 +1840,14 @@ async fn finish_review(
                 anchor = reanchor(l, v, t, &f.body);
             }
         }
-        anchors.push(anchor);
+        // A resolved multi-line quote posts as one comment over the range. It
+        // attaches to the range's last line, as GitHub reports a thread's line,
+        // and that is also the line logged: `(file, anchored_line)` is the join
+        // key for anything matching comments afterwards. Only a quote sets
+        // `end_line`, and a quoted finding anchors exactly at `line`, so the range
+        // always starts where the anchor is.
+        let range_end = f.end_line.filter(|_| anchor.is_some() && anchor == f.line);
+        anchors.push(range_end.or(anchor));
         match anchor {
             Some(line) => {
                 let (body, suggested) = inline_body_for(
@@ -1856,7 +1863,8 @@ async fn finish_review(
                 }
                 inline.push(InlineComment {
                     path: f.file.clone(),
-                    line,
+                    line: range_end.unwrap_or(line),
+                    start_line: range_end.map(|_| line),
                     body,
                 })
             }
@@ -3707,7 +3715,12 @@ mod orchestrator_tests {
         assert_eq!(v["funnel"]["quoted"], 1);
         assert_eq!(v["funnel"]["quote_resolved"], 1);
         assert_eq!(v["funnel"]["anchored"], 1, "posted inline, not folded");
-        assert_eq!(v["findings"][0]["anchored_line"], 2);
+        assert_eq!(
+            v["findings"][0]["anchored_line"], 3,
+            "a range attaches to its last line"
+        );
+        let c = &out.inline_detail[0];
+        assert_eq!((c.start_line, c.line), (Some(2), 3), "one comment over 2–3");
         assert_eq!(v["findings"][0]["line"], 2, "where the quote is");
         assert_eq!(v["findings"][0]["typed_line"], 40, "what the model typed");
     }
