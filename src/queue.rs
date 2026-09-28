@@ -606,4 +606,17 @@ mod tests {
     fn an_empty_log_says_so_rather_than_rendering_an_empty_table() {
         assert!(render_queue(&[], 0).contains("No reviewed PRs"));
     }
+
+    /// Only the hour branch (via `render_queue`) was exercised before; the minute
+    /// and day branches, and the boundaries between all three, were not.
+    #[test]
+    fn age_label_switches_units_at_its_boundaries() {
+        assert_eq!(age_label(0), "0m");
+        assert_eq!(age_label(59), "0m");
+        assert_eq!(age_label(3599), "59m");
+        assert_eq!(age_label(3600), "1h");
+        assert_eq!(age_label(86_399), "23h");
+        assert_eq!(age_label(86_400), "1d");
+        assert_eq!(age_label(2 * 86_400), "2d");
+    }
 }
