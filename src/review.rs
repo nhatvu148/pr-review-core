@@ -1680,13 +1680,16 @@ async fn sampled_review(
 /// most of all, since it is long and the critique is judging the body. The
 /// prompt asks for it to be carried through; this covers the times it is not.
 ///
-/// A kept finding with no quote takes one from the originals, first from the
-/// original at the same `(file, line)`, and failing that — the critique may
-/// also have rewritten the line — from the only original in that file that
-/// carried a quote. Either step declines when more than one original fits:
-/// the findings cannot be told apart, and a wrong quote would move the
-/// finding. A quote that is still missing costs only the quote; the finding
-/// anchors by its typed line as it did before quotes existed.
+/// A quote is only restored where the kept finding can be shown to *be* the
+/// original that carried it. The critique removes findings and never adds
+/// them, so when exactly one original sits at the kept finding's
+/// `(file, line)` — or, if the critique also rewrote the line, when exactly one
+/// original exists in that file at all — the kept finding is that original.
+/// Counting only the *quoted* originals would not be enough: a finding may
+/// have no quote on purpose, and borrowing a neighbour's would move it onto
+/// that neighbour's code. When correspondence cannot be shown the quote stays
+/// missing, which costs only the quote: the finding anchors by its typed line
+/// as it did before quotes existed.
 fn restore_quotes(kept: &mut [Finding], original: &[Finding]) {
     fn only<'a>(mut it: impl Iterator<Item = &'a Finding>) -> Option<&'a Finding> {
         match (it.next(), it.next()) {
@@ -1695,13 +1698,8 @@ fn restore_quotes(kept: &mut [Finding], original: &[Finding]) {
         }
     }
     for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
-        let quoted_in_file = || {
-            original
-                .iter()
-                .filter(|o| o.file == k.file && o.existing_code.is_some())
-        };
-        let source =
-            only(quoted_in_file().filter(|o| o.line == k.line)).or_else(|| only(quoted_in_file()));
+        let in_file = || original.iter().filter(|o| o.file == k.file);
+        let source = only(in_file().filter(|o| o.line == k.line)).or_else(|| only(in_file()));
         if let Some(o) = source {
             k.existing_code = o.existing_code.clone();
         }
@@ -4733,6 +4731,31 @@ mod tests {
             quoted("a.rs", 30, Some("t += 1;")),
         ];
         let mut kept = [quoted("a.rs", 14, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code, None);
+    }
+
+    #[test]
+    fn an_unquoted_finding_never_borrows_a_neighbours_quote() {
+        // Found in review of the first fallback: the finding at 30 had no quote
+        // on purpose, and the file-wide step gave it the one from line 12.
+        let original = [
+            quoted("a.rs", 12, Some("let t = 0;")),
+            quoted("a.rs", 30, None),
+        ];
+        let mut kept = [quoted("a.rs", 30, None), quoted("a.rs", 31, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code, None, "same spot, and it had none");
+        assert_eq!(kept[1].existing_code, None, "moved, and the file has two");
+    }
+
+    #[test]
+    fn a_quote_is_not_restored_past_an_unquoted_finding_on_the_same_line() {
+        let original = [
+            quoted("a.rs", 12, Some("let t = 0;")),
+            quoted("a.rs", 12, None),
+        ];
+        let mut kept = [quoted("a.rs", 12, None)];
         restore_quotes(&mut kept, &original);
         assert_eq!(kept[0].existing_code, None);
     }
