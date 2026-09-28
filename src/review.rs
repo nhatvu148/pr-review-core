@@ -55,6 +55,16 @@ pub struct RunReviewOutput {
     /// Populated on every run, posted or not.
     #[serde(default)]
     pub inline_detail: Vec<InlineComment>,
+    /// Vulnerable dependency versions the PR adds, from the OSV scan of its
+    /// lockfiles.
+    ///
+    /// Structured here because the summary's markdown was the only place they
+    /// surfaced, and a CI gate cannot act on prose. Deterministic — unlike
+    /// `recommendation`, nothing a model says can add to or remove from it — which
+    /// is what makes it safe to fail a build on. Always empty on a local review,
+    /// which runs no dependency scan.
+    #[serde(default)]
+    pub advisories: Vec<crate::deps::DepAdvisory>,
     pub posted: bool,
     pub comment_url: Option<String>,
     pub summary_markdown: String,
@@ -1266,6 +1276,7 @@ async fn post_advisory_only(
         findings_detail: hygiene,
         inline_posted: 0,
         inline_detail: Vec::new(),
+        advisories,
         posted: false,
         comment_url: None,
         summary_markdown: summary,
@@ -2209,6 +2220,7 @@ pub async fn run_review_with(
         findings_detail: findings,
         inline_posted: inline_count,
         inline_detail: post.inline.clone(),
+        advisories: advisories.clone(),
         posted: false,
         comment_url: None,
         summary_markdown: summary,
@@ -2352,6 +2364,7 @@ pub async fn run_review_local(
                 findings_detail: prepared.hygiene,
                 inline_posted: 0,
                 inline_detail: Vec::new(),
+                advisories: Vec::new(),
                 posted: false,
                 comment_url: None,
                 summary_markdown: summary,
@@ -2452,6 +2465,7 @@ pub async fn run_review_local(
         findings_detail: finished.findings,
         inline_posted: finished.inline.len(),
         inline_detail: finished.inline.clone(),
+        advisories: Vec::new(),
         posted: false,
         comment_url: None,
         summary_markdown: finished.summary,

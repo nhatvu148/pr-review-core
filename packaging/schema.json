@@ -4,6 +4,14 @@
   "description": "Result of one review run (serialized as the HTTP/CLI response).",
   "type": "object",
   "properties": {
+    "advisories": {
+      "description": "Vulnerable dependency versions the PR adds, from the OSV scan of its\nlockfiles.\n\nStructured here because the summary's markdown was the only place they\nsurfaced, and a CI gate cannot act on prose. Deterministic — unlike\n`recommendation`, nothing a model says can add to or remove from it — which\nis what makes it safe to fail a build on. Always empty on a local review,\nwhich runs no dependency scan.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/DepAdvisory"
+      }
+    },
     "commentUrl": {
       "type": [
         "string",
@@ -82,6 +90,54 @@
     "summaryMarkdown"
   ],
   "$defs": {
+    "DepAdvisory": {
+      "description": "One vulnerability advisory OSV reported for an added dependency.\n\nSerialized onto [`crate::review::RunReviewOutput`] so a caller can act on the\nscan without scraping the summary's markdown — `kaniscope --fail-on\nadvisories` gates CI on exactly this list.",
+      "type": "object",
+      "properties": {
+        "ecosystem": {
+          "type": "string"
+        },
+        "fixed": {
+          "description": "First fixed version for this package, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "OSV, GHSA or CVE id, such as `RUSTSEC-2021-0079` or `GHSA-xxxx`.",
+          "type": "string"
+        },
+        "package": {
+          "type": "string"
+        },
+        "severity": {
+          "description": "Coarse severity label (`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`) when OSV reports one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        },
+        "url": {
+          "description": "Human-facing advisory URL.",
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ecosystem",
+        "package",
+        "version",
+        "id",
+        "summary",
+        "url"
+      ]
+    },
     "Finding": {
       "description": "One review finding from the model.\n\nOnly `body` is required. `severity` and `file` are defaulted rather than\ndemanded because a model that drops one field must not cost the whole review:\nan unlabelled severity becomes MEDIUM, and an empty `file` simply fails to\nanchor and folds into the summary.",
       "type": "object",

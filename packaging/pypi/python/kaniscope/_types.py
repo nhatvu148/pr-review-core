@@ -20,10 +20,27 @@ class _RunReviewOutputRequired(TypedDict):
 class RunReviewOutput(_RunReviewOutputRequired, total=False):
     """Result of one review run (serialized as the HTTP/CLI response)."""
 
+    advisories: List[DepAdvisory]
     commentUrl: Optional[str]
     findingsDetail: List[Finding]
     inlineDetail: List[InlineComment]
     usage: Optional[Usage]
+
+
+class _DepAdvisoryRequired(TypedDict):
+    ecosystem: str
+    id: str
+    package: str
+    summary: str
+    url: str
+    version: str
+
+
+class DepAdvisory(_DepAdvisoryRequired, total=False):
+    """One vulnerability advisory OSV reported for an added dependency."""
+
+    fixed: Optional[str]
+    severity: Optional[str]
 
 
 class _FindingRequired(TypedDict):
@@ -386,6 +403,7 @@ ExplanationVerdict = Literal["holds", "doesNotHold", "inconclusive"]
 
 
 __all__ = [
+    "DepAdvisory",
     "EffectiveRules",
     "ExplainInput",
     "ExplainOutput",

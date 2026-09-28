@@ -58,12 +58,16 @@ pub struct PackageQuery {
 }
 
 /// One vulnerability advisory OSV reported for an added dependency.
-#[derive(Debug, Clone)]
+///
+/// Serialized onto [`crate::review::RunReviewOutput`] so a caller can act on the
+/// scan without scraping the summary's markdown — `kaniscope --fail-on
+/// advisories` gates CI on exactly this list.
+#[derive(Debug, Clone, serde::Serialize, schemars::JsonSchema)]
 pub struct DepAdvisory {
     pub ecosystem: String,
     pub package: String,
     pub version: String,
-    /// OSV / GHSA / CVE id (e.g. `RUSTSEC-2021-0079`, `GHSA-xxxx`).
+    /// OSV, GHSA or CVE id, such as `RUSTSEC-2021-0079` or `GHSA-xxxx`.
     pub id: String,
     pub summary: String,
     /// Coarse severity label (`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`) when OSV reports one.
