@@ -583,8 +583,13 @@ fn tripped_gate(out: &RunReviewOutput, fail_on: &[FailOn]) -> Option<String> {
     fail_on.iter().find_map(|gate| match gate {
         FailOn::Advisories if !out.advisories.is_empty() => {
             let ids: Vec<&str> = out.advisories.iter().map(|a| a.id.as_str()).collect();
+            let noun = if ids.len() == 1 {
+                "advisory"
+            } else {
+                "advisories"
+            };
             Some(format!(
-                "--fail-on advisories: {} vulnerable dependency advisor(y/ies): {}",
+                "--fail-on advisories: {} vulnerable dependency {noun}: {}",
                 ids.len(),
                 ids.join(", ")
             ))
@@ -1322,6 +1327,10 @@ mod tests {
         )
         .expect("gate trips");
         assert!(reason.contains("RUSTSEC-2020-0071"), "{reason}");
+        assert!(
+            reason.contains("1 vulnerable dependency advisory:"),
+            "{reason}"
+        );
     }
 
     #[test]
