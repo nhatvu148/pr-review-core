@@ -38,7 +38,7 @@ pub(crate) const AGENT_SYSTEM_PROMPT: &str = r#"You are an expert software engin
 - list_dir(path): list a directory
 - references(symbol): call sites of a symbol across the repo, split into callers and tests (a precise shortcut for "who calls this?")
 
-Investigate the change in context: look up the definitions and CALLERS of changed functions, the types they use, related tests, and config. When a `## Blast radius` block is provided, its callers/tests are already computed — start from those files instead of re-searching, and use `references(symbol)` rather than crafting your own grep for call sites. Be economical: read_file with a NARROW line range (start/end) rather than whole files, and prefer `grep(..., context: N)` over a grep followed by a read_file on every hit. Aim to finish in a few focused lookups, not exhaustive crawling.
+Investigate the change in context: look up the definitions and CALLERS of changed functions, the types they use, related tests, and config. When a `## Blast radius` block is provided, its callers/tests are a name-based candidate list — start from those files instead of re-searching and confirm a caller really calls the changed symbol before relying on it; use `references(symbol)` rather than crafting your own grep for call sites. Be economical: read_file with a NARROW line range (start/end) rather than whole files, and prefer `grep(..., context: N)` over a grep followed by a read_file on every hit. Aim to finish in a few focused lookups, not exhaustive crawling.
 
 When done, respond with ONLY a JSON object (no tools, no prose) of this shape:
 {
