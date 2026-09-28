@@ -24,6 +24,7 @@ Return ONLY a JSON object — no markdown fences, no prose around it — with ex
       "severity": "BLOCKING" | "HIGH" | "MEDIUM" | "LOW",
       "file": "<path EXACTLY as it appears in the diff, new side>",
       "line": <integer line number in the NEW version of the file, or null if not line-specific>,
+      "existing_code": "<the line(s) this finding is about, copied verbatim from the diff's new side, or null>",
       "body": "<one sentence describing the problem, then ' Fix: ' and a concrete fix>",
       "confidence": <integer 0-100 — your confidence a senior reviewer would flag this>,
       "suggestion": "<replacement text for `line`, or null — see the suggestion rules>"
@@ -33,6 +34,7 @@ Return ONLY a JSON object — no markdown fences, no prose around it — with ex
 
 Rules:
 - `file` MUST match a path shown in the diff. `line` MUST be a line shown in the diff (an added or context line) on the new side — if you cannot pin an exact line, set `line` to null (it will be folded into the summary).
+- `existing_code` is how the finding is placed: copy the exact line(s) it is about from the diff's new side (added or context lines, without the leading `+`), several consecutive lines if the problem spans them. It is matched against the diff, so copy rather than paraphrase; `line` is then only a hint. Use null when the finding is not about specific lines.
 - Prioritize high-severity and security issues. Be specific and concise.
 - Assign confidence honestly; reserve 90+ for clear correctness/security issues. Do NOT report style nits or speculative concerns.
 - Do NOT invent problems. If the diff is clean, return "findings": [].
@@ -221,7 +223,7 @@ pub fn review_system_prompt(cfg: &Config) -> String {
 /// System prompt for the optional second-pass self-critique. Given the diff and a
 /// JSON array of proposed findings, the model prunes noise and re-scores what it
 /// keeps, returning ONLY a JSON array of the surviving findings.
-pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence, suggestion}. Carry `suggestion` through UNCHANGED on a finding you keep — it is replacement code that was checked against the diff, and silently dropping or rewriting it here loses work the review already did. Set it to null only if the suggestion itself is what makes the finding wrong. If all should be dropped, return []."#;
+pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence, suggestion, existing_code}. Carry `existing_code` through UNCHANGED on a finding you keep — it is the quoted code that places the finding, and without it the finding falls back to a guessed line. Carry `suggestion` through UNCHANGED on a finding you keep — it is replacement code that was checked against the diff, and silently dropping or rewriting it here loses work the review already did. Set it to null only if the suggestion itself is what makes the finding wrong. If all should be dropped, return []."#;
 
 /// System prompt for the `/ask` command: answer a free-form question about the
 /// PR, grounded strictly in its diff.
@@ -1226,5 +1228,76 @@ mod change_intent_tests {
     #[test]
     fn an_empty_context_renders_nothing() {
         assert_eq!(UntrustedContext::default().render(), "");
+    }
+}
+
+#[cfg(test)]
+mod finding_shape_tests {
+    //! The finding shape is spelled out in prose in every review prompt, apart
+    //! from the type it is parsed into. A field added to `Finding` and not to a
+    //! prompt parses fine (`serde(default)`) and is simply never produced, so the
+    //! feature ships dark with CI green — committable suggestions did exactly that.
+
+    use crate::llm::Finding;
+
+    /// Every key of a fully populated `Finding`, as it serializes.
+    fn finding_keys() -> Vec<String> {
+        let f = Finding {
+            severity: "HIGH".into(),
+            file: "a.rs".into(),
+            line: Some(1),
+            body: "b".into(),
+            confidence: Some(90),
+            suggestion: Some("x".into()),
+            existing_code: Some("y".into()),
+            end_line: Some(2),
+        };
+        let v = serde_json::to_value(&f).expect("serializes");
+        v.as_object().expect("an object").keys().cloned().collect()
+    }
+
+    /// `end_line` is derived from a resolved `existing_code`, never asked for:
+    /// a range the model typed has nothing to check it against.
+    const DERIVED: &[&str] = &["end_line"];
+
+    #[test]
+    fn every_finding_field_the_model_writes_is_in_both_review_prompts() {
+        for (name, prompt) in [
+            ("SYSTEM_PROMPT", super::SYSTEM_PROMPT),
+            ("AGENT_SYSTEM_PROMPT", crate::agent::AGENT_SYSTEM_PROMPT),
+        ] {
+            for key in finding_keys() {
+                if DERIVED.contains(&key.as_str()) {
+                    continue;
+                }
+                assert!(
+                    prompt.contains(&format!("\"{key}\"")),
+                    "{name} never asks for `{key}`, so no model will produce it"
+                );
+            }
+        }
+    }
+
+    /// The self-critique pass rewrites every finding it keeps, so a field it
+    /// does not list is a field it drops — after the first pass produced it.
+    /// Missed for `existing_code` until the pre-push review caught it.
+    #[test]
+    fn the_critique_prompt_carries_every_field_it_is_given() {
+        let prompt = super::CRITIQUE_SYSTEM_PROMPT;
+        let start = prompt
+            .find("same shape {")
+            .expect("the critique names its shape")
+            + 12;
+        let end = start + prompt[start..].find('}').expect("closed");
+        let shape: Vec<&str> = prompt[start..end].split(',').map(str::trim).collect();
+        for key in finding_keys() {
+            if DERIVED.contains(&key.as_str()) {
+                continue;
+            }
+            assert!(
+                shape.contains(&key.as_str()),
+                "the critique's shape omits `{key}`, so every kept finding loses it"
+            );
+        }
     }
 }
