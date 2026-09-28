@@ -471,17 +471,23 @@ fn inline_position(
 type FilePositions = std::collections::HashMap<String, std::collections::HashMap<u64, (u64, bool)>>;
 
 /// One end of a GitLab `line_range`. The `line_code` is GitLab's own:
-/// `sha1(path)_old_new`. An added line is typed `new`; an unchanged one carries
-/// no type.
+/// `sha1(path)_old_new`. GitLab wants `type` on both ends — `new` for a line
+/// the change added, `old` otherwise — and an unchanged line identified by its
+/// old number as well as its new one. Leaving `type` off an unchanged end gets
+/// the range rejected, which the single-line retry would then hide.
 fn range_end(path: &str, new_line: u64, (old_line, added): (u64, bool)) -> serde_json::Value {
     use sha1::Digest;
     let code = format!(
         "{}_{old_line}_{new_line}",
         hex::encode(sha1::Sha1::digest(path.as_bytes()))
     );
-    let mut end = serde_json::json!({ "line_code": code, "new_line": new_line });
-    if added {
-        end["type"] = "new".into();
+    let mut end = serde_json::json!({
+        "line_code": code,
+        "type": if added { "new" } else { "old" },
+        "new_line": new_line,
+    });
+    if !added {
+        end["old_line"] = old_line.into();
     }
     end
 }
@@ -919,12 +925,11 @@ mod tests {
         let sha = "371f574bcfd6f16d2b8277d407f9db09f24ab634"; // sha1("src/a.py")
         let r = &pos["line_range"];
         assert_eq!(r["start"]["line_code"], format!("{sha}_10_10"));
-        assert!(
-            r["start"].get("type").is_none(),
-            "context lines carry no type"
-        );
+        assert_eq!(r["start"]["type"], "old", "an unchanged end is typed old");
+        assert_eq!(r["start"]["old_line"], 10, "and names its old line");
         assert_eq!(r["end"]["line_code"], format!("{sha}_12_11"));
         assert_eq!(r["end"]["type"], "new");
+        assert!(r["end"].get("old_line").is_none(), "an added line has none");
     }
 
     #[test]
