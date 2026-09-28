@@ -320,6 +320,7 @@ mod tests {
 
     fn finding(sev: &str) -> LoggedFinding {
         LoggedFinding {
+            typed_line: None,
             severity: sev.to_string(),
             file: "a.rs".into(),
             line: Some(1),

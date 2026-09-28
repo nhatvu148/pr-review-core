@@ -182,9 +182,14 @@ pub struct Funnel {
 pub struct LoggedFinding {
     pub severity: String,
     pub file: String,
-    /// The line the *model* named. Not necessarily where the comment went — see
-    /// `anchored_line`.
+    /// The finding's line as reported: where its quoted code (`existing_code`)
+    /// was found when the quote resolved, otherwise the line the model named.
+    /// Not necessarily where the comment went — see `anchored_line`.
     pub line: Option<u64>,
+    /// The line the model typed, before a resolved quote replaced it. Equal to
+    /// `line` when there was no quote or it did not resolve; the gap between the
+    /// two is how far off the typed number was.
+    pub typed_line: Option<u64>,
     pub confidence: Option<u8>,
     /// True when this finding was posted as an inline comment rather than folded
     /// into the summary.
@@ -316,6 +321,9 @@ pub fn logged_findings(findings: &[Finding], anchors: &[Option<u64>]) -> Vec<Log
                 severity: f.severity.clone(),
                 file: f.file.clone(),
                 line: f.line,
+                // Overwritten by the review when it knows the typed line; a
+                // caller without one gets the only line there is.
+                typed_line: f.line,
                 confidence: f.confidence,
                 anchored: anchored_line.is_some(),
                 anchored_line,
@@ -437,6 +445,7 @@ mod tests {
                 quote_resolved: 0,
             },
             findings: vec![LoggedFinding {
+                typed_line: None,
                 severity: "HIGH".into(),
                 file: "src/a.rs".into(),
                 line: Some(12),

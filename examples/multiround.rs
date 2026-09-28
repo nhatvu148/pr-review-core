@@ -623,6 +623,8 @@ mod tests {
             body: "x".to_string(),
             confidence: Some(50),
             suggestion: None,
+            existing_code: None,
+            end_line: None,
         }
     }
 

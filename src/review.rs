@@ -1226,6 +1226,9 @@ struct RunLogParts<'a> {
     /// The line each posted finding anchored to, index-aligned with
     /// `out.findings_detail`; empty means none anchored.
     anchors: &'a [Option<u64>],
+    /// The line the model typed for each finding, index-aligned with
+    /// `out.findings_detail`; empty when there were no model findings.
+    typed_lines: &'a [Option<u64>],
     started: std::time::Instant,
 }
 
@@ -1257,7 +1260,13 @@ fn log_run(cfg: &Config, p: RunLogParts<'_>) {
         truncated_salvage: p.truncated_salvage,
         recommendation: p.out.recommendation.clone(),
         funnel: p.funnel,
-        findings: crate::runlog::logged_findings(&p.out.findings_detail, p.anchors),
+        findings: {
+            let mut logged = crate::runlog::logged_findings(&p.out.findings_detail, p.anchors);
+            for (l, typed) in logged.iter_mut().zip(p.typed_lines) {
+                l.typed_line = *typed;
+            }
+            logged
+        },
         usage: p.out.usage.clone(),
         duration_ms: p.started.elapsed().as_millis() as u64,
     };
@@ -1454,6 +1463,10 @@ struct FinishedReview {
     /// predecessor's vector, so a caller holding only the final findings cannot
     /// reconstruct what the critique, the confidence floor, or the cap removed.
     funnel: crate::runlog::Funnel,
+    /// The line the model typed for each of `findings`, index-aligned — captured
+    /// before a resolved quote overwrites `line`, so the run log can still show
+    /// how far the typed line was from the code the finding quoted.
+    typed_lines: Vec<Option<u64>>,
     /// The line each of `findings` was anchored to, index-aligned, or `None` for
     /// the ones that folded into the summary.
     ///
@@ -1665,17 +1678,31 @@ async fn sampled_review(
 /// The critique returns the findings it keeps rewritten from scratch, and a
 /// model re-emitting JSON drops fields it was not attending to — `existing_code`
 /// most of all, since it is long and the critique is judging the body. The
-/// prompt asks for it to be carried through; this is what makes that a
-/// guarantee. A kept finding with no quote takes the one from the original
-/// finding at the same `(file, line)`, when exactly one original sits there —
-/// two findings on one line cannot be told apart, and a wrong quote would move
-/// the finding.
+/// prompt asks for it to be carried through; this covers the times it is not.
+///
+/// A kept finding with no quote takes one from the originals, first from the
+/// original at the same `(file, line)`, and failing that — the critique may
+/// also have rewritten the line — from the only original in that file that
+/// carried a quote. Either step declines when more than one original fits:
+/// the findings cannot be told apart, and a wrong quote would move the
+/// finding. A quote that is still missing costs only the quote; the finding
+/// anchors by its typed line as it did before quotes existed.
 fn restore_quotes(kept: &mut [Finding], original: &[Finding]) {
+    fn only<'a>(mut it: impl Iterator<Item = &'a Finding>) -> Option<&'a Finding> {
+        match (it.next(), it.next()) {
+            (Some(o), None) => Some(o),
+            _ => None,
+        }
+    }
     for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
-        let mut same_spot = original
-            .iter()
-            .filter(|o| o.file == k.file && o.line == k.line && o.existing_code.is_some());
-        if let (Some(o), None) = (same_spot.next(), same_spot.next()) {
+        let quoted_in_file = || {
+            original
+                .iter()
+                .filter(|o| o.file == k.file && o.existing_code.is_some())
+        };
+        let source =
+            only(quoted_in_file().filter(|o| o.line == k.line)).or_else(|| only(quoted_in_file()));
+        if let Some(o) = source {
             k.existing_code = o.existing_code.clone();
         }
     }
@@ -1753,6 +1780,7 @@ async fn finish_review(
     // actually is, so `findings_detail` reports the checked location too. A range
     // comes only from a resolved quote — a model-sent `end_line` with nothing to
     // check it against is dropped, since a wrong range is worse than none.
+    let typed_lines: Vec<Option<u64>> = findings.iter().map(|f| f.line).collect();
     for f in &mut findings {
         f.end_line = None;
         if f.existing_code.is_none() {
@@ -1837,6 +1865,7 @@ async fn finish_review(
         summary,
         inline,
         funnel,
+        typed_lines,
         anchors,
     }
 }
@@ -1950,6 +1979,7 @@ pub async fn run_review_with(
                         ..Default::default()
                     },
                     anchors: &[],
+                    typed_lines: &[],
                     started,
                 },
             );
@@ -2087,6 +2117,7 @@ pub async fn run_review_with(
         summary,
         inline,
         funnel,
+        typed_lines,
         anchors,
     } = finished;
     let inline_count = inline.len();
@@ -2130,6 +2161,7 @@ pub async fn run_review_with(
             truncated_salvage: truncated,
             funnel,
             anchors: &anchors,
+            typed_lines: &typed_lines,
             started,
         },
     );
@@ -3665,6 +3697,8 @@ mod orchestrator_tests {
         assert_eq!(v["funnel"]["quote_resolved"], 1);
         assert_eq!(v["funnel"]["anchored"], 1, "posted inline, not folded");
         assert_eq!(v["findings"][0]["anchored_line"], 2);
+        assert_eq!(v["findings"][0]["line"], 2, "where the quote is");
+        assert_eq!(v["findings"][0]["typed_line"], 40, "what the model typed");
     }
 
     /// A new file: every line is an added line, blank ones included. New-side 2
@@ -4680,6 +4714,25 @@ mod tests {
             quoted("a.rs", 12, Some("t += 1;")),
         ];
         let mut kept = [quoted("a.rs", 12, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code, None);
+    }
+
+    #[test]
+    fn a_quote_follows_a_finding_whose_line_the_critique_changed() {
+        let original = [quoted("a.rs", 12, Some("let t = 0;"))];
+        let mut kept = [quoted("a.rs", 14, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code.as_deref(), Some("let t = 0;"));
+    }
+
+    #[test]
+    fn a_moved_line_does_not_borrow_a_quote_when_the_file_has_several() {
+        let original = [
+            quoted("a.rs", 12, Some("let t = 0;")),
+            quoted("a.rs", 30, Some("t += 1;")),
+        ];
+        let mut kept = [quoted("a.rs", 14, None)];
         restore_quotes(&mut kept, &original);
         assert_eq!(kept[0].existing_code, None);
     }
