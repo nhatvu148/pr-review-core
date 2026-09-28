@@ -240,7 +240,7 @@ async fn prepared_diff(
     let raw = provider.get_diff(client, cfg, repo, meta.pr).await?;
     let (diff, glob_dropped) =
         crate::diff::filter_diff_by_globs(&raw, &cfg.include_globs, &cfg.exclude_globs);
-    let (diff, packed_dropped) = crate::diff::pack_diff(&diff, cfg.max_diff_chars);
+    let (diff, packed_dropped) = crate::review::pack_to_budget(cfg, &diff);
     let omitted_note = crate::review::omission_note(&glob_dropped, &packed_dropped);
     let structural = if cfg.structural_context && !diff.trim().is_empty() {
         crate::structure::structural_context(provider, client, cfg, repo, meta, &diff).await
