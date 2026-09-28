@@ -1332,6 +1332,53 @@ mod tests {
         assert_eq!(render_advisories(&[]), "");
     }
 
+    fn crate_bump() -> String {
+        section(
+            "Cargo.lock",
+            &["[[package]]", "name = \"time\"", "version = \"0.1.44\""],
+        )
+    }
+
+    /// Each of these returns an empty list, and a CI gate has to tell them apart:
+    /// only the first two mean "nothing vulnerable was added".
+    #[tokio::test]
+    async fn a_disabled_scan_reports_disabled_not_clean() {
+        let mut cfg = crate::config::Config::from_env();
+        cfg.cve_scan = false;
+        let (advisories, status) =
+            scan_with_status(&reqwest::Client::new(), &cfg, &crate_bump()).await;
+        assert!(advisories.is_empty());
+        assert_eq!(status, ScanStatus::Disabled);
+        assert!(!status.verified());
+    }
+
+    #[tokio::test]
+    async fn a_diff_with_no_lockfile_is_verified_without_asking_osv() {
+        let mut cfg = crate::config::Config::from_env();
+        cfg.cve_scan = true;
+        // Unreachable on purpose: reaching OSV here would be the bug.
+        cfg.osv_api_base = "http://127.0.0.1:1".into();
+        let diff = section("src/main.rs", &["fn main() {}"]);
+        let (advisories, status) = scan_with_status(&reqwest::Client::new(), &cfg, &diff).await;
+        assert!(advisories.is_empty());
+        assert_eq!(status, ScanStatus::NoLockfiles);
+        assert!(status.verified());
+    }
+
+    /// The fail-open path: the review must still get an empty list, and the
+    /// status must say nothing was checked.
+    #[tokio::test]
+    async fn an_unreachable_osv_reports_failed_not_clean() {
+        let mut cfg = crate::config::Config::from_env();
+        cfg.cve_scan = true;
+        cfg.osv_api_base = "http://127.0.0.1:1".into();
+        let (advisories, status) =
+            scan_with_status(&reqwest::Client::new(), &cfg, &crate_bump()).await;
+        assert!(advisories.is_empty());
+        assert_eq!(status, ScanStatus::Failed);
+        assert!(!status.verified());
+    }
+
     /// Live end-to-end scan against the real OSV.dev API. Ignored by default
     /// Live end-to-end check for the PyPI TOML lockfiles: a poetry.lock pin must
     /// reach OSV as `PyPI` and come back with a real advisory (needs network).
