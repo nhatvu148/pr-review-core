@@ -34,6 +34,8 @@ class Finding(_FindingRequired, total=False):
     """One review finding from the model."""
 
     confidence: Optional[int]
+    end_line: Optional[int]
+    existing_code: Optional[str]
     file: str
     line: Optional[int]
     severity: str

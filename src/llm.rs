@@ -75,6 +75,22 @@ pub struct Finding {
         skip_serializing_if = "Option::is_none"
     )]
     pub suggestion: Option<String>,
+    /// The code this finding is about, quoted verbatim from the diff's new side —
+    /// one or more consecutive lines.
+    ///
+    /// When present it is the anchor, and `line` is only a hint: the review
+    /// locates the excerpt in the file's hunks and overwrites `line` and
+    /// `end_line` with where it actually is. Models quote code far more reliably
+    /// than they count lines, so a line number derived from a quote can be
+    /// checked, where one the model typed can only be trusted. Absent on older
+    /// responses and when the finding is not about specific lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_code: Option<String>,
+    /// Last line of a multi-line finding, inclusive; `line` is the first. `None`
+    /// for a single-line finding. Set only from a resolved `existing_code`: a value
+    /// the model sends itself is discarded, because nothing can check it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u64>,
 }
 
 /// Accept a suggestion in whatever shape the model sent it, and drop it rather

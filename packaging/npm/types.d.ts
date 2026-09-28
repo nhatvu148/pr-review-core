@@ -25,6 +25,10 @@ export interface Finding {
   body: string;
   /** Model's confidence (0–100) that this is a real, actionable issue a senior reviewer would flag. */
   confidence?: number | null;
+  /** Last line of a multi-line finding, inclusive; `line` is the first. */
+  end_line?: number | null;
+  /** The code this finding is about, quoted verbatim from the diff's new side — one or more consecutive lines. */
+  existing_code?: string | null;
   file?: string;
   line?: number | null;
   severity?: string;

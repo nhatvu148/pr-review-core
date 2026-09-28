@@ -529,6 +529,95 @@ fn line_symbols(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// One line of code reduced to what a quote has to agree on: trimmed, with every
+/// run of whitespace collapsed to one space. Indentation and alignment are the
+/// details a model reproduces least faithfully and that say least about *which*
+/// line it meant.
+fn normalize_code_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Locate a finding's quoted code (`existing_code`) in one file's diff, as an
+/// inclusive `(start, end)` range of new-side line numbers.
+///
+/// `texts` is that file's new-side diff lines (context and added) by number, so
+/// only code the diff actually shows can match — the same set an inline comment
+/// can land on. The excerpt must match a run of *consecutive* line numbers,
+/// line for line, after [`normalize_code_line`]; leading and trailing blank lines
+/// in the excerpt are ignored. A `+` on every line may be a marker the model
+/// copied from the diff or real code (`+x` is valid in several languages), so
+/// the quote is tried as written first and with the markers stripped only if
+/// that finds nothing.
+///
+/// A quote that matches in several places is ambiguous, and guessing trades one
+/// wrong location for another. So a repeat is resolved only when exactly one of
+/// the matches contains `hint` (the line the model typed); otherwise it declines
+/// and the caller falls back to anchoring by that line, as before quotes existed.
+fn resolve_excerpt(
+    excerpt: &str,
+    texts: &std::collections::HashMap<u64, String>,
+    hint: Option<u64>,
+) -> Option<(u64, u64)> {
+    let mut lines: Vec<&str> = excerpt.lines().collect();
+    while lines.first().is_some_and(|l| l.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    locate_lines(&lines, texts, hint).or_else(|| {
+        // A model quoting from the diff sometimes keeps the `+` markers. Only a
+        // fallback: for a one-line quote "every line starts with `+`" is just
+        // "this line does", and that line may be code.
+        lines.iter().all(|l| l.starts_with('+')).then(|| {
+            let stripped: Vec<&str> = lines.iter().map(|l| &l[1..]).collect();
+            locate_lines(&stripped, texts, hint)
+        })?
+    })
+}
+
+/// The matching half of [`resolve_excerpt`], for lines already trimmed of blank
+/// edges: a unique consecutive run, or the one run holding `hint`.
+fn locate_lines(
+    lines: &[&str],
+    texts: &std::collections::HashMap<u64, String>,
+    hint: Option<u64>,
+) -> Option<(u64, u64)> {
+    let want: Vec<String> = lines.iter().map(|l| normalize_code_line(l)).collect();
+    let span = want.len() as u64;
+
+    let mut starts: Vec<u64> = texts.keys().copied().collect();
+    starts.sort_unstable();
+    let matches: Vec<u64> = starts
+        .into_iter()
+        .filter(|&s| {
+            want.iter().enumerate().all(|(k, w)| {
+                texts
+                    .get(&(s + k as u64))
+                    .is_some_and(|t| normalize_code_line(t) == *w)
+            })
+        })
+        .collect();
+
+    let start = match matches.as_slice() {
+        [] => return None,
+        [only] => *only,
+        several => {
+            let mut containing = several
+                .iter()
+                .filter(|&&s| hint.is_some_and(|h| (s..s + span).contains(&h)));
+            match (containing.next(), containing.next()) {
+                (Some(&s), None) => s,
+                _ => return None,
+            }
+        }
+    };
+    Some((start, start + span - 1))
+}
+
 /// Re-anchor a finding at `line` (which isn't itself a diff line) to the nearest
 /// diff line within [`REANCHOR_WINDOW`] whose code shares a *significant* symbol
 /// with the finding body. Conservative — no shared significant symbol means `None`
@@ -1150,6 +1239,9 @@ struct RunLogParts<'a> {
     /// The line each posted finding anchored to, index-aligned with
     /// `out.findings_detail`; empty means none anchored.
     anchors: &'a [Option<u64>],
+    /// The line the model typed for each finding, index-aligned with
+    /// `out.findings_detail`; empty when there were no model findings.
+    typed_lines: &'a [Option<u64>],
     started: std::time::Instant,
 }
 
@@ -1181,7 +1273,13 @@ fn log_run(cfg: &Config, p: RunLogParts<'_>) {
         truncated_salvage: p.truncated_salvage,
         recommendation: p.out.recommendation.clone(),
         funnel: p.funnel,
-        findings: crate::runlog::logged_findings(&p.out.findings_detail, p.anchors),
+        findings: {
+            let mut logged = crate::runlog::logged_findings(&p.out.findings_detail, p.anchors);
+            for (l, typed) in logged.iter_mut().zip(p.typed_lines) {
+                l.typed_line = *typed;
+            }
+            logged
+        },
         usage: p.out.usage.clone(),
         duration_ms: p.started.elapsed().as_millis() as u64,
     };
@@ -1324,6 +1422,8 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
     let hygiene: Vec<Finding> = crate::diff::diff_hygiene_with(raw_diff, &cfg.vendored_globs)
         .into_iter()
         .map(|h| Finding {
+            existing_code: None,
+            end_line: None,
             severity: h.severity.to_string(),
             file: h.file,
             line: None,
@@ -1376,6 +1476,10 @@ struct FinishedReview {
     /// predecessor's vector, so a caller holding only the final findings cannot
     /// reconstruct what the critique, the confidence floor, or the cap removed.
     funnel: crate::runlog::Funnel,
+    /// The line the model typed for each of `findings`, index-aligned — captured
+    /// before a resolved quote overwrites `line`, so the run log can still show
+    /// how far the typed line was from the code the finding quoted.
+    typed_lines: Vec<Option<u64>>,
     /// The line each of `findings` was anchored to, index-aligned, or `None` for
     /// the ones that folded into the summary.
     ///
@@ -1582,6 +1686,39 @@ async fn sampled_review(
     })
 }
 
+/// Give back a quote the self-critique pass dropped.
+///
+/// The critique returns the findings it keeps rewritten from scratch, and a
+/// model re-emitting JSON drops fields it was not attending to — `existing_code`
+/// most of all, since it is long and the critique is judging the body. The
+/// prompt asks for it to be carried through; this covers the times it is not.
+///
+/// A quote is only restored where the kept finding can be shown to *be* the
+/// original that carried it. The critique removes findings and never adds
+/// them, so when exactly one original sits at the kept finding's
+/// `(file, line)` — or, if the critique also rewrote the line, when exactly one
+/// original exists in that file at all — the kept finding is that original.
+/// Counting only the *quoted* originals would not be enough: a finding may
+/// have no quote on purpose, and borrowing a neighbour's would move it onto
+/// that neighbour's code. When correspondence cannot be shown the quote stays
+/// missing, which costs only the quote: the finding anchors by its typed line
+/// as it did before quotes existed.
+fn restore_quotes(kept: &mut [Finding], original: &[Finding]) {
+    fn only<'a>(mut it: impl Iterator<Item = &'a Finding>) -> Option<&'a Finding> {
+        match (it.next(), it.next()) {
+            (Some(o), None) => Some(o),
+            _ => None,
+        }
+    }
+    for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
+        let in_file = || original.iter().filter(|o| o.file == k.file);
+        let source = only(in_file().filter(|o| o.line == k.line)).or_else(|| only(in_file()));
+        if let Some(o) = source {
+            k.existing_code = o.existing_code.clone();
+        }
+    }
+}
+
 /// Everything between the backend's answer and a postable review: self-critique,
 /// confidence floor, hygiene merge, CI demotion, burst collapse, severity sort,
 /// recommendation floor, cap, line anchoring, and the summary.
@@ -1605,7 +1742,10 @@ async fn finish_review(
         // Through the backend seam, so the critique runs on whatever produced the
         // review — not always OpenRouter.
         findings = match crate::llm::critique_findings(cfg, backend, meta, diff, &findings).await {
-            Ok(f) => f,
+            Ok(mut kept) => {
+                restore_quotes(&mut kept, &findings);
+                kept
+            }
             Err(e) => {
                 tracing::warn!("self-critique failed ({e:#}); keeping original findings");
                 findings
@@ -1646,6 +1786,30 @@ async fn finish_review(
     // `anchorable`), so there is no configuration in which these are unused.
     let line_texts = crate::diff::diff_line_texts(diff);
 
+    // A finding that quotes its code is placed by the quote, not by the number the
+    // model typed: `line` and `end_line` are overwritten with where the excerpt
+    // actually is, so `findings_detail` reports the checked location too. A range
+    // comes only from a resolved quote — a model-sent `end_line` with nothing to
+    // check it against is dropped, since a wrong range is worse than none.
+    let typed_lines: Vec<Option<u64>> = findings.iter().map(|f| f.line).collect();
+    for f in &mut findings {
+        f.end_line = None;
+        if f.existing_code.is_none() {
+            continue;
+        }
+        funnel.quoted += 1;
+        let resolved = f
+            .existing_code
+            .as_deref()
+            .zip(line_texts.get(&f.file))
+            .and_then(|(code, texts)| resolve_excerpt(code, texts, f.line));
+        if let Some((start, end)) = resolved {
+            funnel.quote_resolved += 1;
+            f.line = Some(start);
+            f.end_line = (end > start).then_some(end);
+        }
+    }
+
     // Anchor findings whose (file, line) is actually in the diff. A finding that
     // just missed (model off-by-a-few / drift) is re-anchored to a nearby diff line
     // when its code matches; the rest fold into the summary so the provider never
@@ -1665,8 +1829,10 @@ async fn finish_review(
             )
         });
         // Whether the comment is going to the line the model named. A suggestion
-        // is only valid against that line — see `inline_body_for`.
-        let exact_anchor = anchor.is_some();
+        // is only valid against that line — see `inline_body_for`. A range is
+        // never exact: a suggestion replaces one line, and a multi-line finding
+        // is about more than the first of them.
+        let exact_anchor = anchor.is_some() && f.end_line.is_none();
         if anchor.is_none() && cfg.reanchor_findings {
             if let (Some(l), Some(v), Some(t)) =
                 (f.line, valid.get(&f.file), line_texts.get(&f.file))
@@ -1710,6 +1876,7 @@ async fn finish_review(
         summary,
         inline,
         funnel,
+        typed_lines,
         anchors,
     }
 }
@@ -1823,6 +1990,7 @@ pub async fn run_review_with(
                         ..Default::default()
                     },
                     anchors: &[],
+                    typed_lines: &[],
                     started,
                 },
             );
@@ -1960,6 +2128,7 @@ pub async fn run_review_with(
         summary,
         inline,
         funnel,
+        typed_lines,
         anchors,
     } = finished;
     let inline_count = inline.len();
@@ -2003,6 +2172,7 @@ pub async fn run_review_with(
             truncated_salvage: truncated,
             funnel,
             anchors: &anchors,
+            typed_lines: &typed_lines,
             started,
         },
     );
@@ -2307,6 +2477,8 @@ mod local_review_tests {
                     summary: "an accumulator replaced a fold".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![Finding {
+                        existing_code: None,
+                        end_line: None,
                         severity: "MEDIUM".to_string(),
                         file: "src/order.rs".to_string(),
                         line: Some(3),
@@ -2461,6 +2633,8 @@ mod local_review_tests {
                         summary: "s".to_string(),
                         recommendation: "APPROVE".to_string(),
                         findings: vec![Finding {
+                            existing_code: None,
+                            end_line: None,
                             severity: "LOW".to_string(),
                             file: "src/order.rs".to_string(),
                             line: Some(900),
@@ -3177,6 +3351,8 @@ mod orchestrator_tests {
         async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
             let f = |sev: &str, file: &str, line: Option<u64>, conf: u8, body: &str| {
                 crate::llm::Finding {
+                    existing_code: None,
+                    end_line: None,
                     severity: sev.to_string(),
                     file: file.to_string(),
                     line,
@@ -3285,6 +3461,8 @@ mod orchestrator_tests {
                 *c
             };
             let f = |file: &str, line: u64, body: &str| crate::llm::Finding {
+                existing_code: None,
+                end_line: None,
                 severity: "MEDIUM".to_string(),
                 file: file.to_string(),
                 line: Some(line),
@@ -3416,6 +3594,8 @@ mod orchestrator_tests {
                     summary: "one drifted finding".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        existing_code: None,
+                        end_line: None,
                         severity: "HIGH".to_string(),
                         file: "src/order.ts".to_string(),
                         line: Some(5),
@@ -3468,6 +3648,70 @@ mod orchestrator_tests {
         assert_eq!(f["anchored_line"], 3, "onto the line naming calcTotal");
     }
 
+    /// Types a line nowhere near the code, but quotes the two added lines of
+    /// [`DRIFT_DIFF`] correctly.
+    struct QuotingBackend;
+
+    #[async_trait]
+    impl ReviewBackend for QuotingBackend {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "one quoted finding".to_string(),
+                    recommendation: "APPROVE WITH CHANGES".to_string(),
+                    findings: vec![crate::llm::Finding {
+                        existing_code: Some(
+                            "const subtotal = sum(items);\nreturn calcTotal(order, tax);"
+                                .to_string(),
+                        ),
+                        end_line: None,
+                        severity: "HIGH".to_string(),
+                        file: "src/order.ts".to_string(),
+                        line: Some(40),
+                        body: "The subtotal is computed and then ignored.".to_string(),
+                        confidence: Some(90),
+                        suggestion: None,
+                    }],
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    /// A quoted finding is placed by its quote, and the output reports where.
+    ///
+    /// The typed line (40) is off the diff and the body shares no symbol with
+    /// the code, so before quotes this finding folded into the summary. The quote
+    /// pins it to lines 2–3, and `findings_detail` carries that range: it is what
+    /// `--json` consumers, the AACR-Bench adapter among them, read.
+    #[tokio::test]
+    async fn a_quoted_finding_is_placed_by_its_quote_not_its_typed_line() {
+        let srv = github_stub_with(DRIFT_DIFF).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
+
+        let out = run_review_with(&cfg, input(), &QuotingBackend)
+            .await
+            .expect("the review runs");
+
+        let f = &out.findings_detail[0];
+        assert_eq!((f.line, f.end_line), (Some(2), Some(3)));
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        let v: serde_json::Value =
+            serde_json::from_str(text.trim()).expect("one parseable JSON line");
+        assert_eq!(v["funnel"]["quoted"], 1);
+        assert_eq!(v["funnel"]["quote_resolved"], 1);
+        assert_eq!(v["funnel"]["anchored"], 1, "posted inline, not folded");
+        assert_eq!(v["findings"][0]["anchored_line"], 2);
+        assert_eq!(v["findings"][0]["line"], 2, "where the quote is");
+        assert_eq!(v["findings"][0]["typed_line"], 40, "what the model typed");
+    }
+
     /// A new file: every line is an added line, blank ones included. New-side 2
     /// is blank; `calcTotal` is on 3.
     const BLANK_LINE_DIFF: &str = "diff --git a/src/order.ts b/src/order.ts\n--- /dev/null\n+++ b/src/order.ts\n@@ -0,0 +1,4 @@\n+function f() {\n+\n+  return calcTotal(order, tax);\n+}\n";
@@ -3484,6 +3728,8 @@ mod orchestrator_tests {
                     summary: "drifted onto a blank line".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        existing_code: None,
+                        end_line: None,
                         severity: "HIGH".to_string(),
                         file: "src/order.ts".to_string(),
                         line: Some(2),
@@ -3545,6 +3791,8 @@ mod orchestrator_tests {
                     summary: "one finding with a fix".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        existing_code: None,
+                        end_line: None,
                         severity: "HIGH".to_string(),
                         file: "src/order.ts".to_string(),
                         line: Some(self.line),
@@ -3688,6 +3936,8 @@ return calcTotal(order, tax, region);
 
     fn proposed(file: &str, body: &str) -> crate::llm::Finding {
         crate::llm::Finding {
+            existing_code: None,
+            end_line: None,
             severity: "MEDIUM".to_string(),
             file: file.to_string(),
             line: None,
@@ -3853,13 +4103,15 @@ mod tests {
     use super::{
         anchorable, burst_key, collapse_bursts, demote_falsified_build_claims,
         effective_recommendation, idents, line_symbols, merge_samples, reanchor,
-        render_no_review_summary,
+        render_no_review_summary, resolve_excerpt, restore_quotes,
     };
     use crate::llm::Finding;
     use std::collections::{HashMap, HashSet};
 
     fn f(severity: &str, file: &str, body: &str) -> Finding {
         Finding {
+            existing_code: None,
+            end_line: None,
             severity: severity.to_string(),
             file: file.to_string(),
             line: None,
@@ -4076,6 +4328,8 @@ mod tests {
 
     fn at(file: &str, line: Option<u64>, sev: &str, conf: u8, body: &str) -> Finding {
         Finding {
+            existing_code: None,
+            end_line: None,
             severity: sev.to_string(),
             file: file.to_string(),
             line,
@@ -4231,6 +4485,8 @@ mod tests {
 
     fn finding(severity: &str) -> Finding {
         Finding {
+            existing_code: None,
+            end_line: None,
             severity: severity.to_string(),
             file: "assets/ime.zip".to_string(),
             line: None,
@@ -4379,6 +4635,165 @@ mod tests {
         // symbol matches.
         assert_eq!(reanchor(9, &valid, &texts, "calcTotal issue"), None);
     }
+
+    /// New-side lines 10–14 of a file, as `diff_line_texts` would report them.
+    fn excerpt_texts() -> HashMap<u64, String> {
+        [
+            (10, "fn total(items: &[Item]) -> u64 {"),
+            (11, "    let mut t = 0;"),
+            (12, "    for i in items {"),
+            (13, "        t += i.price;"),
+            (14, "    }"),
+        ]
+        .into_iter()
+        .map(|(n, s)| (n, s.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn a_quoted_run_of_lines_resolves_to_its_range_whatever_line_the_model_typed() {
+        let got = resolve_excerpt(
+            "for i in items {\n    t += i.price;",
+            &excerpt_texts(),
+            Some(40),
+        );
+        assert_eq!(got, Some((12, 13)));
+    }
+
+    #[test]
+    fn indentation_and_diff_markers_in_a_quote_do_not_matter() {
+        let got = resolve_excerpt(
+            "+let mut t   = 0;\n+  for i in items {",
+            &excerpt_texts(),
+            None,
+        );
+        assert_eq!(got, Some((11, 12)));
+    }
+
+    #[test]
+    fn a_one_line_quote_that_starts_with_plus_is_tried_as_code_first() {
+        let mut texts = excerpt_texts();
+        texts.insert(15, "+x".to_string());
+        texts.insert(16, "x".to_string());
+        // `+x` is on 15 as written; stripping first would have matched 16.
+        assert_eq!(resolve_excerpt("+x", &texts, None), Some((15, 15)));
+        // A copied marker on a line with no literal `+` still resolves.
+        assert_eq!(
+            resolve_excerpt("+    t += i.price;", &excerpt_texts(), None),
+            Some((13, 13))
+        );
+    }
+
+    #[test]
+    fn blank_lines_around_a_quote_are_not_part_of_it() {
+        let got = resolve_excerpt("\n\n        t += i.price;\n\n", &excerpt_texts(), None);
+        assert_eq!(got, Some((13, 13)));
+    }
+
+    #[test]
+    fn a_quote_that_is_not_in_the_diff_resolves_to_nothing() {
+        assert_eq!(
+            resolve_excerpt("t -= i.discount;", &excerpt_texts(), Some(13)),
+            None
+        );
+        assert_eq!(resolve_excerpt("  \n ", &excerpt_texts(), Some(13)), None);
+    }
+
+    #[test]
+    fn a_quote_that_is_only_consecutive_by_content_is_not_a_match() {
+        // Lines 11 and 13 exist, but not as a run: 12 sits between them.
+        let got = resolve_excerpt("let mut t = 0;\nt += i.price;", &excerpt_texts(), None);
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn a_repeated_quote_is_resolved_only_by_the_one_match_holding_the_typed_line() {
+        let mut texts = excerpt_texts();
+        texts.insert(20, "    }".to_string());
+        // `}` sits on 14 and 20. The typed line picks one; with no hint, or a hint
+        // on neither, the quote is ambiguous and declines.
+        assert_eq!(resolve_excerpt("}", &texts, Some(20)), Some((20, 20)));
+        assert_eq!(resolve_excerpt("}", &texts, None), None);
+        assert_eq!(resolve_excerpt("}", &texts, Some(17)), None);
+    }
+
+    fn quoted(file: &str, line: u64, code: Option<&str>) -> Finding {
+        let mut x = f("HIGH", file, "the body the critique may reword");
+        x.line = Some(line);
+        x.existing_code = code.map(str::to_string);
+        x
+    }
+
+    #[test]
+    fn a_quote_the_critique_dropped_comes_back_from_the_same_spot() {
+        let original = [quoted("a.rs", 12, Some("let t = 0;"))];
+        let mut kept = [quoted("a.rs", 12, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code.as_deref(), Some("let t = 0;"));
+    }
+
+    #[test]
+    fn a_quote_is_not_restored_when_two_originals_share_the_spot() {
+        let original = [
+            quoted("a.rs", 12, Some("let t = 0;")),
+            quoted("a.rs", 12, Some("t += 1;")),
+        ];
+        let mut kept = [quoted("a.rs", 12, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code, None);
+    }
+
+    #[test]
+    fn a_quote_follows_a_finding_whose_line_the_critique_changed() {
+        let original = [quoted("a.rs", 12, Some("let t = 0;"))];
+        let mut kept = [quoted("a.rs", 14, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code.as_deref(), Some("let t = 0;"));
+    }
+
+    #[test]
+    fn a_moved_line_does_not_borrow_a_quote_when_the_file_has_several() {
+        let original = [
+            quoted("a.rs", 12, Some("let t = 0;")),
+            quoted("a.rs", 30, Some("t += 1;")),
+        ];
+        let mut kept = [quoted("a.rs", 14, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code, None);
+    }
+
+    #[test]
+    fn an_unquoted_finding_never_borrows_a_neighbours_quote() {
+        // Found in review of the first fallback: the finding at 30 had no quote
+        // on purpose, and the file-wide step gave it the one from line 12.
+        let original = [
+            quoted("a.rs", 12, Some("let t = 0;")),
+            quoted("a.rs", 30, None),
+        ];
+        let mut kept = [quoted("a.rs", 30, None), quoted("a.rs", 31, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code, None, "same spot, and it had none");
+        assert_eq!(kept[1].existing_code, None, "moved, and the file has two");
+    }
+
+    #[test]
+    fn a_quote_is_not_restored_past_an_unquoted_finding_on_the_same_line() {
+        let original = [
+            quoted("a.rs", 12, Some("let t = 0;")),
+            quoted("a.rs", 12, None),
+        ];
+        let mut kept = [quoted("a.rs", 12, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code, None);
+    }
+
+    #[test]
+    fn a_quote_the_critique_kept_or_rewrote_is_left_alone() {
+        let original = [quoted("a.rs", 12, Some("let t = 0;"))];
+        let mut kept = [quoted("a.rs", 12, Some("let t = 1;"))];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code.as_deref(), Some("let t = 1;"));
+    }
 }
 
 #[cfg(test)]
@@ -4488,6 +4903,8 @@ mod change_map_tests {
     #[test]
     fn the_table_attributes_each_finding_to_its_file() {
         let findings = vec![Finding {
+            existing_code: None,
+            end_line: None,
             severity: "BLOCKING".into(),
             file: "b.rs".into(),
             line: Some(1),
