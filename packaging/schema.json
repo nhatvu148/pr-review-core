@@ -100,6 +100,22 @@
           "maximum": 255,
           "minimum": 0
         },
+        "end_line": {
+          "description": "Last line of a multi-line finding, inclusive; `line` is the first. `None`\nfor a single-line finding. Set only from a resolved `existing_code`: a value\nthe model sends itself is discarded, because nothing can check it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "existing_code": {
+          "description": "The code this finding is about, quoted verbatim from the diff's new side —\none or more consecutive lines.\n\nWhen present it is the anchor, and `line` is only a hint: the review\nlocates the excerpt in the file's hunks and overwrites `line` and\n`end_line` with where it actually is. Models quote code far more reliably\nthan they count lines, so a line number derived from a quote can be\nchecked, where one the model typed can only be trusted. Absent on older\nresponses and when the finding is not about specific lines.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "file": {
           "type": "string",
           "default": ""

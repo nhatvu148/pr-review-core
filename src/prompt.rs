@@ -24,6 +24,7 @@ Return ONLY a JSON object — no markdown fences, no prose around it — with ex
       "severity": "BLOCKING" | "HIGH" | "MEDIUM" | "LOW",
       "file": "<path EXACTLY as it appears in the diff, new side>",
       "line": <integer line number in the NEW version of the file, or null if not line-specific>,
+      "existing_code": "<the line(s) this finding is about, copied verbatim from the diff's new side, or null>",
       "body": "<one sentence describing the problem, then ' Fix: ' and a concrete fix>",
       "confidence": <integer 0-100 — your confidence a senior reviewer would flag this>,
       "suggestion": "<replacement text for `line`, or null — see the suggestion rules>"
@@ -33,6 +34,7 @@ Return ONLY a JSON object — no markdown fences, no prose around it — with ex
 
 Rules:
 - `file` MUST match a path shown in the diff. `line` MUST be a line shown in the diff (an added or context line) on the new side — if you cannot pin an exact line, set `line` to null (it will be folded into the summary).
+- `existing_code` is how the finding is placed: copy the exact line(s) it is about from the diff's new side (added or context lines, without the leading `+`), several consecutive lines if the problem spans them. It is matched against the diff, so copy rather than paraphrase; `line` is then only a hint. Use null when the finding is not about specific lines.
 - Prioritize high-severity and security issues. Be specific and concise.
 - Assign confidence honestly; reserve 90+ for clear correctness/security issues. Do NOT report style nits or speculative concerns.
 - Do NOT invent problems. If the diff is clean, return "findings": [].
@@ -1226,5 +1228,53 @@ mod change_intent_tests {
     #[test]
     fn an_empty_context_renders_nothing() {
         assert_eq!(UntrustedContext::default().render(), "");
+    }
+}
+
+#[cfg(test)]
+mod finding_shape_tests {
+    //! The finding shape is spelled out in prose in every review prompt, apart
+    //! from the type it is parsed into. A field added to `Finding` and not to a
+    //! prompt parses fine (`serde(default)`) and is simply never produced, so the
+    //! feature ships dark with CI green — committable suggestions did exactly that.
+
+    use crate::llm::Finding;
+
+    /// Every key of a fully populated `Finding`, as it serializes.
+    fn finding_keys() -> Vec<String> {
+        let f = Finding {
+            severity: "HIGH".into(),
+            file: "a.rs".into(),
+            line: Some(1),
+            body: "b".into(),
+            confidence: Some(90),
+            suggestion: Some("x".into()),
+            existing_code: Some("y".into()),
+            end_line: Some(2),
+        };
+        let v = serde_json::to_value(&f).expect("serializes");
+        v.as_object().expect("an object").keys().cloned().collect()
+    }
+
+    /// `end_line` is derived from a resolved `existing_code`, never asked for:
+    /// a range the model typed has nothing to check it against.
+    const DERIVED: &[&str] = &["end_line"];
+
+    #[test]
+    fn every_finding_field_the_model_writes_is_in_both_review_prompts() {
+        for (name, prompt) in [
+            ("SYSTEM_PROMPT", super::SYSTEM_PROMPT),
+            ("AGENT_SYSTEM_PROMPT", crate::agent::AGENT_SYSTEM_PROMPT),
+        ] {
+            for key in finding_keys() {
+                if DERIVED.contains(&key.as_str()) {
+                    continue;
+                }
+                assert!(
+                    prompt.contains(&format!("\"{key}\"")),
+                    "{name} never asks for `{key}`, so no model will produce it"
+                );
+            }
+        }
     }
 }

@@ -679,6 +679,8 @@ mod tests {
 
     fn finding(file: &str, sev: &str) -> Finding {
         Finding {
+            existing_code: None,
+            end_line: None,
             severity: sev.to_string(),
             file: file.to_string(),
             line: Some(1),

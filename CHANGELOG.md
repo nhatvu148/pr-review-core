@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- **A finding is placed by the code it quotes, and can span several lines.** `Finding` gains `existing_code` (the line or lines the finding is about, copied verbatim from the diff) and `end_line`. Both review prompts ask for the quote, and the review looks for it as a consecutive run of new-side diff lines. When it is found, `line` and `end_line` are overwritten with where the quote actually is, in `findings_detail` too. Before this, the only anchor was a line number the model typed, and that number is what models get wrong: on the AACR-Bench pilot, findings landed in the right file and region but on the wrong line, so none of them matched at k=1. A quote that matches nothing, or matches several places with no typed line inside exactly one of them, falls back to the old path unchanged: the typed line, then re-anchoring. `end_line` comes only from a resolved quote; a range the model types itself is dropped. The run log's funnel counts `quoted` and `quote_resolved`, so how often quotes resolve can be measured rather than assumed.
+- A test fails the build if a `Finding` field the model is meant to write is missing from either review prompt. A field added to the type but not the prompts used to parse fine and never be produced.
+
+### Migration
+
+| change | who it touches |
+| --- | --- |
+| `llm::Finding` has two new public fields, `existing_code: Option<String>` and `end_line: Option<u64>` | Code that builds a `Finding` with a struct literal must add both (`None` keeps the old behaviour). JSON consumers are unaffected: both are optional and omitted when empty. The generated Node and Python types include them. |
+| Prompts in consumers that declare their own finding shape | `pr-review-bot`'s Claude and codex backends and `simcel-pr-bot` spell the shape out themselves. Until each asks for `existing_code`, their findings keep anchoring by typed line only. |
+
+Multi-line comments are not posted yet: an inline comment still goes on the range's first line. Posting the range to GitHub and GitLab comes separately.
+
 ### Fixed
 
 - **`/ask` and `/describe` now pack the diff the way the review does.** They called `pack_diff` directly and ignored `FILE_BUNDLING`, which is on by default, so on an over-budget PR they could keep a different set of files than the review, and tell the model a different list of omitted files, despite documenting that they saw the reviewer's diff. Both paths now go through one helper, `review::pack_to_budget`. Behaviour change, shipping silently: on over-budget PRs, `/ask` and `/describe` answers can differ from before. Found by the codex backend once it was told to read the checkout (pr-review-bot#99).

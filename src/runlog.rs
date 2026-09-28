@@ -162,6 +162,16 @@ pub struct Funnel {
     /// trusted with a commit button.
     #[serde(default)]
     pub suggested: usize,
+    /// Of the posted findings, how many quoted the code they are about
+    /// (`existing_code`).
+    #[serde(default)]
+    pub quoted: usize,
+    /// Of the quoted ones, how many were found in the diff and so were anchored
+    /// by the quote rather than by the line number the model typed. The gap to
+    /// `quoted` is quotes that matched nothing, or matched in several places
+    /// with nothing to choose between them.
+    #[serde(default)]
+    pub quote_resolved: usize,
 }
 
 /// One finding as logged: its metadata, where it was posted, and its text.
@@ -423,6 +433,8 @@ mod tests {
                 anchored: 3,
                 unanchored: 1,
                 suggested: 0,
+                quoted: 0,
+                quote_resolved: 0,
             },
             findings: vec![LoggedFinding {
                 severity: "HIGH".into(),
@@ -473,6 +485,8 @@ mod tests {
 
     fn finding(file: &str, line: Option<u64>) -> Finding {
         Finding {
+            existing_code: None,
+            end_line: None,
             severity: "HIGH".into(),
             file: file.into(),
             line,
