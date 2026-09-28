@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.36.0
+
+**A finding is placed by the code it quotes rather than the line number the model typed, and can span several lines.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). `simcel-pr-bot` (104 tests) needed no change. `pr-review-bot` passes on its default, `claude-code` and `claude-code,nats` builds (129, 141 and 147 tests), and fails to compile with `--features codex`: a test in `codex_backend.rs` builds a `Finding` with a struct literal. That is the first row of the migration table below, and it is intended: the test sitting beside it checks the codex output schema against `Finding`, so the bot cannot take this version without also asking codex for the new fields.
+
+This release is minor rather than a patch because `Finding` gained public fields, which breaks struct-literal construction, and the generated Node and Python types changed.
 
 ### Added
 
