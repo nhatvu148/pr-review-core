@@ -544,8 +544,10 @@ fn normalize_code_line(s: &str) -> String {
 /// only code the diff actually shows can match — the same set an inline comment
 /// can land on. The excerpt must match a run of *consecutive* line numbers,
 /// line for line, after [`normalize_code_line`]; leading and trailing blank lines
-/// in the excerpt are ignored, and so is a `+` that a model copied from the diff
-/// onto every line.
+/// in the excerpt are ignored. A `+` on every line may be a marker the model
+/// copied from the diff or real code (`+x` is valid in several languages), so
+/// the quote is tried as written first and with the markers stripped only if
+/// that finds nothing.
 ///
 /// A quote that matches in several places is ambiguous, and guessing trades one
 /// wrong location for another. So a repeat is resolved only when exactly one of
@@ -566,13 +568,24 @@ fn resolve_excerpt(
     if lines.is_empty() {
         return None;
     }
-    // A model quoting from the diff sometimes keeps the `+` markers. Strip them
-    // only when every line has one: a single leading `+` is as likely to be code.
-    if lines.iter().all(|l| l.starts_with('+')) {
-        for l in &mut lines {
-            *l = &l[1..];
-        }
-    }
+    locate_lines(&lines, texts, hint).or_else(|| {
+        // A model quoting from the diff sometimes keeps the `+` markers. Only a
+        // fallback: for a one-line quote "every line starts with `+`" is just
+        // "this line does", and that line may be code.
+        lines.iter().all(|l| l.starts_with('+')).then(|| {
+            let stripped: Vec<&str> = lines.iter().map(|l| &l[1..]).collect();
+            locate_lines(&stripped, texts, hint)
+        })?
+    })
+}
+
+/// The matching half of [`resolve_excerpt`], for lines already trimmed of blank
+/// edges: a unique consecutive run, or the one run holding `hint`.
+fn locate_lines(
+    lines: &[&str],
+    texts: &std::collections::HashMap<u64, String>,
+    hint: Option<u64>,
+) -> Option<(u64, u64)> {
     let want: Vec<String> = lines.iter().map(|l| normalize_code_line(l)).collect();
     let span = want.len() as u64;
 
@@ -4655,6 +4668,20 @@ mod tests {
             None,
         );
         assert_eq!(got, Some((11, 12)));
+    }
+
+    #[test]
+    fn a_one_line_quote_that_starts_with_plus_is_tried_as_code_first() {
+        let mut texts = excerpt_texts();
+        texts.insert(15, "+x".to_string());
+        texts.insert(16, "x".to_string());
+        // `+x` is on 15 as written; stripping first would have matched 16.
+        assert_eq!(resolve_excerpt("+x", &texts, None), Some((15, 15)));
+        // A copied marker on a line with no literal `+` still resolves.
+        assert_eq!(
+            resolve_excerpt("+    t += i.price;", &excerpt_texts(), None),
+            Some((13, 13))
+        );
     }
 
     #[test]
