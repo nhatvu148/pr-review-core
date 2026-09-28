@@ -78,11 +78,41 @@ pub struct DepAdvisory {
     pub url: String,
 }
 
+/// How far a dependency scan got — what an empty advisory list actually means.
+///
+/// [`scan`] fails open, so an empty list is returned for "checked, all clean"
+/// and for "never checked" alike. That is right for a review, which must not
+/// block on OSV, and wrong for a CI gate, which would pass exactly when it could
+/// not verify anything. The status keeps the two apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanStatus {
+    /// `CVE_SCAN` is off.
+    Disabled,
+    /// The diff changed no lockfile this scan reads, so there was nothing to check.
+    NoLockfiles,
+    /// Every changed package was checked.
+    Complete,
+    /// More packages changed than `CVE_MAX_PACKAGES`; the rest went unchecked.
+    Truncated,
+    /// The OSV query failed; nothing was checked.
+    Failed,
+}
+
+impl ScanStatus {
+    /// Whether an empty advisory list with this status means "no known
+    /// vulnerability" rather than "not checked".
+    pub fn verified(self) -> bool {
+        matches!(self, ScanStatus::Complete | ScanStatus::NoLockfiles)
+    }
+}
+
 /// Scan the raw PR diff for vulnerable dependencies added by the PR.
 ///
 /// Returns an empty vector when the scan is disabled, no lockfiles changed, or
 /// anything goes wrong (fail-open). Callers should treat the result as advisory
-/// context to append to the review summary.
+/// context to append to the review summary; [`scan_with_status`] also says which
+/// of those an empty result was.
 ///
 /// # Examples
 /// ```no_run
@@ -94,17 +124,29 @@ pub struct DepAdvisory {
 /// # }
 /// ```
 pub async fn scan(client: &Client, cfg: &Config, diff: &str) -> Vec<DepAdvisory> {
+    scan_with_status(client, cfg, diff).await.0
+}
+
+/// [`scan`], plus how far it got. Fails open in exactly the same way; the
+/// status is what tells a caller whether an empty list can be trusted.
+pub async fn scan_with_status(
+    client: &Client,
+    cfg: &Config,
+    diff: &str,
+) -> (Vec<DepAdvisory>, ScanStatus) {
     if !cfg.cve_scan {
-        return Vec::new();
+        return (Vec::new(), ScanStatus::Disabled);
     }
     let mut pkgs = changed_packages(diff);
     // Stable order + dedupe so a package pinned in two lockfiles is queried once.
     pkgs.sort();
     pkgs.dedup();
     if pkgs.is_empty() {
-        return Vec::new();
+        return (Vec::new(), ScanStatus::NoLockfiles);
     }
+    let mut status = ScanStatus::Complete;
     if pkgs.len() > cfg.cve_max_packages {
+        status = ScanStatus::Truncated;
         tracing::info!(
             "OSV scan: {} changed packages exceed CVE_MAX_PACKAGES={}, checking the first {}",
             pkgs.len(),
@@ -120,11 +162,11 @@ pub async fn scan(client: &Client, cfg: &Config, diff: &str) -> Vec<DepAdvisory>
                     .cmp(&severity_rank(a.severity.as_deref()))
                     .then(a.package.cmp(&b.package))
             });
-            advisories
+            (advisories, status)
         }
         Err(e) => {
             tracing::warn!("OSV scan failed ({e:#}); skipping dependency advisories");
-            Vec::new()
+            (Vec::new(), ScanStatus::Failed)
         }
     }
 }

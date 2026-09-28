@@ -65,6 +65,11 @@ pub struct RunReviewOutput {
     /// which runs no dependency scan.
     #[serde(default)]
     pub advisories: Vec<crate::deps::DepAdvisory>,
+    /// How far the dependency scan got, so an empty `advisories` can be told
+    /// apart from one that was never checked. `None` on a local review, which
+    /// runs no scan.
+    #[serde(default)]
+    pub advisory_scan: Option<crate::deps::ScanStatus>,
     pub posted: bool,
     pub comment_url: Option<String>,
     pub summary_markdown: String,
@@ -1250,7 +1255,7 @@ async fn post_advisory_only(
     cfg: &Config,
     meta: &PrMeta,
     input: &RunReviewInput,
-    advisories: Vec<crate::deps::DepAdvisory>,
+    (advisories, scan_status): (Vec<crate::deps::DepAdvisory>, crate::deps::ScanStatus),
     hygiene: Vec<Finding>,
 ) -> Result<RunReviewOutput> {
     let summary = render_no_review_summary(&advisories, &hygiene);
@@ -1277,6 +1282,7 @@ async fn post_advisory_only(
         inline_posted: 0,
         inline_detail: Vec::new(),
         advisories,
+        advisory_scan: Some(scan_status),
         posted: false,
         comment_url: None,
         summary_markdown: summary,
@@ -2014,7 +2020,7 @@ pub async fn run_review_with(
     // Dependency vulnerability scan runs on the RAW diff: lockfiles are dropped
     // by the glob filter below (and never reach the LLM), so we must read added
     // dependency lines before that. Fully fail-open — returns [] on any error.
-    let advisories = crate::deps::scan(&client, cfg, &raw_diff).await;
+    let (advisories, scan_status) = crate::deps::scan_with_status(&client, cfg, &raw_diff).await;
     if !advisories.is_empty() {
         tracing::info!(
             "OSV: {} dependency advisor(y/ies) for {}#{}",
@@ -2038,7 +2044,7 @@ pub async fn run_review_with(
                 cfg,
                 &meta,
                 &input,
-                advisories,
+                (advisories, scan_status),
                 prepared.hygiene,
             )
             .await?;
@@ -2221,6 +2227,7 @@ pub async fn run_review_with(
         inline_posted: inline_count,
         inline_detail: post.inline.clone(),
         advisories: advisories.clone(),
+        advisory_scan: Some(scan_status),
         posted: false,
         comment_url: None,
         summary_markdown: summary,
@@ -2365,6 +2372,7 @@ pub async fn run_review_local(
                 inline_posted: 0,
                 inline_detail: Vec::new(),
                 advisories: Vec::new(),
+                advisory_scan: None,
                 posted: false,
                 comment_url: None,
                 summary_markdown: summary,
@@ -2466,6 +2474,7 @@ pub async fn run_review_local(
         inline_posted: finished.inline.len(),
         inline_detail: finished.inline.clone(),
         advisories: Vec::new(),
+        advisory_scan: None,
         posted: false,
         comment_url: None,
         summary_markdown: finished.summary,

@@ -551,6 +551,33 @@ async fn run() -> anyhow::Result<()> {
     enforce_gate(&out, &args.fail_on)
 }
 
+/// Refuse to report a gate as passed when its input was never checked.
+///
+/// The dependency scan fails open, so "no advisories" also comes back when the
+/// scan was off, OSV was down, or packages past `CVE_MAX_PACKAGES` were skipped.
+/// A security gate that passes exactly when it could not look is worse than no
+/// gate, so those runs are an ordinary error — exit 1, "the check did not run" —
+/// never a pass and never [`GATE_EXIT`].
+fn unverified_gate(out: &RunReviewOutput, fail_on: &[FailOn]) -> Option<String> {
+    use pr_review_core::deps::ScanStatus;
+    if !fail_on.contains(&FailOn::Advisories) {
+        return None;
+    }
+    let why = match out.advisory_scan {
+        Some(s) if s.verified() => return None,
+        Some(ScanStatus::Disabled) => "the dependency scan is off (CVE_SCAN)",
+        Some(ScanStatus::Truncated) => {
+            "more packages changed than CVE_MAX_PACKAGES, so some went unchecked"
+        }
+        Some(ScanStatus::Failed) => "the OSV query failed",
+        // `verified()` covers the rest; `None` means no scan ran at all.
+        Some(_) | None => "no dependency scan ran",
+    };
+    Some(format!(
+        "--fail-on advisories could not verify this PR: {why}"
+    ))
+}
+
 /// Which `--fail-on` gate `out` trips, as a line for stderr, or `None`.
 fn tripped_gate(out: &RunReviewOutput, fail_on: &[FailOn]) -> Option<String> {
     fail_on.iter().find_map(|gate| match gate {
@@ -566,15 +593,21 @@ fn tripped_gate(out: &RunReviewOutput, fail_on: &[FailOn]) -> Option<String> {
     })
 }
 
-/// Fail with [`GateTripped`] if a `--fail-on` gate trips.
+/// Fail with [`GateTripped`] if a `--fail-on` gate trips, or with an ordinary
+/// error if its input was never checked.
 ///
 /// Called only after the review is printed and `--json-out` is written: the
 /// gate decides the exit status, never whether the caller gets to see why.
 fn enforce_gate(out: &RunReviewOutput, fail_on: &[FailOn]) -> anyhow::Result<()> {
-    match tripped_gate(out, fail_on) {
-        Some(reason) => Err(GateTripped(reason).into()),
-        None => Ok(()),
+    // Found advisories win over an incomplete scan: a truncated scan that still
+    // found one has a real finding to report, not merely an unverified PR.
+    if let Some(reason) = tripped_gate(out, fail_on) {
+        return Err(GateTripped(reason).into());
     }
+    if let Some(reason) = unverified_gate(out, fail_on) {
+        anyhow::bail!(reason);
+    }
+    Ok(())
 }
 
 /// Run one explicit operation and print exactly one JSON document on stdout.
@@ -1184,8 +1217,12 @@ fn run_token() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{change_intent, tmp_sibling, tripped_gate, usable_branch, Args, FailOn};
+    use super::{
+        change_intent, enforce_gate, tmp_sibling, tripped_gate, unverified_gate, usable_branch,
+        Args, FailOn, GateTripped,
+    };
     use clap::Parser;
+    use pr_review_core::deps::ScanStatus;
     use std::path::Path;
 
     #[test]
@@ -1269,6 +1306,7 @@ mod tests {
                     url: "u".into(),
                 })
                 .collect(),
+            advisory_scan: Some(ScanStatus::Complete),
             posted: false,
             comment_url: None,
             summary_markdown: String::new(),
@@ -1296,6 +1334,52 @@ mod tests {
             tripped_gate(&output_with_advisories(&["RUSTSEC-2020-0071"]), &[]),
             None
         );
+    }
+
+    /// The scan fails open, so an empty list from a scan that never looked must
+    /// not pass the gate — a security gate that is green exactly when it could
+    /// not check is the failure this flag exists to prevent.
+    #[test]
+    fn an_unchecked_scan_fails_the_gate_as_an_error_not_a_pass() {
+        for status in [
+            Some(ScanStatus::Disabled),
+            Some(ScanStatus::Failed),
+            Some(ScanStatus::Truncated),
+            None,
+        ] {
+            let mut out = output_with_advisories(&[]);
+            out.advisory_scan = status;
+            let err = enforce_gate(&out, &[FailOn::Advisories]).expect_err("must not pass");
+            assert!(
+                err.downcast_ref::<GateTripped>().is_none(),
+                "{status:?} is 'could not check' (exit 1), not a found advisory (exit 3)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_complete_scan_or_no_lockfile_change_is_a_verified_pass() {
+        for status in [ScanStatus::Complete, ScanStatus::NoLockfiles] {
+            let mut out = output_with_advisories(&[]);
+            out.advisory_scan = Some(status);
+            assert!(
+                enforce_gate(&out, &[FailOn::Advisories]).is_ok(),
+                "{status:?}"
+            );
+        }
+        // Without the flag, an unchecked scan changes nothing.
+        let mut out = output_with_advisories(&[]);
+        out.advisory_scan = Some(ScanStatus::Failed);
+        assert_eq!(unverified_gate(&out, &[]), None);
+    }
+
+    /// A truncated scan that still found something has a real result to report.
+    #[test]
+    fn a_found_advisory_outranks_a_truncated_scan() {
+        let mut out = output_with_advisories(&["RUSTSEC-2020-0071"]);
+        out.advisory_scan = Some(ScanStatus::Truncated);
+        let err = enforce_gate(&out, &[FailOn::Advisories]).expect_err("trips");
+        assert!(err.downcast_ref::<GateTripped>().is_some());
     }
 
     /// A local review runs no dependency scan, so a gate on it could never trip

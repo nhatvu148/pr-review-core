@@ -21,6 +21,7 @@ class RunReviewOutput(_RunReviewOutputRequired, total=False):
     """Result of one review run (serialized as the HTTP/CLI response)."""
 
     advisories: List[DepAdvisory]
+    advisoryScan: Optional[ScanStatus]
     commentUrl: Optional[str]
     findingsDetail: List[Finding]
     inlineDetail: List[InlineComment]
@@ -69,6 +70,10 @@ class InlineComment(_InlineCommentRequired, total=False):
     """One inline comment anchored to a file + line on the new side of the diff."""
 
     start_line: Optional[int]
+
+
+# How far a dependency scan got — what an empty advisory list actually means.
+ScanStatus = Literal["disabled", "no_lockfiles", "complete", "truncated", "failed"]
 
 
 class _UsageRequired(TypedDict):
@@ -426,5 +431,6 @@ __all__ = [
     "ReviewSettings",
     "RulesScope",
     "RunReviewOutput",
+    "ScanStatus",
     "Usage",
 ]

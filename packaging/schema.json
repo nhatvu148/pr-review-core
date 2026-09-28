@@ -12,6 +12,18 @@
         "$ref": "#/$defs/DepAdvisory"
       }
     },
+    "advisoryScan": {
+      "description": "How far the dependency scan got, so an empty `advisories` can be told\napart from one that was never checked. `None` on a local review, which\nruns no scan.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScanStatus"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "commentUrl": {
       "type": [
         "string",
@@ -231,6 +243,36 @@
         "path",
         "line",
         "body"
+      ]
+    },
+    "ScanStatus": {
+      "description": "How far a dependency scan got — what an empty advisory list actually means.\n\n[`scan`] fails open, so an empty list is returned for \"checked, all clean\"\nand for \"never checked\" alike. That is right for a review, which must not\nblock on OSV, and wrong for a CI gate, which would pass exactly when it could\nnot verify anything. The status keeps the two apart.",
+      "oneOf": [
+        {
+          "description": "`CVE_SCAN` is off.",
+          "type": "string",
+          "const": "disabled"
+        },
+        {
+          "description": "The diff changed no lockfile this scan reads, so there was nothing to check.",
+          "type": "string",
+          "const": "no_lockfiles"
+        },
+        {
+          "description": "Every changed package was checked.",
+          "type": "string",
+          "const": "complete"
+        },
+        {
+          "description": "More packages changed than `CVE_MAX_PACKAGES`; the rest went unchecked.",
+          "type": "string",
+          "const": "truncated"
+        },
+        {
+          "description": "The OSV query failed; nothing was checked.",
+          "type": "string",
+          "const": "failed"
+        }
       ]
     },
     "Usage": {
