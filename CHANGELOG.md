@@ -5,6 +5,7 @@
 ### Fixed
 
 - **`/ask` and `/describe` now pack the diff the way the review does.** They called `pack_diff` directly and ignored `FILE_BUNDLING`, which is on by default, so on an over-budget PR they could keep a different set of files than the review, and tell the model a different list of omitted files, despite documenting that they saw the reviewer's diff. Both paths now go through one helper, `review::pack_to_budget`. Behaviour change, shipping silently: on over-budget PRs, `/ask` and `/describe` answers can differ from before. Found by the codex backend once it was told to read the checkout (pr-review-bot#99).
+- **The agentic prompt no longer calls the blast-radius callers "already computed".** `blast::call_sites` matches by bare name, so a common name like `main`, `render` or `complete` pulls in every same-named function in the repo. The prompt told the agent to start from that list as if it were resolved. It now calls it a name-based candidate list and asks the agent to confirm a caller before relying on it, matching what `blast_seed`'s own header already said. Behaviour change, shipping silently: agentic reviews may spend a lookup confirming a caller they used to take on trust.
 
 ## 0.35.0
 
