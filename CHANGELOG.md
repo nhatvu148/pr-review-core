@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.37.0
+
+**A quoted range posts as one multi-line comment, and `kaniscope --fail-on advisories` makes the dependency scan a CI gate.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). `simcel-pr-bot` (105 tests) needed no change. `pr-review-bot` fails to compile until a test helper in `src/telegram.rs` that builds a `RunReviewOutput` with a struct literal gains `advisories: Vec::new(), advisory_scan: None`; that is the second row of the migration table below. With that two-line fix it passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (133, 146, 152 and 143 tests).
+
+This release is minor rather than a patch because `InlineComment` and `RunReviewOutput` gained public fields, which breaks struct-literal construction, and the generated Node and Python types changed.
 
 ### Added
 
