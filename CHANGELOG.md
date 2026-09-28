@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`/ask` and `/describe` now pack the diff the way the review does.** They called `pack_diff` directly and ignored `FILE_BUNDLING`, which is on by default, so on an over-budget PR they could keep a different set of files than the review, and tell the model a different list of omitted files, despite documenting that they saw the reviewer's diff. Both paths now go through one helper, `review::pack_to_budget`. Behaviour change, shipping silently: on over-budget PRs, `/ask` and `/describe` answers can differ from before. Found by the codex backend once it was told to read the checkout (pr-review-bot#99).
+
 ## 0.35.0
 
 **The model is told what it cannot see — in the review, in `/ask`, in `/describe`, and in the reply when everything was filtered out.**

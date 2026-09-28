@@ -1290,6 +1290,21 @@ pub(crate) fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) 
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
+/// Pack a filtered diff to `max_diff_chars` with the packer `file_bundling` picks.
+///
+/// Shared with `/ask` and `/describe` ([`crate::command`]), which used to call
+/// [`crate::diff::pack_diff`] directly. With bundling on — the default — they then
+/// kept a different set of files than the review did, and told the model a
+/// different list of what was omitted, while documenting that they saw the same
+/// diff as the reviewer.
+pub(crate) fn pack_to_budget(cfg: &Config, diff: &str) -> (String, Vec<String>) {
+    if cfg.file_bundling {
+        crate::diff::pack_diff_bundled(diff, cfg.max_diff_chars)
+    } else {
+        crate::diff::pack_diff(diff, cfg.max_diff_chars)
+    }
+}
+
 /// Glob-filter, hygiene-scan, and size-pack a raw diff.
 fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
     // Drop noisy files (lockfiles, generated, vendored, minified) before the LLM
@@ -1330,11 +1345,7 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
     // Smart size handling: keep whole files, dropping the lowest-priority ones
     // first, until the diff fits `max_diff_chars` — instead of a blunt mid-file
     // char cut. Applied ONCE here so every review path gets the same packed diff.
-    let (diff, packed_dropped) = if cfg.file_bundling {
-        crate::diff::pack_diff_bundled(&diff, cfg.max_diff_chars)
-    } else {
-        crate::diff::pack_diff(&diff, cfg.max_diff_chars)
-    };
+    let (diff, packed_dropped) = pack_to_budget(cfg, &diff);
     if !packed_dropped.is_empty() {
         tracing::info!(
             "packed diff: omitted {} lower-priority file(s) to fit budget: {:?}",
@@ -2231,7 +2242,7 @@ mod local_review_tests {
     use anyhow::Result;
     use async_trait::async_trait;
 
-    use super::{prepare_diff, run_review_local, LocalReviewInput, LOCAL_PROVIDER};
+    use super::{pack_to_budget, prepare_diff, run_review_local, LocalReviewInput, LOCAL_PROVIDER};
     use crate::backend::{ReviewBackend, ReviewContext};
     use crate::config::Config;
     use crate::llm::{Finding, Review, ReviewResult};
@@ -2357,6 +2368,37 @@ mod local_review_tests {
             "the lockfile is filtered out of the reviewed diff: {}",
             p.diff
         );
+    }
+
+    /// `/ask` and `/describe` pack through [`pack_to_budget`], so this pins the
+    /// packer it picks. The diff is one the two packers disagree on — a source,
+    /// its test, and two others at a budget that fits only some of them — so a
+    /// helper that ignored `file_bundling` would fail one of the two arms.
+    #[test]
+    fn the_packer_follows_file_bundling() {
+        let section = |path: &str, body: &str| {
+            format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n+{body}\n"
+            )
+        };
+        let diff = [
+            section("src/foo.ts", "aa"),
+            section("src/other.ts", "x"),
+            section("src/mid.ts", &"m".repeat(60)),
+            section("src/foo.test.ts", &"b".repeat(40)),
+        ]
+        .concat();
+        let mut c = cfg();
+        c.max_diff_chars = 100;
+
+        let bundled = crate::diff::pack_diff_bundled(&diff, 100);
+        let plain = crate::diff::pack_diff(&diff, 100);
+        assert_ne!(bundled, plain, "the fixture must separate the two packers");
+
+        c.file_bundling = true;
+        assert_eq!(pack_to_budget(&c, &diff), bundled);
+        c.file_bundling = false;
+        assert_eq!(pack_to_budget(&c, &diff), plain);
     }
 
     fn spy() -> (LocalSpy, Seen) {
