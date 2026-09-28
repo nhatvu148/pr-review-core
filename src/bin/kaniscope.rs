@@ -98,6 +98,39 @@ enum Op {
     Schema(SchemaArgs),
 }
 
+/// A deterministic result that fails the run, for `--fail-on`.
+///
+/// An enum rather than a bool so the next gate is a new variant, not a second
+/// flag. Only conditions a scanner decides belong here: a gate on the model's
+/// `recommendation` would fail a build on whatever this sample of the model
+/// happened to say, and re-running CI would be a way to get it to pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum FailOn {
+    /// The dependency scan found a vulnerable version the PR adds.
+    Advisories,
+}
+
+/// The exit status when a `--fail-on` gate trips.
+///
+/// Not 1, which is what any error exits with — a CI step has to be able to tell
+/// "the gate found something" from "the review never ran", or a dead OSV
+/// endpoint and an expired token both read as a vulnerable dependency. Not 2,
+/// which clap uses for a usage error.
+const GATE_EXIT: u8 = 3;
+
+/// A `--fail-on` gate tripped. Carried as an error so it unwinds through `run`
+/// like any other early exit, and `main` alone turns it into [`GATE_EXIT`].
+#[derive(Debug)]
+struct GateTripped(String);
+
+impl std::fmt::Display for GateTripped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GateTripped {}
+
 #[derive(clap::Args)]
 struct FindingsArgs {
     #[arg(long)]
@@ -205,6 +238,10 @@ struct PrArgs {
     json_out: Option<PathBuf>,
     #[arg(long, default_value_t = false)]
     human: bool,
+    /// Exit with status 3, after printing the review, when this holds.
+    /// Comma-separated or repeated.
+    #[arg(long = "fail-on", value_enum, value_delimiter = ',')]
+    fail_on: Vec<FailOn>,
 }
 
 #[derive(clap::Args)]
@@ -326,6 +363,22 @@ struct Args {
     /// re-deriving the same findings.
     #[arg(long = "json-out", value_name = "PATH")]
     json_out: Option<PathBuf>,
+    /// PR mode: exit with status 3, after printing the review, when this holds.
+    /// Comma-separated or repeated. `advisories` fails on any vulnerable
+    /// dependency version the PR adds.
+    ///
+    /// The review still prints and still posts; only the exit status changes, so
+    /// a CI step can block a merge on the scan without parsing `--json`.
+    ///
+    /// Refused with `--local`: a local review runs no dependency scan, so the gate
+    /// could never trip, and a gate that cannot fail reads as a clean scan.
+    #[arg(
+        long = "fail-on",
+        value_enum,
+        value_delimiter = ',',
+        conflicts_with = "local"
+    )]
+    fail_on: Vec<FailOn>,
     /// Print the engine's full environment-variable surface as a markdown table
     /// and exit. Needs no key, no token and no network.
     ///
@@ -354,7 +407,25 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => match e.downcast_ref::<GateTripped>() {
+            Some(gate) => {
+                tracing::error!("{gate}");
+                std::process::ExitCode::from(GATE_EXIT)
+            }
+            None => {
+                // What returning `anyhow::Result` from `main` printed, kept so an
+                // error reads the same as before this wrapper existed.
+                eprintln!("Error: {e:?}");
+                std::process::ExitCode::FAILURE
+            }
+        },
+    }
+}
+
+async fn run() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
     // Diagnostics on stderr, always — `--json` promises stdout is one JSON
     // document, and a tracing line on stdout would break every caller that parses
@@ -464,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
         if let Some(path) = &args.json_out {
             write_json_out(path, &out)?;
         }
-        return Ok(());
+        return enforce_gate(&out, &args.fail_on);
     }
 
     print_human(&args, &out);
@@ -476,6 +547,70 @@ async fn main() -> anyhow::Result<()> {
     // nothing.
     if let Some(path) = &args.json_out {
         write_json_out(path, &out)?;
+    }
+    enforce_gate(&out, &args.fail_on)
+}
+
+/// Refuse to report a gate as passed when its input was never checked.
+///
+/// The dependency scan fails open, so "no advisories" also comes back when the
+/// scan was off, OSV was down, or packages past `CVE_MAX_PACKAGES` were skipped.
+/// A security gate that passes exactly when it could not look is worse than no
+/// gate, so those runs are an ordinary error — exit 1, "the check did not run" —
+/// never a pass and never [`GATE_EXIT`].
+fn unverified_gate(out: &RunReviewOutput, fail_on: &[FailOn]) -> Option<String> {
+    use pr_review_core::deps::ScanStatus;
+    if !fail_on.contains(&FailOn::Advisories) {
+        return None;
+    }
+    let why = match out.advisory_scan {
+        Some(s) if s.verified() => return None,
+        Some(ScanStatus::Disabled) => "the dependency scan is off (CVE_SCAN)",
+        Some(ScanStatus::Truncated) => {
+            "more packages changed than CVE_MAX_PACKAGES, so some went unchecked"
+        }
+        Some(ScanStatus::Failed) => "the OSV query failed",
+        // `verified()` covers the rest; `None` means no scan ran at all.
+        Some(_) | None => "no dependency scan ran",
+    };
+    Some(format!(
+        "--fail-on advisories could not verify this PR: {why}"
+    ))
+}
+
+/// Which `--fail-on` gate `out` trips, as a line for stderr, or `None`.
+fn tripped_gate(out: &RunReviewOutput, fail_on: &[FailOn]) -> Option<String> {
+    fail_on.iter().find_map(|gate| match gate {
+        FailOn::Advisories if !out.advisories.is_empty() => {
+            let ids: Vec<&str> = out.advisories.iter().map(|a| a.id.as_str()).collect();
+            let noun = if ids.len() == 1 {
+                "advisory"
+            } else {
+                "advisories"
+            };
+            Some(format!(
+                "--fail-on advisories: {} vulnerable dependency {noun}: {}",
+                ids.len(),
+                ids.join(", ")
+            ))
+        }
+        FailOn::Advisories => None,
+    })
+}
+
+/// Fail with [`GateTripped`] if a `--fail-on` gate trips, or with an ordinary
+/// error if its input was never checked.
+///
+/// Called only after the review is printed and `--json-out` is written: the
+/// gate decides the exit status, never whether the caller gets to see why.
+fn enforce_gate(out: &RunReviewOutput, fail_on: &[FailOn]) -> anyhow::Result<()> {
+    // Found advisories win over an incomplete scan: a truncated scan that still
+    // found one has a real finding to report, not merely an unverified PR.
+    if let Some(reason) = tripped_gate(out, fail_on) {
+        return Err(GateTripped(reason).into());
+    }
+    if let Some(reason) = unverified_gate(out, fail_on) {
+        anyhow::bail!(reason);
     }
     Ok(())
 }
@@ -593,7 +728,8 @@ async fn run_op(cfg: &Config, op: Op) -> anyhow::Result<()> {
                 },
             )
             .await?;
-            finish_review_output(&out, a.human, false, !a.post, a.json_out.as_deref())
+            finish_review_output(&out, a.human, false, !a.post, a.json_out.as_deref())?;
+            enforce_gate(&out, &a.fail_on)
         }
         Op::ReviewLocal(a) => {
             let root = a.repo_root.clone().unwrap_or_else(|| PathBuf::from("."));
@@ -1086,8 +1222,12 @@ fn run_token() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{change_intent, tmp_sibling, usable_branch, Args};
+    use super::{
+        change_intent, enforce_gate, tmp_sibling, tripped_gate, unverified_gate, usable_branch,
+        Args, FailOn, GateTripped,
+    };
     use clap::Parser;
+    use pr_review_core::deps::ScanStatus;
     use std::path::Path;
 
     #[test]
@@ -1145,6 +1285,164 @@ mod tests {
         ] {
             assert!(props.contains_key(field), "schema is missing {field}");
         }
+    }
+
+    fn output_with_advisories(ids: &[&str]) -> pr_review_core::review::RunReviewOutput {
+        pr_review_core::review::RunReviewOutput {
+            provider: "github".into(),
+            repo: "o/r".into(),
+            pr: 1,
+            model: "m".into(),
+            recommendation: "APPROVE".into(),
+            findings: 0,
+            findings_detail: Vec::new(),
+            inline_posted: 0,
+            inline_detail: Vec::new(),
+            advisories: ids
+                .iter()
+                .map(|id| pr_review_core::deps::DepAdvisory {
+                    ecosystem: "crates.io".into(),
+                    package: "time".into(),
+                    version: "0.1.44".into(),
+                    id: (*id).into(),
+                    summary: "s".into(),
+                    severity: None,
+                    fixed: None,
+                    url: "u".into(),
+                })
+                .collect(),
+            advisory_scan: Some(ScanStatus::Complete),
+            posted: false,
+            comment_url: None,
+            summary_markdown: String::new(),
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn an_advisory_trips_the_advisories_gate_and_names_it() {
+        let reason = tripped_gate(
+            &output_with_advisories(&["RUSTSEC-2020-0071"]),
+            &[FailOn::Advisories],
+        )
+        .expect("gate trips");
+        assert!(reason.contains("RUSTSEC-2020-0071"), "{reason}");
+        assert!(
+            reason.contains("1 vulnerable dependency advisory:"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn no_advisories_or_no_gate_means_the_run_passes() {
+        assert_eq!(
+            tripped_gate(&output_with_advisories(&[]), &[FailOn::Advisories]),
+            None
+        );
+        assert_eq!(
+            tripped_gate(&output_with_advisories(&["RUSTSEC-2020-0071"]), &[]),
+            None
+        );
+    }
+
+    /// The scan fails open, so an empty list from a scan that never looked must
+    /// not pass the gate — a security gate that is green exactly when it could
+    /// not check is the failure this flag exists to prevent.
+    #[test]
+    fn an_unchecked_scan_fails_the_gate_as_an_error_not_a_pass() {
+        for status in [
+            Some(ScanStatus::Disabled),
+            Some(ScanStatus::Failed),
+            Some(ScanStatus::Truncated),
+            None,
+        ] {
+            let mut out = output_with_advisories(&[]);
+            out.advisory_scan = status;
+            let err = enforce_gate(&out, &[FailOn::Advisories]).expect_err("must not pass");
+            assert!(
+                err.downcast_ref::<GateTripped>().is_none(),
+                "{status:?} is 'could not check' (exit 1), not a found advisory (exit 3)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_complete_scan_or_no_lockfile_change_is_a_verified_pass() {
+        for status in [ScanStatus::Complete, ScanStatus::NoLockfiles] {
+            let mut out = output_with_advisories(&[]);
+            out.advisory_scan = Some(status);
+            assert!(
+                enforce_gate(&out, &[FailOn::Advisories]).is_ok(),
+                "{status:?}"
+            );
+        }
+        // Without the flag, an unchecked scan changes nothing.
+        let mut out = output_with_advisories(&[]);
+        out.advisory_scan = Some(ScanStatus::Failed);
+        assert_eq!(unverified_gate(&out, &[]), None);
+    }
+
+    /// A truncated scan that still found something has a real result to report.
+    #[test]
+    fn a_found_advisory_outranks_a_truncated_scan() {
+        let mut out = output_with_advisories(&["RUSTSEC-2020-0071"]);
+        out.advisory_scan = Some(ScanStatus::Truncated);
+        let err = enforce_gate(&out, &[FailOn::Advisories]).expect_err("trips");
+        assert!(err.downcast_ref::<GateTripped>().is_some());
+    }
+
+    /// A local review runs no dependency scan, so a gate on it could never trip
+    /// and would read as a clean scan.
+    #[test]
+    fn fail_on_is_refused_for_a_local_review() {
+        assert!(Args::try_parse_from([
+            "kaniscope",
+            "--local",
+            "--base",
+            "main",
+            "--fail-on",
+            "advisories"
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "kaniscope",
+            "review-local",
+            "--base",
+            "main",
+            "--fail-on",
+            "advisories"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn fail_on_parses_in_pr_mode_and_on_review_pr() {
+        let a = Args::try_parse_from([
+            "kaniscope",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "1",
+            "--fail-on",
+            "advisories",
+        ])
+        .expect("parses");
+        assert_eq!(a.fail_on, vec![FailOn::Advisories]);
+        assert!(Args::try_parse_from([
+            "kaniscope",
+            "review-pr",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "1",
+            "--fail-on",
+            "advisories"
+        ])
+        .is_ok());
     }
 
     /// Two sources for one input is a silent-precedence bug waiting to happen, so

@@ -3,6 +3,10 @@
 
 /** Result of one review run (serialized as the HTTP/CLI response). */
 export interface RunReviewOutput {
+  /** Vulnerable dependency versions the PR adds, from the OSV scan of its lockfiles. */
+  advisories?: DepAdvisory[];
+  /** How far the dependency scan got, so an empty `advisories` can be told apart from one that was never checked. */
+  advisoryScan?: ScanStatus | null;
   commentUrl?: string | null;
   findings: number;
   /** The post-processed findings that were posted (after self-critique, confidence floor, sort, and cap). */
@@ -18,6 +22,22 @@ export interface RunReviewOutput {
   repo: string;
   summaryMarkdown: string;
   usage?: Usage | null;
+}
+
+/** One vulnerability advisory OSV reported for an added dependency. */
+export interface DepAdvisory {
+  ecosystem: string;
+  /** First fixed version for this package, when known. */
+  fixed?: string | null;
+  /** OSV, GHSA or CVE id, such as `RUSTSEC-2021-0079` or `GHSA-xxxx`. */
+  id: string;
+  package: string;
+  /** Coarse severity label (`CRITICAL`/`HIGH`/`MEDIUM`/`LOW`) when OSV reports one. */
+  severity?: string | null;
+  summary: string;
+  /** Human-facing advisory URL. */
+  url: string;
+  version: string;
 }
 
 /** One review finding from the model. */
@@ -45,6 +65,9 @@ export interface InlineComment {
   /** First line of a multi-line comment; `None` for a single line. */
   start_line?: number | null;
 }
+
+/** How far a dependency scan got — what an empty advisory list actually means. */
+export type ScanStatus = "disabled" | "no_lockfiles" | "complete" | "truncated" | "failed";
 
 /** Token accounting echoed back by OpenRouter. */
 export interface Usage {

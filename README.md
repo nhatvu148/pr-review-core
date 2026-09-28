@@ -120,6 +120,7 @@ The engine is a Rust library, but a bot that consumes it does not have to be a R
 cargo install pr-review-core --features cli     # the crate is pr-review-core; the binary is kaniscope
 kaniscope --provider github --repo me/app --pr 12 --dry-run
 kaniscope --provider github --repo me/app --pr 12 --json | jq .findingsDetail
+kaniscope --provider github --repo me/app --pr 12 --fail-on advisories   # exit 3 on a vulnerable dependency
 kaniscope --local --base main                   # review a diff that has no PR yet
 kaniscope --local --base main --intent "Retry 5xx with backoff; leave 4xx alone."
 kaniscope --schema                              # the JSON Schema of --json output
