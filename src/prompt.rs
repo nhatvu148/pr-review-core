@@ -223,7 +223,7 @@ pub fn review_system_prompt(cfg: &Config) -> String {
 /// System prompt for the optional second-pass self-critique. Given the diff and a
 /// JSON array of proposed findings, the model prunes noise and re-scores what it
 /// keeps, returning ONLY a JSON array of the surviving findings.
-pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence, suggestion}. Carry `suggestion` through UNCHANGED on a finding you keep — it is replacement code that was checked against the diff, and silently dropping or rewriting it here loses work the review already did. Set it to null only if the suggestion itself is what makes the finding wrong. If all should be dropped, return []."#;
+pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence, suggestion, existing_code}. Carry `existing_code` through UNCHANGED on a finding you keep — it is the quoted code that places the finding, and without it the finding falls back to a guessed line. Carry `suggestion` through UNCHANGED on a finding you keep — it is replacement code that was checked against the diff, and silently dropping or rewriting it here loses work the review already did. Set it to null only if the suggestion itself is what makes the finding wrong. If all should be dropped, return []."#;
 
 /// System prompt for the `/ask` command: answer a free-form question about the
 /// PR, grounded strictly in its diff.
@@ -1275,6 +1275,29 @@ mod finding_shape_tests {
                     "{name} never asks for `{key}`, so no model will produce it"
                 );
             }
+        }
+    }
+
+    /// The self-critique pass rewrites every finding it keeps, so a field it
+    /// does not list is a field it drops — after the first pass produced it.
+    /// Missed for `existing_code` until the pre-push review caught it.
+    #[test]
+    fn the_critique_prompt_carries_every_field_it_is_given() {
+        let prompt = super::CRITIQUE_SYSTEM_PROMPT;
+        let start = prompt
+            .find("same shape {")
+            .expect("the critique names its shape")
+            + 12;
+        let end = start + prompt[start..].find('}').expect("closed");
+        let shape: Vec<&str> = prompt[start..end].split(',').map(str::trim).collect();
+        for key in finding_keys() {
+            if DERIVED.contains(&key.as_str()) {
+                continue;
+            }
+            assert!(
+                shape.contains(&key.as_str()),
+                "the critique's shape omits `{key}`, so every kept finding loses it"
+            );
         }
     }
 }

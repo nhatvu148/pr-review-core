@@ -1660,6 +1660,27 @@ async fn sampled_review(
     })
 }
 
+/// Give back a quote the self-critique pass dropped.
+///
+/// The critique returns the findings it keeps rewritten from scratch, and a
+/// model re-emitting JSON drops fields it was not attending to — `existing_code`
+/// most of all, since it is long and the critique is judging the body. The
+/// prompt asks for it to be carried through; this is what makes that a
+/// guarantee. A kept finding with no quote takes the one from the original
+/// finding at the same `(file, line)`, when exactly one original sits there —
+/// two findings on one line cannot be told apart, and a wrong quote would move
+/// the finding.
+fn restore_quotes(kept: &mut [Finding], original: &[Finding]) {
+    for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
+        let mut same_spot = original
+            .iter()
+            .filter(|o| o.file == k.file && o.line == k.line && o.existing_code.is_some());
+        if let (Some(o), None) = (same_spot.next(), same_spot.next()) {
+            k.existing_code = o.existing_code.clone();
+        }
+    }
+}
+
 /// Everything between the backend's answer and a postable review: self-critique,
 /// confidence floor, hygiene merge, CI demotion, burst collapse, severity sort,
 /// recommendation floor, cap, line anchoring, and the summary.
@@ -1683,7 +1704,10 @@ async fn finish_review(
         // Through the backend seam, so the critique runs on whatever produced the
         // review — not always OpenRouter.
         findings = match crate::llm::critique_findings(cfg, backend, meta, diff, &findings).await {
-            Ok(f) => f,
+            Ok(mut kept) => {
+                restore_quotes(&mut kept, &findings);
+                kept
+            }
             Err(e) => {
                 tracing::warn!("self-critique failed ({e:#}); keeping original findings");
                 findings
@@ -4034,7 +4058,7 @@ mod tests {
     use super::{
         anchorable, burst_key, collapse_bursts, demote_falsified_build_claims,
         effective_recommendation, idents, line_symbols, merge_samples, reanchor,
-        render_no_review_summary, resolve_excerpt,
+        render_no_review_summary, resolve_excerpt, restore_quotes,
     };
     use crate::llm::Finding;
     use std::collections::{HashMap, HashSet};
@@ -4632,6 +4656,40 @@ mod tests {
         assert_eq!(resolve_excerpt("}", &texts, Some(20)), Some((20, 20)));
         assert_eq!(resolve_excerpt("}", &texts, None), None);
         assert_eq!(resolve_excerpt("}", &texts, Some(17)), None);
+    }
+
+    fn quoted(file: &str, line: u64, code: Option<&str>) -> Finding {
+        let mut x = f("HIGH", file, "the body the critique may reword");
+        x.line = Some(line);
+        x.existing_code = code.map(str::to_string);
+        x
+    }
+
+    #[test]
+    fn a_quote_the_critique_dropped_comes_back_from_the_same_spot() {
+        let original = [quoted("a.rs", 12, Some("let t = 0;"))];
+        let mut kept = [quoted("a.rs", 12, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code.as_deref(), Some("let t = 0;"));
+    }
+
+    #[test]
+    fn a_quote_is_not_restored_when_two_originals_share_the_spot() {
+        let original = [
+            quoted("a.rs", 12, Some("let t = 0;")),
+            quoted("a.rs", 12, Some("t += 1;")),
+        ];
+        let mut kept = [quoted("a.rs", 12, None)];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code, None);
+    }
+
+    #[test]
+    fn a_quote_the_critique_kept_or_rewrote_is_left_alone() {
+        let original = [quoted("a.rs", 12, Some("let t = 0;"))];
+        let mut kept = [quoted("a.rs", 12, Some("let t = 1;"))];
+        restore_quotes(&mut kept, &original);
+        assert_eq!(kept[0].existing_code.as_deref(), Some("let t = 1;"));
     }
 }
 
