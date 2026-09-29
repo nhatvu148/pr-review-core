@@ -263,6 +263,44 @@ pub(crate) fn extract_json_array(text: &str) -> Option<&str> {
     }
 }
 
+#[cfg(test)]
+mod extraction_tests {
+    //! Both extractors take the first opening bracket through the last closing
+    //! one, so they must be pinned on the shapes a model actually returns:
+    //! prose or a ```json fence around the payload, and the "no bracket at all"
+    //! case each has to refuse rather than panic on.
+
+    use super::{extract_json, extract_json_array};
+
+    #[test]
+    fn extract_json_strips_prose_and_fences_around_an_object() {
+        assert_eq!(extract_json(r#"{"a":1}"#), Some(r#"{"a":1}"#));
+        assert_eq!(
+            extract_json("Sure, here you go:\n```json\n{\"a\":1}\n```\nHope that helps!"),
+            Some("{\"a\":1}")
+        );
+        assert_eq!(extract_json("no braces here"), None);
+    }
+
+    #[test]
+    fn extract_json_array_strips_prose_and_fences_around_an_array() {
+        assert_eq!(extract_json_array("[1,2,3]"), Some("[1,2,3]"));
+        assert_eq!(
+            extract_json_array("```json\n[{\"file\":\"a.rs\"}]\n```"),
+            Some("[{\"file\":\"a.rs\"}]")
+        );
+        assert_eq!(extract_json_array("no brackets here"), None);
+    }
+
+    /// A lone `]` with no matching `[` (or vice versa) must not panic on the
+    /// slice — `end > start` is the guard that keeps it a refusal.
+    #[test]
+    fn a_lone_closing_bracket_is_not_mistaken_for_a_match() {
+        assert_eq!(extract_json_array("oops ] only a close"), None);
+        assert_eq!(extract_json("oops } only a close"), None);
+    }
+}
+
 /// Call OpenRouter and parse the structured review.
 ///
 /// The diff is expected to be pre-packed to fit the size budget (whole files

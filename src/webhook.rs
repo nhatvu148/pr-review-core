@@ -272,8 +272,29 @@ pub fn is_review_command(action: &str, is_pull_request: bool, body: &str) -> boo
 mod tests {
     use super::{
         is_review_command, parse_bitbucket_comment_event, parse_gitlab_mr_event, should_review,
-        should_review_bitbucket, should_review_gitlab, verify_gitlab_token,
+        should_review_bitbucket, should_review_gitlab, verify_gitlab_token, verify_signature,
+        HmacSha256,
     };
+    use hmac::Mac;
+
+    /// The doctest on `verify_signature` only exercises rejection (missing/wrong
+    /// signature); nothing computed a real HMAC and checked the accept path.
+    #[test]
+    fn a_correctly_signed_body_is_accepted() {
+        let secret = "s3cret";
+        let body = b"{\"action\":\"opened\"}";
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("valid key length");
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        assert!(verify_signature(secret, body, Some(&sig)));
+        assert!(!verify_signature("wrong-secret", body, Some(&sig)));
+        assert!(!verify_signature(
+            secret,
+            b"{\"action\":\"closed\"}",
+            Some(&sig)
+        ));
+    }
 
     #[test]
     fn opened_reopened_ready_always_review() {
