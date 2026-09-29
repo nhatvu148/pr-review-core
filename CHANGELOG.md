@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Notes
+
+- **GitLab multi-line notes have now been tested against a live server.** 0.37.0 shipped them untested. On 2026-09-29, a posted review on a self-hosted GitLab MR made three ranged notes, and GitLab stored each with the `line_range` it was sent (48→63, 65→77, 24→39). None fell back to a single line. All three ranges started and ended on added lines, so the `old`-typed end, used when a range touches an unchanged line, has still not met a real server. It keeps the single-line fallback.
+
 ## 0.37.0
 
 **A quoted range posts as one multi-line comment, and `kaniscope --fail-on advisories` makes the dependency scan a CI gate.**
