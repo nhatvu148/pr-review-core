@@ -292,12 +292,12 @@ mod extraction_tests {
         assert_eq!(extract_json_array("no brackets here"), None);
     }
 
-    /// A lone `]` with no matching `[` (or vice versa) must not panic on the
-    /// slice — `end > start` is the guard that keeps it a refusal.
+    /// A closing bracket that comes before the only opening one must not
+    /// panic on the slice — `end > start` is the guard that keeps it a refusal.
     #[test]
-    fn a_lone_closing_bracket_is_not_mistaken_for_a_match() {
-        assert_eq!(extract_json_array("oops ] only a close"), None);
-        assert_eq!(extract_json("oops } only a close"), None);
+    fn a_close_before_the_open_is_not_mistaken_for_a_match() {
+        assert_eq!(extract_json_array("oops ] then ["), None);
+        assert_eq!(extract_json("oops } then {"), None);
     }
 }
 
