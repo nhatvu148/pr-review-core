@@ -271,9 +271,35 @@ pub fn is_review_command(action: &str, is_pull_request: bool, body: &str) -> boo
 #[cfg(test)]
 mod tests {
     use super::{
-        is_review_command, parse_bitbucket_comment_event, parse_gitlab_mr_event, should_review,
-        should_review_bitbucket, should_review_gitlab, verify_gitlab_token,
+        is_review_command, parse_bitbucket_comment_event, parse_gitlab_mr_event,
+        parse_issue_comment_event, parse_pull_request_event, should_review,
+        should_review_bitbucket, should_review_gitlab, verify_gitlab_token, verify_signature,
     };
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    /// The doctest on `verify_signature` only shows the reject path (wrong or
+    /// missing signature). The accept path — a correctly HMAC-signed body — is
+    /// the one GitHub actually exercises on every legitimate webhook, so it needs
+    /// its own coverage rather than being inferred from the rejections.
+    #[test]
+    fn a_correctly_signed_body_is_accepted() {
+        let secret = "s3cret";
+        let body = br#"{"action":"opened"}"#;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        assert!(verify_signature(secret, body, Some(&sig)));
+        // A body byte flipped after signing must not verify.
+        assert!(!verify_signature(
+            secret,
+            b"{\"action\":\"closed\"}",
+            Some(&sig)
+        ));
+        // The right shape, wrong secret, must not verify either.
+        assert!(!verify_signature("other", body, Some(&sig)));
+    }
 
     #[test]
     fn opened_reopened_ready_always_review() {
@@ -366,5 +392,46 @@ mod tests {
         assert_eq!(text, "/review");
         // The parsed body feeds the same provider-neutral command check as GitHub.
         assert!(is_review_command("created", true, &text));
+    }
+
+    #[test]
+    fn parse_pull_request_extracts_repo_number_and_action() {
+        let body = br#"{
+            "action": "synchronize",
+            "repository": { "full_name": "owner/repo" },
+            "pull_request": { "number": 99 }
+        }"#;
+        let ev = parse_pull_request_event(body).unwrap();
+        assert_eq!(ev.repo, "owner/repo");
+        assert_eq!(ev.pr, 99);
+        assert_eq!(ev.action, "synchronize");
+    }
+
+    /// `issue_comment` fires for comments on both issues and PRs; only the
+    /// `issue.pull_request` field (present only for PRs) tells them apart, and
+    /// `is_review_command` must not fire on a plain issue.
+    #[test]
+    fn issue_comment_distinguishes_issues_from_pull_requests() {
+        let pr_comment = br#"{
+            "action": "created",
+            "repository": { "full_name": "owner/repo" },
+            "issue": { "number": 5, "pull_request": {} },
+            "comment": { "body": "/review" }
+        }"#;
+        let ev = parse_issue_comment_event(pr_comment).unwrap();
+        assert_eq!(ev.repo, "owner/repo");
+        assert_eq!(ev.pr, 5);
+        assert!(ev.is_pull_request);
+        assert!(is_review_command(&ev.action, ev.is_pull_request, &ev.body));
+
+        let issue_comment = br#"{
+            "action": "created",
+            "repository": { "full_name": "owner/repo" },
+            "issue": { "number": 6 },
+            "comment": { "body": "/review" }
+        }"#;
+        let ev = parse_issue_comment_event(issue_comment).unwrap();
+        assert!(!ev.is_pull_request);
+        assert!(!is_review_command(&ev.action, ev.is_pull_request, &ev.body));
     }
 }
