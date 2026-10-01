@@ -218,9 +218,6 @@ impl Workspace {
         let root = self.root.canonicalize()?;
 
         for result in WalkBuilder::new(&root).hidden(false).build() {
-            if matches >= max_results {
-                break;
-            }
             let entry = match result {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -229,6 +226,13 @@ impl Workspace {
                 let path = entry.path();
                 let rel = path.strip_prefix(&root).unwrap_or(path).display();
                 symlinks.push(format!("{rel} -> {}", link_target(path)));
+                continue;
+            }
+            // Past the match cap the walk goes on, but only to finish the
+            // symlink list: stopping here would report the links met before the
+            // cap as if they were all of them. No file is opened from here on,
+            // so the extra cost is directory entries, not file reads.
+            if matches >= max_results {
                 continue;
             }
             if !entry.file_type().is_some_and(|t| t.is_file()) {
@@ -289,9 +293,6 @@ impl Workspace {
                 if matches >= max_results {
                     break;
                 }
-            }
-            if matches >= max_results {
-                break;
             }
         }
         Ok(GrepReport {
@@ -931,6 +932,24 @@ mod tests {
             r.hits,
             "the plain grep is the report's hits"
         );
+    }
+
+    /// Hitting the match cap must not truncate the symlink list: a link the walk
+    /// would have reached after the cap is still reported, and the cap still holds.
+    #[cfg(unix)]
+    #[test]
+    fn grep_lists_every_symlink_even_after_the_match_cap() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            fs::write(d.path().join(format!("f{i:02}.txt")), "NEEDLE\n").unwrap();
+        }
+        fs::create_dir_all(d.path().join("z/deep")).unwrap();
+        std::os::unix::fs::symlink("../../f00.txt", d.path().join("z/deep/late")).unwrap();
+        let ws = Workspace::from_dir(d.path());
+
+        let r = ws.grep_report("NEEDLE", 1, 0).unwrap();
+        assert_eq!(r.hits.len(), 1, "the cap still holds: {:?}", r.hits);
+        assert_eq!(r.symlinks, vec!["z/deep/late -> ../../f00.txt".to_string()]);
     }
 
     #[test]
