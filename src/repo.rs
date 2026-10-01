@@ -129,7 +129,7 @@ impl Workspace {
     /// when it points at a directory inside the clone. `DirEntry::file_type` does
     /// not follow links, so without this a symlinked directory came back as a bare
     /// name, indistinguishable from a regular file — see [`Workspace::grep_report`]
-    /// for the false positive that caused.
+    /// for the false positive that blindness produces.
     pub fn list_dir(&self, rel: &str) -> Result<Vec<String>> {
         let path = self.resolve(rel)?;
         let root = self.root.canonicalize()?;
@@ -196,11 +196,13 @@ impl Workspace {
     /// Symlinks are never followed. One whose target is inside the clone adds
     /// nothing, since the target is searched under its own path. One whose target
     /// is outside it would let a pull request point grep at the host's files.
-    /// But skipping them silently left the reviewer unable to see that they exist:
-    /// on nomnaviet#195 it searched for a symlink, found none, and filed a HIGH
-    /// claiming a font would not ship, when `apps/nommoji/public/fonts` was a
-    /// symlink to the directory holding it. So the ones met are reported, as
-    /// `path -> target`, for the caller to show alongside the matches.
+    /// But skipping them silently leaves the reviewer unable to see that they
+    /// exist, and a reviewer that searches for a symlink and finds none will say
+    /// there is none. That is the false positive on nomnaviet#195, a HIGH that a
+    /// font "would not ship" when `apps/nommoji/public/fonts` was a symlink to the
+    /// directory holding it. That review ran on Claude Code's own `Grep`/`Glob`,
+    /// which have the same blindness, not on these tools. So the ones met are
+    /// reported, as `path -> target`, for the caller to show alongside the matches.
     pub fn grep_report(
         &self,
         pattern: &str,
