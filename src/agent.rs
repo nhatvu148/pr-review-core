@@ -131,7 +131,8 @@ impl Tool for GrepTool {
          Pass `context` (1-8) to also get that many lines either side of each \
          match, shown as `path-N- text`; with context, fewer matches are returned. \
          Sweep first WITHOUT context to see every site a pattern has, then re-grep \
-         WITH context on the ones you need to judge."
+         WITH context on the ones you need to judge. Symlinks are not followed; \
+         any the search passed are listed after the matches as `path -> target`."
     }
     async fn call(&self, args: Self::Args) -> std::result::Result<ToolOutput, ToolError> {
         let context = if self.context_enabled {
@@ -146,17 +147,45 @@ impl Tool for GrepTool {
         };
         Ok(ws_result_clipped(
             self.ws
-                .grep_with_context(&args.pattern, max_hits, context)
-                .map(|hits| {
-                    if hits.is_empty() {
-                        "(no matches)".to_string()
-                    } else {
-                        hits.join("\n")
-                    }
-                }),
+                .grep_report(&args.pattern, max_hits, context)
+                .map(|r| render_grep(&r.hits, &r.symlinks)),
             limit,
         ))
     }
+}
+
+/// How many skipped symlinks a grep result names before summarising the rest.
+const GREP_MAX_SYMLINKS_SHOWN: usize = 10;
+
+/// A grep result as the model sees it: the matches, then any symlinks the
+/// search did not enter.
+///
+/// The symlink note comes after the matches so the clip, which cuts from the
+/// end, takes it before it takes a match. It says that the targets ARE searched
+/// under their own paths, because the useful fact is usually that two paths
+/// are the same file, not that something was missed.
+fn render_grep(hits: &[String], symlinks: &[String]) -> String {
+    let mut out = if hits.is_empty() {
+        "(no matches)".to_string()
+    } else {
+        hits.join("\n")
+    };
+    if !symlinks.is_empty() {
+        out.push_str(
+            "\n\nSymlinks not searched (a target inside the repository is searched under its own path):",
+        );
+        for link in symlinks.iter().take(GREP_MAX_SYMLINKS_SHOWN) {
+            out.push_str("\n  ");
+            out.push_str(link);
+        }
+        if symlinks.len() > GREP_MAX_SYMLINKS_SHOWN {
+            out.push_str(&format!(
+                "\n  … and {} more",
+                symlinks.len() - GREP_MAX_SYMLINKS_SHOWN
+            ));
+        }
+    }
+    out
 }
 
 struct ReadFileTool {
@@ -206,7 +235,8 @@ impl Tool for ListDirTool {
         "list_dir"
     }
     fn description(&self) -> &'static str {
-        "List entries directly under a directory."
+        "List entries directly under a directory. Directories end with `/`; a \
+         symlink is shown with its target as `name -> target`."
     }
     async fn call(&self, args: Self::Args) -> std::result::Result<ToolOutput, ToolError> {
         Ok(ws_result(
@@ -1198,6 +1228,44 @@ mod tests {
         let text = format!("{out:?}");
         assert!(text.contains("a.rs:3: NEEDLE"), "{text}");
         assert!(!text.contains("a.rs-2-"), "context must be ignored: {text}");
+    }
+
+    /// Skipped symlinks follow the matches, so the clip drops them first, and a
+    /// repo full of links cannot flood the result.
+    #[test]
+    fn grep_names_skipped_symlinks_after_the_matches_and_caps_them() {
+        let hits = vec!["a.rs:1: NEEDLE".to_string()];
+        let one = vec!["app/public/fonts -> ../../web/public/fonts".to_string()];
+        let out = render_grep(&hits, &one);
+        assert!(
+            out.starts_with("a.rs:1: NEEDLE\n\nSymlinks not searched"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with("\n  app/public/fonts -> ../../web/public/fonts"),
+            "{out}"
+        );
+
+        assert_eq!(
+            render_grep(&hits, &[]),
+            "a.rs:1: NEEDLE",
+            "no links, no note"
+        );
+        assert!(render_grep(&[], &one).starts_with("(no matches)\n\nSymlinks"));
+
+        let many: Vec<String> = (0..GREP_MAX_SYMLINKS_SHOWN + 3)
+            .map(|i| format!("l{i} -> t{i}"))
+            .collect();
+        let out = render_grep(&hits, &many);
+        assert!(
+            out.contains(&format!("l{} -> ", GREP_MAX_SYMLINKS_SHOWN - 1)),
+            "{out}"
+        );
+        assert!(
+            !out.contains(&format!("l{} -> ", GREP_MAX_SYMLINKS_SHOWN)),
+            "{out}"
+        );
+        assert!(out.ends_with("… and 3 more"), "{out}");
     }
 
     /// A runaway `context` cannot be used to pull the repo into the prompt.
