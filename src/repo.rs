@@ -140,17 +140,13 @@ impl Workspace {
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
                 let link = entry.path();
-                // Only a target that resolves inside the clone is described. A
-                // broken link and one pointing outside get the same label on
-                // purpose: telling them apart would tell the model whether a path
-                // on the host exists, and a PR must not be able to probe the
-                // host's filesystem through a link it adds.
-                let inside = link.canonicalize().ok().filter(|c| c.starts_with(&root));
+                // Only a target that resolves inside the clone is described;
+                // see `resolve_inside` for why outside and broken look alike.
                 let target = link_target(&link);
-                out.push(match inside {
+                out.push(match resolve_inside(&link, &root) {
                     Some(c) if c.is_dir() => format!("{name}/ -> {target}"),
                     Some(_) => format!("{name} -> {target}"),
-                    None => format!("{name} -> {target} (does not resolve inside the repository)"),
+                    None => format!("{name} -> {target} ({UNRESOLVED_LINK})"),
                 });
             } else if file_type.is_dir() {
                 out.push(format!("{name}/"));
@@ -225,7 +221,14 @@ impl Workspace {
             if entry.path_is_symlink() {
                 let path = entry.path();
                 let rel = path.strip_prefix(&root).unwrap_or(path).display();
-                symlinks.push(format!("{rel} -> {}", link_target(path)));
+                let target = link_target(path);
+                // An in-repo target is searched under its own path. Anything else
+                // is searched nowhere, and must say so: an unmarked entry under a
+                // note about in-repo targets would read as already covered.
+                symlinks.push(match resolve_inside(path, &root) {
+                    Some(_) => format!("{rel} -> {target}"),
+                    None => format!("{rel} -> {target} ({UNRESOLVED_LINK}: not searched)"),
+                });
                 continue;
             }
             // Past the match cap the walk goes on, but only to finish the
@@ -426,6 +429,20 @@ fn is_capability_failure(err: &anyhow::Error) -> bool {
         return false;
     }
     CAPABILITY_REFUSALS.iter().any(|sig| msg.contains(sig))
+}
+
+/// The label for a symlink that does not resolve to a path inside the clone.
+const UNRESOLVED_LINK: &str = "does not resolve inside the repository";
+
+/// Where a symlink resolves, if that is inside the clone.
+///
+/// A broken link and one pointing outside both come back `None`, on purpose:
+/// telling them apart would tell the model whether a path on the host exists,
+/// and a PR must not be able to probe the host's filesystem through a link it
+/// adds. Shared by `list_dir` and `grep_report` so the two tools label the same
+/// link the same way.
+fn resolve_inside(link: &Path, root: &Path) -> Option<PathBuf> {
+    link.canonicalize().ok().filter(|c| c.starts_with(root))
 }
 
 /// A symlink's target as git stores it — the raw link text, not the resolved
@@ -919,13 +936,17 @@ mod tests {
         assert_eq!(r.hits, vec!["real/a.txt:1: NEEDLE in the repo".to_string()]);
         assert!(
             r.symlinks.contains(&"alias -> real".to_string()),
-            "{:?}",
+            "an in-repo link is unmarked: {:?}",
             r.symlinks
         );
+        let ext = r
+            .symlinks
+            .iter()
+            .find(|s| s.starts_with("ext -> "))
+            .unwrap();
         assert!(
-            r.symlinks.iter().any(|s| s.starts_with("ext -> ")),
-            "{:?}",
-            r.symlinks
+            ext.ends_with("(does not resolve inside the repository: not searched)"),
+            "a link out of the clone must not read as covered: {ext}"
         );
         assert_eq!(
             ws.grep_with_context("NEEDLE", 10, 0).unwrap(),

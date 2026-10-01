@@ -161,9 +161,12 @@ const GREP_MAX_SYMLINKS_SHOWN: usize = 10;
 /// search did not enter.
 ///
 /// The symlink note comes after the matches so the clip, which cuts from the
-/// end, takes it before it takes a match. It says that the targets ARE searched
-/// under their own paths, because the useful fact is usually that two paths
-/// are the same file, not that something was missed.
+/// end, takes it before it takes a match. It separates the two cases rather
+/// than reassuring about both: an unmarked link's target is inside the
+/// repository and IS searched under its own path, usually the useful fact,
+/// since it means two paths are the same file. A link marked `not searched`
+/// resolves nowhere inside the clone and was searched nowhere. A blanket
+/// "searched elsewhere" would let the model treat that one as covered too.
 fn render_grep(hits: &[String], symlinks: &[String]) -> String {
     let mut out = if hits.is_empty() {
         "(no matches)".to_string()
@@ -172,7 +175,7 @@ fn render_grep(hits: &[String], symlinks: &[String]) -> String {
     };
     if !symlinks.is_empty() {
         out.push_str(
-            "\n\nSymlinks not searched (a target inside the repository is searched under its own path):",
+            "\n\nSymlinks not followed. An unmarked one points inside the repository, and its target is searched under its own path; one marked `not searched` was searched nowhere:",
         );
         for link in symlinks.iter().take(GREP_MAX_SYMLINKS_SHOWN) {
             out.push_str("\n  ");
@@ -1238,7 +1241,7 @@ mod tests {
         let one = vec!["app/public/fonts -> ../../web/public/fonts".to_string()];
         let out = render_grep(&hits, &one);
         assert!(
-            out.starts_with("a.rs:1: NEEDLE\n\nSymlinks not searched"),
+            out.starts_with("a.rs:1: NEEDLE\n\nSymlinks not followed"),
             "{out}"
         );
         assert!(
@@ -1251,7 +1254,7 @@ mod tests {
             "a.rs:1: NEEDLE",
             "no links, no note"
         );
-        assert!(render_grep(&[], &one).starts_with("(no matches)\n\nSymlinks"));
+        assert!(render_grep(&[], &one).starts_with("(no matches)\n\nSymlinks not followed"));
 
         let many: Vec<String> = (0..GREP_MAX_SYMLINKS_SHOWN + 3)
             .map(|i| format!("l{i} -> t{i}"))
