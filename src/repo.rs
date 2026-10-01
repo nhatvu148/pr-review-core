@@ -16,6 +16,15 @@ pub struct Workspace {
     root: PathBuf,
 }
 
+/// What [`Workspace::grep_report`] found.
+#[derive(Debug, Default)]
+pub struct GrepReport {
+    /// Matches in [`Workspace::grep_with_context`]'s format.
+    pub hits: Vec<String>,
+    /// Symlinks the walk passed over without searching, as `path -> target`.
+    pub symlinks: Vec<String>,
+}
+
 impl Workspace {
     /// Wrap an existing directory (used by tests). No clone, no cleanup.
     pub fn from_dir(root: impl Into<PathBuf>) -> Self {
@@ -115,13 +124,31 @@ impl Workspace {
     }
 
     /// List entries (dirs end with `/`) directly under a repo-relative directory.
+    ///
+    /// A symlink is shown with its target, `name -> target`, and keeps the `/`
+    /// when it points at a directory inside the clone. `DirEntry::file_type` does
+    /// not follow links, so without this a symlinked directory came back as a bare
+    /// name, indistinguishable from a regular file — see [`Workspace::grep_report`]
+    /// for the false positive that caused.
     pub fn list_dir(&self, rel: &str) -> Result<Vec<String>> {
         let path = self.resolve(rel)?;
+        let root = self.root.canonicalize()?;
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&path).with_context(|| format!("list {rel}"))? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if entry.file_type()?.is_dir() {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                let link = entry.path();
+                // Only a target that resolves inside the clone is described;
+                // see `resolve_inside` for why outside and broken look alike.
+                let target = link_target(&link);
+                out.push(match resolve_inside(&link, &root) {
+                    Some(c) if c.is_dir() => format!("{name}/ -> {target}"),
+                    Some(_) => format!("{name} -> {target}"),
+                    None => format!("{name} -> {target} ({UNRESOLVED_LINK})"),
+                });
+            } else if file_type.is_dir() {
                 out.push(format!("{name}/"));
             } else {
                 out.push(name);
@@ -160,19 +187,57 @@ impl Workspace {
         max_results: usize,
         context: usize,
     ) -> Result<Vec<String>> {
+        self.grep_report(pattern, max_results, context)
+            .map(|r| r.hits)
+    }
+
+    /// [`Workspace::grep_with_context`], plus the symlinks the walk passed over.
+    ///
+    /// Symlinks are never followed. One whose target is inside the clone adds
+    /// nothing, since the target is searched under its own path. One whose target
+    /// is outside it would let a pull request point grep at the host's files.
+    /// But skipping them silently left the reviewer unable to see that they exist:
+    /// on nomnaviet#195 it searched for a symlink, found none, and filed a HIGH
+    /// claiming a font would not ship, when `apps/nommoji/public/fonts` was a
+    /// symlink to the directory holding it. So the ones met are reported, as
+    /// `path -> target`, for the caller to show alongside the matches.
+    pub fn grep_report(
+        &self,
+        pattern: &str,
+        max_results: usize,
+        context: usize,
+    ) -> Result<GrepReport> {
         let re = regex::Regex::new(pattern).with_context(|| format!("bad regex: {pattern}"))?;
         let mut out = Vec::new();
+        let mut symlinks = Vec::new();
         let mut matches = 0usize;
         let root = self.root.canonicalize()?;
 
         for result in WalkBuilder::new(&root).hidden(false).build() {
-            if matches >= max_results {
-                break;
-            }
             let entry = match result {
                 Ok(e) => e,
                 Err(_) => continue,
             };
+            if entry.path_is_symlink() {
+                let path = entry.path();
+                let rel = path.strip_prefix(&root).unwrap_or(path).display();
+                let target = link_target(path);
+                // An in-repo target is searched under its own path. Anything else
+                // is searched nowhere, and must say so: an unmarked entry under a
+                // note about in-repo targets would read as already covered.
+                symlinks.push(match resolve_inside(path, &root) {
+                    Some(_) => format!("{rel} -> {target}"),
+                    None => format!("{rel} -> {target} ({UNRESOLVED_LINK}: not searched)"),
+                });
+                continue;
+            }
+            // Past the match cap the walk goes on, but only to finish the
+            // symlink list: stopping here would report the links met before the
+            // cap as if they were all of them. No file is opened from here on,
+            // so the extra cost is directory entries, not file reads.
+            if matches >= max_results {
+                continue;
+            }
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -232,11 +297,11 @@ impl Workspace {
                     break;
                 }
             }
-            if matches >= max_results {
-                break;
-            }
         }
-        Ok(out)
+        Ok(GrepReport {
+            hits: out,
+            symlinks,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -364,6 +429,29 @@ fn is_capability_failure(err: &anyhow::Error) -> bool {
         return false;
     }
     CAPABILITY_REFUSALS.iter().any(|sig| msg.contains(sig))
+}
+
+/// The label for a symlink that does not resolve to a path inside the clone.
+const UNRESOLVED_LINK: &str = "does not resolve inside the repository";
+
+/// Where a symlink resolves, if that is inside the clone.
+///
+/// A broken link and one pointing outside both come back `None`, on purpose:
+/// telling them apart would tell the model whether a path on the host exists,
+/// and a PR must not be able to probe the host's filesystem through a link it
+/// adds. Shared by `list_dir` and `grep_report` so the two tools label the same
+/// link the same way.
+fn resolve_inside(link: &Path, root: &Path) -> Option<PathBuf> {
+    link.canonicalize().ok().filter(|c| c.starts_with(root))
+}
+
+/// A symlink's target as git stores it — the raw link text, not the resolved
+/// path, so it reads the same as `git cat-file` on the link's blob and leaks
+/// nothing about where the clone lives on disk.
+fn link_target(link: &Path) -> String {
+    std::fs::read_link(link)
+        .map(|t| t.display().to_string())
+        .unwrap_or_else(|_| "?".to_string())
 }
 
 /// Why a path is not in the workspace: genuinely absent, or deliberately skipped.
@@ -777,6 +865,112 @@ mod tests {
         let entries = ws.list_dir("").unwrap();
         assert!(entries.contains(&"src/".to_string()));
         assert!(entries.contains(&"README.md".to_string()));
+    }
+
+    /// The nomnaviet#195 shape: one app's `public/fonts` is a link to another
+    /// app's fonts directory. Listed as a bare `fonts`, it read as a regular file.
+    #[cfg(unix)]
+    #[test]
+    fn list_dir_shows_a_symlinked_directory_with_its_target() {
+        let d = tempfile::tempdir().unwrap();
+        fs::create_dir_all(d.path().join("web/fonts")).unwrap();
+        fs::write(d.path().join("web/fonts/p.woff2"), "x").unwrap();
+        fs::create_dir_all(d.path().join("app/public")).unwrap();
+        std::os::unix::fs::symlink("../../web/fonts", d.path().join("app/public/fonts")).unwrap();
+        std::os::unix::fs::symlink("../web/fonts/p.woff2", d.path().join("app/p.woff2")).unwrap();
+        let ws = Workspace::from_dir(d.path());
+
+        let entries = ws.list_dir("app/public").unwrap();
+        assert_eq!(entries, vec!["fonts/ -> ../../web/fonts".to_string()]);
+        let entries = ws.list_dir("app").unwrap();
+        assert!(
+            entries.contains(&"p.woff2 -> ../web/fonts/p.woff2".to_string()),
+            "a link to a file keeps no slash: {entries:?}"
+        );
+    }
+
+    /// A link out of the clone, and a broken one, are named but not described,
+    /// and alike: different labels would tell the model whether a host path exists.
+    #[cfg(unix)]
+    #[test]
+    fn list_dir_labels_outside_and_broken_links_the_same() {
+        let d = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("secret")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), d.path().join("out")).unwrap();
+        std::os::unix::fs::symlink("nowhere", d.path().join("gone")).unwrap();
+        let ws = Workspace::from_dir(d.path());
+
+        let entries = ws.list_dir("").unwrap();
+        let out = entries.iter().find(|e| e.starts_with("out")).unwrap();
+        let gone = entries.iter().find(|e| e.starts_with("gone")).unwrap();
+        assert!(
+            !out.starts_with("out/"),
+            "an outside directory gets no slash: {out}"
+        );
+        assert!(
+            out.ends_with("(does not resolve inside the repository)"),
+            "{out}"
+        );
+        assert!(
+            gone.ends_with("(does not resolve inside the repository)"),
+            "{gone}"
+        );
+    }
+
+    /// Links are reported, never followed: an in-repo target is found once under
+    /// its own path, and a target outside the clone is never read.
+    #[cfg(unix)]
+    #[test]
+    fn grep_reports_the_symlinks_it_passes_and_follows_none() {
+        let d = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("host.txt"), "NEEDLE on the host\n").unwrap();
+        fs::create_dir_all(d.path().join("real")).unwrap();
+        fs::write(d.path().join("real/a.txt"), "NEEDLE in the repo\n").unwrap();
+        std::os::unix::fs::symlink("real", d.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), d.path().join("ext")).unwrap();
+        let ws = Workspace::from_dir(d.path());
+
+        let r = ws.grep_report("NEEDLE", 10, 0).unwrap();
+        assert_eq!(r.hits, vec!["real/a.txt:1: NEEDLE in the repo".to_string()]);
+        assert!(
+            r.symlinks.contains(&"alias -> real".to_string()),
+            "an in-repo link is unmarked: {:?}",
+            r.symlinks
+        );
+        let ext = r
+            .symlinks
+            .iter()
+            .find(|s| s.starts_with("ext -> "))
+            .unwrap();
+        assert!(
+            ext.ends_with("(does not resolve inside the repository: not searched)"),
+            "a link out of the clone must not read as covered: {ext}"
+        );
+        assert_eq!(
+            ws.grep_with_context("NEEDLE", 10, 0).unwrap(),
+            r.hits,
+            "the plain grep is the report's hits"
+        );
+    }
+
+    /// Hitting the match cap must not truncate the symlink list: a link the walk
+    /// would have reached after the cap is still reported, and the cap still holds.
+    #[cfg(unix)]
+    #[test]
+    fn grep_lists_every_symlink_even_after_the_match_cap() {
+        let d = tempfile::tempdir().unwrap();
+        for i in 0..20 {
+            fs::write(d.path().join(format!("f{i:02}.txt")), "NEEDLE\n").unwrap();
+        }
+        fs::create_dir_all(d.path().join("z/deep")).unwrap();
+        std::os::unix::fs::symlink("../../f00.txt", d.path().join("z/deep/late")).unwrap();
+        let ws = Workspace::from_dir(d.path());
+
+        let r = ws.grep_report("NEEDLE", 1, 0).unwrap();
+        assert_eq!(r.hits.len(), 1, "the cap still holds: {:?}", r.hits);
+        assert_eq!(r.symlinks, vec!["z/deep/late -> ../../f00.txt".to_string()]);
     }
 
     #[test]

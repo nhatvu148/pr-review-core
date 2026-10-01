@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed
+
+- **The reviewer's tools can see symlinks.** `list_dir` used the non-following `DirEntry::file_type`, so a symlinked directory came back as a bare name, indistinguishable from a regular file. `grep` skipped symlinks without a word. Together they let the reviewer search for a symlink, find nothing, and say so: on nomnaviet#195 it filed a HIGH that a regenerated font "would not ship", because there was "no … symlink found anywhere in the repo", when `apps/nommoji/public/fonts` was a git-tracked symlink to the directory holding it. `list_dir` now shows `name -> target`, keeping the trailing `/` when the link resolves to a directory inside the clone. `grep` lists every symlink it passed after the matches, capped at ten shown. A link that resolves outside the clone, and a broken one, get the same label, `(does not resolve inside the repository)`, because telling them apart would tell the model whether a path on the host exists. In `grep` that label adds `: not searched`, since such a link's target is searched nowhere. An unmarked link points inside the repository, and its target is searched under its own path.
+- `grep` still does not follow symlinks, deliberately. A target inside the clone is already searched under its own path, so following it would only repeat matches. A target outside the clone would let a pull request point the search at the host's files.
+
+### Added
+
+- `Workspace::grep_report` returns a `GrepReport` with the matches and the symlinks the walk passed. `Workspace::grep_with_context` is unchanged and returns the same matches.
+
+### Behaviour changes — these ship silently
+
+- **What the model reads has changed.** The `grep` and `list_dir` tool descriptions now say how symlinks appear, and that reaches every agentic review. The tool outputs change only in repositories that contain symlinks; elsewhere they are byte-identical to before.
+
 ### Notes
 
 - **GitLab multi-line notes have now been tested against a live server.** 0.37.0 shipped them untested. On 2026-09-29, a posted review on a self-hosted GitLab MR made three ranged notes, and GitLab stored each with the `line_range` it was sent (48→63, 65→77, 24→39). None fell back to a single line. All three ranges started and ended on added lines, so the `old`-typed end, used when a range touches an unchanged line, has still not met a real server. It keeps the single-line fallback.
