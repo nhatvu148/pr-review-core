@@ -559,3 +559,129 @@ mod path_resolution_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod render_tests {
+    //! `render` is the one place the PR comment and the CLI's `--json` output are
+    //! guaranteed to agree, so its shape is worth pinning directly rather than only
+    //! through the entry points that happen to call it.
+
+    use super::render;
+    use crate::llm::{Finding, Review};
+
+    fn review() -> Review {
+        Review {
+            summary: "  looks fine overall  ".to_string(),
+            recommendation: "APPROVE".to_string(),
+            findings: Vec::new(),
+        }
+    }
+
+    fn finding(severity: &str, line: Option<u64>, body: &str) -> Finding {
+        Finding {
+            severity: severity.to_string(),
+            file: "src/a.rs".to_string(),
+            line,
+            body: body.to_string(),
+            confidence: None,
+            suggestion: None,
+            existing_code: None,
+            end_line: None,
+        }
+    }
+
+    #[test]
+    fn no_findings_says_so_instead_of_an_empty_list() {
+        let out = render("src/a.rs", &review(), &[]);
+        assert!(out.contains("No issues found."));
+        assert!(!out.contains("## Findings"));
+    }
+
+    #[test]
+    fn a_finding_is_listed_with_its_line_and_severity() {
+        let f = finding("HIGH", Some(42), "off-by-one in the loop bound");
+        let out = render("src/a.rs", &review(), std::slice::from_ref(&f));
+        assert!(out.contains("## Findings"));
+        assert!(out.contains("HIGH"));
+        assert!(out.contains("(line 42)"));
+        assert!(out.contains("off-by-one in the loop bound"));
+    }
+
+    #[test]
+    fn a_finding_with_no_line_omits_the_location_suffix() {
+        let f = finding("LOW", None, "unclear naming");
+        let out = render("src/a.rs", &review(), std::slice::from_ref(&f));
+        assert!(
+            !out.contains("(line"),
+            "no line number should render no location: {out}"
+        );
+    }
+
+    #[test]
+    fn the_summary_and_recommendation_are_trimmed() {
+        let out = render("src/a.rs", &review(), &[]);
+        assert!(out.contains("looks fine overall"));
+        assert!(!out.contains("  looks fine overall  "));
+        assert!(out.contains("**Recommendation:** APPROVE"));
+    }
+}
+
+#[cfg(test)]
+mod review_local_tests {
+    //! `review_local` must refuse an excluded or missing path before the backend
+    //! is ever consulted — the filter exists so a disclosure never reaches a model
+    //! call. A backend that panics if invoked proves the short-circuit rather than
+    //! merely asserting the returned outcome.
+
+    use super::{review_local, FileReviewOutcome, FileSource};
+    use crate::backend::{ReviewBackend, ReviewContext};
+    use crate::config::Config;
+    use crate::llm::ReviewResult;
+    use async_trait::async_trait;
+
+    struct PanicsIfCalled;
+
+    #[async_trait]
+    impl ReviewBackend for PanicsIfCalled {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> anyhow::Result<ReviewResult> {
+            panic!("a refused path must never reach the backend");
+        }
+    }
+
+    fn cfg() -> Config {
+        let mut c = Config::from_env();
+        c.include_globs = Vec::new();
+        c.exclude_globs = vec!["**/.env".to_string()];
+        c
+    }
+
+    #[tokio::test]
+    async fn an_excluded_path_is_refused_without_calling_the_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join(".env"), "TOKEN=shhh\n").expect("write");
+
+        let out = review_local(&cfg(), &PanicsIfCalled, dir.path(), ".env")
+            .await
+            .expect("refusal is a result, not an error");
+
+        assert!(matches!(out.source, FileSource::Local { .. }));
+        match out.outcome {
+            FileReviewOutcome::Excluded { reason } => assert!(reason.contains("excluded")),
+            other => panic!("expected an exclusion, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_is_reported_as_not_found_without_calling_the_backend() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let out = review_local(&cfg(), &PanicsIfCalled, dir.path(), "src/nope.rs")
+            .await
+            .expect("a missing file is an outcome, not an error");
+
+        match out.outcome {
+            FileReviewOutcome::NotFound { reason } => assert!(reason.contains("no file at")),
+            other => panic!("expected not-found, got {other:?}"),
+        }
+    }
+}
