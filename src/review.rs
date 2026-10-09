@@ -1816,6 +1816,13 @@ fn origin_of<'a>(k: &Finding, original: &'a [Finding]) -> Option<&'a Finding> {
 /// correspondence rule as a quote; a kept finding that cannot be shown to be
 /// one original loses its count, which leaves the run log short one number
 /// rather than wrong by one.
+///
+/// Known limit, shared with [`restore_quotes`]: a critique that rewrites a
+/// finding's line onto another original's exact spot is matched to that other
+/// original and takes its count. Telling them apart would need the bodies
+/// compared, which the critique also rewrites. It needs SELF_CRITIQUE on and a
+/// moved line landing exactly on a neighbour, so it is left documented, not
+/// solved.
 fn restore_samples(kept: &mut [Finding], original: &[Finding]) {
     for k in kept.iter_mut() {
         k.samples = origin_of(k, original).and_then(|o| o.samples);
