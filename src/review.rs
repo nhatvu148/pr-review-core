@@ -1,7 +1,7 @@
 //! Orchestrator: fetch the diff, run the structured AI review, anchor findings
 //! to diff lines, render a summary, and (unless dry-run) post the review.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::agent::agentic_review;
@@ -2152,18 +2152,20 @@ pub async fn run_review_with(
         // "Reviewing…" forever: a caller that settles NothingToReview, rather than
         // retrying it, leaves nothing else to replace it. Only when we posted one,
         // so a PR the engine never commented on stays silent.
+        //
+        // A failed replacement is returned as the error, not swallowed: returning
+        // NothingToReview would tell the caller to settle and leave exactly the
+        // stuck placeholder this exists to clear. As an ordinary error it gets
+        // retried, and the retry finds the same empty diff and tries again.
         if input.placeholder && !input.dry_run {
             let note = ReviewPost {
                 summary: render_no_review_summary(&[], &[]),
                 inline: Vec::new(),
             };
-            if let Err(e) = provider.post_review(&client, cfg, &meta, &note).await {
-                tracing::warn!(
-                    "could not replace the placeholder for {}#{}: {e:#}",
-                    input.repo,
-                    input.pr
-                );
-            }
+            provider
+                .post_review(&client, cfg, &meta, &note)
+                .await
+                .context("nothing to review, but the placeholder could not be replaced")?;
         }
         return Err(NothingToReview { local: false }.into());
     }
@@ -3448,6 +3450,42 @@ mod orchestrator_tests {
             "then the note that replaces it: {}",
             posts[1]
         );
+    }
+
+    /// A replacement that fails is an ordinary, retryable error — not
+    /// NothingToReview, which would have the caller settle and keep the stuck
+    /// placeholder.
+    #[tokio::test]
+    async fn a_failed_placeholder_replacement_is_not_nothing_to_review() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&srv)
+            .await;
+        let mut live = input();
+        live.dry_run = false;
+        live.placeholder = true;
+
+        let err = run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("the replacement failed");
+        assert!(
+            err.downcast_ref::<NothingToReview>().is_none(),
+            "a caller must retry this, not settle it: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("placeholder could not be replaced"));
     }
 
     /// The same PR without a placeholder stays silent: nothing is posted.

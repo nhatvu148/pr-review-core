@@ -8,7 +8,7 @@
 
 ### Behaviour changes — these ship silently
 
-- **A "Reviewing…" placeholder on a PR with nothing to review is replaced.** When `run_review` was asked to post a placeholder and the diff then turns out empty or fully excluded, it now upserts the summary to "No reviewable source changes (all files excluded by filters)." before returning `NothingToReview`. Before, the placeholder stayed: a caller that retried eventually overwrote it with a failure notice, but a caller that settles `NothingToReview`, as the bot's queue now will, would leave "Reviewing this PR…" on the PR for good. Without a placeholder nothing is posted, so a PR the engine never commented on stays silent.
+- **A "Reviewing…" placeholder on a PR with nothing to review is replaced.** When `run_review` was asked to post a placeholder and the diff then turns out empty or fully excluded, it now upserts the summary to "No reviewable source changes (all files excluded by filters)." before returning `NothingToReview`. Before, the placeholder stayed: a caller that retried eventually overwrote it with a failure notice, but a caller that settles `NothingToReview`, as the bot's queue now will, would leave "Reviewing this PR…" on the PR for good. Without a placeholder nothing is posted, so a PR the engine never commented on stays silent. If the replacement itself fails, the posting error is returned instead of `NothingToReview`, so the caller retries rather than settling with the placeholder still up.
 
 ## 0.38.0
 
