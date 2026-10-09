@@ -2148,6 +2148,23 @@ pub async fn run_review_with(
             );
             return Ok(out);
         }
+        // The placeholder posted above would otherwise sit on the PR saying
+        // "Reviewing…" forever: a caller that settles NothingToReview, rather than
+        // retrying it, leaves nothing else to replace it. Only when we posted one,
+        // so a PR the engine never commented on stays silent.
+        if input.placeholder && !input.dry_run {
+            let note = ReviewPost {
+                summary: render_no_review_summary(&[], &[]),
+                inline: Vec::new(),
+            };
+            if let Err(e) = provider.post_review(&client, cfg, &meta, &note).await {
+                tracing::warn!(
+                    "could not replace the placeholder for {}#{}: {e:#}",
+                    input.repo,
+                    input.pr
+                );
+            }
+        }
         return Err(NothingToReview { local: false }.into());
     }
     let PreparedDiff {
@@ -3370,6 +3387,92 @@ mod orchestrator_tests {
             "PR diff is empty (all files excluded by globs, or no changes) — nothing to review.",
             "the message is unchanged from the plain error it replaces"
         );
+    }
+
+    /// A lockfile-only PR that was given a "Reviewing…" placeholder must not leave
+    /// it there: the bot now settles NothingToReview instead of retrying, so
+    /// nothing else would ever replace it.
+    #[tokio::test]
+    async fn nothing_to_review_replaces_the_placeholder() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "html_url": "https://x/1" })),
+            )
+            .mount(&srv)
+            .await;
+        let mut live = input();
+        live.dry_run = false;
+        live.placeholder = true;
+
+        let err = run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("a lockfile-only PR has nothing to review");
+        assert!(err.downcast_ref::<NothingToReview>().is_some());
+
+        let posts: Vec<String> = srv
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == "POST" && r.url.path() == "/repos/o/r/issues/1/comments"
+            })
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            posts.len(),
+            2,
+            "the placeholder, then its replacement: {posts:?}"
+        );
+        assert!(
+            posts[0].contains("Reviewing"),
+            "first the placeholder: {}",
+            posts[0]
+        );
+        assert!(
+            posts[1].contains("No reviewable source changes"),
+            "then the note that replaces it: {}",
+            posts[1]
+        );
+    }
+
+    /// The same PR without a placeholder stays silent: nothing is posted.
+    #[tokio::test]
+    async fn nothing_to_review_without_a_placeholder_posts_nothing() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        let mut live = input();
+        live.dry_run = false;
+        run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("nothing to review");
+        let posts = srv
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .into_iter()
+            .filter(|r| r.method.as_str() != "GET")
+            .count();
+        assert_eq!(posts, 0, "a PR the engine never commented on stays silent");
     }
 
     /// [`github_stub`] over a caller-chosen diff, for tests that need particular
