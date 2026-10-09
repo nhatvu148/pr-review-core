@@ -2073,17 +2073,22 @@ pub async fn run_review_with(
 
     // Instant feedback: drop a "Reviewing…" summary comment before the slow LLM
     // call. It's upserted, so the real review updates this same comment.
+    // Whether a placeholder actually went up — not merely whether one was asked
+    // for. The nothing-to-review path below replaces it only if it exists, so a
+    // failed placeholder post must not turn into a comment on a silent PR.
+    let mut placeholder_posted = false;
     if input.placeholder && !input.dry_run {
         let pending = ReviewPost {
             summary: render_pending(),
             inline: Vec::new(),
         };
-        if let Err(e) = provider.post_review(&client, cfg, &meta, &pending).await {
-            tracing::warn!(
+        match provider.post_review(&client, cfg, &meta, &pending).await {
+            Ok(_) => placeholder_posted = true,
+            Err(e) => tracing::warn!(
                 "placeholder comment failed for {}#{}: {e:#}",
                 input.repo,
                 input.pr
-            );
+            ),
         }
     }
 
@@ -2158,7 +2163,7 @@ pub async fn run_review_with(
         // NothingToReview would tell the caller to settle and leave exactly the
         // stuck placeholder this exists to clear. As an ordinary error it gets
         // retried, and the retry finds the same empty diff and tries again.
-        if input.placeholder && !input.dry_run {
+        if placeholder_posted {
             let note = ReviewPost {
                 summary: render_no_review_summary(&[], &[]),
                 inline: Vec::new(),
@@ -3470,6 +3475,16 @@ mod orchestrator_tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(&srv)
             .await;
+        // The placeholder posts; the replacement then fails.
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "html_url": "https://x/1" })),
+            )
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
         Mock::given(method("POST"))
             .and(path("/repos/o/r/issues/1/comments"))
             .respond_with(ResponseTemplate::new(500))
@@ -3487,6 +3502,60 @@ mod orchestrator_tests {
             "a caller must retry this, not settle it: {err:#}"
         );
         assert!(format!("{err:#}").contains("placeholder could not be replaced"));
+    }
+
+    /// A placeholder that failed to post leaves nothing to replace, so the PR
+    /// stays silent: no "no reviewable changes" note appears from nowhere.
+    #[tokio::test]
+    async fn a_placeholder_that_never_posted_is_not_replaced() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&srv)
+            .await;
+        // The placeholder POST fails; any later POST would succeed.
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "html_url": "https://x/1" })),
+            )
+            .mount(&srv)
+            .await;
+        let mut live = input();
+        live.dry_run = false;
+        live.placeholder = true;
+
+        let err = run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("nothing to review");
+        assert!(err.downcast_ref::<NothingToReview>().is_some());
+        let comment_posts = srv
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == "POST" && r.url.path() == "/repos/o/r/issues/1/comments"
+            })
+            .count();
+        assert_eq!(
+            comment_posts, 1,
+            "only the failed placeholder attempt, no replacement"
+        );
     }
 
     /// The same PR without a placeholder stays silent: nothing is posted.
