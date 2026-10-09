@@ -91,6 +91,21 @@ pub struct Finding {
     /// the model sends itself is discarded, because nothing can check it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<u64>,
+    /// How many of the review's samples reported this finding. `None` whenever no
+    /// agreement was measured for it — see `runlog::LoggedFinding::samples` for
+    /// every case that leaves it absent.
+    ///
+    /// Set by the sample merge, never by a model, and internal to the pipeline:
+    /// skipped by serde in both directions, so no response can claim agreement it
+    /// did not earn, and no serialized `Finding` (`RunReviewOutput`, the MCP
+    /// tools) carries a field its published schema does not describe. The run
+    /// log reads it through `runlog::LoggedFinding`, which is where it is for.
+    /// It is what turns the run log's agreement histogram into an answer per
+    /// finding — whether the findings only one sample saw tend to be real, which
+    /// is the whole question behind paying for more than one sample.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub samples: Option<u32>,
 }
 
 /// Accept a suggestion in whatever shape the model sent it, and drop it rather
@@ -447,7 +462,16 @@ pub async fn critique_findings(
     findings: &[Finding],
 ) -> Result<Vec<Finding>> {
     let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
-    let findings_json = serde_json::to_string_pretty(findings)
+    // Without `samples`: the count is evidence for the run log, not a hint for the
+    // judge. Shown "seen by 1 of 3", a critique could start pruning on agreement —
+    // a behaviour change nobody chose, and one that would bias the very data the
+    // count exists to collect. The caller restores it afterwards.
+    let shown: Vec<Finding> = findings
+        .iter()
+        .cloned()
+        .map(|f| Finding { samples: None, ..f })
+        .collect();
+    let findings_json = serde_json::to_string_pretty(&shown)
         .map_err(|e| anyhow::anyhow!("could not serialize findings for critique: {e}"))?;
     let user = format!(
         "Repository: {}\nPull request: #{}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---\n\n--- PROPOSED FINDINGS (JSON) ---\n{findings_json}",
@@ -675,6 +699,19 @@ mod tests {
     //! after a ~5-minute agent run). These pin the salvage behaviour.
 
     use super::{findings_from_values, Review};
+
+    /// `samples` is the merge's evidence, never the model's claim: a response that
+    /// sends it is ignored on that field, and the finding survives.
+    #[test]
+    fn a_model_cannot_claim_sample_agreement() {
+        let review: Review = serde_json::from_str(
+            r#"{"summary":"s","recommendation":"APPROVE","findings":[
+                {"severity":"LOW","file":"a.rs","line":1,"body":"b","samples":3}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(review.findings.len(), 1);
+        assert_eq!(review.findings[0].samples, None);
+    }
 
     /// The warning has to say what arrived, not only what was missing.
     ///

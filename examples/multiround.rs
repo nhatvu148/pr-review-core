@@ -625,6 +625,7 @@ mod tests {
             suggestion: None,
             existing_code: None,
             end_line: None,
+            samples: None,
         }
     }
 

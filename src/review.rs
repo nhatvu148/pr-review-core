@@ -424,6 +424,13 @@ fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
             .max_by_key(|(i, f)| (severity_rank(&f.severity), std::cmp::Reverse(*i)))
             .map_or(0, |(i, _)| i);
         let mut rep = group.remove(best);
+        // No count survives a collapse. How many samples reported the claim is not
+        // recoverable from the members' counts: three samples each reporting it in
+        // a different file give three members at 1 — the claim was seen by three,
+        // the max says one, the sum would double-count a sample that reported two
+        // files. Absent beats wrong in data meant to settle REVIEW_SAMPLES, and a
+        // burst is rare enough that the gap costs little.
+        rep.samples = None;
 
         // Name enough files that the reader can check the pattern themselves; the
         // cap only exists to keep one comment from becoming a file listing.
@@ -1493,6 +1500,7 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
     let hygiene: Vec<Finding> = crate::diff::diff_hygiene_with(raw_diff, &cfg.vendored_globs)
         .into_iter()
         .map(|h| Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: h.severity.to_string(),
@@ -1666,7 +1674,15 @@ fn merge_samples(samples: &[Vec<Finding>], tolerance: u64, min_agreement: usize)
         findings: clusters
             .into_iter()
             .filter(|c| c.agreement >= min_agreement)
-            .map(|c| c.best)
+            .map(|c| Finding {
+                // Only when two or more samples survived to be compared. With
+                // REVIEW_SAMPLES=3 and two failing, every finding would read 1 —
+                // indistinguishable from "one sample in three saw it", the very
+                // signal this count exists to measure.
+                samples: (samples.len() > 1)
+                    .then(|| u32::try_from(c.agreement).unwrap_or(u32::MAX)),
+                ..c.best
+            })
             .collect(),
         agreement,
     }
@@ -1775,18 +1791,46 @@ async fn sampled_review(
 /// missing, which costs only the quote: the finding anchors by its typed line
 /// as it did before quotes existed.
 fn restore_quotes(kept: &mut [Finding], original: &[Finding]) {
+    for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
+        if let Some(o) = origin_of(k, original) {
+            k.existing_code = o.existing_code.clone();
+        }
+    }
+}
+
+/// The original a finding kept by the self-critique demonstrably is, by the rule
+/// [`restore_quotes`] documents: the only original at its `(file, line)`, or
+/// failing that the only one in its file. `None` when correspondence cannot be
+/// shown.
+fn origin_of<'a>(k: &Finding, original: &'a [Finding]) -> Option<&'a Finding> {
     fn only<'a>(mut it: impl Iterator<Item = &'a Finding>) -> Option<&'a Finding> {
         match (it.next(), it.next()) {
             (Some(o), None) => Some(o),
             _ => None,
         }
     }
-    for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
-        let in_file = || original.iter().filter(|o| o.file == k.file);
-        let source = only(in_file().filter(|o| o.line == k.line)).or_else(|| only(in_file()));
-        if let Some(o) = source {
-            k.existing_code = o.existing_code.clone();
-        }
+    let in_file = || original.iter().filter(|o| o.file == k.file);
+    only(in_file().filter(|o| o.line == k.line)).or_else(|| only(in_file()))
+}
+
+/// Give back the sample count the self-critique pass cannot carry.
+///
+/// `Finding::samples` is skipped on input — no model may claim agreement — so
+/// every finding the critique returns comes back without it, every time, not
+/// just when the model drops a field. It is restored by the same
+/// correspondence rule as a quote; a kept finding that cannot be shown to be
+/// one original loses its count, which leaves the run log short one number
+/// rather than wrong by one.
+///
+/// Known limit, shared with [`restore_quotes`]: a critique that rewrites a
+/// finding's line onto another original's exact spot is matched to that other
+/// original and takes its count. Telling them apart would need the bodies
+/// compared, which the critique also rewrites. It needs SELF_CRITIQUE on and a
+/// moved line landing exactly on a neighbour, so it is left documented, not
+/// solved.
+fn restore_samples(kept: &mut [Finding], original: &[Finding]) {
+    for k in kept.iter_mut() {
+        k.samples = origin_of(k, original).and_then(|o| o.samples);
     }
 }
 
@@ -1815,6 +1859,7 @@ async fn finish_review(
         findings = match crate::llm::critique_findings(cfg, backend, meta, diff, &findings).await {
             Ok(mut kept) => {
                 restore_quotes(&mut kept, &findings);
+                restore_samples(&mut kept, &findings);
                 kept
             }
             Err(e) => {
@@ -2562,6 +2607,7 @@ mod local_review_tests {
                     summary: "an accumulator replaced a fold".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "MEDIUM".to_string(),
@@ -2718,6 +2764,7 @@ mod local_review_tests {
                         summary: "s".to_string(),
                         recommendation: "APPROVE".to_string(),
                         findings: vec![Finding {
+                            samples: None,
                             existing_code: None,
                             end_line: None,
                             severity: "LOW".to_string(),
@@ -3436,6 +3483,7 @@ mod orchestrator_tests {
         async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
             let f = |sev: &str, file: &str, line: Option<u64>, conf: u8, body: &str| {
                 crate::llm::Finding {
+                    samples: None,
                     existing_code: None,
                     end_line: None,
                     severity: sev.to_string(),
@@ -3526,6 +3574,12 @@ mod orchestrator_tests {
         assert_eq!(findings[2]["file"], "src/zzz.rs");
         assert_eq!(findings[2]["anchored"], false);
         assert!(findings[2]["anchored_line"].is_null());
+        // One sample: there is no agreement to report, so the key is absent and a
+        // single-sample record reads exactly as it did before the field existed.
+        assert!(
+            findings.iter().all(|f| f.get("samples").is_none()),
+            "a single-sample review writes no per-finding count"
+        );
     }
 
     /// Three partly-overlapping samples, each billing the same tokens.
@@ -3546,6 +3600,7 @@ mod orchestrator_tests {
                 *c
             };
             let f = |file: &str, line: u64, body: &str| crate::llm::Finding {
+                samples: None,
                 existing_code: None,
                 end_line: None,
                 severity: "MEDIUM".to_string(),
@@ -3661,6 +3716,90 @@ mod orchestrator_tests {
             serde_json::json!([1, 1, 1]),
             "one finding seen once, one twice, one by all three"
         );
+
+        // The same agreement, per posted finding — what the histogram cannot say
+        // is WHICH finding only one sample saw.
+        let mut counts: Vec<u64> = v["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .map(|f| {
+                f["samples"]
+                    .as_u64()
+                    .expect("every sampled finding has a count")
+            })
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![1, 2, 3], "one count per agreement level");
+    }
+
+    /// The sampled review, with a critique that keeps two of the three clusters and
+    /// records what it was shown.
+    struct SampledCritique {
+        sampling: SamplingBackend,
+        shown: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ReviewBackend for SampledCritique {
+        async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.sampling.review(ctx).await
+        }
+
+        async fn complete(&self, _cfg: &Config, _system: &str, user: &str) -> Result<String> {
+            self.shown.lock().unwrap().push(user.to_string());
+            Ok(r#"[
+                {"severity":"MEDIUM","file":"src/a.rs","line":2,"body":"every sample sees this","confidence":85},
+                {"severity":"MEDIUM","file":"src/c.rs","line":80,"body":"only the last sample sees this","confidence":85}
+            ]"#
+            .to_string())
+        }
+    }
+
+    /// Self-critique rewrites every finding from the model's JSON, and `samples` is
+    /// skipped on input — so without a restore, turning critique on would erase
+    /// every count. It must survive, and the critique must not be shown it.
+    #[tokio::test]
+    async fn sample_counts_survive_the_self_critique_it_never_sees() {
+        let srv = github_stub().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.review_samples = 3;
+        cfg.self_critique = true;
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let backend = SampledCritique {
+            sampling: SamplingBackend {
+                calls: Arc::new(Mutex::new(0)),
+            },
+            shown: Arc::clone(&shown),
+        };
+
+        run_review_with(&cfg, input(), &backend)
+            .await
+            .expect("the review runs");
+
+        let shown = shown.lock().unwrap();
+        assert_eq!(shown.len(), 1, "the critique ran once");
+        assert!(
+            !shown[0].contains("\"samples\""),
+            "the critique is not shown the agreement it might prune on"
+        );
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        let v: serde_json::Value = serde_json::from_str(text.trim()).expect("one JSON line");
+        let count = |file: &str| {
+            v["findings"]
+                .as_array()
+                .expect("findings")
+                .iter()
+                .find(|f| f["file"] == file)
+                .map(|f| f["samples"].clone())
+        };
+        assert_eq!(count("src/a.rs"), Some(serde_json::json!(3)));
+        assert_eq!(count("src/c.rs"), Some(serde_json::json!(1)));
+        assert_eq!(count("src/b.rs"), None, "the critique dropped it");
     }
 
     /// New-side lines: 1 is context, 2 and 3 are added. A finding that names
@@ -3679,6 +3818,7 @@ mod orchestrator_tests {
                     summary: "one drifted finding".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "HIGH".to_string(),
@@ -3745,6 +3885,7 @@ mod orchestrator_tests {
                     summary: "one quoted finding".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: Some(
                             "const subtotal = sum(items);\nreturn calcTotal(order, tax);"
                                 .to_string(),
@@ -3818,6 +3959,7 @@ mod orchestrator_tests {
                     summary: "drifted onto a blank line".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "HIGH".to_string(),
@@ -3881,6 +4023,7 @@ mod orchestrator_tests {
                     summary: "one finding with a fix".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "HIGH".to_string(),
@@ -4026,6 +4169,7 @@ return calcTotal(order, tax, region);
 
     fn proposed(file: &str, body: &str) -> crate::llm::Finding {
         crate::llm::Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: "MEDIUM".to_string(),
@@ -4193,13 +4337,14 @@ mod tests {
     use super::{
         anchorable, burst_key, collapse_bursts, demote_falsified_build_claims,
         effective_recommendation, idents, line_symbols, merge_samples, reanchor,
-        render_no_review_summary, resolve_excerpt, restore_quotes,
+        render_no_review_summary, resolve_excerpt, restore_quotes, restore_samples,
     };
     use crate::llm::Finding;
     use std::collections::{HashMap, HashSet};
 
     fn f(severity: &str, file: &str, body: &str) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: severity.to_string(),
@@ -4227,6 +4372,37 @@ mod tests {
         // The unrelated finding is untouched.
         assert_eq!(out[1].file, "d.rs");
         assert!(!out[1].body.contains("other file(s)"));
+    }
+
+    /// A collapsed claim's agreement cannot be derived from its members' counts,
+    /// so it records none rather than a misleading one.
+    #[test]
+    fn a_collapsed_group_records_no_sample_count() {
+        let with = |mut x: Finding, n: u32| {
+            x.samples = Some(n);
+            x
+        };
+        let findings = vec![
+            with(
+                f("LOW", "a.cxx", "`a.cxx` adds 2192 lines in one new file."),
+                1,
+            ),
+            with(
+                f("LOW", "b.cxx", "`b.cxx` adds 1868 lines in one new file."),
+                3,
+            ),
+            with(
+                f("LOW", "c.cxx", "`c.cxx` adds 1268 lines in one new file."),
+                2,
+            ),
+        ];
+        let out = collapse_bursts(findings);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].file, "a.cxx",
+            "the first member represents the group"
+        );
+        assert_eq!(out[0].samples, None, "the group's agreement is unknowable");
     }
 
     #[test]
@@ -4418,6 +4594,7 @@ mod tests {
 
     fn at(file: &str, line: Option<u64>, sev: &str, conf: u8, body: &str) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: sev.to_string(),
@@ -4427,6 +4604,34 @@ mod tests {
             confidence: Some(conf),
             suggestion: None,
         }
+    }
+
+    /// Each merged finding carries how many samples reported it.
+    #[test]
+    fn merged_findings_carry_their_sample_count() {
+        let a = vec![
+            at("a.rs", Some(10), "MEDIUM", 60, "shared"),
+            at("c.rs", Some(5), "LOW", 30, "only a"),
+        ];
+        let b = vec![at("a.rs", Some(12), "MEDIUM", 55, "shared, reworded")];
+        let merged = merge_samples(&[a, b], 10, 1).findings;
+        let count = |file: &str| {
+            merged
+                .iter()
+                .find(|f| f.file == file)
+                .and_then(|f| f.samples)
+        };
+        assert_eq!(count("a.rs"), Some(2), "both samples reported it");
+        assert_eq!(count("c.rs"), Some(1), "one sample reported it");
+    }
+
+    /// One surviving sample measures no agreement, so it records none — a count of
+    /// 1 would read as "one sample in N saw it".
+    #[test]
+    fn a_lone_surviving_sample_records_no_count() {
+        let only = vec![at("a.rs", Some(10), "MEDIUM", 60, "x")];
+        let merged = merge_samples(std::slice::from_ref(&only), 10, 1).findings;
+        assert_eq!(merged[0].samples, None);
     }
 
     /// A single sample must come out exactly as it went in.
@@ -4575,6 +4780,7 @@ mod tests {
 
     fn finding(severity: &str) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: severity.to_string(),
@@ -4815,6 +5021,29 @@ mod tests {
     }
 
     #[test]
+    fn a_sample_count_comes_back_from_the_same_spot_or_not_at_all() {
+        let counted = |file: &str, line: u64, n: u32| {
+            let mut x = quoted(file, line, None);
+            x.samples = Some(n);
+            x
+        };
+        let original = [
+            counted("a.rs", 12, 3),
+            counted("b.rs", 4, 1),
+            counted("b.rs", 9, 2),
+        ];
+        let mut kept = [
+            quoted("a.rs", 12, None), // the only original at that spot
+            quoted("a.rs", 30, None), // line rewritten, but the only original in a.rs
+            quoted("b.rs", 6, None),  // two originals in b.rs, neither at line 6
+        ];
+        restore_samples(&mut kept, &original);
+        assert_eq!(kept[0].samples, Some(3));
+        assert_eq!(kept[1].samples, Some(3));
+        assert_eq!(kept[2].samples, None, "correspondence cannot be shown");
+    }
+
+    #[test]
     fn a_quote_the_critique_dropped_comes_back_from_the_same_spot() {
         let original = [quoted("a.rs", 12, Some("let t = 0;"))];
         let mut kept = [quoted("a.rs", 12, None)];
@@ -4993,6 +5222,7 @@ mod change_map_tests {
     #[test]
     fn the_table_attributes_each_finding_to_its_file() {
         let findings = vec![Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: "BLOCKING".into(),
