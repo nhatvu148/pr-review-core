@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.38.0
+
+**The run log says how many samples reported each finding, and the reviewer's tools can see symlinks.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Each fails to compile until its one test that builds an `llm::Finding` with a struct literal gains `samples: None`: `pr-review-bot` in `src/claude_backend.rs` and `src/codex_backend.rs`, `simcel-pr-bot` in `src/claude_backend.rs`. With that one-line fix, `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (141, 160, 166 and 151 tests) and `simcel-pr-bot` on its default build (105 tests).
+
+This release is minor rather than a patch because `llm::Finding` and `runlog::LoggedFinding` gained public fields, which breaks struct-literal construction, and because the `grep` and `list_dir` tool descriptions changed what every agentic review reads. The generated Node and Python types did not change: `Finding::samples` is internal to the pipeline and absent from the schema.
 
 ### Fixed
 
