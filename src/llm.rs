@@ -91,6 +91,17 @@ pub struct Finding {
     /// the model sends itself is discarded, because nothing can check it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<u64>,
+    /// How many of the review's samples reported this finding, when the review
+    /// took more than one (`REVIEW_SAMPLES`); `None` for a single-sample review.
+    ///
+    /// Set by the sample merge, never by a model: it is skipped on input and kept
+    /// out of the schema, so no response can claim agreement it did not earn.
+    /// It is what turns the run log's agreement histogram into an answer per
+    /// finding — whether the findings only one sample saw tend to be real, which
+    /// is the whole question behind paying for more than one sample.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub samples: Option<u8>,
 }
 
 /// Accept a suggestion in whatever shape the model sent it, and drop it rather
@@ -675,6 +686,19 @@ mod tests {
     //! after a ~5-minute agent run). These pin the salvage behaviour.
 
     use super::{findings_from_values, Review};
+
+    /// `samples` is the merge's evidence, never the model's claim: a response that
+    /// sends it is ignored on that field, and the finding survives.
+    #[test]
+    fn a_model_cannot_claim_sample_agreement() {
+        let review: Review = serde_json::from_str(
+            r#"{"summary":"s","recommendation":"APPROVE","findings":[
+                {"severity":"LOW","file":"a.rs","line":1,"body":"b","samples":3}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(review.findings.len(), 1);
+        assert_eq!(review.findings[0].samples, None);
+    }
 
     /// The warning has to say what arrived, not only what was missing.
     ///

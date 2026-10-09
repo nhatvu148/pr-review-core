@@ -203,6 +203,11 @@ pub struct LoggedFinding {
     /// is what a human replies to and what the reconciler later deletes.
     pub anchored_line: Option<u64>,
     pub body: String,
+    /// How many samples reported this finding (`Finding::samples`); absent for a
+    /// single-sample review. Read it beside `Funnel::sample_agreement`: that is
+    /// the histogram over every cluster, this is the count for the ones posted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples: Option<u8>,
 }
 
 /// One review run.
@@ -328,6 +333,7 @@ pub fn logged_findings(findings: &[Finding], anchors: &[Option<u64>]) -> Vec<Log
                 anchored: anchored_line.is_some(),
                 anchored_line,
                 body: f.body.clone(),
+                samples: f.samples,
             }
         })
         .collect()
@@ -445,6 +451,7 @@ mod tests {
                 quote_resolved: 0,
             },
             findings: vec![LoggedFinding {
+                samples: None,
                 typed_line: None,
                 severity: "HIGH".into(),
                 file: "src/a.rs".into(),
@@ -494,6 +501,7 @@ mod tests {
 
     fn finding(file: &str, line: Option<u64>) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: "HIGH".into(),

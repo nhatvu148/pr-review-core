@@ -1243,6 +1243,7 @@ mod finding_shape_tests {
     /// Every key of a fully populated `Finding`, as it serializes.
     fn finding_keys() -> Vec<String> {
         let f = Finding {
+            samples: None,
             severity: "HIGH".into(),
             file: "a.rs".into(),
             line: Some(1),

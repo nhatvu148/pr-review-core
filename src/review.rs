@@ -424,6 +424,12 @@ fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
             .max_by_key(|(i, f)| (severity_rank(&f.severity), std::cmp::Reverse(*i)))
             .map_or(0, |(i, _)| i);
         let mut rep = group.remove(best);
+        // The claim stands for the whole group, so it carries the strongest
+        // agreement any member had — not just the representative's.
+        rep.samples = std::iter::once(rep.samples)
+            .chain(group.iter().map(|f| f.samples))
+            .flatten()
+            .max();
 
         // Name enough files that the reader can check the pattern themselves; the
         // cap only exists to keep one comment from becoming a file listing.
@@ -1493,6 +1499,7 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
     let hygiene: Vec<Finding> = crate::diff::diff_hygiene_with(raw_diff, &cfg.vendored_globs)
         .into_iter()
         .map(|h| Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: h.severity.to_string(),
@@ -1666,7 +1673,10 @@ fn merge_samples(samples: &[Vec<Finding>], tolerance: u64, min_agreement: usize)
         findings: clusters
             .into_iter()
             .filter(|c| c.agreement >= min_agreement)
-            .map(|c| c.best)
+            .map(|c| Finding {
+                samples: Some(u8::try_from(c.agreement).unwrap_or(u8::MAX)),
+                ..c.best
+            })
             .collect(),
         agreement,
     }
@@ -2562,6 +2572,7 @@ mod local_review_tests {
                     summary: "an accumulator replaced a fold".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "MEDIUM".to_string(),
@@ -2718,6 +2729,7 @@ mod local_review_tests {
                         summary: "s".to_string(),
                         recommendation: "APPROVE".to_string(),
                         findings: vec![Finding {
+                            samples: None,
                             existing_code: None,
                             end_line: None,
                             severity: "LOW".to_string(),
@@ -3436,6 +3448,7 @@ mod orchestrator_tests {
         async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
             let f = |sev: &str, file: &str, line: Option<u64>, conf: u8, body: &str| {
                 crate::llm::Finding {
+                    samples: None,
                     existing_code: None,
                     end_line: None,
                     severity: sev.to_string(),
@@ -3526,6 +3539,12 @@ mod orchestrator_tests {
         assert_eq!(findings[2]["file"], "src/zzz.rs");
         assert_eq!(findings[2]["anchored"], false);
         assert!(findings[2]["anchored_line"].is_null());
+        // One sample: there is no agreement to report, so the key is absent and a
+        // single-sample record reads exactly as it did before the field existed.
+        assert!(
+            findings.iter().all(|f| f.get("samples").is_none()),
+            "a single-sample review writes no per-finding count"
+        );
     }
 
     /// Three partly-overlapping samples, each billing the same tokens.
@@ -3546,6 +3565,7 @@ mod orchestrator_tests {
                 *c
             };
             let f = |file: &str, line: u64, body: &str| crate::llm::Finding {
+                samples: None,
                 existing_code: None,
                 end_line: None,
                 severity: "MEDIUM".to_string(),
@@ -3661,6 +3681,21 @@ mod orchestrator_tests {
             serde_json::json!([1, 1, 1]),
             "one finding seen once, one twice, one by all three"
         );
+
+        // The same agreement, per posted finding — what the histogram cannot say
+        // is WHICH finding only one sample saw.
+        let mut counts: Vec<u64> = v["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .map(|f| {
+                f["samples"]
+                    .as_u64()
+                    .expect("every sampled finding has a count")
+            })
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![1, 2, 3], "one count per agreement level");
     }
 
     /// New-side lines: 1 is context, 2 and 3 are added. A finding that names
@@ -3679,6 +3714,7 @@ mod orchestrator_tests {
                     summary: "one drifted finding".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "HIGH".to_string(),
@@ -3745,6 +3781,7 @@ mod orchestrator_tests {
                     summary: "one quoted finding".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: Some(
                             "const subtotal = sum(items);\nreturn calcTotal(order, tax);"
                                 .to_string(),
@@ -3818,6 +3855,7 @@ mod orchestrator_tests {
                     summary: "drifted onto a blank line".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "HIGH".to_string(),
@@ -3881,6 +3919,7 @@ mod orchestrator_tests {
                     summary: "one finding with a fix".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "HIGH".to_string(),
@@ -4026,6 +4065,7 @@ return calcTotal(order, tax, region);
 
     fn proposed(file: &str, body: &str) -> crate::llm::Finding {
         crate::llm::Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: "MEDIUM".to_string(),
@@ -4200,6 +4240,7 @@ mod tests {
 
     fn f(severity: &str, file: &str, body: &str) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: severity.to_string(),
@@ -4227,6 +4268,42 @@ mod tests {
         // The unrelated finding is untouched.
         assert_eq!(out[1].file, "d.rs");
         assert!(!out[1].body.contains("other file(s)"));
+    }
+
+    /// The collapsed claim stands for its whole group, so it keeps the strongest
+    /// agreement any member had — the representative is chosen by severity, not
+    /// by how many samples saw it.
+    #[test]
+    fn a_collapsed_group_keeps_its_strongest_sample_count() {
+        let with = |mut x: Finding, n: u8| {
+            x.samples = Some(n);
+            x
+        };
+        let findings = vec![
+            with(
+                f("LOW", "a.cxx", "`a.cxx` adds 2192 lines in one new file."),
+                1,
+            ),
+            with(
+                f("LOW", "b.cxx", "`b.cxx` adds 1868 lines in one new file."),
+                3,
+            ),
+            with(
+                f("LOW", "c.cxx", "`c.cxx` adds 1268 lines in one new file."),
+                2,
+            ),
+        ];
+        let out = collapse_bursts(findings);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].file, "a.cxx",
+            "the first member represents the group"
+        );
+        assert_eq!(
+            out[0].samples,
+            Some(3),
+            "but the group's agreement is its best"
+        );
     }
 
     #[test]
@@ -4418,6 +4495,7 @@ mod tests {
 
     fn at(file: &str, line: Option<u64>, sev: &str, conf: u8, body: &str) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: sev.to_string(),
@@ -4427,6 +4505,25 @@ mod tests {
             confidence: Some(conf),
             suggestion: None,
         }
+    }
+
+    /// Each merged finding carries how many samples reported it.
+    #[test]
+    fn merged_findings_carry_their_sample_count() {
+        let a = vec![
+            at("a.rs", Some(10), "MEDIUM", 60, "shared"),
+            at("c.rs", Some(5), "LOW", 30, "only a"),
+        ];
+        let b = vec![at("a.rs", Some(12), "MEDIUM", 55, "shared, reworded")];
+        let merged = merge_samples(&[a, b], 10, 1).findings;
+        let count = |file: &str| {
+            merged
+                .iter()
+                .find(|f| f.file == file)
+                .and_then(|f| f.samples)
+        };
+        assert_eq!(count("a.rs"), Some(2), "both samples reported it");
+        assert_eq!(count("c.rs"), Some(1), "one sample reported it");
     }
 
     /// A single sample must come out exactly as it went in.
@@ -4575,6 +4672,7 @@ mod tests {
 
     fn finding(severity: &str) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: severity.to_string(),
@@ -4993,6 +5091,7 @@ mod change_map_tests {
     #[test]
     fn the_table_attributes_each_finding_to_its_file() {
         let findings = vec![Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: "BLOCKING".into(),
