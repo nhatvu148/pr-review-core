@@ -91,8 +91,9 @@ pub struct Finding {
     /// the model sends itself is discarded, because nothing can check it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<u64>,
-    /// How many of the review's samples reported this finding, when the review
-    /// took more than one (`REVIEW_SAMPLES`); `None` for a single-sample review.
+    /// How many of the review's samples reported this finding. `None` whenever no
+    /// agreement was measured for it — see `runlog::LoggedFinding::samples` for
+    /// every case that leaves it absent.
     ///
     /// Set by the sample merge, never by a model, and internal to the pipeline:
     /// skipped by serde in both directions, so no response can claim agreement it

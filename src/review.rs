@@ -1675,7 +1675,12 @@ fn merge_samples(samples: &[Vec<Finding>], tolerance: u64, min_agreement: usize)
             .into_iter()
             .filter(|c| c.agreement >= min_agreement)
             .map(|c| Finding {
-                samples: Some(u32::try_from(c.agreement).unwrap_or(u32::MAX)),
+                // Only when two or more samples survived to be compared. With
+                // REVIEW_SAMPLES=3 and two failing, every finding would read 1 —
+                // indistinguishable from "one sample in three saw it", the very
+                // signal this count exists to measure.
+                samples: (samples.len() > 1)
+                    .then(|| u32::try_from(c.agreement).unwrap_or(u32::MAX)),
                 ..c.best
             })
             .collect(),
@@ -4618,6 +4623,15 @@ mod tests {
         };
         assert_eq!(count("a.rs"), Some(2), "both samples reported it");
         assert_eq!(count("c.rs"), Some(1), "one sample reported it");
+    }
+
+    /// One surviving sample measures no agreement, so it records none — a count of
+    /// 1 would read as "one sample in N saw it".
+    #[test]
+    fn a_lone_surviving_sample_records_no_count() {
+        let only = vec![at("a.rs", Some(10), "MEDIUM", 60, "x")];
+        let merged = merge_samples(std::slice::from_ref(&only), 10, 1).findings;
+        assert_eq!(merged[0].samples, None);
     }
 
     /// A single sample must come out exactly as it went in.
