@@ -25,6 +25,34 @@ pub struct RunReviewInput {
     pub placeholder: bool,
 }
 
+/// The review had nothing to look at: the diff was empty, or every file in it
+/// was removed by `EXCLUDE_GLOBS` (a lockfile-only change, say), and no
+/// diff-hygiene finding stood in for it.
+///
+/// Returned as the error of [`run_review`] and [`run_review_local`] so a caller
+/// can tell this outcome from a failure: `err.downcast_ref::<NothingToReview>()`.
+/// It is a finished answer, not a fault — retrying gets the same empty diff —
+/// so a queue should settle the job rather than retry it, and an alert should
+/// not fire. The `Display` text is unchanged from when this was a plain error,
+/// so anything that matched on the message keeps working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NothingToReview {
+    /// `true` for a local review, which says "Diff" rather than "PR diff".
+    pub local: bool,
+}
+
+impl std::fmt::Display for NothingToReview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = if self.local { "Diff" } else { "PR diff" };
+        write!(
+            f,
+            "{what} is empty (all files excluded by globs, or no changes) — nothing to review."
+        )
+    }
+}
+
+impl std::error::Error for NothingToReview {}
+
 /// Result of one review run (serialized as the HTTP/CLI response).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -2120,9 +2148,7 @@ pub async fn run_review_with(
             );
             return Ok(out);
         }
-        anyhow::bail!(
-            "PR diff is empty (all files excluded by globs, or no changes) — nothing to review."
-        );
+        return Err(NothingToReview { local: false }.into());
     }
     let PreparedDiff {
         diff,
@@ -2424,9 +2450,7 @@ pub async fn run_review_local(
                 usage: None,
             });
         }
-        anyhow::bail!(
-            "Diff is empty (all files excluded by globs, or no changes) — nothing to review."
-        );
+        return Err(NothingToReview { local: true }.into());
     }
     let PreparedDiff {
         diff,
@@ -2542,7 +2566,10 @@ mod local_review_tests {
     use anyhow::Result;
     use async_trait::async_trait;
 
-    use super::{pack_to_budget, prepare_diff, run_review_local, LocalReviewInput, LOCAL_PROVIDER};
+    use super::{
+        pack_to_budget, prepare_diff, run_review_local, LocalReviewInput, NothingToReview,
+        LOCAL_PROVIDER,
+    };
     use crate::backend::{ReviewBackend, ReviewContext};
     use crate::config::Config;
     use crate::llm::{Finding, Review, ReviewResult};
@@ -2958,6 +2985,11 @@ mod local_review_tests {
         .await
         .expect_err("an empty diff has nothing to review");
         assert!(err.to_string().contains("nothing to review"));
+        assert_eq!(
+            err.downcast_ref::<NothingToReview>(),
+            Some(&NothingToReview { local: true }),
+            "callers tell this outcome from a failure by its type"
+        );
     }
 
     /// The acceptance test for the feature: a backend that imports nothing from
@@ -3255,7 +3287,7 @@ mod orchestrator_tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{run_review_with, RunReviewInput};
+    use super::{run_review_with, NothingToReview, RunReviewInput};
     use crate::backend::{ReviewBackend, ReviewContext};
     use crate::config::Config;
     use crate::llm::{Review, ReviewResult};
@@ -3301,6 +3333,43 @@ mod orchestrator_tests {
     /// `.prbot.toml` — 404s, which the provider reads as "absent".
     async fn github_stub() -> MockServer {
         github_stub_with(DIFF).await
+    }
+
+    /// A backend that must never be reached.
+    struct Unreachable;
+
+    #[async_trait]
+    impl ReviewBackend for Unreachable {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            panic!("an all-excluded PR must not reach the backend");
+        }
+    }
+
+    /// The PR path's "nothing to review" is a typed outcome, the shape that a
+    /// lockfile-only PR (pr-review-core#150) takes. pr-review-bot's queue retried
+    /// it three times and dead-lettered it because it could not tell it from a
+    /// failure.
+    #[tokio::test]
+    async fn an_all_excluded_pr_is_typed_nothing_to_review() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        let err = run_review_with(&cfg_for(&srv.uri()), input(), &Unreachable)
+            .await
+            .expect_err("a lockfile-only PR has nothing to review");
+        assert_eq!(
+            err.downcast_ref::<NothingToReview>(),
+            Some(&NothingToReview { local: false })
+        );
+        assert_eq!(
+            err.to_string(),
+            "PR diff is empty (all files excluded by globs, or no changes) — nothing to review.",
+            "the message is unchanged from the plain error it replaces"
+        );
     }
 
     /// [`github_stub`] over a caller-chosen diff, for tests that need particular

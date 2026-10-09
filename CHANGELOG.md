@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`review::NothingToReview` tells "nothing to review" apart from a failure.** `run_review` and `run_review_local` return it as their error when the diff is empty or every file was removed by `EXCLUDE_GLOBS` (a lockfile-only change, say). Before, it was a plain `anyhow` error, so a caller could only match the message text. `pr-review-bot`'s queue couldn't tell it from a real failure: it retried pr-review-core#150, a `Cargo.lock`-only PR, three times over about twenty minutes and dead-lettered it, where there was nothing to retry. A caller now checks `err.downcast_ref::<NothingToReview>()` and settles the job. The message is unchanged, and nothing breaks: it is a new type, and the error type of both functions is still `anyhow::Error`.
+
 ## 0.38.0
 
 **The run log says how many samples reported each finding, and the reviewer's tools can see symlinks.**
