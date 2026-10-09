@@ -144,3 +144,12 @@ libc = "0.2"
 # so the agent loop can be characterised end-to-end over real HTTP without
 # changing production code.
 wiremock = "0.6"
+
+# Examples are built as plain binaries by default, so `clippy --all-targets` never
+# compiles an example's `#[cfg(test)]` module and lints none of it. `test = true`
+# makes this one a test target as well, so clippy (and plain `cargo test`) cover
+# its tests. Any example that gains a test module needs the same entry; until it
+# has one, CI's `cargo test --examples` still compiles and runs those tests.
+[[example]]
+name = "multiround"
+test = true
