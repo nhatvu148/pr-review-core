@@ -26,8 +26,9 @@ pub struct RunReviewInput {
 }
 
 /// The review had nothing to look at: the diff was empty, or every file in it
-/// was removed by `EXCLUDE_GLOBS` (a lockfile-only change, say), and no
-/// diff-hygiene finding stood in for it.
+/// was removed by `EXCLUDE_GLOBS` (a lockfile-only change, say), and nothing
+/// stood in for it — no diff-hygiene finding and, on the PR path, no dependency
+/// advisory (either of those posts a no-review summary instead).
 ///
 /// Returned as the error of [`run_review`] and [`run_review_local`] so a caller
 /// can tell this outcome from a failure: `err.downcast_ref::<NothingToReview>()`.
