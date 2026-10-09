@@ -424,12 +424,13 @@ fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
             .max_by_key(|(i, f)| (severity_rank(&f.severity), std::cmp::Reverse(*i)))
             .map_or(0, |(i, _)| i);
         let mut rep = group.remove(best);
-        // The claim stands for the whole group, so it carries the strongest
-        // agreement any member had — not just the representative's.
-        rep.samples = std::iter::once(rep.samples)
-            .chain(group.iter().map(|f| f.samples))
-            .flatten()
-            .max();
+        // No count survives a collapse. How many samples reported the claim is not
+        // recoverable from the members' counts: three samples each reporting it in
+        // a different file give three members at 1 — the claim was seen by three,
+        // the max says one, the sum would double-count a sample that reported two
+        // files. Absent beats wrong in data meant to settle REVIEW_SAMPLES, and a
+        // burst is rare enough that the gap costs little.
+        rep.samples = None;
 
         // Name enough files that the reader can check the pattern themselves; the
         // cap only exists to keep one comment from becoming a file listing.
@@ -4361,11 +4362,10 @@ mod tests {
         assert!(!out[1].body.contains("other file(s)"));
     }
 
-    /// The collapsed claim stands for its whole group, so it keeps the strongest
-    /// agreement any member had — the representative is chosen by severity, not
-    /// by how many samples saw it.
+    /// A collapsed claim's agreement cannot be derived from its members' counts,
+    /// so it records none rather than a misleading one.
     #[test]
-    fn a_collapsed_group_keeps_its_strongest_sample_count() {
+    fn a_collapsed_group_records_no_sample_count() {
         let with = |mut x: Finding, n: u8| {
             x.samples = Some(n);
             x
@@ -4390,11 +4390,7 @@ mod tests {
             out[0].file, "a.cxx",
             "the first member represents the group"
         );
-        assert_eq!(
-            out[0].samples,
-            Some(3),
-            "but the group's agreement is its best"
-        );
+        assert_eq!(out[0].samples, None, "the group's agreement is unknowable");
     }
 
     #[test]
