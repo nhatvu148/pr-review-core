@@ -1785,18 +1785,39 @@ async fn sampled_review(
 /// missing, which costs only the quote: the finding anchors by its typed line
 /// as it did before quotes existed.
 fn restore_quotes(kept: &mut [Finding], original: &[Finding]) {
+    for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
+        if let Some(o) = origin_of(k, original) {
+            k.existing_code = o.existing_code.clone();
+        }
+    }
+}
+
+/// The original a finding kept by the self-critique demonstrably is, by the rule
+/// [`restore_quotes`] documents: the only original at its `(file, line)`, or
+/// failing that the only one in its file. `None` when correspondence cannot be
+/// shown.
+fn origin_of<'a>(k: &Finding, original: &'a [Finding]) -> Option<&'a Finding> {
     fn only<'a>(mut it: impl Iterator<Item = &'a Finding>) -> Option<&'a Finding> {
         match (it.next(), it.next()) {
             (Some(o), None) => Some(o),
             _ => None,
         }
     }
-    for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
-        let in_file = || original.iter().filter(|o| o.file == k.file);
-        let source = only(in_file().filter(|o| o.line == k.line)).or_else(|| only(in_file()));
-        if let Some(o) = source {
-            k.existing_code = o.existing_code.clone();
-        }
+    let in_file = || original.iter().filter(|o| o.file == k.file);
+    only(in_file().filter(|o| o.line == k.line)).or_else(|| only(in_file()))
+}
+
+/// Give back the sample count the self-critique pass cannot carry.
+///
+/// `Finding::samples` is skipped on input — no model may claim agreement — so
+/// every finding the critique returns comes back without it, every time, not
+/// just when the model drops a field. It is restored by the same
+/// correspondence rule as a quote; a kept finding that cannot be shown to be
+/// one original loses its count, which leaves the run log short one number
+/// rather than wrong by one.
+fn restore_samples(kept: &mut [Finding], original: &[Finding]) {
+    for k in kept.iter_mut() {
+        k.samples = origin_of(k, original).and_then(|o| o.samples);
     }
 }
 
@@ -1825,6 +1846,7 @@ async fn finish_review(
         findings = match crate::llm::critique_findings(cfg, backend, meta, diff, &findings).await {
             Ok(mut kept) => {
                 restore_quotes(&mut kept, &findings);
+                restore_samples(&mut kept, &findings);
                 kept
             }
             Err(e) => {
@@ -3698,6 +3720,75 @@ mod orchestrator_tests {
         assert_eq!(counts, vec![1, 2, 3], "one count per agreement level");
     }
 
+    /// The sampled review, with a critique that keeps two of the three clusters and
+    /// records what it was shown.
+    struct SampledCritique {
+        sampling: SamplingBackend,
+        shown: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ReviewBackend for SampledCritique {
+        async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.sampling.review(ctx).await
+        }
+
+        async fn complete(&self, _cfg: &Config, _system: &str, user: &str) -> Result<String> {
+            self.shown.lock().unwrap().push(user.to_string());
+            Ok(r#"[
+                {"severity":"MEDIUM","file":"src/a.rs","line":2,"body":"every sample sees this","confidence":85},
+                {"severity":"MEDIUM","file":"src/c.rs","line":80,"body":"only the last sample sees this","confidence":85}
+            ]"#
+            .to_string())
+        }
+    }
+
+    /// Self-critique rewrites every finding from the model's JSON, and `samples` is
+    /// skipped on input — so without a restore, turning critique on would erase
+    /// every count. It must survive, and the critique must not be shown it.
+    #[tokio::test]
+    async fn sample_counts_survive_the_self_critique_it_never_sees() {
+        let srv = github_stub().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.review_samples = 3;
+        cfg.self_critique = true;
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let backend = SampledCritique {
+            sampling: SamplingBackend {
+                calls: Arc::new(Mutex::new(0)),
+            },
+            shown: Arc::clone(&shown),
+        };
+
+        run_review_with(&cfg, input(), &backend)
+            .await
+            .expect("the review runs");
+
+        let shown = shown.lock().unwrap();
+        assert_eq!(shown.len(), 1, "the critique ran once");
+        assert!(
+            !shown[0].contains("\"samples\""),
+            "the critique is not shown the agreement it might prune on"
+        );
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        let v: serde_json::Value = serde_json::from_str(text.trim()).expect("one JSON line");
+        let count = |file: &str| {
+            v["findings"]
+                .as_array()
+                .expect("findings")
+                .iter()
+                .find(|f| f["file"] == file)
+                .map(|f| f["samples"].clone())
+        };
+        assert_eq!(count("src/a.rs"), Some(serde_json::json!(3)));
+        assert_eq!(count("src/c.rs"), Some(serde_json::json!(1)));
+        assert_eq!(count("src/b.rs"), None, "the critique dropped it");
+    }
+
     /// New-side lines: 1 is context, 2 and 3 are added. A finding that names
     /// `calcTotal` but claims line 5 re-anchors onto line 3.
     const DRIFT_DIFF: &str = "diff --git a/src/order.ts b/src/order.ts\n--- a/src/order.ts\n+++ b/src/order.ts\n@@ -1,1 +1,3 @@\n const items = [];\n+const subtotal = sum(items);\n+return calcTotal(order, tax);\n";
@@ -4233,7 +4324,7 @@ mod tests {
     use super::{
         anchorable, burst_key, collapse_bursts, demote_falsified_build_claims,
         effective_recommendation, idents, line_symbols, merge_samples, reanchor,
-        render_no_review_summary, resolve_excerpt, restore_quotes,
+        render_no_review_summary, resolve_excerpt, restore_quotes, restore_samples,
     };
     use crate::llm::Finding;
     use std::collections::{HashMap, HashSet};
@@ -4910,6 +5001,29 @@ mod tests {
         x.line = Some(line);
         x.existing_code = code.map(str::to_string);
         x
+    }
+
+    #[test]
+    fn a_sample_count_comes_back_from_the_same_spot_or_not_at_all() {
+        let counted = |file: &str, line: u64, n: u8| {
+            let mut x = quoted(file, line, None);
+            x.samples = Some(n);
+            x
+        };
+        let original = [
+            counted("a.rs", 12, 3),
+            counted("b.rs", 4, 1),
+            counted("b.rs", 9, 2),
+        ];
+        let mut kept = [
+            quoted("a.rs", 12, None), // the only original at that spot
+            quoted("a.rs", 30, None), // line rewritten, but the only original in a.rs
+            quoted("b.rs", 6, None),  // two originals in b.rs, neither at line 6
+        ];
+        restore_samples(&mut kept, &original);
+        assert_eq!(kept[0].samples, Some(3));
+        assert_eq!(kept[1].samples, Some(3));
+        assert_eq!(kept[2].samples, None, "correspondence cannot be shown");
     }
 
     #[test]

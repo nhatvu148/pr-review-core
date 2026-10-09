@@ -458,7 +458,16 @@ pub async fn critique_findings(
     findings: &[Finding],
 ) -> Result<Vec<Finding>> {
     let clipped: String = diff.chars().take(cfg.max_diff_chars).collect();
-    let findings_json = serde_json::to_string_pretty(findings)
+    // Without `samples`: the count is evidence for the run log, not a hint for the
+    // judge. Shown "seen by 1 of 3", a critique could start pruning on agreement —
+    // a behaviour change nobody chose, and one that would bias the very data the
+    // count exists to collect. The caller restores it afterwards.
+    let shown: Vec<Finding> = findings
+        .iter()
+        .cloned()
+        .map(|f| Finding { samples: None, ..f })
+        .collect();
+    let findings_json = serde_json::to_string_pretty(&shown)
         .map_err(|e| anyhow::anyhow!("could not serialize findings for critique: {e}"))?;
     let user = format!(
         "Repository: {}\nPull request: #{}\n\n--- BEGIN DIFF ---\n{clipped}\n--- END DIFF ---\n\n--- PROPOSED FINDINGS (JSON) ---\n{findings_json}",
