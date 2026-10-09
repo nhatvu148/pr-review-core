@@ -1675,7 +1675,7 @@ fn merge_samples(samples: &[Vec<Finding>], tolerance: u64, min_agreement: usize)
             .into_iter()
             .filter(|c| c.agreement >= min_agreement)
             .map(|c| Finding {
-                samples: Some(u8::try_from(c.agreement).unwrap_or(u8::MAX)),
+                samples: Some(u32::try_from(c.agreement).unwrap_or(u32::MAX)),
                 ..c.best
             })
             .collect(),
@@ -4373,7 +4373,7 @@ mod tests {
     /// so it records none rather than a misleading one.
     #[test]
     fn a_collapsed_group_records_no_sample_count() {
-        let with = |mut x: Finding, n: u8| {
+        let with = |mut x: Finding, n: u32| {
             x.samples = Some(n);
             x
         };
@@ -5008,7 +5008,7 @@ mod tests {
 
     #[test]
     fn a_sample_count_comes_back_from_the_same_spot_or_not_at_all() {
-        let counted = |file: &str, line: u64, n: u8| {
+        let counted = |file: &str, line: u64, n: u32| {
             let mut x = quoted(file, line, None);
             x.samples = Some(n);
             x

@@ -94,14 +94,17 @@ pub struct Finding {
     /// How many of the review's samples reported this finding, when the review
     /// took more than one (`REVIEW_SAMPLES`); `None` for a single-sample review.
     ///
-    /// Set by the sample merge, never by a model: it is skipped on input and kept
-    /// out of the schema, so no response can claim agreement it did not earn.
+    /// Set by the sample merge, never by a model, and internal to the pipeline:
+    /// skipped by serde in both directions, so no response can claim agreement it
+    /// did not earn, and no serialized `Finding` (`RunReviewOutput`, the MCP
+    /// tools) carries a field its published schema does not describe. The run
+    /// log reads it through `runlog::LoggedFinding`, which is where it is for.
     /// It is what turns the run log's agreement histogram into an answer per
     /// finding — whether the findings only one sample saw tend to be real, which
     /// is the whole question behind paying for more than one sample.
-    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     #[schemars(skip)]
-    pub samples: Option<u8>,
+    pub samples: Option<u32>,
 }
 
 /// Accept a suggestion in whatever shape the model sent it, and drop it rather

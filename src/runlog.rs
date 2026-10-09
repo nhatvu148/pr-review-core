@@ -207,7 +207,7 @@ pub struct LoggedFinding {
     /// single-sample review. Read it beside `Funnel::sample_agreement`: that is
     /// the histogram over every cluster, this is the count for the ones posted.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub samples: Option<u8>,
+    pub samples: Option<u32>,
 }
 
 /// One review run.
