@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.39.0
+
+**"Nothing to review" is a typed outcome, so a queue can settle a lockfile-only PR instead of dead-lettering it.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Neither needed a change: `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (142, 161, 167 and 152 tests) and `simcel-pr-bot` on its default build (105 tests).
+
+This release is minor rather than a patch because of the behaviour change below: a PR that was given a "Reviewing…" placeholder and turns out to have nothing to review now gets its placeholder replaced with a no-review note, which a caller can see. `NothingToReview` itself is a new type and breaks nothing.
 
 ### Added
 
