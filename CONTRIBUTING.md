@@ -17,12 +17,13 @@ or a reproducible diff.
 
 ## The local loop
 
-CI's `check` job runs exactly these three, and they must be clean:
+CI's `check` job runs exactly these four, and they must be clean:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-features --all-targets -- -D warnings
 cargo test --all-features
+cargo test --all-features --examples
 ```
 
 `clippy` runs with `-D warnings`, so a warning is a failure.
