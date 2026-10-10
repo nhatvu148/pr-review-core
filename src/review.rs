@@ -1,7 +1,7 @@
 //! Orchestrator: fetch the diff, run the structured AI review, anchor findings
 //! to diff lines, render a summary, and (unless dry-run) post the review.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::agent::agentic_review;
@@ -24,6 +24,35 @@ pub struct RunReviewInput {
     /// the PR shows instant feedback (used on the webhook path). Ignored on dry-run.
     pub placeholder: bool,
 }
+
+/// The review had nothing to look at: the diff was empty, or every file in it
+/// was removed by `EXCLUDE_GLOBS` (a lockfile-only change, say), and nothing
+/// stood in for it — no diff-hygiene finding and, on the PR path, no dependency
+/// advisory (either of those posts a no-review summary instead).
+///
+/// Returned as the error of [`run_review`] and [`run_review_local`] so a caller
+/// can tell this outcome from a failure: `err.downcast_ref::<NothingToReview>()`.
+/// It is a finished answer, not a fault — retrying gets the same empty diff —
+/// so a queue should settle the job rather than retry it, and an alert should
+/// not fire. The `Display` text is unchanged from when this was a plain error,
+/// so anything that matched on the message keeps working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NothingToReview {
+    /// `true` for a local review, which says "Diff" rather than "PR diff".
+    pub local: bool,
+}
+
+impl std::fmt::Display for NothingToReview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = if self.local { "Diff" } else { "PR diff" };
+        write!(
+            f,
+            "{what} is empty (all files excluded by globs, or no changes) — nothing to review."
+        )
+    }
+}
+
+impl std::error::Error for NothingToReview {}
 
 /// Result of one review run (serialized as the HTTP/CLI response).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -2044,17 +2073,22 @@ pub async fn run_review_with(
 
     // Instant feedback: drop a "Reviewing…" summary comment before the slow LLM
     // call. It's upserted, so the real review updates this same comment.
+    // Whether a placeholder actually went up — not merely whether one was asked
+    // for. The nothing-to-review path below replaces it only if it exists, so a
+    // failed placeholder post must not turn into a comment on a silent PR.
+    let mut placeholder_posted = false;
     if input.placeholder && !input.dry_run {
         let pending = ReviewPost {
             summary: render_pending(),
             inline: Vec::new(),
         };
-        if let Err(e) = provider.post_review(&client, cfg, &meta, &pending).await {
-            tracing::warn!(
+        match provider.post_review(&client, cfg, &meta, &pending).await {
+            Ok(_) => placeholder_posted = true,
+            Err(e) => tracing::warn!(
                 "placeholder comment failed for {}#{}: {e:#}",
                 input.repo,
                 input.pr
-            );
+            ),
         }
     }
 
@@ -2120,9 +2154,26 @@ pub async fn run_review_with(
             );
             return Ok(out);
         }
-        anyhow::bail!(
-            "PR diff is empty (all files excluded by globs, or no changes) — nothing to review."
-        );
+        // The placeholder posted above would otherwise sit on the PR saying
+        // "Reviewing…" forever: a caller that settles NothingToReview, rather than
+        // retrying it, leaves nothing else to replace it. Only when we posted one,
+        // so a PR the engine never commented on stays silent.
+        //
+        // A failed replacement is returned as the error, not swallowed: returning
+        // NothingToReview would tell the caller to settle and leave exactly the
+        // stuck placeholder this exists to clear. As an ordinary error it gets
+        // retried, and the retry finds the same empty diff and tries again.
+        if placeholder_posted {
+            let note = ReviewPost {
+                summary: render_no_review_summary(&[], &[]),
+                inline: Vec::new(),
+            };
+            provider
+                .post_review(&client, cfg, &meta, &note)
+                .await
+                .context("nothing to review, but the placeholder could not be replaced")?;
+        }
+        return Err(NothingToReview { local: false }.into());
     }
     let PreparedDiff {
         diff,
@@ -2424,9 +2475,7 @@ pub async fn run_review_local(
                 usage: None,
             });
         }
-        anyhow::bail!(
-            "Diff is empty (all files excluded by globs, or no changes) — nothing to review."
-        );
+        return Err(NothingToReview { local: true }.into());
     }
     let PreparedDiff {
         diff,
@@ -2542,7 +2591,10 @@ mod local_review_tests {
     use anyhow::Result;
     use async_trait::async_trait;
 
-    use super::{pack_to_budget, prepare_diff, run_review_local, LocalReviewInput, LOCAL_PROVIDER};
+    use super::{
+        pack_to_budget, prepare_diff, run_review_local, LocalReviewInput, NothingToReview,
+        LOCAL_PROVIDER,
+    };
     use crate::backend::{ReviewBackend, ReviewContext};
     use crate::config::Config;
     use crate::llm::{Finding, Review, ReviewResult};
@@ -2958,6 +3010,11 @@ mod local_review_tests {
         .await
         .expect_err("an empty diff has nothing to review");
         assert!(err.to_string().contains("nothing to review"));
+        assert_eq!(
+            err.downcast_ref::<NothingToReview>(),
+            Some(&NothingToReview { local: true }),
+            "callers tell this outcome from a failure by its type"
+        );
     }
 
     /// The acceptance test for the feature: a backend that imports nothing from
@@ -3255,7 +3312,7 @@ mod orchestrator_tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{run_review_with, RunReviewInput};
+    use super::{run_review_with, NothingToReview, RunReviewInput};
     use crate::backend::{ReviewBackend, ReviewContext};
     use crate::config::Config;
     use crate::llm::{Review, ReviewResult};
@@ -3301,6 +3358,229 @@ mod orchestrator_tests {
     /// `.prbot.toml` — 404s, which the provider reads as "absent".
     async fn github_stub() -> MockServer {
         github_stub_with(DIFF).await
+    }
+
+    /// A backend that must never be reached.
+    struct Unreachable;
+
+    #[async_trait]
+    impl ReviewBackend for Unreachable {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            panic!("an all-excluded PR must not reach the backend");
+        }
+    }
+
+    /// The PR path's "nothing to review" is a typed outcome, the shape that a
+    /// lockfile-only PR (pr-review-core#150) takes. pr-review-bot's queue retried
+    /// it three times and dead-lettered it because it could not tell it from a
+    /// failure.
+    #[tokio::test]
+    async fn an_all_excluded_pr_is_typed_nothing_to_review() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        let err = run_review_with(&cfg_for(&srv.uri()), input(), &Unreachable)
+            .await
+            .expect_err("a lockfile-only PR has nothing to review");
+        assert_eq!(
+            err.downcast_ref::<NothingToReview>(),
+            Some(&NothingToReview { local: false })
+        );
+        assert_eq!(
+            err.to_string(),
+            "PR diff is empty (all files excluded by globs, or no changes) — nothing to review.",
+            "the message is unchanged from the plain error it replaces"
+        );
+    }
+
+    /// A lockfile-only PR that was given a "Reviewing…" placeholder must not leave
+    /// it there: the bot now settles NothingToReview instead of retrying, so
+    /// nothing else would ever replace it.
+    #[tokio::test]
+    async fn nothing_to_review_replaces_the_placeholder() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "html_url": "https://x/1" })),
+            )
+            .mount(&srv)
+            .await;
+        let mut live = input();
+        live.dry_run = false;
+        live.placeholder = true;
+
+        let err = run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("a lockfile-only PR has nothing to review");
+        assert!(err.downcast_ref::<NothingToReview>().is_some());
+
+        let posts: Vec<String> = srv
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == "POST" && r.url.path() == "/repos/o/r/issues/1/comments"
+            })
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            posts.len(),
+            2,
+            "the placeholder, then its replacement: {posts:?}"
+        );
+        assert!(
+            posts[0].contains("Reviewing"),
+            "first the placeholder: {}",
+            posts[0]
+        );
+        assert!(
+            posts[1].contains("No reviewable source changes"),
+            "then the note that replaces it: {}",
+            posts[1]
+        );
+    }
+
+    /// A replacement that fails is an ordinary, retryable error — not
+    /// NothingToReview, which would have the caller settle and keep the stuck
+    /// placeholder.
+    #[tokio::test]
+    async fn a_failed_placeholder_replacement_is_not_nothing_to_review() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&srv)
+            .await;
+        // The placeholder posts; the replacement then fails.
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "html_url": "https://x/1" })),
+            )
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&srv)
+            .await;
+        let mut live = input();
+        live.dry_run = false;
+        live.placeholder = true;
+
+        let err = run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("the replacement failed");
+        assert!(
+            err.downcast_ref::<NothingToReview>().is_none(),
+            "a caller must retry this, not settle it: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("placeholder could not be replaced"));
+    }
+
+    /// A placeholder that failed to post leaves nothing to replace, so the PR
+    /// stays silent: no "no reviewable changes" note appears from nowhere.
+    #[tokio::test]
+    async fn a_placeholder_that_never_posted_is_not_replaced() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&srv)
+            .await;
+        // The placeholder POST fails; any later POST would succeed.
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "html_url": "https://x/1" })),
+            )
+            .mount(&srv)
+            .await;
+        let mut live = input();
+        live.dry_run = false;
+        live.placeholder = true;
+
+        let err = run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("nothing to review");
+        assert!(err.downcast_ref::<NothingToReview>().is_some());
+        let comment_posts = srv
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == "POST" && r.url.path() == "/repos/o/r/issues/1/comments"
+            })
+            .count();
+        assert_eq!(
+            comment_posts, 1,
+            "only the failed placeholder attempt, no replacement"
+        );
+    }
+
+    /// The same PR without a placeholder stays silent: nothing is posted.
+    #[tokio::test]
+    async fn nothing_to_review_without_a_placeholder_posts_nothing() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        let mut live = input();
+        live.dry_run = false;
+        run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("nothing to review");
+        let posts = srv
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .into_iter()
+            .filter(|r| r.method.as_str() != "GET")
+            .count();
+        assert_eq!(posts, 0, "a PR the engine never commented on stays silent");
     }
 
     /// [`github_stub`] over a caller-chosen diff, for tests that need particular
