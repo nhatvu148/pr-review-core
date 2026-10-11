@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A `yarn.lock` version bump is scanned for CVEs.** `parse_yarn_lock` read added lines only, but `yarn.lock` is a block format: the `"pkg@range":` header names the package and an indented `version` line pins it. Upgrading within the declared range (`yarn upgrade`, a Dependabot bump) rewrites only the `version` line and leaves the header as unchanged context, so the parser had a version with no name and reported nothing. A bumped npm dependency in a Yarn project went through the advisory scan unchecked, while the same bump in `package-lock.json` was caught. It now reads the whole hunk like the TOML, `package-lock.json` and `composer.lock` parsers, and still emits only when the version line was added; an unchanged version line in context closes its block, so an untouched pin is never reported. Found by a `/code-review` run on PR #54, which the bot's own review of that PR missed.
+- The private end-to-end fixture `prbot-lockfile-smoke` covers the four TOML-style formats only, so this path is exercised by unit tests (classic and berry dialects, plus an unchanged-pin control), not yet by a fixture PR.
+
 ## 0.39.0
 
 **"Nothing to review" is a typed outcome, so a queue can settle a lockfile-only PR instead of dead-lettering it.**
