@@ -438,21 +438,27 @@ async fn run() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let (human, json_out) = output_mode(&args);
-    settle(dispatch(args).await, human, json_out.as_deref())
+    let (settles, json_out) = output_mode(&args);
+    settle(dispatch(args).await, settles, json_out.as_deref())
 }
 
-/// Whether this invocation prints human-readable output, and where `--json-out`
-/// writes — the two facts [`settle`] needs. The flat path is human unless
-/// `--json`; the review subcommands are JSON unless `--human`. Any other
-/// operation never returns [`NothingToReview`], so it is treated as JSON and keeps
+/// Whether an empty review may exit 0 here, and where `--json-out` writes — the
+/// two facts [`settle`] needs.
+///
+/// It may only when the output is for a person (the flat path unless `--json`,
+/// a review subcommand with `--human`) AND no `--fail-on` gate was requested. A
+/// gated PR run that reviewed nothing has not verified anything: with the scan
+/// off, failed or truncated it returns no advisories and then
+/// [`NothingToReview`], and exiting 0 would pass the gate on exactly the
+/// lockfile-only PRs it exists for — the case [`unverified_gate`] blocks on the
+/// normal path. Any other operation never returns `NothingToReview`, so it keeps
 /// whatever error it returns.
 fn output_mode(args: &Args) -> (bool, Option<PathBuf>) {
     match &args.op {
         Some(Op::ReviewLocal(a)) => (a.human, a.json_out.clone()),
-        Some(Op::ReviewPr(a)) => (a.human, a.json_out.clone()),
+        Some(Op::ReviewPr(a)) => (a.human && a.fail_on.is_empty(), a.json_out.clone()),
         Some(_) => (false, None),
-        None => (!args.json, args.json_out.clone()),
+        None => (!args.json && args.fail_on.is_empty(), args.json_out.clone()),
     }
 }
 
@@ -462,7 +468,7 @@ fn output_mode(args: &Args) -> (bool, Option<PathBuf>) {
 /// exited 1, which a pre-push hook or a CI step reads as a broken reviewer.
 ///
 /// Where stdout is a JSON contract (`--json`, or a review subcommand without
-/// `--human`) it stays an error: exiting 0 with nothing to parse would break a
+/// `--human`), or a `--fail-on` gate was requested, it stays an error: exiting 0 with nothing to parse would break a
 /// caller that checks the status and then parses. And an existing `--json-out`
 /// target is removed first, because a file from an earlier run would otherwise
 /// read as this run's verdict after an exit 0.
@@ -471,11 +477,11 @@ fn output_mode(args: &Args) -> (bool, Option<PathBuf>) {
 /// vulnerable dependency gets an advisory-only review, not [`NothingToReview`].
 fn settle(
     result: anyhow::Result<()>,
-    human: bool,
+    settles: bool,
     json_out: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
     match result {
-        Err(e) if human && e.downcast_ref::<NothingToReview>().is_some() => {
+        Err(e) if settles && e.downcast_ref::<NothingToReview>().is_some() => {
             if let Some(path) = json_out {
                 match std::fs::remove_file(path) {
                     Ok(()) => {}
@@ -1359,6 +1365,55 @@ mod tests {
             "x.json",
         ]));
         assert_eq!(out.as_deref(), Some(Path::new("x.json")));
+    }
+
+    /// A requested gate must never pass on a run that verified nothing: with the
+    /// scan off or failed, a lockfile-only PR returns no advisories and then
+    /// `NothingToReview`, and exiting 0 would turn a CI gate green unchecked.
+    #[test]
+    fn a_fail_on_gate_never_settles_an_empty_review() {
+        let parse = |argv: &[&str]| Args::try_parse_from(argv).expect("parses");
+        let flat = parse(&[
+            "kaniscope",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "1",
+            "--fail-on",
+            "advisories",
+        ]);
+        assert!(!output_mode(&flat).0, "flat PR mode with --fail-on settled");
+        let sub = parse(&[
+            "kaniscope",
+            "review-pr",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "1",
+            "--human",
+            "--fail-on",
+            "advisories",
+        ]);
+        assert!(
+            !output_mode(&sub).0,
+            "review-pr --human with --fail-on settled"
+        );
+        assert!(settle(Err(nothing()), output_mode(&sub).0, None).is_err());
+        // Without a gate, the same human PR run does settle.
+        let ungated = parse(&[
+            "kaniscope",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "1",
+        ]);
+        assert!(output_mode(&ungated).0);
     }
 
     #[test]
