@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-**A PR from an outside author is reviewed without a clone, and `.prbot.toml` is read from the base branch.**
+**Untrusted input stays untrusted: the clone keeps no token and the tools cannot read `.git`; a PR from an author without write access is reviewed without a clone; `.prbot.toml` is read from the base branch.**
 
 ### Migration — every consumer this breaks
 
@@ -15,6 +15,8 @@ Both consumers' Claude Code backends clone for themselves, so each also needs a 
 
 ### Behaviour changes — these ship silently
 
+- **A clone whose credential cannot be scrubbed is an error.** `Workspace::clone` now fails, rather than returning a checkout with a token in it, if rewriting `origin` fails or the credential is still found in `.git` afterwards. A caller that degrades to a diff-only review on a clone error (both bots do) does that instead.
+- **`read_file`, `read_raw`, `list_dir` and `grep` refuse `.git`.** A path under `.git`, at any depth and by any spelling (including a committed symlink into it), is an error. `list_dir` omits `.git` entries, and `grep` no longer searches it. A review never needed anything there.
 - **On GitHub, a PR from anyone without write access to the repository gets a diff-only review.** No clone and no repository tools, even with `AGENTIC=true`. Trust comes from the author's effective permission (GitHub's collaborator-permission endpoint): `admin`, `maintain` and `write` may clone, while `read`, `triage`, `none` and outside contributors may not. The endpoint costs one more API call per review. A lookup that fails counts as untrusted, so it fails closed. The summary says so when a clone was actually withheld (`AGENTIC` on, or a backend that clones for itself): "This PR's author does not have write access to this repository, so the review read the diff only." Bot accounts such as Dependabot usually land here. These reviews lose cross-file depth.
 - **`.prbot.toml` is read from the base branch, not the PR head.** A PR that edits it is reviewed under the settings it would replace, and its summary says the change takes effect once merged. When the provider reports no base branch, no `.prbot.toml` is read at all. There is no fallback to the head. `kaniscope get-rules` reports the same source.
 
@@ -26,10 +28,12 @@ Both consumers' Claude Code backends clone for themselves, so each also needs a 
 
 ### Fixed
 
+- **The clone token was left in `.git/config` for the whole review.** `Workspace::clone` clones from a token-bearing URL, and git writes that URL into the clone's remote config. Its only protections were a private directory and redacted error messages. The agentic reviewer reads that same clone, and a prompt injection in the pull request could ask for `.git/config`: `read_file` and `grep` would both return it (`grep` walks dotfiles, so `.git` included). A token minted for an installation is not scoped to the reviewed repository, so this could expose every repository the installation reaches. Once git is done with the network, the remote is rewritten without the credential, and all of `.git` except `objects/` is searched for any copy left behind (`FETCH_HEAD`, reflog messages). Verified against a real authenticated clone of a private repository: before the fix the token was in `.git/config`, and after it no file in the checkout contains it. The Claude Code backends in `pr-review-bot` and `simcel-pr-bot` already deny `Read(./.git/**)` as a stopgap; this fixes it at the source, and for the OpenRouter agentic path, which had no stopgap.
 - **A PR could configure its own review.** `.prbot.toml` was fetched at the PR's head commit. So a PR could add `exclude_globs` covering the files it changes, raise `min_confidence` past its own findings, or add `instructions` telling the reviewer to report nothing, and its own review would obey.
 - **Anyone who could open a PR could reach the reviewer's tools.** Every attack found on the agentic reviewer so far needs the clone: a `.claude/settings.json` hook or `.mcp.json` server for the agent-CLI backends, a token in `.git/config`, a prompt injection asking for a file. Outside authors no longer get one.
 
-Known limits: Bitbucket and GitLab are not asked for a permission, so on those hosts every PR is still treated as trusted and cloned when agentic review is on. The trusted set is fixed (`admin`, `maintain`, `write`), with no setting to change it. If the token cannot read collaborator permissions, every review fails closed to diff-only; that is logged at WARN on each review. The local path (`run_review_local`) still reads the working tree's `.prbot.toml`, because its operator owns the process; a local review of a change that edits the file applies the edit, where the PR review of the same commit does not.
+Known limits: the token still reaches git during the clone itself, in its arguments, for the seconds the clone runs; nothing that reads the clone runs in that window. Scoping the minted token to the reviewed repository is the caller's job (the GitHub App mints it) and is not part of this change. Bitbucket and GitLab are not asked for a permission, so on those hosts every PR is still treated as trusted and cloned when agentic review is on. The trusted set is fixed (`admin`, `maintain`, `write`), with no setting to change it. If the token cannot read collaborator permissions, every review fails closed to diff-only; that is logged at WARN on each review. The local path (`run_review_local`) still reads the working tree's `.prbot.toml`, because its operator owns the process; a local review of a change that edits the file applies the edit, where the PR review of the same commit does not.
+
 
 ## 0.39.1
 

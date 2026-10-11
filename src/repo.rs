@@ -36,6 +36,17 @@ impl Workspace {
 
     /// Shallow-clone `clone_url` (which must embed any auth) and check out
     /// `head_sha`. Falls back to the default branch if the sha can't be fetched.
+    ///
+    /// The returned checkout holds no credentials: once git is done with the
+    /// network, `origin` is rewritten without them and `.git` is checked for any
+    /// copy left behind. If either step fails this is an error, not a checkout
+    /// with a token in it.
+    ///
+    /// So the checkout cannot fetch on demand. It is a partial (`blob:none`),
+    /// sparse clone, and a later git command that needs a missing object — a
+    /// `git show`, `git log -p`, widening the sparse set — tries `origin` without
+    /// auth and fails. Read the files on disk; nothing in this crate runs git in
+    /// the checkout afterwards.
     pub fn clone(clone_url: &str, head_sha: Option<&str>) -> Result<Self> {
         let tmp = tempfile::tempdir().context("create temp dir for clone")?;
         let root = tmp.path().to_path_buf();
@@ -76,6 +87,8 @@ impl Workspace {
             }
         }
 
+        scrub_clone_credentials(&root, clone_url)?;
+
         Ok(Self {
             _tmp: Some(tmp),
             root,
@@ -84,6 +97,12 @@ impl Workspace {
 
     /// Resolve a repo-relative path and ensure it stays inside the clone root.
     fn resolve(&self, rel: &str) -> Result<PathBuf> {
+        // By name first, so the refusal does not depend on the file existing: on
+        // a case-sensitive filesystem `.GIT/config` would otherwise fail as "not
+        // found" rather than as refused.
+        if in_git_dir(Path::new(rel)) {
+            bail!("{GIT_DIR_REFUSED}: {rel}");
+        }
         let candidate = self.root.join(rel.trim_start_matches('/'));
         let canon = candidate
             .canonicalize()
@@ -91,6 +110,11 @@ impl Workspace {
         let root = self.root.canonicalize()?;
         if !canon.starts_with(&root) {
             bail!("path escapes the repository: {rel}");
+        }
+        // Checked on the canonical path, so a committed `cfg -> .git/config`
+        // link is refused along with the direct spelling.
+        if in_git_dir(canon.strip_prefix(&root).unwrap_or(&canon)) {
+            bail!("{GIT_DIR_REFUSED}: {rel}");
         }
         Ok(canon)
     }
@@ -136,6 +160,9 @@ impl Workspace {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&path).with_context(|| format!("list {rel}"))? {
             let entry = entry?;
+            if is_git_name(&entry.file_name()) {
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let file_type = entry.file_type()?;
             if file_type.is_symlink() {
@@ -215,7 +242,13 @@ impl Workspace {
         let mut matches = 0usize;
         let root = self.root.canonicalize()?;
 
-        for result in WalkBuilder::new(&root).hidden(false).build() {
+        // `hidden(false)` so dotfiles are searched, which would include `.git`;
+        // pruned here for the reason `in_git_dir` gives.
+        for result in WalkBuilder::new(&root)
+            .hidden(false)
+            .filter_entry(|e| !is_git_name(e.file_name()))
+            .build()
+        {
             let entry = match result {
                 Ok(e) => e,
                 Err(_) => continue,
@@ -670,6 +703,98 @@ fn clone_with_retry(clone_url: &str, root: &Path) -> Result<()> {
     )
 }
 
+/// What a tool says when asked for anything under `.git`.
+const GIT_DIR_REFUSED: &str = "the repository's .git directory is not readable";
+
+/// Whether a clone-relative path is inside a `.git` directory, at any depth.
+///
+/// The reviewer reads a clone of someone else's pull request, and a prompt
+/// injection in it can ask for anything the tools can reach. `.git` holds
+/// nothing a review needs, and it is where git keeps remote URLs, which is
+/// where a token lands if one ever does.
+///
+/// Case-insensitive: on macOS and Windows `.GIT/config` opens the same file.
+fn in_git_dir(rel: &Path) -> bool {
+    rel.components().any(|c| is_git_name(c.as_os_str()))
+}
+
+/// Whether a path component is `.git`, in any case.
+fn is_git_name(name: &std::ffi::OsStr) -> bool {
+    name.eq_ignore_ascii_case(".git")
+}
+
+/// Shortest password-less userinfo treated as a token rather than a username.
+/// Tokens are long (`ghp_` ones are 40 characters); a username like `git` is
+/// neither a secret nor safe to search for — it appears in git's own sample hooks
+/// and would fail every clone.
+const MIN_BARE_TOKEN_LEN: usize = 20;
+
+/// Split the credentials out of a `scheme://userinfo@host/...` URL, returning the
+/// URL without them and the secret to look for: the password, or the whole
+/// userinfo when it is a bare token (`https://ghp_xxx@github.com/...`).
+fn split_credentials(url: &str) -> Option<(String, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (userinfo, host) = rest[..authority_end].rsplit_once('@')?;
+    let secret = match userinfo.split_once(':') {
+        Some((_, pass)) => pass,
+        None if userinfo.len() >= MIN_BARE_TOKEN_LEN => userinfo,
+        None => return None,
+    };
+    if secret.is_empty() {
+        return None;
+    }
+    let stripped = format!("{scheme}://{host}{}", &rest[authority_end..]);
+    Some((stripped, secret.to_string()))
+}
+
+/// Rewrite `origin` without the clone URL's credentials, then refuse the checkout
+/// if the secret survives anywhere under `.git`.
+///
+/// Every git call that needs the network has already run by now, and nothing
+/// later runs git in the clone, so the credential is no longer needed. Rewriting
+/// the remote alone is not trusted to be enough: other places can carry the URL
+/// (`FETCH_HEAD`, reflog messages), and which ones do varies across git versions.
+/// So the whole metadata tree is searched, except `objects/`, which holds the
+/// repository's own content and would report a token that is committed in it.
+fn scrub_clone_credentials(root: &Path, clone_url: &str) -> Result<()> {
+    let Some((stripped, secret)) = split_credentials(clone_url) else {
+        return Ok(());
+    };
+    run_git_bounded(
+        &["remote", "set-url", "origin", &stripped],
+        Some(root),
+        CLONE_ATTEMPT_TIMEOUT,
+    )
+    .context("remove the credentials from the clone's remote")?;
+    let git_dir = root.join(".git");
+    // The object store itself, by full path: a ref or log entry that happens to
+    // be named `objects` is metadata and is still searched.
+    let objects = git_dir.join("objects");
+    for entry in WalkBuilder::new(&git_dir)
+        .standard_filters(false)
+        .filter_entry(move |e| e.path() != objects)
+        .build()
+    {
+        // An unreadable entry fails the scrub rather than being skipped: a file
+        // that cannot be searched cannot be said to be clean.
+        let entry = entry.context("walk the clone's .git")?;
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let bytes = std::fs::read(entry.path())
+            .with_context(|| format!("read {}", entry.path().display()))?;
+        if bytes.windows(secret.len()).any(|w| w == secret.as_bytes()) {
+            let rel = entry.path().strip_prefix(root).unwrap_or(entry.path());
+            bail!(
+                "the clone credential is still on disk in {} after scrubbing",
+                rel.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Create `path` as a directory only this user can enter.
 ///
 /// The clone writes the token-bearing remote URL into `.git/config`, so the
@@ -1065,6 +1190,193 @@ mod tests {
         let d = fixture();
         let ws = Workspace::from_dir(d.path());
         assert!(ws.read_file("../../etc/passwd", None, None).is_err());
+    }
+
+    /// A clone of a pull request is the author's, and a prompt injection in it
+    /// can ask for anything the tools reach. `.git` is where a remote URL — and
+    /// so a token, if one is ever left there — lives.
+    fn fixture_with_git_dir() -> tempfile::TempDir {
+        let d = fixture();
+        fs::create_dir(d.path().join(".git")).unwrap();
+        fs::write(
+            d.path().join(".git/config"),
+            "[remote \"origin\"]\n\turl = https://x-access-token:GITCANARY@github.com/o/r.git\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(".git/config", d.path().join("cfg")).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_tools_refuse_to_read_the_git_dir_by_any_spelling() {
+        let d = fixture_with_git_dir();
+        let ws = Workspace::from_dir(d.path());
+        let mut spellings = vec![
+            ".git/config",
+            "/.git/config",
+            "src/../.git/config",
+            // Opens `.git/config` on a case-insensitive filesystem; refused
+            // everywhere, by name, so the guard does not depend on which one.
+            ".GIT/config",
+        ];
+        if cfg!(unix) {
+            spellings.push("cfg");
+        }
+        for rel in spellings {
+            let err = ws.read_file(rel, None, None).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(super::GIT_DIR_REFUSED),
+                "{rel}: {err:#}"
+            );
+            assert!(ws.read_raw(rel).is_err(), "{rel}");
+        }
+        assert!(ws.list_dir(".git").is_err());
+    }
+
+    #[test]
+    fn the_git_dir_is_neither_listed_nor_searched() {
+        let d = fixture_with_git_dir();
+        let ws = Workspace::from_dir(d.path());
+        assert!(
+            !ws.list_dir(".")
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with(".git")),
+            "{:?}",
+            ws.list_dir(".").unwrap()
+        );
+        let hits = ws.grep("GITCANARY", 10).unwrap();
+        assert!(hits.is_empty(), "{hits:?}");
+        // Still a working grep: dotfiles outside `.git` are searched.
+        fs::write(d.path().join(".env.example"), "GITCANARY_EXAMPLE=1\n").unwrap();
+        assert_eq!(ws.grep("GITCANARY", 10).unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::*;
+
+    #[test]
+    fn credentials_are_split_from_the_url_in_either_form() {
+        assert_eq!(
+            split_credentials("https://x-access-token:ghs_abc@github.com/o/r.git"),
+            Some((
+                "https://github.com/o/r.git".to_string(),
+                "ghs_abc".to_string()
+            ))
+        );
+        assert_eq!(
+            split_credentials(
+                "https://ghp_0123456789abcdefghij0123456789abcdef@github.com/o/r.git"
+            ),
+            Some((
+                "https://github.com/o/r.git".to_string(),
+                "ghp_0123456789abcdefghij0123456789abcdef".to_string()
+            ))
+        );
+        // A short password-less userinfo is a username, not a token.
+        assert_eq!(split_credentials("https://git@github.com/o/r.git"), None);
+        // An `@` in the path is not userinfo.
+        assert_eq!(split_credentials("https://github.com/o/r@v1.git"), None);
+        assert_eq!(split_credentials("https://github.com/o/r.git"), None);
+        assert_eq!(split_credentials("/local/path"), None);
+    }
+
+    fn repo_with_remote(url: &str) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        for args in [
+            &["init", "--quiet"][..],
+            &["remote", "add", "origin", url][..],
+        ] {
+            run_git_bounded(args, Some(d.path()), Duration::from_secs(10)).unwrap();
+        }
+        d
+    }
+
+    const URL: &str = "https://x-access-token:ghs_SCRUBME@github.com/o/r.git";
+
+    #[test]
+    fn scrubbing_rewrites_the_remote_without_its_credentials() {
+        let d = repo_with_remote(URL);
+        scrub_clone_credentials(d.path(), URL).expect("a clean scrub");
+        let config = std::fs::read_to_string(d.path().join(".git/config")).unwrap();
+        assert!(!config.contains("ghs_SCRUBME"), "{config}");
+        assert!(
+            config.contains("url = https://github.com/o/r.git"),
+            "{config}"
+        );
+    }
+
+    /// The remote is not the only place a URL can land. Rather than enumerate
+    /// them per git version, the scrub searches all of `.git` and refuses the
+    /// checkout when a copy survives.
+    #[test]
+    fn a_credential_left_anywhere_in_the_metadata_fails_the_clone() {
+        let d = repo_with_remote(URL);
+        std::fs::write(
+            d.path().join(".git/FETCH_HEAD"),
+            format!("abc123\t\tbranch 'main' of {URL}\n"),
+        )
+        .unwrap();
+        let err = scrub_clone_credentials(d.path(), URL).unwrap_err();
+        assert!(format!("{err:#}").contains("FETCH_HEAD"), "{err:#}");
+    }
+
+    /// `objects/` is the repository's own content. A token committed in it is
+    /// the repository's business, not a leak of ours, and must not fail clones.
+    #[test]
+    fn the_object_store_is_not_searched() {
+        let d = repo_with_remote(URL);
+        let obj = d.path().join(".git/objects/ab");
+        std::fs::create_dir_all(&obj).unwrap();
+        std::fs::write(obj.join("cdef"), "ghs_SCRUBME").unwrap();
+        scrub_clone_credentials(d.path(), URL).expect("objects are skipped");
+    }
+
+    /// Only the object store is skipped, by full path: metadata that happens to
+    /// be named `objects` (a ref, a log) is still searched.
+    #[test]
+    fn a_ref_named_objects_is_still_searched() {
+        let d = repo_with_remote(URL);
+        let refs = d.path().join(".git/refs/heads");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("objects"), "ghs_SCRUBME").unwrap();
+        assert!(scrub_clone_credentials(d.path(), URL).is_err());
+    }
+
+    #[test]
+    fn a_url_without_credentials_is_left_alone() {
+        let d = repo_with_remote("https://github.com/o/r.git");
+        scrub_clone_credentials(d.path(), "https://github.com/o/r.git").unwrap();
+    }
+
+    /// End to end against a real host, because which files git writes the URL
+    /// into is git's behaviour, not ours. Needs a token-bearing clone URL for a
+    /// repository the token can read:
+    ///
+    /// ```sh
+    /// PRBOT_TEST_CLONE_URL="https://x-access-token:$(gh auth token)@github.com/OWNER/PRIVATE_REPO.git" \
+    ///   cargo test --all-features -- --ignored a_real_authenticated_clone
+    /// ```
+    #[test]
+    #[ignore = "needs network and a token-bearing PRBOT_TEST_CLONE_URL"]
+    fn a_real_authenticated_clone_leaves_no_credential_on_disk() {
+        let url = std::env::var("PRBOT_TEST_CLONE_URL").expect("PRBOT_TEST_CLONE_URL");
+        let (_, secret) = split_credentials(&url).expect("the URL carries a credential");
+        let ws = Workspace::clone(&url, None).expect("clone");
+        for entry in WalkBuilder::new(ws.root()).standard_filters(false).build() {
+            let entry = entry.unwrap();
+            if entry.file_type().is_some_and(|t| t.is_file()) {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                assert!(
+                    !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+                    "credential found in {}",
+                    entry.path().display()
+                );
+            }
+        }
     }
 }
 
