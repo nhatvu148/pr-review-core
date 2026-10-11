@@ -97,6 +97,12 @@ impl Workspace {
 
     /// Resolve a repo-relative path and ensure it stays inside the clone root.
     fn resolve(&self, rel: &str) -> Result<PathBuf> {
+        // By name first, so the refusal does not depend on the file existing: on
+        // a case-sensitive filesystem `.GIT/config` would otherwise fail as "not
+        // found" rather than as refused.
+        if in_git_dir(Path::new(rel)) {
+            bail!("{GIT_DIR_REFUSED}: {rel}");
+        }
         let candidate = self.root.join(rel.trim_start_matches('/'));
         let canon = candidate
             .canonicalize()
@@ -154,7 +160,7 @@ impl Workspace {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&path).with_context(|| format!("list {rel}"))? {
             let entry = entry?;
-            if entry.file_name() == ".git" {
+            if is_git_name(&entry.file_name()) {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -240,7 +246,7 @@ impl Workspace {
         // pruned here for the reason `in_git_dir` gives.
         for result in WalkBuilder::new(&root)
             .hidden(false)
-            .filter_entry(|e| e.file_name() != ".git")
+            .filter_entry(|e| !is_git_name(e.file_name()))
             .build()
         {
             let entry = match result {
@@ -706,8 +712,15 @@ const GIT_DIR_REFUSED: &str = "the repository's .git directory is not readable";
 /// injection in it can ask for anything the tools can reach. `.git` holds
 /// nothing a review needs, and it is where git keeps remote URLs, which is
 /// where a token lands if one ever does.
+///
+/// Case-insensitive: on macOS and Windows `.GIT/config` opens the same file.
 fn in_git_dir(rel: &Path) -> bool {
-    rel.components().any(|c| c.as_os_str() == ".git")
+    rel.components().any(|c| is_git_name(c.as_os_str()))
+}
+
+/// Whether a path component is `.git`, in any case.
+fn is_git_name(name: &std::ffi::OsStr) -> bool {
+    name.eq_ignore_ascii_case(".git")
 }
 
 /// Shortest password-less userinfo treated as a token rather than a username.
@@ -1199,7 +1212,14 @@ mod tests {
     fn the_tools_refuse_to_read_the_git_dir_by_any_spelling() {
         let d = fixture_with_git_dir();
         let ws = Workspace::from_dir(d.path());
-        let mut spellings = vec![".git/config", "/.git/config", "src/../.git/config"];
+        let mut spellings = vec![
+            ".git/config",
+            "/.git/config",
+            "src/../.git/config",
+            // Opens `.git/config` on a case-insensitive filesystem; refused
+            // everywhere, by name, so the guard does not depend on which one.
+            ".GIT/config",
+        ];
         if cfg!(unix) {
             spellings.push("cfg");
         }
