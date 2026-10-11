@@ -78,7 +78,14 @@ prompt through [`Config`].
   hygiene findings on or propose edits inside), confidence/caps, `pr_body` and
   `pr_body_max_chars` (how much of the PR description the reviewer reads — a repo
   whose PRs run long descriptions wants a higher cap), `grep_context`, and adds
-  free-text review `instructions`.
+  free-text review `instructions`. On a pull request it is read from the base
+  branch, never the PR's head, so a PR cannot change the settings it is reviewed
+  under; a PR that edits the file is told its change applies once merged.
+- **Untrusted authors get a diff-only review**: on GitHub, a PR from anyone without
+  write access to the repository (by its collaborator permission) is reviewed
+  without cloning it, so nothing in the PR's tree reaches the reviewer's tools. A
+  permission that cannot be looked up counts as untrusted. Bitbucket and GitLab are
+  not asked and are unaffected.
 - **Benchmark harness**: `examples/bench.rs` scores the reviewer against a corpus
   of PRs with known issues (`examples/bench-corpus.example.json`) — reporting
   precision / recall / F1 and token cost, so a feature's effect (blast radius,
