@@ -13,6 +13,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "kaniscope": "^0.39.1"
+    "kaniscope": "^0.40.0"
   }
 }
