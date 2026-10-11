@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Behaviour changes — these ship silently
+
+- **`kaniscope` exits 0 when there is nothing to review and the output is for a person.** A lockfile-only branch leaves no reviewable diff once the globs drop the lockfile, and `NothingToReview` used to exit 1, so a pre-push hook or a CI step read every such run as a broken reviewer. The flat path without `--json`, and `review-local` / `review-pr` with `--human`, now print the reason on stderr and exit 0, after removing an existing `--json-out` target so a file from an earlier run cannot pass for this run's verdict. Where stdout is a JSON contract (`--json`, or a review subcommand without `--human`) it still exits 1, since exiting 0 with nothing to parse would break a caller that checks the status and then parses; the npm and PyPI clients use that path and see no change. An empty diff that adds a vulnerable dependency is unaffected: it already gets an advisory-only review. `pr-review-bot`'s CLI made the same change in its #126.
+
 ## 0.39.1
 
 **A `yarn.lock` version bump is now scanned for CVEs.**

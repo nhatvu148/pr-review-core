@@ -54,7 +54,8 @@ use clap::Parser;
 use pr_review_core::backend::OpenRouterBackend;
 use pr_review_core::config::Config;
 use pr_review_core::review::{
-    run_review, run_review_local, LocalReviewInput, RunReviewInput, RunReviewOutput,
+    run_review, run_review_local, LocalReviewInput, NothingToReview, RunReviewInput,
+    RunReviewOutput,
 };
 
 /// The toolbox surface: one explicit operation per subcommand.
@@ -437,7 +438,62 @@ async fn run() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let (human, json_out) = output_mode(&args);
+    settle(dispatch(args).await, human, json_out.as_deref())
+}
 
+/// Whether this invocation prints human-readable output, and where `--json-out`
+/// writes — the two facts [`settle`] needs. The flat path is human unless
+/// `--json`; the review subcommands are JSON unless `--human`. Any other
+/// operation never returns [`NothingToReview`], so it is treated as JSON and keeps
+/// whatever error it returns.
+fn output_mode(args: &Args) -> (bool, Option<PathBuf>) {
+    match &args.op {
+        Some(Op::ReviewLocal(a)) => (a.human, a.json_out.clone()),
+        Some(Op::ReviewPr(a)) => (a.human, a.json_out.clone()),
+        Some(_) => (false, None),
+        None => (!args.json, args.json_out.clone()),
+    }
+}
+
+/// A diff with nothing reviewable — empty, or every file excluded by the globs,
+/// as on a lockfile-only branch — is an outcome, not a failure. When the output
+/// is meant for a person it exits 0 with the reason on stderr; as an error it
+/// exited 1, which a pre-push hook or a CI step reads as a broken reviewer.
+///
+/// Where stdout is a JSON contract (`--json`, or a review subcommand without
+/// `--human`) it stays an error: exiting 0 with nothing to parse would break a
+/// caller that checks the status and then parses. And an existing `--json-out`
+/// target is removed first, because a file from an earlier run would otherwise
+/// read as this run's verdict after an exit 0.
+///
+/// Only reached when there were no advisories either: an empty diff that adds a
+/// vulnerable dependency gets an advisory-only review, not [`NothingToReview`].
+fn settle(
+    result: anyhow::Result<()>,
+    human: bool,
+    json_out: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    match result {
+        Err(e) if human && e.downcast_ref::<NothingToReview>().is_some() => {
+            if let Some(path) = json_out {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(anyhow::Error::new(err)
+                            .context(format!("removing stale {}", path.display())))
+                    }
+                }
+            }
+            eprintln!("{e}");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
+async fn dispatch(args: Args) -> anyhow::Result<()> {
     // Before any config read or network call: a schema dump is a pure function of
     // the binary, and demanding a key for it would make the typed-client
     // generation step need production credentials.
@@ -1223,12 +1279,87 @@ fn run_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        change_intent, enforce_gate, tmp_sibling, tripped_gate, unverified_gate, usable_branch,
-        Args, FailOn, GateTripped,
+        change_intent, enforce_gate, output_mode, settle, tmp_sibling, tripped_gate,
+        unverified_gate, usable_branch, Args, FailOn, GateTripped, NothingToReview,
     };
     use clap::Parser;
     use pr_review_core::deps::ScanStatus;
     use std::path::Path;
+
+    fn nothing() -> anyhow::Error {
+        NothingToReview { local: true }.into()
+    }
+
+    /// Human output settles an empty review as success; any other error still
+    /// fails.
+    #[test]
+    fn nothing_to_review_exits_zero_for_human_output() {
+        assert!(settle(Err(nothing()), true, None).is_ok());
+        assert!(settle(Err(anyhow::anyhow!("provider down")), true, None).is_err());
+        assert!(settle(Ok(()), true, None).is_ok());
+    }
+
+    /// Where stdout is a JSON contract, exiting 0 with nothing on it would break
+    /// a caller that checks the status and then parses.
+    #[test]
+    fn a_json_caller_still_gets_an_error_for_nothing_to_review() {
+        assert!(settle(Err(nothing()), false, None).is_err());
+    }
+
+    /// A `--json-out` from an earlier run must not survive an exit 0 that wrote
+    /// nothing, or it reads as this run's verdict.
+    #[test]
+    fn a_stale_json_out_is_removed_when_there_is_nothing_to_review() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("branch.json");
+        std::fs::write(&path, "{\"findings\":3}").expect("seed");
+        assert!(settle(Err(nothing()), true, Some(&path)).is_ok());
+        assert!(!path.exists(), "the stale file survived");
+        assert!(settle(Err(nothing()), true, Some(&path)).is_ok());
+    }
+
+    /// Which output contract each mode has: the flat path is human unless
+    /// `--json`; the review subcommands are JSON unless `--human`.
+    #[test]
+    fn the_output_mode_follows_each_surfaces_default() {
+        let parse = |argv: &[&str]| Args::try_parse_from(argv).expect("parses");
+        assert!(output_mode(&parse(&["kaniscope", "--local", "--base", "main"])).0);
+        assert!(
+            !output_mode(&parse(&[
+                "kaniscope",
+                "--local",
+                "--base",
+                "main",
+                "--json"
+            ]))
+            .0
+        );
+        assert!(!output_mode(&parse(&["kaniscope", "review-local", "--base", "main"])).0);
+        assert!(
+            output_mode(&parse(&[
+                "kaniscope",
+                "review-local",
+                "--base",
+                "main",
+                "--human"
+            ]))
+            .0
+        );
+        let (_, out) = output_mode(&parse(&[
+            "kaniscope",
+            "review-pr",
+            "--provider",
+            "github",
+            "--repo",
+            "o/r",
+            "--pr",
+            "1",
+            "--human",
+            "--json-out",
+            "x.json",
+        ]));
+        assert_eq!(out.as_deref(), Some(Path::new("x.json")));
+    }
 
     #[test]
     fn a_real_branch_name_is_used() {
