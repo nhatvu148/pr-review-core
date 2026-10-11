@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         head_sha: None,
         body: None,
         ci_status: None,
-        author_association: None,
+        author_permission: None,
     };
 
     let system = format!(

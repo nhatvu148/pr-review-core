@@ -983,7 +983,7 @@ mod tests {
             head_sha: None,
             body: None,
             ci_status: None,
-            author_association: None,
+            author_permission: None,
         };
         // Exercise the clamp through the same builder the backend uses.
         let truncated = huge.chars().count() > cfg.max_diff_chars;

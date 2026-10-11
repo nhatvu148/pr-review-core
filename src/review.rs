@@ -767,11 +767,11 @@ fn reanchor(
 
 /// Whether a pull request's author is trusted to have it cloned.
 ///
-/// Trusted: GitHub's `OWNER`, `MEMBER` and `COLLABORATOR` — people who could push
-/// to the repository without a PR, so the clone gives them nothing they lacked.
-/// Everyone else (`CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `NONE`, and bots such
-/// as Dependabot) gets a diff-only review; see [`ReviewContext::may_clone`] for
-/// why the clone is the part worth withholding.
+/// Trusted: an author with `admin` or `write` permission on the repository —
+/// someone who could push without a PR, so the clone gives them nothing they
+/// lacked. Everyone else (`read`, `none`, and `unknown` when the lookup failed,
+/// which fails closed) gets a diff-only review; see
+/// [`ReviewContext::may_clone`] for why the clone is the part worth withholding.
 ///
 /// A provider that reports no association (`None`: Bitbucket, GitLab) is
 /// trusted. That keeps their reviews unchanged, and it is a gap: on those hosts
@@ -783,27 +783,28 @@ fn reanchor(
 ///
 /// let meta = |a: Option<&str>| PrMeta {
 ///     repo: "o/r".into(), pr: 1, title: None, base_branch: None, head_sha: None,
-///     body: None, ci_status: None, author_association: a.map(String::from),
+///     body: None, ci_status: None, author_permission: a.map(String::from),
 /// };
-/// assert!(author_may_clone(&meta(Some("COLLABORATOR"))));
-/// assert!(!author_may_clone(&meta(Some("FIRST_TIME_CONTRIBUTOR"))));
+/// assert!(author_may_clone(&meta(Some("write"))));
+/// assert!(!author_may_clone(&meta(Some("read"))));
+/// assert!(!author_may_clone(&meta(Some("unknown"))));
 /// assert!(author_may_clone(&meta(None)));
 /// ```
 pub fn author_may_clone(meta: &PrMeta) -> bool {
-    match meta.author_association.as_deref() {
+    match meta.author_permission.as_deref() {
         None => true,
-        Some(a) => matches!(
-            a.to_ascii_uppercase().as_str(),
-            "OWNER" | "MEMBER" | "COLLABORATOR"
+        Some(p) => matches!(
+            p.to_ascii_lowercase().as_str(),
+            "admin" | "maintain" | "write"
         ),
     }
 }
 
 /// Appended to the summary of a review that withheld the clone. A reader
 /// comparing it with a deeper review on another PR deserves to know why.
-const DIFF_ONLY_FOR_AUTHOR_NOTE: &str = "\n\n_This PR's author is not a collaborator on \
-     this repository, so the review read the diff only: no clone, no repository tools. \
-     Cross-file effects may be missed._";
+const DIFF_ONLY_FOR_AUTHOR_NOTE: &str = "\n\n_This PR's author does not have write \
+     access to this repository, so the review read the diff only: no clone, no \
+     repository tools. Cross-file effects may be missed._";
 
 /// Appended when the PR edits `.prbot.toml`, which is read from the base branch.
 const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Reviews read \
@@ -990,7 +991,7 @@ pub async fn post_review_queued(provider_name: &str, cfg: &Config, repo: &str, p
         head_sha: None,
         body: None,
         ci_status: None,
-        author_association: None,
+        author_permission: None,
     };
     let post = ReviewPost {
         summary: render_queued(),
@@ -1050,7 +1051,7 @@ pub async fn post_review_failure(
         head_sha: None,
         body: None,
         ci_status: None,
-        author_association: None,
+        author_permission: None,
     };
     let post = ReviewPost {
         summary: render_failed(err),
@@ -2306,7 +2307,7 @@ pub async fn run_review_with(
             "{}#{}: author is {:?} on the repository, reviewing the diff only",
             input.repo,
             input.pr,
-            meta.author_association
+            meta.author_permission
         );
     }
     let ctx = ReviewContext {
@@ -2522,7 +2523,7 @@ pub async fn run_review_local(
         head_sha: None,
         body: None,
         ci_status: None,
-        author_association: None,
+        author_permission: None,
     };
 
     let prepared = prepare_diff(cfg, &input.diff);
@@ -3716,10 +3717,11 @@ mod orchestrator_tests {
         s
     }
 
-    /// A GitHub stub like [`github_stub_with`], with the author's association on
-    /// the metadata and a `.prbot.toml` served per ref (base `main`, head
+    /// A GitHub stub like [`github_stub_with`], with author `alice`, her
+    /// permission answer (a permission name, or `404` / `500` for the endpoint's
+    /// failure modes), and a `.prbot.toml` served per ref (base `main`, head
     /// `deadbeef`), each setting a different `instructions` line.
-    async fn github_stub_trust(diff: &str, association: &str) -> MockServer {
+    async fn github_stub_trust(diff: &str, permission: &str) -> MockServer {
         use base64::Engine as _;
         use wiremock::matchers::query_param;
         let s = MockServer::start().await;
@@ -3737,8 +3739,18 @@ mod orchestrator_tests {
                 "body": null,
                 "base": { "ref": "main" },
                 "head": { "sha": "deadbeef" },
-                "author_association": association,
+                "user": { "login": "alice" },
             })))
+            .mount(&s)
+            .await;
+        let answer = match permission {
+            "404" => ResponseTemplate::new(404),
+            "500" => ResponseTemplate::new(500),
+            p => ResponseTemplate::new(200).set_body_json(serde_json::json!({ "permission": p })),
+        };
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/collaborators/alice/permission"))
+            .respond_with(answer)
             .mount(&s)
             .await;
         for (git_ref, rule) in [("main", "BASE-RULE"), ("deadbeef", "HEAD-RULE")] {
@@ -3788,8 +3800,8 @@ mod orchestrator_tests {
         }
     }
 
-    async fn review_as(diff: &str, association: &str) -> (Vec<bool>, Vec<String>, String) {
-        let srv = github_stub_trust(diff, association).await;
+    async fn review_as(diff: &str, permission: &str) -> (Vec<bool>, Vec<String>, String) {
+        let srv = github_stub_trust(diff, permission).await;
         let spy = CloneSpy {
             may_clone: Arc::default(),
             prompts: Arc::default(),
@@ -3804,27 +3816,28 @@ mod orchestrator_tests {
 
     /// Every attack on the reviewer found so far needs the clone, so a PR from
     /// someone who could not push to the repository is reviewed without one, and
-    /// its summary says why the review is shallower.
+    /// its summary says why the review is shallower. A permission that cannot be
+    /// established (the endpoint fails) fails closed.
     #[tokio::test]
     async fn an_outside_authors_pr_is_reviewed_without_a_clone() {
-        for association in ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"] {
-            let (seen, _, summary) = review_as(DIFF, association).await;
+        for permission in ["read", "none", "404", "500"] {
+            let (seen, _, summary) = review_as(DIFF, permission).await;
             assert!(
                 !seen.is_empty() && seen.iter().all(|m| !m),
-                "{association}: {seen:?}"
+                "{permission}: {seen:?}"
             );
             assert!(
                 summary.contains("read the diff only"),
-                "{association}: {summary}"
+                "{permission}: {summary}"
             );
         }
-        for association in ["OWNER", "MEMBER", "COLLABORATOR"] {
-            let (seen, _, summary) = review_as(DIFF, association).await;
+        for permission in ["admin", "maintain", "write"] {
+            let (seen, _, summary) = review_as(DIFF, permission).await;
             assert!(
                 !seen.is_empty() && seen.iter().all(|m| *m),
-                "{association}: {seen:?}"
+                "{permission}: {seen:?}"
             );
-            assert!(!summary.contains("read the diff only"), "{association}");
+            assert!(!summary.contains("read the diff only"), "{permission}");
         }
     }
 
@@ -3832,7 +3845,7 @@ mod orchestrator_tests {
     /// author's summary must not blame them for a depth no review got.
     #[tokio::test]
     async fn no_diff_only_note_when_the_backend_would_not_have_cloned() {
-        let srv = github_stub_trust(DIFF, "NONE").await;
+        let srv = github_stub_trust(DIFF, "none").await;
         let spy = SpyBackend {
             seen: Arc::default(),
             bodies: Arc::default(),
@@ -3865,7 +3878,7 @@ mod orchestrator_tests {
     /// nothing. The stub serves a different `instructions` per ref.
     #[tokio::test]
     async fn prbot_toml_is_read_from_the_base_branch_not_the_head() {
-        let (_, prompts, _) = review_as(DIFF, "COLLABORATOR").await;
+        let (_, prompts, _) = review_as(DIFF, "write").await;
         assert!(!prompts.is_empty());
         for p in &prompts {
             assert!(p.contains("BASE-RULE"), "base settings not applied: {p}");
@@ -3879,12 +3892,12 @@ mod orchestrator_tests {
             "{DIFF}diff --git a/.prbot.toml b/.prbot.toml\n--- a/.prbot.toml\n+++ b/.prbot.toml\n\
              @@ -1 +1 @@\n-instructions = \"BASE-RULE\"\n+instructions = \"HEAD-RULE\"\n"
         );
-        let (_, _, summary) = review_as(&diff, "OWNER").await;
+        let (_, _, summary) = review_as(&diff, "admin").await;
         assert!(
             summary.contains("This PR changes `.prbot.toml`"),
             "{summary}"
         );
-        let (_, _, summary) = review_as(DIFF, "OWNER").await;
+        let (_, _, summary) = review_as(DIFF, "admin").await;
         assert!(
             !summary.contains("This PR changes `.prbot.toml`"),
             "{summary}"

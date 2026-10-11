@@ -322,7 +322,7 @@ mod tests {
             head_sha: None,
             body: None,
             ci_status: None,
-            author_association: None,
+            author_permission: None,
         };
 
         for provider in [super::Provider::Gitlab, super::Provider::Bitbucket] {

@@ -6,7 +6,7 @@
 
 ### Migration — every consumer this breaks
 
-`PrMeta` gains `author_association: Option<String>` and `ReviewContext` gains `may_clone: bool`. A struct literal of either must add the field: `None` for `PrMeta` keeps the old behaviour, and `true` for a `ReviewContext` built in a test. Checked against both known consumers:
+`PrMeta` gains `author_permission: Option<String>` and `ReviewContext` gains `may_clone: bool`. A struct literal of either must add the field: `None` for `PrMeta` keeps the old behaviour, and `true` for a `ReviewContext` built in a test. Checked against both known consumers:
 
 - `pr-review-bot` builds `PrMeta` literals in `bin/server.rs` (1) and `claude_backend.rs` (2), and `ReviewContext` literals in `claude_backend.rs` (3, all tests).
 - `simcel-pr-bot` builds one `PrMeta` literal in `claude_backend.rs`.
@@ -15,21 +15,21 @@ Both consumers' Claude Code backends clone for themselves, so each also needs a 
 
 ### Behaviour changes — these ship silently
 
-- **On GitHub, a PR from anyone who is not an `OWNER`, `MEMBER` or `COLLABORATOR` gets a diff-only review.** No clone and no repository tools, even with `AGENTIC=true`. Its summary says so when a clone was actually withheld (`AGENTIC` on, or a backend that clones for itself): "This PR's author is not a collaborator on this repository, so the review read the diff only." `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `NONE` and bot accounts such as Dependabot all land here. Their reviews lose cross-file depth.
+- **On GitHub, a PR from anyone without write access to the repository gets a diff-only review.** No clone and no repository tools, even with `AGENTIC=true`. Trust comes from the author's effective permission (GitHub's collaborator-permission endpoint): `admin`, `maintain` and `write` may clone, while `read`, `triage`, `none` and outside contributors may not. The endpoint costs one more API call per review. A lookup that fails counts as untrusted, so it fails closed. The summary says so when a clone was actually withheld (`AGENTIC` on, or a backend that clones for itself): "This PR's author does not have write access to this repository, so the review read the diff only." Bot accounts such as Dependabot usually land here. These reviews lose cross-file depth.
 - **`.prbot.toml` is read from the base branch, not the PR head.** A PR that edits it is reviewed under the settings it would replace, and its summary says the change takes effect once merged. When the provider reports no base branch, no `.prbot.toml` is read at all. There is no fallback to the head. `kaniscope get-rules` reports the same source.
 
 ### Added
 
 - **`ReviewBackend::clones_when_allowed`**, defaulted to `cfg.agentic`, so it breaks no implementor. The diff-only note appears only when the backend would really have cloned. An agent-CLI backend that clones regardless of `AGENTIC` should return `true`, or its outside authors' reviews will not say why they are shallower.
 - **`ReviewContext::may_clone`.** `false` when the author is not trusted. A backend must then review the diff alone. `OpenRouterBackend` honours it. An agent-CLI backend that clones for itself must check it, or it keeps cloning outside authors' PRs. Adding the field breaks any code that constructs a `ReviewContext` (usually a backend's tests); set it to `true` there.
-- **`PrMeta::author_association`** and **`review::author_may_clone`.** The association is read from GitHub's PR payload, and `author_may_clone` is the trust decision. Code that constructs a `PrMeta` needs the new field (`None` keeps the old behaviour).
+- **`PrMeta::author_permission`**, **`providers::github::get_author_permission`** and **`review::author_may_clone`.** The permission is looked up for the PR's author when its metadata is fetched, and `author_may_clone` is the trust decision. It is a permission, not the PR's `author_association`: an association describes a relationship, not access. A `COLLABORATOR` can be read-only, a `MEMBER` may lack write access to this repository, and an org member whose membership is private shows up as `CONTRIBUTOR`. Code that constructs a `PrMeta` needs the new field (`None` keeps the old behaviour).
 
 ### Fixed
 
 - **A PR could configure its own review.** `.prbot.toml` was fetched at the PR's head commit. So a PR could add `exclude_globs` covering the files it changes, raise `min_confidence` past its own findings, or add `instructions` telling the reviewer to report nothing, and its own review would obey.
 - **Anyone who could open a PR could reach the reviewer's tools.** Every attack found on the agentic reviewer so far needs the clone: a `.claude/settings.json` hook or `.mcp.json` server for the agent-CLI backends, a token in `.git/config`, a prompt injection asking for a file. Outside authors no longer get one.
 
-Known limits: GitHub reports `author_association` as the token can see it, so an org member whose membership is private can come back as `CONTRIBUTOR` or `NONE` and get a diff-only review. That fails safe; checking `/collaborators/{user}/permission` as a second signal would fix it, at one more API call per review. Bitbucket and GitLab do not report an author association, so on those hosts every PR is still treated as trusted and cloned when agentic review is on. The trusted set is fixed (`OWNER`, `MEMBER`, `COLLABORATOR`), with no setting to change it. The local path (`run_review_local`) still reads the working tree's `.prbot.toml`, because its operator owns the process; a local review of a change that edits the file applies the edit, where the PR review of the same commit does not.
+Known limits: Bitbucket and GitLab are not asked for a permission, so on those hosts every PR is still treated as trusted and cloned when agentic review is on. The trusted set is fixed (`admin`, `maintain`, `write`), with no setting to change it. If the token cannot read collaborator permissions, every review fails closed to diff-only; that is logged at WARN on each review. The local path (`run_review_local`) still reads the working tree's `.prbot.toml`, because its operator owns the process; a local review of a change that edits the file applies the edit, where the PR review of the same commit does not.
 
 ## 0.39.1
 
