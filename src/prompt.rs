@@ -718,6 +718,7 @@ mod tests {
             head_sha: None,
             body: None,
             ci_status: ci.map(str::to_string),
+            author_permission: None,
         }
     }
 

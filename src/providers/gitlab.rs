@@ -82,6 +82,7 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         // GitLab pipeline status is not wired up yet — `None` reads as "unknown",
         // so the reviewer simply gets no CI block rather than a wrong one.
         ci_status: None,
+        author_permission: None,
     })
 }
 

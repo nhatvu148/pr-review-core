@@ -98,6 +98,17 @@ pub struct ReviewContext<'a> {
     /// skips these rules produces a review that looks normal and is
     /// systematically miscalibrated; that failure shipped undetected for months.
     pub injected_rules: &'a str,
+    /// Whether this review may clone the change and give the model repository
+    /// tools. `false` when the PR's author is not trusted on the repository (see
+    /// [`crate::review::author_may_clone`]): a backend MUST then review the diff
+    /// alone — no clone, no tools.
+    ///
+    /// Every attack on a reviewer found so far reaches it through the clone: a
+    /// `.claude/settings.json` hook, a `.mcp.json` server, a token in
+    /// `.git/config`, a prompt injection that asks for a file. A diff-only review
+    /// has none of those inputs. The cost is cross-file depth, paid only on
+    /// changes from people who could not push to the repository anyway.
+    pub may_clone: bool,
 }
 
 impl ReviewContext<'_> {
@@ -118,6 +129,17 @@ impl ReviewContext<'_> {
 #[async_trait]
 pub trait ReviewBackend: Send + Sync {
     async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult>;
+
+    /// Whether this backend clones the change when [`ReviewContext::may_clone`]
+    /// lets it. Decides only whether a diff-only review for an untrusted author
+    /// says so: the note is true only when a clone was actually withheld.
+    ///
+    /// Default: `cfg.agentic`, which is when the built-in backend clones. A
+    /// backend that clones on its own terms (an agent CLI exploring a checkout)
+    /// should return `true`.
+    fn clones_when_allowed(&self, cfg: &Config) -> bool {
+        cfg.agentic
+    }
 
     /// Free-form text completion, given a system prompt and a user prompt (which
     /// already contains the diff/context). Powers the `/ask` and `/describe`
@@ -187,7 +209,7 @@ impl ReviewBackend for OpenRouterBackend {
         // The agentic path reads the repo from a clone, which needs a host to clone
         // from. On the local path there is none, so it reviews the diff alone rather
         // than pretending it explored the tree.
-        if let (true, Some(provider)) = (ctx.cfg.agentic, ctx.provider) {
+        if let (true, true, Some(provider)) = (ctx.cfg.agentic, ctx.may_clone, ctx.provider) {
             match run_agentic(
                 provider,
                 ctx.client,

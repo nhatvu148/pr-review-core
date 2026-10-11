@@ -580,6 +580,7 @@ mod tests {
             head_sha: None,
             body: None,
             ci_status: None,
+            author_permission: None,
         }
     }
 

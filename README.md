@@ -78,7 +78,14 @@ prompt through [`Config`].
   hygiene findings on or propose edits inside), confidence/caps, `pr_body` and
   `pr_body_max_chars` (how much of the PR description the reviewer reads — a repo
   whose PRs run long descriptions wants a higher cap), `grep_context`, and adds
-  free-text review `instructions`.
+  free-text review `instructions`. On a pull request it is read from the base
+  branch, never the PR's head, so a PR cannot change the settings it is reviewed
+  under; a PR that edits the file is told its change applies once merged.
+- **Untrusted authors get a diff-only review**: on GitHub, a PR from anyone without
+  write access to the repository (by its collaborator permission) is reviewed
+  without cloning it, so nothing in the PR's tree reaches the reviewer's tools. A
+  permission that cannot be looked up counts as untrusted. Bitbucket and GitLab are
+  not asked and are unaffected.
 - **Benchmark harness**: `examples/bench.rs` scores the reviewer against a corpus
   of PRs with known issues (`examples/bench-corpus.example.json`) — reporting
   precision / recall / F1 and token cost, so a feature's effect (blast radius,
@@ -628,6 +635,15 @@ Then:
    hypothetical: 0.27.0's release PR did exactly that, and the reviewer caught it.
    CI now runs `npm ci` there, which fails on the mismatch rather than shipping an
    example nobody can install.
+8. **Release the GitHub Action.** Bumping `nhatvu148/kaniscope-action`'s dependency
+   (step 5) ships nothing on its own: Marketplace users run its `:v1` GHCR image,
+   not its `main`. Tag a release there and move `v1` as its `RELEASING.md`
+   says; that file is the authority on the order (in short: tag, wait for
+   "Publish image", then move `v1`).
+   CI's `downstream compiles` job proves the Action still *builds* against this
+   crate; nothing proves it was *released*. That gap left the Action on 0.33.0
+   through eight engine releases (0.34.0 – 0.39.1), until a lockfile-only PR showed it
+   dropping the dependency advisories that 0.39 posts.
 
 ## License
 
