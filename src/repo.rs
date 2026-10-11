@@ -41,6 +41,12 @@ impl Workspace {
     /// network, `origin` is rewritten without them and `.git` is checked for any
     /// copy left behind. If either step fails this is an error, not a checkout
     /// with a token in it.
+    ///
+    /// So the checkout cannot fetch on demand. It is a partial (`blob:none`),
+    /// sparse clone, and a later git command that needs a missing object — a
+    /// `git show`, `git log -p`, widening the sparse set — tries `origin` without
+    /// auth and fails. Read the files on disk; nothing in this crate runs git in
+    /// the checkout afterwards.
     pub fn clone(clone_url: &str, head_sha: Option<&str>) -> Result<Self> {
         let tmp = tempfile::tempdir().context("create temp dir for clone")?;
         let root = tmp.path().to_path_buf();
@@ -704,6 +710,12 @@ fn in_git_dir(rel: &Path) -> bool {
     rel.components().any(|c| c.as_os_str() == ".git")
 }
 
+/// Shortest password-less userinfo treated as a token rather than a username.
+/// Tokens are long (`ghp_` ones are 40 characters); a username like `git` is
+/// neither a secret nor safe to search for — it appears in git's own sample hooks
+/// and would fail every clone.
+const MIN_BARE_TOKEN_LEN: usize = 20;
+
 /// Split the credentials out of a `scheme://userinfo@host/...` URL, returning the
 /// URL without them and the secret to look for: the password, or the whole
 /// userinfo when it is a bare token (`https://ghp_xxx@github.com/...`).
@@ -711,7 +723,11 @@ fn split_credentials(url: &str) -> Option<(String, String)> {
     let (scheme, rest) = url.split_once("://")?;
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (userinfo, host) = rest[..authority_end].rsplit_once('@')?;
-    let secret = userinfo.split_once(':').map_or(userinfo, |(_, pass)| pass);
+    let secret = match userinfo.split_once(':') {
+        Some((_, pass)) => pass,
+        None if userinfo.len() >= MIN_BARE_TOKEN_LEN => userinfo,
+        None => return None,
+    };
     if secret.is_empty() {
         return None;
     }
@@ -739,9 +755,12 @@ fn scrub_clone_credentials(root: &Path, clone_url: &str) -> Result<()> {
     )
     .context("remove the credentials from the clone's remote")?;
     let git_dir = root.join(".git");
+    // The object store itself, by full path: a ref or log entry that happens to
+    // be named `objects` is metadata and is still searched.
+    let objects = git_dir.join("objects");
     for entry in WalkBuilder::new(&git_dir)
         .standard_filters(false)
-        .filter_entry(|e| e.file_name() != "objects")
+        .filter_entry(move |e| e.path() != objects)
         .build()
     {
         // An unreadable entry fails the scrub rather than being skipped: a file
@@ -1229,12 +1248,16 @@ mod credential_tests {
             ))
         );
         assert_eq!(
-            split_credentials("https://ghp_abc@github.com/o/r.git"),
+            split_credentials(
+                "https://ghp_0123456789abcdefghij0123456789abcdef@github.com/o/r.git"
+            ),
             Some((
                 "https://github.com/o/r.git".to_string(),
-                "ghp_abc".to_string()
+                "ghp_0123456789abcdefghij0123456789abcdef".to_string()
             ))
         );
+        // A short password-less userinfo is a username, not a token.
+        assert_eq!(split_credentials("https://git@github.com/o/r.git"), None);
         // An `@` in the path is not userinfo.
         assert_eq!(split_credentials("https://github.com/o/r@v1.git"), None);
         assert_eq!(split_credentials("https://github.com/o/r.git"), None);
@@ -1290,6 +1313,17 @@ mod credential_tests {
         std::fs::create_dir_all(&obj).unwrap();
         std::fs::write(obj.join("cdef"), "ghs_SCRUBME").unwrap();
         scrub_clone_credentials(d.path(), URL).expect("objects are skipped");
+    }
+
+    /// Only the object store is skipped, by full path: metadata that happens to
+    /// be named `objects` (a ref, a log) is still searched.
+    #[test]
+    fn a_ref_named_objects_is_still_searched() {
+        let d = repo_with_remote(URL);
+        let refs = d.path().join(".git/refs/heads");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("objects"), "ghs_SCRUBME").unwrap();
+        assert!(scrub_clone_credentials(d.path(), URL).is_err());
     }
 
     #[test]
