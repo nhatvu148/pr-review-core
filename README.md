@@ -635,7 +635,7 @@ Then:
    "Publish image", then move `v1`).
    CI's `downstream compiles` job proves the Action still *builds* against this
    crate; nothing proves it was *released*. That gap left the Action on 0.33.0
-   through six engine releases (0.34 – 0.39.1), until a lockfile-only PR showed it
+   through eight engine releases (0.34.0 – 0.39.1), until a lockfile-only PR showed it
    dropping the dependency advisories that 0.39 posts.
 
 ## License
