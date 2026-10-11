@@ -630,8 +630,9 @@ Then:
    example nobody can install.
 8. **Release the GitHub Action.** Bumping `nhatvu148/kaniscope-action`'s dependency
    (step 5) ships nothing on its own: Marketplace users run its `:v1` GHCR image,
-   not its `main`. Tag a release there and move `v1` in the order its
-   `RELEASING.md` gives — tag, wait for "Publish image", then move the tag.
+   not its `main`. Tag a release there and move `v1` as its `RELEASING.md`
+   says; that file is the authority on the order (in short: tag, wait for
+   "Publish image", then move `v1`).
    CI's `downstream compiles` job proves the Action still *builds* against this
    crate; nothing proves it was *released*. That gap left the Action on 0.33.0
    through six engine releases (0.34 – 0.39.1), until a lockfile-only PR showed it
