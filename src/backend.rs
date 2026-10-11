@@ -130,6 +130,17 @@ impl ReviewContext<'_> {
 pub trait ReviewBackend: Send + Sync {
     async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult>;
 
+    /// Whether this backend clones the change when [`ReviewContext::may_clone`]
+    /// lets it. Decides only whether a diff-only review for an untrusted author
+    /// says so: the note is true only when a clone was actually withheld.
+    ///
+    /// Default: `cfg.agentic`, which is when the built-in backend clones. A
+    /// backend that clones on its own terms (an agent CLI exploring a checkout)
+    /// should return `true`.
+    fn clones_when_allowed(&self, cfg: &Config) -> bool {
+        cfg.agentic
+    }
+
     /// Free-form text completion, given a system prompt and a user prompt (which
     /// already contains the diff/context). Powers the `/ask` and `/describe`
     /// commands, so they run on the same backend as reviews instead of always

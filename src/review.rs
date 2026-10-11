@@ -810,10 +810,19 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
-/// Whether a unified diff adds, removes or changes the root `.prbot.toml`.
+/// Whether a unified diff adds, removes, changes or renames the root
+/// `.prbot.toml`. A pure rename has no `---`/`+++` lines, only the
+/// `rename from`/`rename to` headers.
 fn diff_touches_repo_config(diff: &str) -> bool {
-    diff.lines()
-        .any(|l| matches!(l, "--- a/.prbot.toml" | "+++ b/.prbot.toml"))
+    diff.lines().any(|l| {
+        matches!(
+            l,
+            "--- a/.prbot.toml"
+                | "+++ b/.prbot.toml"
+                | "rename from .prbot.toml"
+                | "rename to .prbot.toml"
+        )
+    })
 }
 
 /// The summary comment: overall + recommendation + any findings that couldn't be
@@ -2350,7 +2359,10 @@ pub async fn run_review_with(
             .summary
             .push_str(&crate::deps::render_advisories(&advisories));
     }
-    if !may_clone {
+    // Only when a clone was actually withheld: with AGENTIC off, the built-in
+    // backend clones nobody's PR, and the note would blame the author for a
+    // depth no review got.
+    if !may_clone && backend.clones_when_allowed(cfg) {
         finished.summary.push_str(DIFF_ONLY_FOR_AUTHOR_NOTE);
     }
     if diff_touches_repo_config(&raw_diff) {
@@ -3752,6 +3764,12 @@ mod orchestrator_tests {
 
     #[async_trait]
     impl ReviewBackend for CloneSpy {
+        /// Stands in for an agent-CLI backend, which clones whatever `AGENTIC`
+        /// says (the test config has it off).
+        fn clones_when_allowed(&self, _cfg: &Config) -> bool {
+            true
+        }
+
         async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
             self.may_clone.lock().unwrap().push(ctx.may_clone);
             self.prompts
@@ -3791,7 +3809,10 @@ mod orchestrator_tests {
     async fn an_outside_authors_pr_is_reviewed_without_a_clone() {
         for association in ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"] {
             let (seen, _, summary) = review_as(DIFF, association).await;
-            assert!(seen.iter().all(|m| !m), "{association}: {seen:?}");
+            assert!(
+                !seen.is_empty() && seen.iter().all(|m| !m),
+                "{association}: {seen:?}"
+            );
             assert!(
                 summary.contains("read the diff only"),
                 "{association}: {summary}"
@@ -3799,9 +3820,44 @@ mod orchestrator_tests {
         }
         for association in ["OWNER", "MEMBER", "COLLABORATOR"] {
             let (seen, _, summary) = review_as(DIFF, association).await;
-            assert!(seen.iter().all(|m| *m), "{association}: {seen:?}");
+            assert!(
+                !seen.is_empty() && seen.iter().all(|m| *m),
+                "{association}: {seen:?}"
+            );
             assert!(!summary.contains("read the diff only"), "{association}");
         }
+    }
+
+    /// With AGENTIC off the built-in backend clones nobody's PR, so an outside
+    /// author's summary must not blame them for a depth no review got.
+    #[tokio::test]
+    async fn no_diff_only_note_when_the_backend_would_not_have_cloned() {
+        let srv = github_stub_trust(DIFF, "NONE").await;
+        let spy = SpyBackend {
+            seen: Arc::default(),
+            bodies: Arc::default(),
+        };
+        let out = run_review_with(&cfg_for(&srv.uri()), input(), &spy)
+            .await
+            .expect("review");
+        assert!(
+            !out.summary_markdown.contains("read the diff only"),
+            "{}",
+            out.summary_markdown
+        );
+    }
+
+    #[test]
+    fn a_rename_onto_or_off_prbot_toml_counts_as_a_change() {
+        for diff in [
+            "diff --git a/old.toml b/.prbot.toml\nsimilarity index 100%\nrename from old.toml\nrename to .prbot.toml\n",
+            "diff --git a/.prbot.toml b/old.toml\nsimilarity index 100%\nrename from .prbot.toml\nrename to old.toml\n",
+        ] {
+            assert!(super::diff_touches_repo_config(diff), "{diff}");
+        }
+        assert!(!super::diff_touches_repo_config(
+            "diff --git a/docs/.prbot.toml.md b/docs/.prbot.toml.md\n--- a/docs/.prbot.toml.md\n+++ b/docs/.prbot.toml.md\n"
+        ));
     }
 
     /// Read from the head, a PR could rewrite its own review settings — exclude
