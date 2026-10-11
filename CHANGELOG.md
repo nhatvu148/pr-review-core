@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+**A clone no longer keeps its token on disk, and the agentic tools cannot read `.git`.**
+
+### Behaviour changes — these ship silently
+
+- **A clone whose credential cannot be scrubbed is an error.** `Workspace::clone` now fails, rather than returning a checkout with a token in it, if rewriting `origin` fails or the credential is still found in `.git` afterwards. A caller that degrades to a diff-only review on a clone error (both bots do) does that instead.
+- **`read_file`, `read_raw`, `list_dir` and `grep` refuse `.git`.** A path under `.git`, at any depth and by any spelling (including a committed symlink into it), is an error. `list_dir` omits `.git` entries, and `grep` no longer searches it. A review never needed anything there.
+
+### Fixed
+
+- **The clone token was left in `.git/config` for the whole review.** `Workspace::clone` clones from a token-bearing URL, and git writes that URL into the clone's remote config. Its only protections were a private directory and redacted error messages. The agentic reviewer reads that same clone, and a prompt injection in the pull request could ask for `.git/config`: `read_file` and `grep` would both return it (`grep` walks dotfiles, so `.git` included). A token minted for an installation is not scoped to the reviewed repository, so this could expose every repository the installation reaches. Once git is done with the network, the remote is rewritten without the credential, and all of `.git` except `objects/` is searched for any copy left behind (`FETCH_HEAD`, reflog messages). Verified against a real authenticated clone of a private repository: before the fix the token was in `.git/config`, and after it no file in the checkout contains it. The Claude Code backends in `pr-review-bot` and `simcel-pr-bot` already deny `Read(./.git/**)` as a stopgap; this fixes it at the source, and for the OpenRouter agentic path, which had no stopgap.
+
+Known limits: the token still reaches git during the clone itself, in its arguments, for the seconds the clone runs; nothing that reads the clone runs in that window. Scoping the minted token to the reviewed repository is the caller's job (the GitHub App mints it) and is not part of this change.
+
 ## 0.39.1
 
 **A `yarn.lock` version bump is now scanned for CVEs.**
