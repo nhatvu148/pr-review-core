@@ -1,8 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.40.0
 
 **Untrusted input stays untrusted: the clone keeps no token and the tools cannot read `.git`; a PR from an author without write access is reviewed without a clone; `.prbot.toml` is read from the base branch.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with the changes the migration below asks for. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (164, 187, 193 and 174 tests) and `simcel-pr-bot` on its default build (106 tests). Both Claude Code backends also passed their live hostile-clone tests against it.
+
+This release is minor rather than a patch because `PrMeta` and `ReviewContext` gain fields, which breaks any code that builds either one, and because of the behaviour changes below: a clone keeps no token, the tools refuse `.git`, an author without write access gets a diff-only review, and `.prbot.toml` comes from the base branch.
 
 ### Migration — every consumer this breaks
 
