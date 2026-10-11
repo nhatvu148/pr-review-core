@@ -115,6 +115,7 @@ impl Case {
             head_sha: None,
             body: None,
             ci_status: None,
+            author_association: None,
         }
     }
 }

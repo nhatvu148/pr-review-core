@@ -765,6 +765,57 @@ fn reanchor(
     None
 }
 
+/// Whether a pull request's author is trusted to have it cloned.
+///
+/// Trusted: GitHub's `OWNER`, `MEMBER` and `COLLABORATOR` — people who could push
+/// to the repository without a PR, so the clone gives them nothing they lacked.
+/// Everyone else (`CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `NONE`, and bots such
+/// as Dependabot) gets a diff-only review; see [`ReviewContext::may_clone`] for
+/// why the clone is the part worth withholding.
+///
+/// A provider that reports no association (`None`: Bitbucket, GitLab) is
+/// trusted. That keeps their reviews unchanged, and it is a gap: on those hosts
+/// nothing here stops an outsider's PR being cloned.
+///
+/// ```
+/// use pr_review_core::providers::PrMeta;
+/// use pr_review_core::review::author_may_clone;
+///
+/// let meta = |a: Option<&str>| PrMeta {
+///     repo: "o/r".into(), pr: 1, title: None, base_branch: None, head_sha: None,
+///     body: None, ci_status: None, author_association: a.map(String::from),
+/// };
+/// assert!(author_may_clone(&meta(Some("COLLABORATOR"))));
+/// assert!(!author_may_clone(&meta(Some("FIRST_TIME_CONTRIBUTOR"))));
+/// assert!(author_may_clone(&meta(None)));
+/// ```
+pub fn author_may_clone(meta: &PrMeta) -> bool {
+    match meta.author_association.as_deref() {
+        None => true,
+        Some(a) => matches!(
+            a.to_ascii_uppercase().as_str(),
+            "OWNER" | "MEMBER" | "COLLABORATOR"
+        ),
+    }
+}
+
+/// Appended to the summary of a review that withheld the clone. A reader
+/// comparing it with a deeper review on another PR deserves to know why.
+const DIFF_ONLY_FOR_AUTHOR_NOTE: &str = "\n\n_This PR's author is not a collaborator on \
+     this repository, so the review read the diff only: no clone, no repository tools. \
+     Cross-file effects may be missed._";
+
+/// Appended when the PR edits `.prbot.toml`, which is read from the base branch.
+const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Reviews read \
+     it from the base branch, so this review ran on the current settings and the \
+     change takes effect once merged._";
+
+/// Whether a unified diff adds, removes or changes the root `.prbot.toml`.
+fn diff_touches_repo_config(diff: &str) -> bool {
+    diff.lines()
+        .any(|l| matches!(l, "--- a/.prbot.toml" | "+++ b/.prbot.toml"))
+}
+
 /// The summary comment: overall + recommendation + any findings that couldn't be
 /// anchored to a diff line (line-anchored ones go inline).
 fn render_summary(
@@ -930,6 +981,7 @@ pub async fn post_review_queued(provider_name: &str, cfg: &Config, repo: &str, p
         head_sha: None,
         body: None,
         ci_status: None,
+        author_association: None,
     };
     let post = ReviewPost {
         summary: render_queued(),
@@ -989,6 +1041,7 @@ pub async fn post_review_failure(
         head_sha: None,
         body: None,
         ci_status: None,
+        author_association: None,
     };
     let post = ReviewPost {
         summary: render_failed(err),
@@ -1057,20 +1110,19 @@ pub(crate) async fn run_agentic(
 /// not predict the PR's findings is worth very little, and the divergence was
 /// invisible: both runs look like a normal review.
 ///
-/// **Read from the working tree, not from a base ref.** That mirrors the PR path,
-/// which fetches `.prbot.toml` from the PR *head* — the version the change itself
-/// proposes.
+/// **Read from the working tree, not from a base ref** — unlike the PR path,
+/// which reads the base branch ([`remote_repo_config_source`]).
 ///
 /// It does mean the change under review can weaken its own reviewer: exclude the
 /// files it touches, raise `min_confidence` past its own findings, or add
-/// `instructions` that talk the reviewer down. Raised in review on this function,
-/// and kept, because reading a base ref costs more than it buys here:
+/// `instructions` that talk the reviewer down. On the PR path that is a real
+/// exposure, because the author is not the operator, and it is why that path
+/// reads the base branch. Here it is kept, because reading a base ref costs more
+/// than it buys:
 ///
-/// - It is not a new exposure. The PR path already reads the *head* commit, so a
-///   contribution can do exactly this to the remote bot today. Matching that is
-///   the point of this function; diverging would make a local review disagree
-///   with the PR review of the same commit precisely when the change edits
-///   `.prbot.toml` — the one case where you most want them to agree.
+/// - The two paths now disagree on a change that edits `.prbot.toml`: a local
+///   review applies the edit, the PR review of the same commit does not (and says
+///   so in its summary). That is the price of the PR path not trusting its author.
 /// - On this path the "attacker" is whoever is running the review, over their own
 ///   checkout, with their own environment. Anyone who can write this file can
 ///   already set `EXCLUDE_GLOBS`, lower the confidence floor, or simply not run
@@ -1186,19 +1238,22 @@ pub(crate) async fn remote_repo_config_source(
 ) -> (Config, crate::rules::RepoConfigSource) {
     use crate::rules::RepoConfigSource;
 
-    // Prefer the exact head commit; fall back to the base branch when the provider
-    // didn't give us a head SHA (e.g. Bitbucket meta). If neither is available,
-    // there's nothing to fetch against — use the base config as-is.
-    let git_ref = match (meta.head_sha.as_deref(), meta.base_branch.as_deref()) {
-        (Some(sha), _) if !sha.is_empty() => sha,
-        (_, Some(branch)) if !branch.is_empty() => branch,
+    // The base branch, never the PR head. The head is the author's: read from
+    // there, a PR could set its own `exclude_globs`, `min_confidence` or
+    // `instructions` and review itself into silence. A PR that edits
+    // `.prbot.toml` is reviewed under the settings it would replace, and the
+    // summary says so (`REPO_CONFIG_CHANGE_NOTE`). No head fallback when the
+    // base branch is unknown: an author-controlled ref is exactly what this
+    // refuses to read.
+    let git_ref = match meta.base_branch.as_deref() {
+        Some(branch) if !branch.is_empty() => branch,
         _ => {
             return (
                 base.clone(),
                 RepoConfigSource::Unavailable {
                     reason: format!(
-                        "{repo} reported neither a head commit nor a base branch, so \
-                         there is no ref to read .prbot.toml from"
+                        "{repo} reported no base branch, so there is no trusted ref \
+                         to read .prbot.toml from"
                     ),
                 },
             )
@@ -2236,6 +2291,15 @@ pub async fn run_review_with(
     // lazily by the first agentic sample and dropped with this scope, so the
     // temporary directory's lifetime is unchanged.
     let workspace = crate::backend::SharedWorkspace::new();
+    let may_clone = author_may_clone(&meta);
+    if !may_clone {
+        tracing::info!(
+            "{}#{}: author is {:?} on the repository, reviewing the diff only",
+            input.repo,
+            input.pr,
+            meta.author_association
+        );
+    }
     let ctx = ReviewContext {
         client: &client,
         cfg,
@@ -2258,6 +2322,7 @@ pub async fn run_review_with(
             change_intent: None,
         },
         injected_rules: &injected_rules,
+        may_clone,
     };
     let Sampled {
         result,
@@ -2284,6 +2349,12 @@ pub async fn run_review_with(
         finished
             .summary
             .push_str(&crate::deps::render_advisories(&advisories));
+    }
+    if !may_clone {
+        finished.summary.push_str(DIFF_ONLY_FOR_AUTHOR_NOTE);
+    }
+    if diff_touches_repo_config(&raw_diff) {
+        finished.summary.push_str(REPO_CONFIG_CHANGE_NOTE);
     }
     // Derived renderings of the change, appended last: they describe what the PR
     // touched, which is context for the findings above rather than a finding
@@ -2439,6 +2510,7 @@ pub async fn run_review_local(
         head_sha: None,
         body: None,
         ci_status: None,
+        author_association: None,
     };
 
     let prepared = prepare_diff(cfg, &input.diff);
@@ -2534,6 +2606,8 @@ pub async fn run_review_local(
             change_intent: change_intent.as_deref(),
         },
         injected_rules: &injected_rules,
+        // A local diff is the caller's own work, never someone else's PR.
+        may_clone: true,
     };
     let Sampled {
         result,
@@ -3628,6 +3702,137 @@ mod orchestrator_tests {
             .mount(&s)
             .await;
         s
+    }
+
+    /// A GitHub stub like [`github_stub_with`], with the author's association on
+    /// the metadata and a `.prbot.toml` served per ref (base `main`, head
+    /// `deadbeef`), each setting a different `instructions` line.
+    async fn github_stub_trust(diff: &str, association: &str) -> MockServer {
+        use base64::Engine as _;
+        use wiremock::matchers::query_param;
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/1"))
+            .and(header("accept", "application/vnd.github.diff"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(diff.to_string()))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/1"))
+            .and(header("accept", "application/vnd.github+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "a change",
+                "body": null,
+                "base": { "ref": "main" },
+                "head": { "sha": "deadbeef" },
+                "author_association": association,
+            })))
+            .mount(&s)
+            .await;
+        for (git_ref, rule) in [("main", "BASE-RULE"), ("deadbeef", "HEAD-RULE")] {
+            let toml = format!("instructions = \"{rule}\"\n");
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/.prbot.toml"))
+                .and(query_param("ref", git_ref))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content": base64::engine::general_purpose::STANDARD.encode(toml),
+                    "encoding": "base64",
+                })))
+                .mount(&s)
+                .await;
+        }
+        s
+    }
+
+    /// Records whether each call was allowed to clone.
+    struct CloneSpy {
+        may_clone: Arc<Mutex<Vec<bool>>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ReviewBackend for CloneSpy {
+        async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.may_clone.lock().unwrap().push(ctx.may_clone);
+            self.prompts
+                .lock()
+                .unwrap()
+                .push(ctx.system_prompt("RUBRIC."));
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "nothing to report".to_string(),
+                    recommendation: "APPROVE".to_string(),
+                    findings: Vec::new(),
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    async fn review_as(diff: &str, association: &str) -> (Vec<bool>, Vec<String>, String) {
+        let srv = github_stub_trust(diff, association).await;
+        let spy = CloneSpy {
+            may_clone: Arc::default(),
+            prompts: Arc::default(),
+        };
+        let out = run_review_with(&cfg_for(&srv.uri()), input(), &spy)
+            .await
+            .expect("review");
+        let seen = spy.may_clone.lock().unwrap().clone();
+        let prompts = spy.prompts.lock().unwrap().clone();
+        (seen, prompts, out.summary_markdown)
+    }
+
+    /// Every attack on the reviewer found so far needs the clone, so a PR from
+    /// someone who could not push to the repository is reviewed without one, and
+    /// its summary says why the review is shallower.
+    #[tokio::test]
+    async fn an_outside_authors_pr_is_reviewed_without_a_clone() {
+        for association in ["NONE", "CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR"] {
+            let (seen, _, summary) = review_as(DIFF, association).await;
+            assert!(seen.iter().all(|m| !m), "{association}: {seen:?}");
+            assert!(
+                summary.contains("read the diff only"),
+                "{association}: {summary}"
+            );
+        }
+        for association in ["OWNER", "MEMBER", "COLLABORATOR"] {
+            let (seen, _, summary) = review_as(DIFF, association).await;
+            assert!(seen.iter().all(|m| *m), "{association}: {seen:?}");
+            assert!(!summary.contains("read the diff only"), "{association}");
+        }
+    }
+
+    /// Read from the head, a PR could rewrite its own review settings — exclude
+    /// its files, raise the confidence floor, or tell the reviewer to report
+    /// nothing. The stub serves a different `instructions` per ref.
+    #[tokio::test]
+    async fn prbot_toml_is_read_from_the_base_branch_not_the_head() {
+        let (_, prompts, _) = review_as(DIFF, "COLLABORATOR").await;
+        assert!(!prompts.is_empty());
+        for p in &prompts {
+            assert!(p.contains("BASE-RULE"), "base settings not applied: {p}");
+            assert!(!p.contains("HEAD-RULE"), "head settings applied: {p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pr_that_edits_prbot_toml_is_told_its_change_applies_after_merge() {
+        let diff = format!(
+            "{DIFF}diff --git a/.prbot.toml b/.prbot.toml\n--- a/.prbot.toml\n+++ b/.prbot.toml\n\
+             @@ -1 +1 @@\n-instructions = \"BASE-RULE\"\n+instructions = \"HEAD-RULE\"\n"
+        );
+        let (_, _, summary) = review_as(&diff, "OWNER").await;
+        assert!(
+            summary.contains("This PR changes `.prbot.toml`"),
+            "{summary}"
+        );
+        let (_, _, summary) = review_as(DIFF, "OWNER").await;
+        assert!(
+            !summary.contains("This PR changes `.prbot.toml`"),
+            "{summary}"
+        );
     }
 
     fn cfg_for(base: &str) -> Config {

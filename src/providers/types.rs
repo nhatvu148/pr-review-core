@@ -31,6 +31,14 @@ pub struct PrMeta {
     /// `None` means "not known" — never "nothing ran". Fail-open: a failed status
     /// fetch must not cost the review.
     pub ci_status: Option<String>,
+    /// The PR author's relationship to the repository, as GitHub reports it
+    /// (`OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `NONE`, …).
+    ///
+    /// Decides whether the review may clone the PR: see
+    /// [`author_may_clone`](crate::review::author_may_clone). `None` means the
+    /// provider does not report one (Bitbucket, GitLab, the local path), which is
+    /// treated as trusted — a known gap, not a verdict.
+    pub author_association: Option<String>,
 }
 
 /// One inline comment anchored to a file + line on the new side of the diff.

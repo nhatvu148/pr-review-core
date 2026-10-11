@@ -508,6 +508,7 @@ mod command_omission_tests {
             head_sha: None,
             body: None,
             ci_status: None,
+            author_association: None,
         };
         let note = "1 file(s) are excluded from the diff by this repository's \
                     configuration and are NOT shown: Cargo.lock.";

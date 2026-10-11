@@ -2,9 +2,10 @@
 //!
 //! A repository being reviewed can ship a `.prbot.toml` at its root to override
 //! review settings for its own PRs — the "custom rules in plain language"
-//! capability. The file is fetched from the PR's head commit at review time and
-//! merged over the env-derived [`Config`](crate::config::Config) for that one
-//! review. Parsing is fail-open at the call site: any fetch/parse error logs a
+//! capability. The file is fetched from the PR's **base branch** at review time
+//! and merged over the env-derived [`Config`](crate::config::Config) for that one
+//! review — never from the head, which the PR's author controls. A PR that edits
+//! the file is reviewed under the settings it would replace. Parsing is fail-open at the call site: any fetch/parse error logs a
 //! warning and the base config is used unchanged.
 
 /// Per-repo review overrides parsed from a `.prbot.toml`.

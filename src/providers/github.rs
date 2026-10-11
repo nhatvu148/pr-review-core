@@ -331,6 +331,7 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         body: Option<String>,
         base: Option<Ref>,
         head: Option<Ref>,
+        author_association: Option<String>,
     }
 
     let res = gh(client.get(pr_url(cfg, repo, pr)), cfg).send().await?;
@@ -361,6 +362,7 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         head_sha,
         body: pr_data.body,
         ci_status,
+        author_association: pr_data.author_association,
     })
 }
 
