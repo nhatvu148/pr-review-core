@@ -467,11 +467,15 @@ fn output_mode(args: &Args) -> (bool, Option<PathBuf>) {
 /// is meant for a person it exits 0 with the reason on stderr; as an error it
 /// exited 1, which a pre-push hook or a CI step reads as a broken reviewer.
 ///
-/// Where stdout is a JSON contract (`--json`, or a review subcommand without
-/// `--human`), or a `--fail-on` gate was requested, it stays an error: exiting 0 with nothing to parse would break a
-/// caller that checks the status and then parses. And an existing `--json-out`
-/// target is removed first, because a file from an earlier run would otherwise
-/// read as this run's verdict after an exit 0.
+/// It stays an error in two cases, decided by [`output_mode`]:
+/// - stdout is a JSON contract (`--json`, or a review subcommand without
+///   `--human`), where exiting 0 with nothing to parse would break a caller that
+///   checks the status and then parses;
+/// - a `--fail-on` gate was requested, where exiting 0 would pass a gate that
+///   verified nothing.
+///
+/// An existing `--json-out` target is removed first, because a file from an
+/// earlier run would otherwise read as this run's verdict after an exit 0.
 ///
 /// Only reached when there were no advisories either: an empty diff that adds a
 /// vulnerable dependency gets an advisory-only review, not [`NothingToReview`].
