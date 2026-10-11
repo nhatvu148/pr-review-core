@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.39.1
+
+**A `yarn.lock` version bump is now scanned for CVEs.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Neither needed a change: `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (160, 179, 185 and 170 tests) and `simcel-pr-bot` on its default build (105 tests).
+
+A patch: no public type or signature changed.
+
+### Behaviour changes — these ship silently
+
+- **A review of a Yarn project can now list advisories it did not before.** A PR that bumps a vulnerable package within its declared range in `yarn.lock` now produces a dependency advisory in the summary, and fails `kaniscope --fail-on advisories`, where 0.39.0 reported it clean.
 
 ### Fixed
 
