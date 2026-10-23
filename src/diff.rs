@@ -532,20 +532,24 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> Packed {
     // The file then takes the whole budget and the preamble goes: a preamble that
     // fits can still leave too little room to show any of the file.
     let mut cut = None;
-    let file_kept = keep
-        .iter()
-        .zip(&sections)
-        .any(|(&k, (path, _))| k && !path.is_empty());
+    //
+    // A preamble is told apart by position and content, not by its empty path: a
+    // `/dev/null` deletion in a diff without git headers has an empty path too,
+    // and is a file.
+    let is_preamble = |i: usize| {
+        i == 0 && sections[0].0.is_empty() && !sections[0].1.lines().any(|l| l.starts_with("+++ "))
+    };
+    let file_kept = (0..sections.len()).any(|i| keep[i] && !is_preamble(i));
     if !file_kept {
-        // The best file; failing that (no parseable headers, so one empty-path
-        // section holds the whole diff), the best section of any kind.
+        // The best file; failing that (no parseable headers, so the one section
+        // holds the whole diff), the best section of any kind.
         let best = order
             .iter()
             .flat_map(|&ui| units[ui].iter().copied())
-            .find(|&i| !sections[i].0.is_empty())
+            .find(|&i| !is_preamble(i))
             .or_else(|| order.first().and_then(|&ui| units[ui].first().copied()));
         if let Some(i) = best {
-            // Only empty-path sections can be kept here, and none is a file.
+            // No file is kept, so the preamble is the only thing this can clear.
             keep.fill(false);
             let (text, kept_hunks, total_hunks) = cut_section(&sections[i].1, max_chars);
             let partial_hunk = kept_hunks == 0 && text.lines().any(|l| l.starts_with("@@"));
@@ -1252,6 +1256,22 @@ mod tests {
         assert_eq!(cut.path, "dict.yaml");
         assert!(cut.kept_hunks > 0, "{cut:?}");
         assert!(p.dropped.is_empty(), "{:?}", p.dropped);
+    }
+
+    /// In a diff without git headers a `/dev/null` deletion has an empty path,
+    /// like a preamble. It is a file, so once kept it must stay and the fallback
+    /// must not run.
+    #[test]
+    fn a_kept_deletion_without_git_headers_is_not_taken_for_a_preamble() {
+        let mut d = String::from("--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n");
+        d.push_str(&format!(
+            "--- a/big.txt\n+++ b/big.txt\n@@ -1 +1 @@\n+{}\n",
+            "y".repeat(400)
+        ));
+        let p = pack_diff(&d, 100);
+        assert!(p.diff.contains("-gone"), "{}", p.diff);
+        assert!(p.cut.is_none(), "{:?}", p.cut);
+        assert_eq!(p.dropped, vec!["big.txt".to_string()]);
     }
 
     /// A preamble that fills nearly the whole budget must not squeeze the file
