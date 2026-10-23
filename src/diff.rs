@@ -339,7 +339,8 @@ pub struct CutFile {
 /// diff order so the packed diff still reads top-to-bottom. If not even the
 /// smallest single section fits, the best one is kept cut to the budget at a
 /// hunk boundary and reported in [`Packed::cut`], so a non-empty diff never
-/// packs to an empty one and never to one over the budget.
+/// packs to one over the budget, and never to an empty one unless the budget is
+/// zero — the one budget nothing fits.
 ///
 /// # Examples
 /// ```
