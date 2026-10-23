@@ -541,11 +541,17 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> Packed {
     };
     let file_kept = (0..sections.len()).any(|i| keep[i] && !is_preamble(i));
     if !file_kept {
-        // The best file; failing that (no parseable headers, so the one section
-        // holds the whole diff), the best section of any kind.
+        // The best file: the best unit's highest-priority member, so a bundle that
+        // lists its test first still gives up its source. Failing that (no
+        // parseable headers, so the one section holds the whole diff), the best
+        // section of any kind.
         let best = order
             .iter()
-            .flat_map(|&ui| units[ui].iter().copied())
+            .flat_map(|&ui| {
+                let mut members = units[ui].clone();
+                members.sort_by_key(|&i| std::cmp::Reverse(file_priority(&sections[i].0)));
+                members
+            })
             .find(|&i| !is_preamble(i))
             .or_else(|| order.first().and_then(|&ui| units[ui].first().copied()));
         if let Some(i) = best {
@@ -1272,6 +1278,22 @@ mod tests {
         assert!(p.diff.contains("-gone"), "{}", p.diff);
         assert!(p.cut.is_none(), "{:?}", p.cut);
         assert_eq!(p.dropped, vec!["big.txt".to_string()]);
+    }
+
+    /// A bundle that lists its test before its source, both over the budget:
+    /// the source is the one cut and kept, as the whole-file packing would.
+    #[test]
+    fn the_cut_keeps_a_bundles_source_over_its_test() {
+        let big = |p: &str| {
+            format!(
+                "diff --git a/{p} b/{p}\n+++ b/{p}\n@@ -1 +1 @@\n+{}\n",
+                "y".repeat(400)
+            )
+        };
+        let d = big("src/foo.test.ts") + &big("src/foo.ts");
+        let p = pack_diff_bundled(&d, 100);
+        assert_eq!(p.cut.expect("cut").path, "src/foo.ts");
+        assert_eq!(p.dropped, vec!["src/foo.test.ts".to_string()]);
     }
 
     /// A preamble that fills nearly the whole budget must not squeeze the file
