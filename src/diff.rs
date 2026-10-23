@@ -656,6 +656,10 @@ fn cut_section(text: &str, max_chars: usize) -> (String, usize, usize) {
 /// diff.
 const DIGEST_PATTERNS: usize = 3;
 const DIGEST_TRANSITIONS: usize = 8;
+/// The most distinct value changes one pattern tallies. Later new ones are
+/// counted by line only, so a file with a different change on every row cannot
+/// grow the tally with the diff.
+const DIGEST_TALLY: usize = 4096;
 
 /// How [`change_digest`] split a line into fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -675,7 +679,9 @@ impl FieldSep {
     }
 
     /// Split both sides the same way, or `None` when they do not have the same
-    /// number of fields under any separator.
+    /// number of fields. A line with a tab or a comma is split on it and only
+    /// on it: falling back to whitespace would read a dropped empty column,
+    /// `a\t\tb` to `a\tb`, as a change in spacing alone.
     fn split<'a>(old: &'a str, new: &'a str) -> Option<(FieldSep, Vec<&'a str>, Vec<&'a str>)> {
         let by = |sep: FieldSep, s: &'a str| -> Vec<&'a str> {
             match sep {
@@ -686,11 +692,9 @@ impl FieldSep {
         };
         for sep in [FieldSep::Tab, FieldSep::Comma] {
             let c = if sep == FieldSep::Tab { '\t' } else { ',' };
-            if old.contains(c) && new.contains(c) {
+            if old.contains(c) || new.contains(c) {
                 let (o, n) = (by(sep, old), by(sep, new));
-                if o.len() == n.len() {
-                    return Some((sep, o, n));
-                }
+                return (o.len() == n.len()).then_some((sep, o, n));
             }
         }
         let (o, n) = (by(FieldSep::Space, old), by(FieldSep::Space, new));
@@ -717,7 +721,8 @@ fn plain_number(s: &str) -> Option<&str> {
 #[derive(Default)]
 struct FieldPattern {
     lines: usize,
-    /// `(old, new)` → count, only while both values are plain numbers.
+    /// `(old, new)` → count, only while both values are plain numbers, and for
+    /// at most [`DIGEST_TALLY`] distinct pairs.
     transitions: HashMap<(String, String), usize>,
     /// Some line in the pattern changed a value that is not a plain number.
     non_numeric: bool,
@@ -802,9 +807,12 @@ pub(crate) fn change_digest(section: &str) -> Option<String> {
                                 Some(std::cmp::Ordering::Less) => p.down += 1,
                                 _ => {}
                             }
-                            *p.transitions
-                                .entry((o.to_string(), n.to_string()))
-                                .or_default() += 1;
+                            let key = (o.to_string(), n.to_string());
+                            if let Some(c) = p.transitions.get_mut(&key) {
+                                *c += 1;
+                            } else if p.transitions.len() < DIGEST_TALLY {
+                                p.transitions.insert(key, 1);
+                            }
                         }
                         _ => p.non_numeric = true,
                     }
@@ -879,11 +887,15 @@ pub(crate) fn change_digest(section: &str) -> Option<String> {
             p.down,
             shown.join(", ")
         ));
-        if t.len() > DIGEST_TRANSITIONS {
-            out.push_str(&format!(
-                ", and {} other value change(s)",
-                t.len() - DIGEST_TRANSITIONS
-            ));
+        // By line, not by distinct pair: lines past the tally are in `p.lines`
+        // and in no pair.
+        let rest = p.lines
+            - t.iter()
+                .take(DIGEST_TRANSITIONS)
+                .map(|(_, c)| **c)
+                .sum::<usize>();
+        if rest > 0 {
+            out.push_str(&format!(", and other values on {rest} line(s)"));
         }
     }
     if other_pairs > 0 {
@@ -1595,6 +1607,32 @@ mod tests {
         );
         assert!(digest.contains("1 change the whole line"), "{digest}");
         assert!(digest.contains("1 change only spacing"), "{digest}");
+
+        let dropped_column = "+++ b/a.tsv\n@@ -1 +1 @@\n-a\t\tb\n+a\tb\n";
+        let digest = change_digest(dropped_column).unwrap();
+        assert!(!digest.contains("spacing"), "a column went: {digest}");
+        assert!(digest.contains("1 change the whole line"), "{digest}");
+    }
+
+    /// Past the tally, a value change is still counted by line, and the counts
+    /// still add up to the lines in the pattern.
+    #[test]
+    fn a_digest_with_more_distinct_values_than_it_tallies_still_counts_every_line() {
+        let mut d = String::from("+++ b/w.tsv\n");
+        let rows = super::DIGEST_TALLY + 100;
+        for i in 0..rows {
+            d.push_str(&format!("@@ -{i} +{i} @@\n-r\t{i}\n+r\t{}\n", i + 1));
+        }
+        let digest = change_digest(&d).unwrap();
+        assert!(
+            digest.contains(&format!("{rows} change only field 2 of 2")),
+            "{digest}"
+        );
+        assert!(digest.contains(&format!("{rows} up, 0 down")), "{digest}");
+        assert!(
+            digest.contains(&format!("and other values on {} line(s)", rows - 8)),
+            "{digest}"
+        );
     }
 
     /// The packer digests the whole file, not just the part it kept.
