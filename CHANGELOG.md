@@ -4,7 +4,7 @@
 
 **The walkthrough marks a file the packer cut, so its `+/−` counts no longer read as the whole change.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with no changes needed. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (166, 189, 195 and 177 tests) and `simcel-pr-bot` on its default build (106 tests).
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with no changes needed. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (166, 189, 195 and 177 tests) and the client-org bot on its default build (106 tests).
 
 This release is minor rather than a patch because `changemap::FileEntry` gains a public field.
 
@@ -20,7 +20,7 @@ This release is minor rather than a patch because `changemap::FileEntry` gains a
 
 **A diff whose every file is over the size budget is cut to the budget at a hunk boundary, instead of being sent whole to a backend that may not clamp it.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with no changes needed. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (166, 189, 195 and 177 tests) and `simcel-pr-bot` on its default build (106 tests).
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with no changes needed. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (166, 189, 195 and 177 tests) and the client-org bot on its default build (106 tests).
 
 This release is minor rather than a patch because `pack_diff` and `pack_diff_bundled` change their return type.
 
@@ -39,7 +39,7 @@ Known limits: a cut file is reviewed on its first hunks only, in diff order, not
 
 **Untrusted input stays untrusted: the clone keeps no token and the tools cannot read `.git`; a PR from an author without write access is reviewed without a clone; `.prbot.toml` is read from the base branch.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with the changes the migration below asks for. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (164, 187, 193 and 174 tests) and `simcel-pr-bot` on its default build (106 tests). Both Claude Code backends also passed their live hostile-clone tests against it.
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with the changes the migration below asks for. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (164, 187, 193 and 174 tests) and the client-org bot on its default build (106 tests). Both Claude Code backends also passed their live hostile-clone tests against it.
 
 This release is minor rather than a patch because `PrMeta` and `ReviewContext` gain fields, which breaks any code that builds either one, and because of the behaviour changes below: a clone keeps no token, the tools refuse `.git`, an author without write access gets a diff-only review, and `.prbot.toml` comes from the base branch.
 
@@ -48,7 +48,7 @@ This release is minor rather than a patch because `PrMeta` and `ReviewContext` g
 `PrMeta` gains `author_permission: Option<String>` and `ReviewContext` gains `may_clone: bool`. A struct literal of either must add the field: `None` for `PrMeta` keeps the old behaviour, and `true` for a `ReviewContext` built in a test. Checked against both known consumers:
 
 - `pr-review-bot` builds `PrMeta` literals in `bin/server.rs` (1) and `claude_backend.rs` (2), and `ReviewContext` literals in `claude_backend.rs` (3, all tests).
-- `simcel-pr-bot` builds one `PrMeta` literal in `claude_backend.rs`.
+- The client-org bot builds one `PrMeta` literal in `claude_backend.rs`.
 
 Both consumers' Claude Code backends clone for themselves, so each also needs a one-line check of `ctx.may_clone` (review diff-only when `false`), and should return `true` from `clones_when_allowed` so the summary explains the shallower review. Without it they compile and keep cloning outside authors' PRs. The `downstream compiles` job fails on pr-review-bot until it is updated.
 
@@ -68,7 +68,7 @@ Both consumers' Claude Code backends clone for themselves, so each also needs a 
 
 ### Fixed
 
-- **The clone token was left in `.git/config` for the whole review.** `Workspace::clone` clones from a token-bearing URL, and git writes that URL into the clone's remote config. Its only protections were a private directory and redacted error messages. The agentic reviewer reads that same clone, and a prompt injection in the pull request could ask for `.git/config`: `read_file` and `grep` would both return it (`grep` walks dotfiles, so `.git` included). A token minted for an installation is not scoped to the reviewed repository, so this could expose every repository the installation reaches. Once git is done with the network, the remote is rewritten without the credential, and all of `.git` except `objects/` is searched for any copy left behind (`FETCH_HEAD`, reflog messages). Verified against a real authenticated clone of a private repository: before the fix the token was in `.git/config`, and after it no file in the checkout contains it. The Claude Code backends in `pr-review-bot` and `simcel-pr-bot` already deny `Read(./.git/**)` as a stopgap; this fixes it at the source, and for the OpenRouter agentic path, which had no stopgap.
+- **The clone token was left in `.git/config` for the whole review.** `Workspace::clone` clones from a token-bearing URL, and git writes that URL into the clone's remote config. Its only protections were a private directory and redacted error messages. The agentic reviewer reads that same clone, and a prompt injection in the pull request could ask for `.git/config`: `read_file` and `grep` would both return it (`grep` walks dotfiles, so `.git` included). A token minted for an installation is not scoped to the reviewed repository, so this could expose every repository the installation reaches. Once git is done with the network, the remote is rewritten without the credential, and all of `.git` except `objects/` is searched for any copy left behind (`FETCH_HEAD`, reflog messages). Verified against a real authenticated clone of a private repository: before the fix the token was in `.git/config`, and after it no file in the checkout contains it. The Claude Code backends in `pr-review-bot` and the client-org bot already deny `Read(./.git/**)` as a stopgap; this fixes it at the source, and for the OpenRouter agentic path, which had no stopgap.
 - **A PR could configure its own review.** `.prbot.toml` was fetched at the PR's head commit. So a PR could add `exclude_globs` covering the files it changes, raise `min_confidence` past its own findings, or add `instructions` telling the reviewer to report nothing, and its own review would obey.
 - **Anyone who could open a PR could reach the reviewer's tools.** Every attack found on the agentic reviewer so far needs the clone: a `.claude/settings.json` hook or `.mcp.json` server for the agent-CLI backends, a token in `.git/config`, a prompt injection asking for a file. Outside authors no longer get one.
 
@@ -79,7 +79,7 @@ Known limits: the token still reaches git during the clone itself, in its argume
 
 **A `yarn.lock` version bump is now scanned for CVEs.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Neither needed a change: `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (160, 179, 185 and 170 tests) and `simcel-pr-bot` on its default build (105 tests).
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Neither needed a change: `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (160, 179, 185 and 170 tests) and the client-org bot on its default build (105 tests).
 
 A patch: no public type or signature changed.
 
@@ -95,7 +95,7 @@ A patch: no public type or signature changed.
 
 **"Nothing to review" is a typed outcome, so a queue can settle a lockfile-only PR instead of dead-lettering it.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Neither needed a change: `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (142, 161, 167 and 152 tests) and `simcel-pr-bot` on its default build (105 tests).
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Neither needed a change: `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (142, 161, 167 and 152 tests) and the client-org bot on its default build (105 tests).
 
 This release is minor rather than a patch because of the behaviour change below: a PR that was given a "Reviewing…" placeholder and turns out to have nothing to review now gets its placeholder replaced with a no-review note, which a caller can see. `NothingToReview` itself is a new type and breaks nothing.
 
@@ -111,7 +111,7 @@ This release is minor rather than a patch because of the behaviour change below:
 
 **The run log says how many samples reported each finding, and the reviewer's tools can see symlinks.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Each fails to compile until its one test that builds an `llm::Finding` with a struct literal gains `samples: None`: `pr-review-bot` in `src/claude_backend.rs` and `src/codex_backend.rs`, `simcel-pr-bot` in `src/claude_backend.rs`. With that one-line fix, `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (141, 160, 166 and 151 tests) and `simcel-pr-bot` on its default build (105 tests).
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Each fails to compile until its one test that builds an `llm::Finding` with a struct literal gains `samples: None`: `pr-review-bot` in `src/claude_backend.rs` and `src/codex_backend.rs`, the client-org bot in `src/claude_backend.rs`. With that one-line fix, `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (141, 160, 166 and 151 tests) and the client-org bot on its default build (105 tests).
 
 This release is minor rather than a patch because `llm::Finding` and `runlog::LoggedFinding` gained public fields, which breaks struct-literal construction, and because the `grep` and `list_dir` tool descriptions changed what every agentic review reads. The generated Node and Python types did not change: `Finding::samples` is internal to the pipeline and absent from the schema.
 
@@ -127,7 +127,7 @@ This release is minor rather than a patch because `llm::Finding` and `runlog::Lo
 
 ### Migration — every consumer this breaks
 
-`llm::Finding` gains `samples: Option<u32>` and `runlog::LoggedFinding` gains `samples: Option<u32>`. Neither changes any JSON a model sends or a stored record holds, but a struct literal of either must add `samples: None`. Checked against both known consumers before release: `pr-review-bot` builds one `Finding` literal in each of `claude_backend.rs` and `codex_backend.rs`, and `simcel-pr-bot` one in `claude_backend.rs`.
+`llm::Finding` gains `samples: Option<u32>` and `runlog::LoggedFinding` gains `samples: Option<u32>`. Neither changes any JSON a model sends or a stored record holds, but a struct literal of either must add `samples: None`. Checked against both known consumers before release: `pr-review-bot` builds one `Finding` literal in each of `claude_backend.rs` and `codex_backend.rs`, and the client-org bot one in `claude_backend.rs`.
 
 ### Behaviour changes — these ship silently
 
@@ -141,7 +141,7 @@ This release is minor rather than a patch because `llm::Finding` and `runlog::Lo
 
 **A quoted range posts as one multi-line comment, and `kaniscope --fail-on advisories` makes the dependency scan a CI gate.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). `simcel-pr-bot` (105 tests) needed no change. `pr-review-bot` fails to compile until a test helper in `src/telegram.rs` that builds a `RunReviewOutput` with a struct literal gains `advisories: Vec::new(), advisory_scan: None`; that is the second row of the migration table below. With that two-line fix it passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (133, 146, 152 and 143 tests).
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). The client-org bot (105 tests) needed no change. `pr-review-bot` fails to compile until a test helper in `src/telegram.rs` that builds a `RunReviewOutput` with a struct literal gains `advisories: Vec::new(), advisory_scan: None`; that is the second row of the migration table below. With that two-line fix it passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (133, 146, 152 and 143 tests).
 
 This release is minor rather than a patch because `InlineComment` and `RunReviewOutput` gained public fields, which breaks struct-literal construction, and the generated Node and Python types changed.
 
@@ -161,7 +161,7 @@ This release is minor rather than a patch because `InlineComment` and `RunReview
 
 | change | who it touches |
 | --- | --- |
-| `InlineComment` has a new public field, `start_line: Option<u64>` | Code that builds one with a struct literal adds `start_line: None`. Neither `pr-review-bot` nor `simcel-pr-bot` does. JSON consumers are unaffected: the field is omitted when empty. |
+| `InlineComment` has a new public field, `start_line: Option<u64>` | Code that builds one with a struct literal adds `start_line: None`. Neither `pr-review-bot` nor the client-org bot does. JSON consumers are unaffected: the field is omitted when empty. |
 | `RunReviewOutput` has two new public fields, `advisories: Vec<DepAdvisory>` and `advisory_scan: Option<ScanStatus>` | Code that builds one with a struct literal adds `advisories: Vec::new(), advisory_scan: None`. `pr-review-bot` does, in `src/telegram.rs`. JSON consumers gain a field and lose nothing. |
 
 A new dependency, `sha1` 0.10, from the same RustCrypto family as the `sha2` already used; it shares its `digest` dependency.
@@ -170,7 +170,7 @@ A new dependency, `sha1` 0.10, from the same RustCrypto family as the `sha2` alr
 
 **A finding is placed by the code it quotes rather than the line number the model typed, and can span several lines.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). `simcel-pr-bot` (104 tests) needed no change. `pr-review-bot` passes on its default, `claude-code` and `claude-code,nats` builds (129, 141 and 147 tests), and fails to compile with `--features codex`: a test in `codex_backend.rs` builds a `Finding` with a struct literal. That is the first row of the migration table below, and it is intended: the test sitting beside it checks the codex output schema against `Finding`, so the bot cannot take this version without also asking codex for the new fields.
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). The client-org bot (104 tests) needed no change. `pr-review-bot` passes on its default, `claude-code` and `claude-code,nats` builds (129, 141 and 147 tests), and fails to compile with `--features codex`: a test in `codex_backend.rs` builds a `Finding` with a struct literal. That is the first row of the migration table below, and it is intended: the test sitting beside it checks the codex output schema against `Finding`, so the bot cannot take this version without also asking codex for the new fields.
 
 This release is minor rather than a patch because `Finding` gained public fields, which breaks struct-literal construction, and the generated Node and Python types changed.
 
@@ -185,7 +185,7 @@ This release is minor rather than a patch because `Finding` gained public fields
 | change | who it touches |
 | --- | --- |
 | `llm::Finding` has two new public fields, `existing_code: Option<String>` and `end_line: Option<u64>` | Code that builds a `Finding` with a struct literal must add both (`None` keeps the old behaviour). JSON consumers are unaffected: both are optional and omitted when empty. The generated Node and Python types include them. |
-| Prompts in consumers that declare their own finding shape | `pr-review-bot`'s Claude and codex backends and `simcel-pr-bot` spell the shape out themselves. Until each asks for `existing_code`, their findings keep anchoring by typed line only. |
+| Prompts in consumers that declare their own finding shape | `pr-review-bot`'s Claude and codex backends and the client-org bot spell the shape out themselves. Until each asks for `existing_code`, their findings keep anchoring by typed line only. |
 
 Multi-line comments are not posted yet: an inline comment still goes on the range's first line. Posting the range to GitHub and GitLab comes separately.
 
@@ -198,13 +198,13 @@ Multi-line comments are not posted yet: an inline comment still goes on the rang
 
 **The model is told what it cannot see — in the review, in `/ask`, in `/describe`, and in the reply when everything was filtered out.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — `pr-review-bot` (138 tests) and `simcel-pr-bot` (104 tests). Neither needed a change. Neither is reachable by CI's `downstream compiles (public consumers)` job.
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — `pr-review-bot` (138 tests) and the client-org bot (104 tests). Neither needed a change. Neither is reachable by CI's `downstream compiles (public consumers)` job.
 
 ### Migration
 
 | change | who it touches |
 | --- | --- |
-| `llm::answer_question` and `llm::describe_pr` each take a new `omitted_note: Option<&str>` before `structural_context` | **No known consumer.** `pr-review-bot` and `simcel-pr-bot` were both checked: neither calls these functions, reaching them only through `/ask` and `/describe`, which are inside this crate. An external caller passes `None` to keep the previous behaviour, though passing the note is the point. |
+| `llm::answer_question` and `llm::describe_pr` each take a new `omitted_note: Option<&str>` before `structural_context` | **No known consumer.** `pr-review-bot` and the client-org bot were both checked: neither calls these functions, reaching them only through `/ask` and `/describe`, which are inside this crate. An external caller passes `None` to keep the previous behaviour, though passing the note is the point. |
 
 This one break is why the release is minor rather than a patch. The alternative — a second `_with_omissions` entry point — would have kept the patch at the cost of two code paths doing one job.
 
@@ -236,13 +236,13 @@ Long lists are capped at ten names plus a count, so a vendoring PR excluding hun
 
 The empty-diff replies carry it too. When every changed file is filtered out, both commands used to answer "There are no reviewable source changes in this PR" — true of the diff and false of the pull request. On a lockfile-only PR that is every file, so `/ask "was the lockfile updated?"` reported that nothing changed, about a change consisting entirely of the file being asked about. They now name what was withheld. A genuinely empty change keeps the plain sentence, since claiming files were withheld when none were is the mirror-image lie.
 
-**API break.** `llm::answer_question` and `llm::describe_pr` each take a new `omitted_note: Option<&str>` before `structural_context`. **Both consumers were checked and neither calls these functions** — `pr-review-bot` and `simcel-pr-bot` reach them only through `/ask` and `/describe`, which are inside this crate. An external caller passes `None` to keep the previous behaviour, though passing the note is the point. This is why the release is a minor bump rather than a patch; a duplicate `_with_omissions` entry point would have avoided it at the cost of two code paths doing one job.
+**API break.** `llm::answer_question` and `llm::describe_pr` each take a new `omitted_note: Option<&str>` before `structural_context`. **Both consumers were checked and neither calls these functions** — `pr-review-bot` and the client-org bot reach them only through `/ask` and `/describe`, which are inside this crate. An external caller passes `None` to keep the previous behaviour, though passing the note is the point. This is why the release is a minor bump rather than a patch; a duplicate `_with_omissions` entry point would have avoided it at the cost of two code paths doing one job.
 
 ## 0.34.1
 
 **An excluded file no longer claims it is missing from the repository.**
 
-Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — `pr-review-bot` (138 tests) and `simcel-pr-bot` (104 tests). Neither needed a change. Neither is reachable by CI's `downstream compiles (public consumers)` job.
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — `pr-review-bot` (138 tests) and the client-org bot (104 tests). Neither needed a change. Neither is reachable by CI's `downstream compiles (public consumers)` job.
 
 Patch release: no API change. The change is to the error text `read_file` returns for a path the clone skipped, which is a behaviour change only in the sense that the model now reads something true where it previously read something false.
 
@@ -258,7 +258,7 @@ Found by a reviewer on the consumer's version-bump PR. The 0.34.0 end-to-end run
 
 **A repo the agentic reviewer could not clone at all is now cloned in 13 seconds, and a sampled review reports what all its samples cost.**
 
-Two consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — `pr-review-bot` (138 tests) and `simcel-pr-bot` (104 tests). Neither needed a change: there is no API break in this release. Neither is reachable by CI's `downstream compiles (public consumers)` job.
+Two consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing) — `pr-review-bot` (138 tests) and the client-org bot (104 tests). Neither needed a change: there is no API break in this release. Neither is reachable by CI's `downstream compiles (public consumers)` job.
 
 ### Behaviour changes — these ship silently
 
@@ -1063,7 +1063,7 @@ sections wants those sections rather than those plus the deployment's default.
 `extra_system_prompt` deliberately does **not** reach this prompt, though an
 earlier cut of this change made it. The argument for that was consistency —
 every other prompt honours the consumer's injected block. Looking at what a
-consumer actually puts there killed it: the deployed SIMCEL block is a hundred
+consumer actually puts there killed it: the deployed client-org block is a hundred
 lines of *review rubric* opening with "weigh these project-specific conventions
 and RAISE a finding when the diff violates one". Handing that to a prompt whose
 job is to describe a change invites descriptions that read like reviews, and
@@ -1085,12 +1085,12 @@ failure the feature exists to avoid.
 
 **A receiver-call in the change diagram no longer reaches across files.** Three
 real reviews on 0.18.0 produced one false arrow, and this is it: an Angular
-widget's `this.loadKpis(token)` was drawn as an arrow to a *different* widget's
-same-named `loadKpis` in another file. The call was to its own class's method all
-along — `kpi-table-widget.ts` calls `kpi-table-widget.ts`.
+widget's `this.loadRows(token)` was drawn as an arrow to a *different* widget's
+same-named `loadRows` in another file. The call was to its own class's method all
+along — `table-widget.ts` calls `table-widget.ts`.
 
 `x.name()` names a method on a value whose type this pass never resolves, and in
-OO code method names collide constantly (`loadKpis`, `refresh`, `update`). Within
+OO code method names collide constantly (`loadRows`, `refresh`, `update`). Within
 one file `this.helper()` is very likely that file's helper; across files it is a
 collision as often as a reference. So that edge kind is now same-file only.
 Losing true cross-file method calls is worth being rid of the false ones: a
@@ -1257,7 +1257,7 @@ way; pick the one the platform can actually keep.
 | `runlog::append(&path, &rec)` | `runlog::write(&sink, &rec)` |
 
 A consumer that only calls `Config::from_env()` needs **no change** — verified
-against `pr-review-bot`, `simcel-pr-bot` and `kaniscope-action`. Only code that
+against `pr-review-bot`, the client-org bot and `kaniscope-action`. Only code that
 sets or reads the field directly is affected; construct it with
 `RunLogSink::File(path)` or `RunLogSink::Stdout`, or parse a raw env value with
 `RunLogSink::from_env_value`.
@@ -1363,7 +1363,7 @@ the change was written for. No behaviour change; visibility only.
 **Review JSON salvage, in core rather than in one backend.** A single unescaped
 `"` in a finding's `body` discarded an entire review: `serde_json::from_str` failed
 at the *syntax* layer, before `lenient_findings` — which only drops findings that
-fail to *deserialize* — ever saw one. On `SIMCEL/simcel-saas#3` that threw away 265
+fail to *deserialize* — ever saw one. On a client-org PR that threw away 265
 seconds of agent work and left the PR sitting on a stale placeholder with nothing
 to retry it.
 
@@ -1467,7 +1467,7 @@ release before it was cut:
 | consumer | change needed |
 |---|---|
 | `pr-review-bot` | `ctx.provider` is an `Option`; `review_diff` takes a system prompt; the claude-code backend now takes its rules from `ctx.system_prompt(..)` instead of importing `REVIEW_RULES` |
-| `simcel-pr-bot` | same two, via `try_clone` and its `review_system_prompt` helper |
+| client-org bot | same two, via `try_clone` and its `review_system_prompt` helper |
 | `kaniscope-action` | none — it only uses `Config` / `run_review` / `RunReviewInput` |
 
 **Behaviour change, latent rather than live:** a backend overriding
