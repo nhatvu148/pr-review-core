@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.42.0
+
+**The walkthrough marks a file the packer cut, so its `+/−` counts no longer read as the whole change.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with no changes needed. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (166, 189, 195 and 177 tests) and `simcel-pr-bot` on its default build (106 tests).
+
+This release is minor rather than a patch because `changemap::FileEntry` gains a public field.
 
 ### Migration
 
