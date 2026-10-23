@@ -357,8 +357,8 @@ pub(crate) fn link_edges(map: &mut ChangeMap, contents: &HashMap<&str, &str>, ma
                 // as a reference — and method names collide constantly in OO code.
                 //
                 // The case that forced this: an Angular widget's
-                // `this.loadKpis(token)` was drawn as an arrow to a *different*
-                // widget's same-named `loadKpis` in another file. The call was to
+                // `this.loadRows(token)` was drawn as an arrow to a *different*
+                // widget's same-named `loadRows` in another file. The call was to
                 // its own class's method all along. Restricting the kind to
                 // same-file targets makes that draw nothing, which is the right
                 // answer — a false arrow is the one thing this render cannot
@@ -937,23 +937,23 @@ mod tests {
         );
     }
 
-    /// A case from a client-org PR. An Angular widget's `this.loadKpis(token)` was
-    /// drawn as an arrow to a *different* widget's same-named `loadKpis` in
+    /// A case from a client-org PR. An Angular widget's `this.loadRows(token)` was
+    /// drawn as an arrow to a *different* widget's same-named `loadRows` in
     /// another file; the call was to its own class's method all along. A
     /// receiver-call only links within one file now, so this draws nothing.
     #[test]
     fn a_receiver_call_never_reaches_across_files() {
         let mut map = ChangeMap {
             symbols: vec![
-                sym("loadKpisForScenario", "kpi-table-widget.ts", 1, 3, None),
-                sym("loadKpis", "pl-chart-widget.ts", 1, 2, None),
+                sym("loadRowsForView", "table-widget.ts", 1, 3, None),
+                sym("loadRows", "chart-widget.ts", 1, 2, None),
             ],
             files: vec![],
             edges: vec![],
             edges_truncated: false,
         };
-        let a = "loadKpisForScenario() {\n    this.loadKpis(token);\n}\n";
-        let contents: HashMap<&str, &str> = [("kpi-table-widget.ts", a)].into_iter().collect();
+        let a = "loadRowsForView() {\n    this.loadRows(token);\n}\n";
+        let contents: HashMap<&str, &str> = [("table-widget.ts", a)].into_iter().collect();
         link_edges(&mut map, &contents, 25);
         assert!(map.edges.is_empty(), "{:?}", map.edges);
     }

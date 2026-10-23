@@ -437,7 +437,7 @@ between symbols this PR changed. A bare call to a name several modules define is
 not disambiguated. A call through an unresolved receiver (`x.append(`) draws
 dotted rather than solid, and only within a single file: across files a method
 name is a collision as often as a reference, which is how a real review drew an
-Angular widget's `this.loadKpis()` as an arrow to a different widget's
+Angular widget's `this.loadRows()` as an arrow to a different widget's
 same-named method.
 
 See it before it posts on anyone's PR:

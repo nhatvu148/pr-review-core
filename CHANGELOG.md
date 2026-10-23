@@ -1085,12 +1085,12 @@ failure the feature exists to avoid.
 
 **A receiver-call in the change diagram no longer reaches across files.** Three
 real reviews on 0.18.0 produced one false arrow, and this is it: an Angular
-widget's `this.loadKpis(token)` was drawn as an arrow to a *different* widget's
-same-named `loadKpis` in another file. The call was to its own class's method all
-along — `kpi-table-widget.ts` calls `kpi-table-widget.ts`.
+widget's `this.loadRows(token)` was drawn as an arrow to a *different* widget's
+same-named `loadRows` in another file. The call was to its own class's method all
+along — `table-widget.ts` calls `table-widget.ts`.
 
 `x.name()` names a method on a value whose type this pass never resolves, and in
-OO code method names collide constantly (`loadKpis`, `refresh`, `update`). Within
+OO code method names collide constantly (`loadRows`, `refresh`, `update`). Within
 one file `this.helper()` is very likely that file's helper; across files it is a
 collision as often as a reference. So that edge kind is now same-file only.
 Losing true cross-file method calls is worth being rid of the false ones: a
