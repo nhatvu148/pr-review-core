@@ -559,14 +559,18 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> Packed {
             keep.fill(false);
             let (text, kept_hunks, total_hunks) = cut_section(&sections[i].1, max_chars);
             let partial_hunk = kept_hunks == 0 && text.lines().any(|l| l.starts_with("@@"));
+            // A file that missed the budget only because of the preamble fits
+            // whole once the preamble goes, and nothing of it was cut.
+            if text.len() < sections[i].1.len() {
+                cut = Some(CutFile {
+                    path: sections[i].0.clone(),
+                    kept_hunks,
+                    partial_hunk,
+                    total_hunks,
+                });
+            }
             sections[i].1 = text;
             keep[i] = true;
-            cut = Some(CutFile {
-                path: sections[i].0.clone(),
-                kept_hunks,
-                partial_hunk,
-                total_hunks,
-            });
         }
     }
 
@@ -1294,6 +1298,18 @@ mod tests {
         let p = pack_diff_bundled(&d, 100);
         assert_eq!(p.cut.expect("cut").path, "src/foo.ts");
         assert_eq!(p.dropped, vec!["src/foo.test.ts".to_string()]);
+    }
+
+    /// A file that misses the budget only because of the preamble fits whole
+    /// once the preamble goes, and must not be reported as cut.
+    #[test]
+    fn a_file_displaced_only_by_the_preamble_is_kept_whole_not_cut() {
+        let file = "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+abc\n";
+        let d = format!("{}\n{file}", "p".repeat(30));
+        let p = pack_diff(&d, file.chars().count() + 5);
+        assert_eq!(p.diff, file);
+        assert_eq!(p.cut, None);
+        assert!(p.dropped.is_empty());
     }
 
     /// A preamble that fills nearly the whole budget must not squeeze the file
