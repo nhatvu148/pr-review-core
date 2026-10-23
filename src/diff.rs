@@ -744,7 +744,8 @@ struct FieldPattern {
 pub(crate) fn change_digest(section: &str) -> Option<String> {
     let mut hunks = 0usize;
     let mut patterns: HashMap<(FieldSep, usize, usize), FieldPattern> = HashMap::new();
-    let (mut other_pairs, mut uneven_removed, mut uneven_added) = (0usize, 0usize, 0usize);
+    let (mut other_pairs, mut spacing_pairs) = (0usize, 0usize);
+    let (mut uneven_removed, mut uneven_added) = (0usize, 0usize);
     let (mut only_removed, mut only_added) = (0usize, 0usize);
     let (mut removed, mut added): (Vec<&str>, Vec<&str>) = (Vec::new(), Vec::new());
 
@@ -761,28 +762,45 @@ pub(crate) fn change_digest(section: &str) -> Option<String> {
             }
             _ => {
                 for (old, new) in removed.iter().zip(added.iter()) {
-                    let changed = FieldSep::split(old, new).and_then(|(sep, o, n)| {
-                        let mut diffs = (0..o.len()).filter(|&i| o[i] != n[i]);
-                        match (diffs.next(), diffs.next()) {
-                            (Some(i), None) => Some((sep, i, o.len(), o[i], n[i])),
-                            _ => None,
-                        }
-                    });
-                    let Some((sep, i, width, o, n)) = changed else {
+                    let Some((sep, o, n)) = FieldSep::split(old, new) else {
                         other_pairs += 1;
                         continue;
                     };
+                    let mut diffs = (0..o.len()).filter(|&i| o[i] != n[i]);
+                    let (i, width) = match (diffs.next(), diffs.next()) {
+                        // Equal fields, so only the spacing between them changed.
+                        (None, _) => {
+                            spacing_pairs += 1;
+                            continue;
+                        }
+                        // A one-field line is the whole line replaced, not a record
+                        // with one field changed: `-foo +bar` is not a pattern.
+                        (Some(i), None) if o.len() > 1 => (i, o.len()),
+                        _ => {
+                            other_pairs += 1;
+                            continue;
+                        }
+                    };
+                    let (o, n) = (o[i], n[i]);
                     let p = patterns.entry((sep, i, width)).or_default();
                     p.lines += 1;
                     match (plain_number(o), plain_number(n)) {
                         (Some(o), Some(n)) => {
-                            let (a, b) = (o.parse::<f64>(), n.parse::<f64>());
-                            if let (Ok(a), Ok(b)) = (a, b) {
-                                if b > a {
-                                    p.up += 1;
-                                } else if b < a {
-                                    p.down += 1;
-                                }
+                            // Integers compare exactly; past 2^53 two different
+                            // ones can be the same `f64`, and the change would
+                            // count as neither up nor down.
+                            let order = match (o.parse::<i128>(), n.parse::<i128>()) {
+                                (Ok(a), Ok(b)) => Some(b.cmp(&a)),
+                                _ => n
+                                    .parse::<f64>()
+                                    .ok()
+                                    .zip(o.parse::<f64>().ok())
+                                    .and_then(|(b, a)| b.partial_cmp(&a)),
+                            };
+                            match order {
+                                Some(std::cmp::Ordering::Greater) => p.up += 1,
+                                Some(std::cmp::Ordering::Less) => p.down += 1,
+                                _ => {}
                             }
                             *p.transitions
                                 .entry((o.to_string(), n.to_string()))
@@ -822,7 +840,7 @@ pub(crate) fn change_digest(section: &str) -> Option<String> {
         return None;
     }
 
-    let edited = patterns.values().map(|p| p.lines).sum::<usize>() + other_pairs;
+    let edited = patterns.values().map(|p| p.lines).sum::<usize>() + other_pairs + spacing_pairs;
     let mut out = format!(
         "Across all {hunks} hunk(s) of this file, computed from its full diff: {edited} line(s) \
          edited in place"
@@ -869,7 +887,12 @@ pub(crate) fn change_digest(section: &str) -> Option<String> {
         }
     }
     if other_pairs > 0 {
-        out.push_str(&format!("; {other_pairs} change more than one field"));
+        out.push_str(&format!(
+            "; {other_pairs} change the whole line, several fields or the number of fields"
+        ));
+    }
+    if spacing_pairs > 0 {
+        out.push_str(&format!("; {spacing_pairs} change only spacing"));
     }
     out.push('.');
     let mut rest = Vec::new();
@@ -1554,6 +1577,24 @@ mod tests {
         assert!(digest.contains("2 line(s) removed outright"), "{digest}");
         assert!(digest.contains("1 line(s) added outright"), "{digest}");
         assert_eq!(change_digest("+++ b/a.rs\n"), None, "no hunks, no digest");
+    }
+
+    /// A one-token line replaced is not a one-field pattern, a spacing change is
+    /// named as one, and integers past 2^53 still say which way they moved.
+    #[test]
+    fn a_digest_names_what_kind_of_edit_it_could_not_pattern() {
+        let d = "+++ b/a.txt\n@@ -1,3 +1,3 @@\n-foo\n-a  b\n-k\t9007199254740992\n\
+                 +bar\n+a b\n+k\t9007199254740993\n";
+        let digest = change_digest(d).unwrap();
+        assert!(digest.contains("3 line(s) edited in place"), "{digest}");
+        assert!(
+            digest.contains(
+                "1 change only field 2 of 2 (tab-separated), always a number: 1 up, 0 down"
+            ),
+            "{digest}"
+        );
+        assert!(digest.contains("1 change the whole line"), "{digest}");
+        assert!(digest.contains("1 change only spacing"), "{digest}");
     }
 
     /// The packer digests the whole file, not just the part it kept.
