@@ -6060,9 +6060,7 @@ mod omission_note_tests {
             kept_hunks: 157,
             partial_hunk: false,
             total_hunks: 1585,
-            digest: Some(
-                "Across all 1585 hunk(s) of this file, computed from its full diff: …".into(),
-            ),
+            digest: Some("Across all 1585 hunk(s), computed from the full diff: …".into()),
         };
         let note = omission_note(&[], &[], Some(&cut)).unwrap();
         let shown = note.find("first 157 of 1585").expect("says what is shown");

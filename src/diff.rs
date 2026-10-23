@@ -702,6 +702,20 @@ impl FieldSep {
     }
 }
 
+/// The old- and new-side line counts of a `@@ -a,b +c,d @@` header. A side with
+/// no `,n` is one line, as unified diff writes it.
+fn hunk_lengths(header: &str) -> Option<(usize, usize)> {
+    let mut ranges = header.strip_prefix("@@ ")?.split(' ');
+    let len = |r: &str, sign: char| -> Option<usize> {
+        let r = r.strip_prefix(sign)?;
+        match r.split_once(',') {
+            Some((_, n)) => n.parse().ok(),
+            None => r.parse::<usize>().ok().map(|_| 1),
+        }
+    };
+    Some((len(ranges.next()?, '-')?, len(ranges.next()?, '+')?))
+}
+
 /// `s` as a plain decimal number, or `None`. Strict on purpose: the digest's
 /// text sits in the reviewer's prompt as a trusted note, so it may only repeat
 /// a field that cannot carry words. `f64` parsing alone would accept `inf` and
@@ -771,7 +785,8 @@ pub(crate) fn change_digest(section: &str) -> Option<String> {
                         other_pairs += 1;
                         continue;
                     };
-                    let mut diffs = (0..o.len()).filter(|&i| o[i] != n[i]);
+                    // Trimmed: `k\t 80` to `k\t80` is spacing, not 80 → 80.
+                    let mut diffs = (0..o.len()).filter(|&i| o[i].trim() != n[i].trim());
                     let (i, width) = match (diffs.next(), diffs.next()) {
                         // Equal fields, so only the spacing between them changed.
                         (None, _) => {
@@ -823,15 +838,33 @@ pub(crate) fn change_digest(section: &str) -> Option<String> {
         added.clear();
     };
 
-    let mut in_hunk = false;
+    // Old- and new-side lines the current hunk has left, from its header. A hunk
+    // ends by its counts, not at the next `@@`: a section that holds more than
+    // one file (a diff with no parseable headers) has the next file's `---` and
+    // `+++` lines after it, which read as a removal and an addition otherwise.
+    let (mut old_left, mut new_left) = (0usize, 0usize);
     for line in section.lines() {
         if line.starts_with("@@") {
             flush(&mut removed, &mut added);
             hunks += 1;
-            in_hunk = true;
-        } else if !in_hunk || line.starts_with('\\') {
-            // File header, or "\ No newline at end of file".
-        } else if let Some(l) = line.strip_prefix('-') {
+            // An unparseable header leaves the hunk open until the next `@@`,
+            // which is how every line was read before the counts were.
+            (old_left, new_left) = hunk_lengths(line).unwrap_or((usize::MAX, usize::MAX));
+            continue;
+        }
+        if old_left == 0 && new_left == 0 || line.starts_with('\\') {
+            // A file header, or "\ No newline at end of file".
+            continue;
+        }
+        match line.as_bytes().first() {
+            Some(b'-') => old_left = old_left.saturating_sub(1),
+            Some(b'+') => new_left = new_left.saturating_sub(1),
+            _ => {
+                old_left = old_left.saturating_sub(1);
+                new_left = new_left.saturating_sub(1);
+            }
+        }
+        if let Some(l) = line.strip_prefix('-') {
             // A removal after additions starts a new block: `-a +b -c +d`.
             if !added.is_empty() {
                 flush(&mut removed, &mut added);
@@ -850,8 +883,7 @@ pub(crate) fn change_digest(section: &str) -> Option<String> {
 
     let edited = patterns.values().map(|p| p.lines).sum::<usize>() + other_pairs + spacing_pairs;
     let mut out = format!(
-        "Across all {hunks} hunk(s) of this file, computed from its full diff: {edited} line(s) \
-         edited in place"
+        "Across all {hunks} hunk(s), computed from the full diff: {edited} line(s) edited in place"
     );
     let mut ranked: Vec<_> = patterns.into_iter().collect();
     ranked.sort_by(|a, b| b.1.lines.cmp(&a.1.lines).then_with(|| a.0.cmp(&b.0)));
@@ -1526,7 +1558,7 @@ mod tests {
                 kept_hunks: 0,
                 partial_hunk: true,
                 total_hunks: 1,
-                digest: Some("Across all 1 hunk(s) of this file, computed from its full diff: 0 line(s) edited in place. Also 1 line(s) added outright.".into()),
+                digest: Some("Across all 1 hunk(s), computed from the full diff: 0 line(s) edited in place. Also 1 line(s) added outright.".into()),
             })
         );
     }
@@ -1577,7 +1609,7 @@ mod tests {
     /// plain additions and removals are counted apart from edits.
     #[test]
     fn a_digest_counts_what_it_cannot_pair() {
-        let d = "+++ b/a.rs\n@@ -1,4 +1,4 @@\n\
+        let d = "+++ b/a.rs\n@@ -1,5 +1,5 @@\n\
                  -fn a() {}\n+fn a() { b(); }\n+fn c() {}\n ctx\n\
                  +new line\n ctx\n-gone\n-gone too\n";
         let digest = change_digest(d).unwrap();
@@ -1612,6 +1644,25 @@ mod tests {
         let digest = change_digest(dropped_column).unwrap();
         assert!(!digest.contains("spacing"), "a column went: {digest}");
         assert!(digest.contains("1 change the whole line"), "{digest}");
+    }
+
+    /// A section holding two files, as the packer's no-headers fallback can
+    /// cut: the second file's header is not read as an edit, and padding
+    /// around a number is spacing, not a value change.
+    #[test]
+    fn a_digest_ends_each_hunk_by_its_counts() {
+        let d = "--- a/x.tsv\n+++ b/x.tsv\n@@ -1,2 +1,2 @@\n-k\t 80\n-j\t1\n+k\t80\n+j\t2\n\
+                 --- a/y.tsv\n+++ b/y.tsv\n@@ -1 +1 @@\n-m\t3\n+m\t4\n";
+        let digest = change_digest(d).unwrap();
+        assert!(digest.contains("all 2 hunk(s)"), "{digest}");
+        assert!(digest.contains("3 line(s) edited in place"), "{digest}");
+        assert!(digest.contains("2 change only field 2 of 2"), "{digest}");
+        assert!(digest.contains("1 change only spacing"), "{digest}");
+        assert!(
+            digest.contains("No line is added or removed outright"),
+            "{digest}"
+        );
+        assert_eq!(super::hunk_lengths("@@ -3 +4,0 @@ fn x"), Some((1, 0)));
     }
 
     /// Past the tally, a value change is still counted by line, and the counts
