@@ -937,7 +937,7 @@ mod tests {
         );
     }
 
-    /// The simcel-saas#75 case. An Angular widget's `this.loadKpis(token)` was
+    /// A case from a client-org PR. An Angular widget's `this.loadKpis(token)` was
     /// drawn as an arrow to a *different* widget's same-named `loadKpis` in
     /// another file; the call was to its own class's method all along. A
     /// receiver-call only links within one file now, so this draws nothing.

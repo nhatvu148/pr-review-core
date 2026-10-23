@@ -568,7 +568,7 @@ It is appended last and declared to outrank the built-in section list, because a
 model handed two section lists without being told which governs returns both.
 
 `EXTRA_SYSTEM_PROMPT` deliberately does **not** reach this prompt. In practice
-that variable holds a *review rubric* — the deployed SIMCEL block opens with
+that variable holds a *review rubric* — the deployed client-org block opens with
 "RAISE a finding when the diff violates one" — and handing that to a prompt whose
 job is to describe a change invites descriptions that read like reviews. If you
 want project context in your descriptions, put it here, where it is scoped to the

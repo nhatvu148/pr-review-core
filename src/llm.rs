@@ -809,7 +809,7 @@ pub(crate) async fn chat_text(
 // ─── Review JSON salvage ────────────────────────────────────────────────────
 //
 // A single unescaped `"` in a finding's `body` used to discard an entire review.
-// On `SIMCEL/simcel-saas#3` that threw away 265s of agent work and left the PR on
+// On a client-org PR that threw away 265s of agent work and left the PR on
 // a stale "Reviewing this PR…" placeholder with nothing to retry it.
 //
 // [`lenient_findings`] does not cover this: it drops findings that fail to
