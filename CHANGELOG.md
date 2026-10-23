@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.41.0
+
+**A diff whose every file is over the size budget is cut to the budget at a hunk boundary, instead of being sent whole to a backend that may not clamp it.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with no changes needed. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (166, 189, 195 and 177 tests) and `simcel-pr-bot` on its default build (106 tests).
+
+This release is minor rather than a patch because `pack_diff` and `pack_diff_bundled` change their return type.
 
 ### Migration
 
