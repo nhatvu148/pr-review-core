@@ -1536,7 +1536,11 @@ fn name_some(paths: &[String]) -> String {
 /// The glob clause says explicitly not to infer anything from the absence,
 /// because the failure mode is not the model lacking the file — it is the model
 /// drawing a conclusion from a gap it cannot see the edges of.
-pub(crate) fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) -> Option<String> {
+pub(crate) fn omission_note(
+    glob_dropped: &[String],
+    packed_dropped: &[String],
+    cut: Option<&crate::diff::CutFile>,
+) -> Option<String> {
     let mut parts = Vec::new();
 
     if !glob_dropped.is_empty() {
@@ -1557,6 +1561,29 @@ pub(crate) fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) 
         ));
     }
 
+    if let Some(c) = cut {
+        let shown = if c.kept_hunks == 0 {
+            format!(
+                "only the start of the first of its {} changed hunk(s) is shown",
+                c.total_hunks
+            )
+        } else {
+            format!(
+                "only its first {} of {} changed hunk(s) are shown",
+                c.kept_hunks, c.total_hunks
+            )
+        };
+        let name = if c.path.is_empty() {
+            "The diff".to_string()
+        } else {
+            format!("`{}`", c.path)
+        };
+        parts.push(format!(
+            "{name} is larger than the size limit on its own: {shown}. The rest of its changes were NOT \
+             reviewed — do not report anything as missing from the part that is not shown."
+        ));
+    }
+
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
@@ -1567,7 +1594,7 @@ pub(crate) fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) 
 /// kept a different set of files than the review did, and told the model a
 /// different list of what was omitted, while documenting that they saw the same
 /// diff as the reviewer.
-pub(crate) fn pack_to_budget(cfg: &Config, diff: &str) -> (String, Vec<String>) {
+pub(crate) fn pack_to_budget(cfg: &Config, diff: &str) -> crate::diff::Packed {
     if cfg.file_bundling {
         crate::diff::pack_diff_bundled(diff, cfg.max_diff_chars)
     } else {
@@ -1618,7 +1645,19 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
     // Smart size handling: keep whole files, dropping the lowest-priority ones
     // first, until the diff fits `max_diff_chars` — instead of a blunt mid-file
     // char cut. Applied ONCE here so every review path gets the same packed diff.
-    let (diff, packed_dropped) = pack_to_budget(cfg, &diff);
+    let crate::diff::Packed {
+        diff,
+        dropped: packed_dropped,
+        cut,
+    } = pack_to_budget(cfg, &diff);
+    if let Some(c) = &cut {
+        tracing::info!(
+            "packed diff: {} is over the budget alone, kept {} of {} hunk(s)",
+            c.path,
+            c.kept_hunks,
+            c.total_hunks
+        );
+    }
     if !packed_dropped.is_empty() {
         tracing::info!(
             "packed diff: omitted {} lower-priority file(s) to fit budget: {:?}",
@@ -1627,8 +1666,8 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
         );
     }
     // Surfaced to the model so it knows these files were NOT reviewed.
-    let omitted_note = omission_note(&glob_dropped, &packed_dropped);
-    let size_dropped = !packed_dropped.is_empty();
+    let omitted_note = omission_note(&glob_dropped, &packed_dropped, cut.as_ref());
+    let size_dropped = !packed_dropped.is_empty() || cut.is_some();
 
     PreparedDiff {
         diff,
@@ -5888,7 +5927,7 @@ mod omission_note_tests {
     /// PRs, against a lockfile that was committed and pinned correctly.
     #[test]
     fn a_glob_excluded_file_is_named_to_the_model() {
-        let note = omission_note(&["Cargo.lock".to_string()], &[])
+        let note = omission_note(&["Cargo.lock".to_string()], &[], None)
             .expect("a glob-excluded file must produce a note");
         assert!(note.contains("Cargo.lock"), "{note}");
         assert!(
@@ -5909,7 +5948,7 @@ mod omission_note_tests {
     /// The budget wording is untouched when only the packer dropped something.
     #[test]
     fn a_packed_out_file_keeps_the_size_wording() {
-        let note = omission_note(&[], &["big/generated.rs".to_string()]).unwrap();
+        let note = omission_note(&[], &["big/generated.rs".to_string()], None).unwrap();
         assert!(note.contains("size limit"), "{note}");
         assert!(note.contains("big/generated.rs"), "{note}");
         assert!(
@@ -5921,7 +5960,8 @@ mod omission_note_tests {
     /// Both routes at once report both reasons, separately.
     #[test]
     fn the_two_reasons_are_reported_separately() {
-        let note = omission_note(&["Cargo.lock".to_string()], &["huge.rs".to_string()]).unwrap();
+        let note =
+            omission_note(&["Cargo.lock".to_string()], &["huge.rs".to_string()], None).unwrap();
         assert!(
             note.contains("configuration") && note.contains("size limit"),
             "{note}"
@@ -5932,17 +5972,33 @@ mod omission_note_tests {
         );
     }
 
+    /// A file cut to fit is named with how much of it the model can see, and is
+    /// not told it was omitted — part of it is right there in the diff.
+    #[test]
+    fn a_cut_file_says_how_much_of_it_is_shown() {
+        let cut = crate::diff::CutFile {
+            path: "dict.yaml".into(),
+            kept_hunks: 120,
+            total_hunks: 1585,
+        };
+        let note = omission_note(&[], &[], Some(&cut)).unwrap();
+        assert!(note.contains("`dict.yaml`"), "{note}");
+        assert!(note.contains("first 120 of 1585"), "{note}");
+        assert!(note.contains("NOT"), "{note}");
+        assert!(!note.contains("were omitted"), "{note}");
+    }
+
     /// Nothing dropped, nothing said.
     #[test]
     fn no_omissions_produce_no_note() {
-        assert!(omission_note(&[], &[]).is_none());
+        assert!(omission_note(&[], &[], None).is_none());
     }
 
     /// A vendoring PR must not paste hundreds of paths into the prompt.
     #[test]
     fn a_long_list_is_capped_and_says_how_many_it_hid() {
         let many: Vec<String> = (0..25).map(|i| format!("vendor/f{i}.js")).collect();
-        let note = omission_note(&many, &[]).unwrap();
+        let note = omission_note(&many, &[], None).unwrap();
         assert!(note.contains("25 file(s)"), "the count stays exact: {note}");
         assert!(note.contains("and 15 more"), "the list is capped: {note}");
         assert!(

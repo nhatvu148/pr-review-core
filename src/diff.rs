@@ -306,26 +306,50 @@ fn file_priority(path: &str) -> u8 {
     2
 }
 
+/// A diff packed to a size budget by [`pack_diff`] or [`pack_diff_bundled`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Packed {
+    /// The packed diff, never longer than the budget in chars.
+    pub diff: String,
+    /// Files left out whole.
+    pub dropped: Vec<String>,
+    /// The one file kept only in part, when every file was over the budget alone.
+    pub cut: Option<CutFile>,
+}
+
+/// A file whose diff was cut to fit the budget, because it did not fit on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CutFile {
+    /// The file's path, or empty when the diff had no parseable file headers.
+    pub path: String,
+    /// Whole hunks kept, in diff order. `0` means even the first hunk was over
+    /// the budget and only its start is kept.
+    pub kept_hunks: usize,
+    /// Hunks the file's diff had before the cut.
+    pub total_hunks: usize,
+}
+
 /// Fit `diff` within `max_chars` by keeping whole file sections, dropping the
-/// lowest-priority files first. Returns `(packed_diff, dropped_paths)`. If the
-/// diff already fits, returns it unchanged with an empty dropped list.
+/// lowest-priority files first. If the diff already fits, returns it unchanged
+/// with nothing dropped or cut.
 ///
 /// Sections are ranked by [`file_priority`] (DESC) then by char-length (ASC, so
 /// more small high-value files fit), then greedily accumulated while the running
 /// total stays within budget. Kept sections are re-emitted in their ORIGINAL
 /// diff order so the packed diff still reads top-to-bottom. If not even the
-/// smallest single section fits, the best one is kept anyway (never returns
-/// empty for a non-empty diff — a downstream safety clamp trims the hard cap).
+/// smallest single section fits, the best one is kept cut to the budget at a
+/// hunk boundary and reported in [`Packed::cut`], so a non-empty diff never
+/// packs to an empty one and never to one over the budget.
 ///
 /// # Examples
 /// ```
 /// # use pr_review_core::diff::pack_diff;
 /// let d = "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+y\n";
-/// let (packed, dropped) = pack_diff(d, 10_000);
-/// assert_eq!(packed, d);
-/// assert!(dropped.is_empty());
+/// let packed = pack_diff(d, 10_000);
+/// assert_eq!(packed.diff, d);
+/// assert!(packed.dropped.is_empty() && packed.cut.is_none());
 /// ```
-pub fn pack_diff(diff: &str, max_chars: usize) -> (String, Vec<String>) {
+pub fn pack_diff(diff: &str, max_chars: usize) -> Packed {
     pack_impl(diff, max_chars, false)
 }
 
@@ -334,7 +358,7 @@ pub fn pack_diff(diff: &str, max_chars: usize) -> (String, Vec<String>) {
 /// by priority. Falls back to keeping a unit's highest-priority members when the
 /// whole unit can't fit, so a big source is never dropped just because its test
 /// pushed the bundle over budget.
-pub fn pack_diff_bundled(diff: &str, max_chars: usize) -> (String, Vec<String>) {
+pub fn pack_diff_bundled(diff: &str, max_chars: usize) -> Packed {
     pack_impl(diff, max_chars, true)
 }
 
@@ -414,12 +438,16 @@ fn bundle_key(path: &str) -> String {
 /// When `bundle`, related files are grouped into units that pack together and stay
 /// adjacent (see [`pack_diff_bundled`]); otherwise each file is its own unit and
 /// the behaviour is the historical per-file packing.
-fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> (String, Vec<String>) {
+fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> Packed {
     if diff.chars().count() <= max_chars {
-        return (diff.to_string(), Vec::new());
+        return Packed {
+            diff: diff.to_string(),
+            dropped: Vec::new(),
+            cut: None,
+        };
     }
 
-    let sections = split_diff_sections(diff);
+    let mut sections = split_diff_sections(diff);
 
     // Units = section-index groups. Without bundling each section is its own unit.
     let units: Vec<Vec<usize>> = if bundle {
@@ -490,10 +518,21 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> (String, Vec<String>
         }
     }
 
-    // Fail-safe: never return empty — keep the best-ranked unit's first section.
+    // Fail-safe: never return empty — keep the best-ranked unit's first section,
+    // cut to the budget. It used to be kept whole, trusting each backend to clamp
+    // its own prompt; pr-review-bot's Claude Code backend did not, and a one-file
+    // 3.4 MB dictionary reweight went to it whole and overflowed the context window.
+    let mut cut = None;
     if !keep.iter().any(|&k| k) {
         if let Some(&i) = order.first().and_then(|&ui| units[ui].first()) {
+            let (text, kept_hunks, total_hunks) = cut_section(&sections[i].1, max_chars);
+            sections[i].1 = text;
             keep[i] = true;
+            cut = Some(CutFile {
+                path: sections[i].0.clone(),
+                kept_hunks,
+                total_hunks,
+            });
         }
     }
 
@@ -519,7 +558,52 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> (String, Vec<String>
         }
     }
 
-    (out, dropped)
+    Packed {
+        diff: out,
+        dropped,
+        cut,
+    }
+}
+
+/// Cut one file's section to `max_chars` at the last hunk boundary that fits, so
+/// what is kept is still a well-formed diff the line anchoring can parse. Returns
+/// `(kept_text, kept_hunks, total_hunks)`.
+///
+/// Only when even the first hunk is over the budget does it fall back to the last
+/// whole line that fits. That leaves the hunk header counting lines that are not
+/// there — the same as the per-backend `take(max_diff_chars)` clamp this replaces
+/// — and is still a bounded prompt where sending the file whole was not.
+fn cut_section(text: &str, max_chars: usize) -> (String, usize, usize) {
+    let total_hunks = text.lines().filter(|l| l.starts_with("@@")).count();
+    let mut chars = 0;
+    let mut hunks_started = 0;
+    let mut hunk_end = None;
+    let mut line_end = 0;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        // Everything before a hunk header is whole hunks, all of which fit.
+        if line.starts_with("@@") {
+            if hunks_started > 0 {
+                hunk_end = Some((offset, hunks_started));
+            }
+            hunks_started += 1;
+        }
+        chars += line.chars().count();
+        if chars > max_chars {
+            break;
+        }
+        offset += line.len();
+        line_end = offset;
+    }
+    if chars <= max_chars {
+        return (text.to_string(), total_hunks, total_hunks);
+    }
+    match hunk_end {
+        Some((end, kept)) => (text[..end].to_string(), kept, total_hunks),
+        None if line_end > 0 => (text[..line_end].to_string(), 0, total_hunks),
+        // A single line over the budget: nothing whole fits, so cut in the line.
+        None => (text.chars().take(max_chars).collect(), 0, total_hunks),
+    }
 }
 
 /// Drop per-file sections of a unified diff that don't pass the include/exclude
@@ -729,7 +813,8 @@ pub fn diff_hygiene_with(diff: &str, vendored_globs: &[String]) -> Vec<HygieneIs
 mod tests {
     use super::{
         bundle_key, diff_hygiene, diff_line_texts, filter_diff_by_globs, is_vendored, pack_diff,
-        pack_diff_bundled, parse_valid_lines, path_matches_globs, split_diff_sections,
+        pack_diff_bundled, parse_valid_lines, path_matches_globs, split_diff_sections, CutFile,
+        Packed,
     };
 
     #[test]
@@ -899,7 +984,11 @@ mod tests {
 
         // Budget fits the small foo+foo.test bundle but not the large `other`.
         let budget = foo.chars().count() + foot.chars().count() + 5;
-        let (packed, dropped) = pack_diff_bundled(&diff, budget);
+        let Packed {
+            diff: packed,
+            dropped,
+            ..
+        } = pack_diff_bundled(&diff, budget);
 
         assert_eq!(
             dropped,
@@ -919,7 +1008,11 @@ mod tests {
         let a = section("src/a.ts", "aa");
         let big = section("src/big.ts", &"y".repeat(400));
         let diff = format!("{a}{big}");
-        let (packed, dropped) = pack_diff(&diff, a.chars().count() + 5);
+        let Packed {
+            diff: packed,
+            dropped,
+            ..
+        } = pack_diff(&diff, a.chars().count() + 5);
         assert!(packed.contains("src/a.ts"));
         assert_eq!(dropped, vec!["src/big.ts".to_string()]);
     }
@@ -1032,7 +1125,11 @@ mod tests {
     #[test]
     fn pack_under_budget_returns_unchanged() {
         let d = "diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+a\n";
-        let (packed, dropped) = pack_diff(d, 10_000);
+        let Packed {
+            diff: packed,
+            dropped,
+            ..
+        } = pack_diff(d, 10_000);
         assert_eq!(packed, d);
         assert!(dropped.is_empty());
     }
@@ -1052,7 +1149,11 @@ mod tests {
              @@ -1 +1 @@\n\
              +small\n"
         );
-        let (packed, dropped) = pack_diff(&d, 120);
+        let Packed {
+            diff: packed,
+            dropped,
+            ..
+        } = pack_diff(&d, 120);
         assert_eq!(dropped, vec!["README.md".to_string()]);
         assert!(packed.contains("src/a.rs"));
         assert!(!packed.contains("README.md"));
@@ -1075,7 +1176,11 @@ mod tests {
                  +++ b/README.md\n\
                  @@ -1 +1 @@\n\
                  +gammagammagammagammagammagamma\n";
-        let (packed, dropped) = pack_diff(d, 160);
+        let Packed {
+            diff: packed,
+            dropped,
+            ..
+        } = pack_diff(d, 160);
         assert_eq!(dropped, vec!["README.md".to_string()]);
         let a = packed.find("src/a.rs").expect("source kept");
         let b = packed.find("src/a.spec.rs").expect("spec kept");
@@ -1084,13 +1189,56 @@ mod tests {
 
     #[test]
     fn pack_keeps_single_oversized_file_rather_than_empty() {
-        // One file, larger than the budget: must still be returned (safety clamp
-        // downstream trims it) — never empty, nothing reported as dropped.
+        // One file whose only hunk is over the budget: never empty, nothing
+        // reported as dropped, and cut inside that hunk rather than sent whole.
         let big = "y".repeat(400);
         let d = format!("diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+{big}\n");
-        let (packed, dropped) = pack_diff(&d, 50);
-        assert!(!packed.is_empty());
-        assert!(packed.contains("src/a.rs"));
-        assert!(dropped.is_empty());
+        let p = pack_diff(&d, 50);
+        assert!(!p.diff.is_empty());
+        assert!(p.diff.contains("src/a.rs"));
+        assert!(p.diff.chars().count() <= 50, "{}", p.diff.len());
+        assert!(p.dropped.is_empty());
+        assert_eq!(
+            p.cut,
+            Some(CutFile {
+                path: "src/a.rs".into(),
+                kept_hunks: 0,
+                total_hunks: 1
+            })
+        );
+    }
+
+    /// The PR that found this: one 3.4 MB file, 1,585 hunks, every one small,
+    /// and the packer handed the backend all of it because nothing else fit.
+    #[test]
+    fn a_single_file_over_the_budget_is_cut_to_it_not_sent_whole() {
+        let mut d =
+            String::from("diff --git a/dict.yaml b/dict.yaml\n--- a/dict.yaml\n+++ b/dict.yaml\n");
+        for i in 0..100 {
+            d.push_str(&format!(
+                "@@ -{i},1 +{i},1 @@\n-字\ta\t5{i}\n+字\ta\t6{i}\n"
+            ));
+        }
+        let budget = 500;
+        let p = pack_diff_bundled(&d, budget);
+
+        assert!(
+            p.diff.chars().count() <= budget,
+            "{}",
+            p.diff.chars().count()
+        );
+        let cut = p.cut.expect("the file was cut, and must say so");
+        assert_eq!(cut.path, "dict.yaml");
+        assert_eq!(cut.total_hunks, 100);
+        assert!(cut.kept_hunks > 0 && cut.kept_hunks < 100, "{cut:?}");
+        assert_eq!(p.diff.matches("\n@@ ").count(), cut.kept_hunks);
+        // Cut at a hunk boundary: what is kept still parses as whole hunks.
+        assert!(p.diff.ends_with('\n') && !p.diff.ends_with("@@\n"));
+        assert_eq!(
+            diff_line_texts(&p.diff)["dict.yaml"].len(),
+            cut.kept_hunks,
+            "every kept hunk still anchors its added line"
+        );
+        assert!(p.dropped.is_empty());
     }
 }

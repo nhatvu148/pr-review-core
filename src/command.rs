@@ -240,8 +240,12 @@ async fn prepared_diff(
     let raw = provider.get_diff(client, cfg, repo, meta.pr).await?;
     let (diff, glob_dropped) =
         crate::diff::filter_diff_by_globs(&raw, &cfg.include_globs, &cfg.exclude_globs);
-    let (diff, packed_dropped) = crate::review::pack_to_budget(cfg, &diff);
-    let omitted_note = crate::review::omission_note(&glob_dropped, &packed_dropped);
+    let crate::diff::Packed {
+        diff,
+        dropped: packed_dropped,
+        cut,
+    } = crate::review::pack_to_budget(cfg, &diff);
+    let omitted_note = crate::review::omission_note(&glob_dropped, &packed_dropped, cut.as_ref());
     let structural = if cfg.structural_context && !diff.trim().is_empty() {
         crate::structure::structural_context(provider, client, cfg, repo, meta, &diff).await
     } else {
@@ -551,7 +555,7 @@ mod command_omission_tests {
     /// Caught by the pre-push review at 94 confidence.
     #[test]
     fn an_all_filtered_pr_says_what_was_withheld_not_that_nothing_changed() {
-        let note = crate::review::omission_note(&["Cargo.lock".to_string()], &[]).unwrap();
+        let note = crate::review::omission_note(&["Cargo.lock".to_string()], &[], None).unwrap();
         let body = nothing_to_review_body(Some(&note));
 
         assert!(
@@ -577,13 +581,13 @@ mod command_omission_tests {
         let globbed = vec!["Cargo.lock".to_string()];
         let packed = vec!["big/generated.rs".to_string()];
 
-        let note =
-            crate::review::omission_note(&globbed, &packed).expect("both routes dropped something");
+        let note = crate::review::omission_note(&globbed, &packed, None)
+            .expect("both routes dropped something");
         assert!(note.contains("configuration") && note.contains("Cargo.lock"));
         assert!(note.contains("size limit") && note.contains("big/generated.rs"));
 
         assert!(
-            crate::review::omission_note(&[], &[]).is_none(),
+            crate::review::omission_note(&[], &[], None).is_none(),
             "nothing withheld, nothing said"
         );
     }
