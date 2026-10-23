@@ -845,6 +845,7 @@ fn assemble_map(
             added,
             removed,
             symbols,
+            hunks_shown: None,
             worst,
         });
     }

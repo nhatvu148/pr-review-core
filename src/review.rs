@@ -1492,6 +1492,8 @@ struct PreparedDiff {
     /// because `EXCLUDE_GLOBS` defaults to `**/*.lock` — the exact conflation
     /// of "budget" and "configuration" the note itself is written to avoid.
     size_dropped: bool,
+    /// The one file the packer cut to fit, for the walkthrough to mark.
+    cut: Option<crate::diff::CutFile>,
 }
 
 /// Name at most `MAX` paths, then say how many more there were.
@@ -1644,6 +1646,7 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
             hygiene,
             omitted_note: None,
             size_dropped: false,
+            cut: None,
         };
     }
 
@@ -1679,6 +1682,7 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
         hygiene,
         omitted_note,
         size_dropped,
+        cut,
     }
 }
 
@@ -2289,6 +2293,7 @@ pub async fn run_review_with(
         hygiene,
         omitted_note,
         size_dropped,
+        cut,
     } = prepared;
     // Recorded now: `diff` is what the backend is about to see (post-filter,
     // post-pack).
@@ -2307,7 +2312,7 @@ pub async fn run_review_with(
     // Ask for exactly what will be rendered and no more: the map costs a pass the
     // prompt block doesn't need, and edge linking costs a pairwise span scan only
     // the diagram reads.
-    let (structural, change_map) = if cfg.structural_context {
+    let (structural, mut change_map) = if cfg.structural_context {
         crate::structure::inner(
             &provider,
             &client,
@@ -2321,6 +2326,7 @@ pub async fn run_review_with(
     } else {
         (String::new(), crate::changemap::ChangeMap::default())
     };
+    change_map.mark_cut(cut.as_ref());
     if !structural.is_empty() {
         tracing::info!(
             "structural context for {}#{}: {} line(s)",
@@ -2612,6 +2618,7 @@ pub async fn run_review_local(
         omitted_note,
         // The local path writes no run-log row, so it records no `diff_truncated`.
         size_dropped: _,
+        cut,
     } = prepared;
 
     // Structural context from the checkout when there is one; hunk headers (Tier A)
@@ -2626,6 +2633,7 @@ pub async fn run_review_local(
         (true, None) => crate::structure::hunk_context(&diff),
         (false, _) => String::new(),
     };
+    change_map.mark_cut(cut.as_ref());
     if !structural.is_empty() {
         tracing::info!(
             "structural context for {}: {} line(s)",
@@ -3016,6 +3024,49 @@ mod local_review_tests {
         );
         assert!(
             out.summary_markdown.contains("`fn total`"),
+            "{}",
+            out.summary_markdown
+        );
+    }
+
+    /// End to end: the packer's cut reaches the walkthrough row. Unit tests cover
+    /// the rendering; this covers `PreparedDiff` carrying the cut to the map.
+    #[tokio::test]
+    async fn a_cut_file_is_marked_partial_in_the_walkthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = String::new();
+        let mut diff =
+            String::from("diff --git a/dict.yaml b/dict.yaml\n--- a/dict.yaml\n+++ b/dict.yaml\n");
+        for i in 0..40 {
+            file.push_str(&format!("x\t6{i}\n\n\n\n\n\n\n\n"));
+            diff.push_str(&format!(
+                "@@ -{0},1 +{0},1 @@\n-x\t5{i}\n+x\t6{i}\n",
+                i * 8 + 1
+            ));
+        }
+        std::fs::write(dir.path().join("dict.yaml"), file).unwrap();
+
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.structural_context = true;
+        c.walkthrough = true;
+        c.max_diff_chars = 400;
+
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff,
+                repo_root: Some(dir.path().to_path_buf()),
+                label: "branch".to_string(),
+                change_intent: None,
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert!(
+            out.summary_markdown.contains("of 40 hunks)"),
             "{}",
             out.summary_markdown
         );
@@ -5746,6 +5797,7 @@ mod change_map_tests {
                     added: 3,
                     removed: 1,
                     symbols: vec![0],
+                    hunks_shown: None,
                     worst: None,
                 },
                 FileEntry {
@@ -5753,6 +5805,7 @@ mod change_map_tests {
                     added: 2,
                     removed: 0,
                     symbols: vec![1],
+                    hunks_shown: None,
                     worst: None,
                 },
             ],
