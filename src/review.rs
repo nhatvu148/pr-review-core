@@ -1562,7 +1562,12 @@ pub(crate) fn omission_note(
     }
 
     if let Some(c) = cut {
-        let shown = if c.kept_hunks == 0 {
+        let shown = if c.kept_hunks == 0 && !c.partial_hunk {
+            format!(
+                "only its file header is shown, none of its {} changed hunk(s)",
+                c.total_hunks
+            )
+        } else if c.kept_hunks == 0 {
             format!(
                 "only the start of the first of its {} changed hunk(s) is shown",
                 c.total_hunks
@@ -5979,6 +5984,7 @@ mod omission_note_tests {
         let cut = crate::diff::CutFile {
             path: "dict.yaml".into(),
             kept_hunks: 120,
+            partial_hunk: false,
             total_hunks: 1585,
         };
         let note = omission_note(&[], &[], Some(&cut)).unwrap();
@@ -5986,6 +5992,21 @@ mod omission_note_tests {
         assert!(note.contains("first 120 of 1585"), "{note}");
         assert!(note.contains("NOT"), "{note}");
         assert!(!note.contains("were omitted"), "{note}");
+    }
+
+    /// A budget that runs out in the file header shows none of the file's
+    /// changes, and the note must not claim part of a hunk is there.
+    #[test]
+    fn a_cut_inside_the_file_header_says_no_hunk_is_shown() {
+        let cut = crate::diff::CutFile {
+            path: "dict.yaml".into(),
+            kept_hunks: 0,
+            partial_hunk: false,
+            total_hunks: 3,
+        };
+        let note = omission_note(&[], &[], Some(&cut)).unwrap();
+        assert!(note.contains("only its file header"), "{note}");
+        assert!(!note.contains("start of the first"), "{note}");
     }
 
     /// Nothing dropped, nothing said.

@@ -323,8 +323,12 @@ pub struct CutFile {
     /// The file's path, or empty when the diff had no parseable file headers.
     pub path: String,
     /// Whole hunks kept, in diff order. `0` means even the first hunk was over
-    /// the budget and only its start is kept.
+    /// the budget; see `partial_hunk` for whether any of it is kept.
     pub kept_hunks: usize,
+    /// The diff ends partway into a hunk. Only when `kept_hunks` is `0`: with
+    /// `false` there, the budget ran out in the file header and none of the
+    /// file's changes are shown.
+    pub partial_hunk: bool,
     /// Hunks the file's diff had before the cut.
     pub total_hunks: usize,
 }
@@ -522,16 +526,18 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> Packed {
     // Fail-safe: never return empty — keep the best-ranked unit's first section,
     // cut to the budget. It used to be kept whole, trusting each backend to clamp
     // its own prompt; pr-review-bot's Claude Code backend did not, and a one-file
-    // 3.4 MB dictionary reweight went to it whole and overflowed the context window.
+    // 3.67 MB dictionary reweight went to it whole and overflowed the context window.
     let mut cut = None;
     if !keep.iter().any(|&k| k) {
         if let Some(&i) = order.first().and_then(|&ui| units[ui].first()) {
             let (text, kept_hunks, total_hunks) = cut_section(&sections[i].1, max_chars);
+            let partial_hunk = kept_hunks == 0 && text.lines().any(|l| l.starts_with("@@"));
             sections[i].1 = text;
             keep[i] = true;
             cut = Some(CutFile {
                 path: sections[i].0.clone(),
                 kept_hunks,
+                partial_hunk,
                 total_hunks,
             });
         }
@@ -1194,22 +1200,37 @@ mod tests {
         // reported as dropped, and cut inside that hunk rather than sent whole.
         let big = "y".repeat(400);
         let d = format!("diff --git a/src/a.rs b/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n+{big}\n");
-        let p = pack_diff(&d, 50);
+        let p = pack_diff(&d, 70);
         assert!(!p.diff.is_empty());
         assert!(p.diff.contains("src/a.rs"));
-        assert!(p.diff.chars().count() <= 50, "{}", p.diff.len());
+        assert!(p.diff.chars().count() <= 70, "{}", p.diff.len());
         assert!(p.dropped.is_empty());
         assert_eq!(
             p.cut,
             Some(CutFile {
                 path: "src/a.rs".into(),
                 kept_hunks: 0,
+                partial_hunk: true,
                 total_hunks: 1
             })
         );
     }
 
-    /// The PR that found this: one 3.4 MB file, 1,585 hunks, every one small,
+    /// A budget that ends inside the file header keeps no hunk at all, and the
+    /// cut must say so rather than claim part of one is shown.
+    #[test]
+    fn a_cut_inside_the_file_header_keeps_no_partial_hunk() {
+        let d = format!(
+            "diff --git a/dict.yaml b/dict.yaml\n--- a/dict.yaml\n+++ b/dict.yaml\n@@ -1 +1 @@\n+{}\n",
+            "y".repeat(400)
+        );
+        let p = pack_diff(&d, 40);
+        assert!(!p.diff.contains("@@"), "{}", p.diff);
+        let cut = p.cut.expect("cut");
+        assert_eq!((cut.kept_hunks, cut.partial_hunk), (0, false));
+    }
+
+    /// The PR that found this: one 3.67 MB file, 1,585 hunks, every one small,
     /// and the packer handed the backend all of it because nothing else fit.
     #[test]
     fn a_single_file_over_the_budget_is_cut_to_it_not_sent_whole() {
