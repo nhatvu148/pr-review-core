@@ -4,11 +4,11 @@
 
 ### Migration
 
-`changemap::FileEntry` gains `hunks_shown: Option<(usize, usize)>`. A struct literal of it must add the field (`None`). Neither known consumer builds one.
+`changemap::FileEntry` gains `cut: Option<diff::CutFile>`. A struct literal of it must add the field (`None`). Neither known consumer builds one.
 
 ### Fixed
 
-- **The walkthrough gave a cut file's partial counts as its whole change.** Its `+/−` cell counts the diff the reviewer saw, on purpose, and since 0.41.0 a file over the budget alone is cut to its first hunks. On the PR that prompted the cut, a 42,719-line rewrite showed as `+3258 −3258`, which reads as the PR's size. The row now says how much was shown: `+3258 −3258 (first 157 of 1585 hunks)`.
+- **The walkthrough gave a cut file's partial counts as its whole change.** Its `+/−` cell counts the diff the reviewer saw, on purpose, and since 0.41.0 a file over the budget alone is cut to its first hunks. On the PR that prompted the cut, a 42,719-line rewrite showed as `+3258 −3258`, which reads as the PR's size. The row now says how much was shown: `+3258 −3258 (first 157 of 1585 hunks)`. A cut that ends in the file header says no hunk was shown, rather than part of one.
 
 ## 0.41.0
 

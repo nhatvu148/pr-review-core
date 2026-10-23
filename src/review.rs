@@ -5797,7 +5797,7 @@ mod change_map_tests {
                     added: 3,
                     removed: 1,
                     symbols: vec![0],
-                    hunks_shown: None,
+                    cut: None,
                     worst: None,
                 },
                 FileEntry {
@@ -5805,7 +5805,7 @@ mod change_map_tests {
                     added: 2,
                     removed: 0,
                     symbols: vec![1],
-                    hunks_shown: None,
+                    cut: None,
                     worst: None,
                 },
             ],

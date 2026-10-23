@@ -118,10 +118,10 @@ pub struct FileEntry {
     /// in the prompt block and a bare `—` in the table describing the same change.
     /// A file's worst complexity is a fact about the file, and needs no symbol.
     pub worst: Option<WorstFn>,
-    /// `(kept, total)` hunks when the packer cut this file to fit the budget
-    /// ([`crate::diff::CutFile`]). `added` / `removed` count only the kept part,
-    /// and without this the row reads as the whole file's change.
-    pub hunks_shown: Option<(usize, usize)>,
+    /// Set when the packer cut this file to fit the budget. `added` / `removed`
+    /// count only the kept part, and without this the row reads as the whole
+    /// file's change.
+    pub cut: Option<crate::diff::CutFile>,
 }
 
 /// How one changed symbol names another.
@@ -177,7 +177,7 @@ impl ChangeMap {
     pub(crate) fn mark_cut(&mut self, cut: Option<&crate::diff::CutFile>) {
         let Some(c) = cut else { return };
         if let Some(f) = self.files.iter_mut().find(|f| f.path == c.path) {
-            f.hunks_shown = Some((c.kept_hunks, c.total_hunks));
+            f.cut = Some(c.clone());
         }
     }
 }
@@ -548,10 +548,15 @@ pub fn render_walkthrough(map: &ChangeMap, findings: &[Finding], max_symbols: us
         // The counts are of what was reviewed. On a cut file that is a fraction
         // of the PR's change, and a bare `+3258 −3258` against a 42,719-line
         // rewrite read as the PR's own size.
-        let shown = match f.hunks_shown {
-            Some((0, total)) => format!(" (part of 1 of {total} hunks)"),
-            Some((kept, total)) => format!(" (first {kept} of {total} hunks)"),
+        // Zero whole hunks is two cases, as in the omitted note: the cut fell
+        // inside the first hunk, or inside the file header before any hunk.
+        let shown = match &f.cut {
             None => String::new(),
+            Some(c) if c.kept_hunks > 0 => {
+                format!(" (first {} of {} hunks)", c.kept_hunks, c.total_hunks)
+            }
+            Some(c) if c.partial_hunk => format!(" (part of 1 of {} hunks)", c.total_hunks),
+            Some(c) => format!(" (none of {} hunks shown)", c.total_hunks),
         };
         s.push_str(&format!(
             "| `{}` | +{} −{}{} | {} | {} | {} |\n",
@@ -1052,7 +1057,7 @@ mod tests {
                     added: 9,
                     removed: 2,
                     symbols: vec![0, 1],
-                    hunks_shown: None,
+                    cut: None,
                     // The grade comes from the complexity pass, never from a join
                     // through `symbols` — see `FileEntry::worst`.
                     worst: Some(WorstFn {
@@ -1066,7 +1071,7 @@ mod tests {
                     added: 1,
                     removed: 0,
                     symbols: vec![],
-                    hunks_shown: None,
+                    cut: None,
                     worst: None,
                 },
             ],
@@ -1104,7 +1109,7 @@ mod tests {
             added: 3258,
             removed: 3258,
             symbols: vec![],
-            hunks_shown: None,
+            cut: None,
             worst: None,
         };
         let mut map = ChangeMap {
@@ -1129,9 +1134,23 @@ mod tests {
             "only the cut file: {out}"
         );
 
-        map.files[1].hunks_shown = Some((0, 3));
+        let header_only = crate::diff::CutFile {
+            path: "dict.yaml".into(),
+            kept_hunks: 0,
+            partial_hunk: false,
+            total_hunks: 3,
+        };
+        map.files[1].cut = Some(crate::diff::CutFile {
+            partial_hunk: true,
+            ..header_only.clone()
+        });
         let out = render_walkthrough(&map, &[], 6);
         assert!(out.contains("(part of 1 of 3 hunks)"), "{out}");
+
+        // Cut inside the file header: no hunk at all, so none may be claimed.
+        map.files[1].cut = Some(header_only);
+        let out = render_walkthrough(&map, &[], 6);
+        assert!(out.contains("(none of 3 hunks shown)"), "{out}");
     }
 
     #[test]
@@ -1143,7 +1162,7 @@ mod tests {
                 added: 1,
                 removed: 0,
                 symbols: vec![0],
-                hunks_shown: None,
+                cut: None,
                 worst: None,
             }],
             edges: vec![],
@@ -1162,7 +1181,7 @@ mod tests {
                 added: 1,
                 removed: 0,
                 symbols: vec![0],
-                hunks_shown: None,
+                cut: None,
                 worst: None,
             }],
             edges: vec![],
@@ -1185,7 +1204,7 @@ mod tests {
                     added: 3,
                     removed: 0,
                     symbols: vec![0],
-                    hunks_shown: None,
+                    cut: None,
                     worst: None,
                 },
                 FileEntry {
@@ -1193,7 +1212,7 @@ mod tests {
                     added: 2,
                     removed: 0,
                     symbols: vec![1, 2],
-                    hunks_shown: None,
+                    cut: None,
                     worst: None,
                 },
             ],
@@ -1230,7 +1249,7 @@ mod tests {
                     added: 1,
                     removed: 0,
                     symbols: vec![0],
-                    hunks_shown: None,
+                    cut: None,
                     worst: None,
                 },
                 FileEntry {
@@ -1238,7 +1257,7 @@ mod tests {
                     added: 1,
                     removed: 0,
                     symbols: vec![1],
-                    hunks_shown: None,
+                    cut: None,
                     worst: None,
                 },
             ],
@@ -1267,7 +1286,7 @@ mod tests {
                     added: 1,
                     removed: 0,
                     symbols: vec![0],
-                    hunks_shown: None,
+                    cut: None,
                     worst: None,
                 },
                 FileEntry {
@@ -1275,7 +1294,7 @@ mod tests {
                     added: 1,
                     removed: 0,
                     symbols: vec![1],
-                    hunks_shown: None,
+                    cut: None,
                     worst: None,
                 },
             ],
