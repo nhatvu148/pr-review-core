@@ -1123,6 +1123,7 @@ mod tests {
             kept_hunks: 157,
             partial_hunk: false,
             total_hunks: 1585,
+            digest: None,
         }));
         let out = render_walkthrough(&map, &[], 6);
         assert!(
@@ -1139,6 +1140,7 @@ mod tests {
             kept_hunks: 0,
             partial_hunk: false,
             total_hunks: 3,
+            digest: None,
         };
         map.files[1].cut = Some(crate::diff::CutFile {
             partial_hunk: true,
