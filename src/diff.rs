@@ -523,14 +523,28 @@ fn pack_impl(diff: &str, max_chars: usize, bundle: bool) -> Packed {
         }
     }
 
-    // Fail-safe: never return empty — keep the best-ranked unit's first section,
-    // cut to the budget. It used to be kept whole, trusting each backend to clamp
-    // its own prompt; pr-review-bot's Claude Code backend did not, and a one-file
-    // 3.67 MB dictionary reweight went to it whole and overflowed the context window.
+    // Fail-safe: never return a diff with no file in it — keep the best-ranked
+    // file, cut to the budget left. It used to be kept whole, trusting each backend
+    // to clamp its own prompt; pr-review-bot's Claude Code backend did not, and a
+    // one-file 3.67 MB dictionary reweight went to it whole and overflowed the
+    // context window. "No file", not "nothing": a small preamble before the first
+    // `diff --git` fits on its own and would otherwise leave the model only that.
     let mut cut = None;
-    if !keep.iter().any(|&k| k) {
-        if let Some(&i) = order.first().and_then(|&ui| units[ui].first()) {
-            let (text, kept_hunks, total_hunks) = cut_section(&sections[i].1, max_chars);
+    let file_kept = keep
+        .iter()
+        .zip(&sections)
+        .any(|(&k, (path, _))| k && !path.is_empty());
+    if !file_kept {
+        // The best file; failing that (no parseable headers, so one empty-path
+        // section holds the whole diff), the best section of any kind.
+        let best = order
+            .iter()
+            .flat_map(|&ui| units[ui].iter().copied())
+            .find(|&i| !sections[i].0.is_empty())
+            .or_else(|| order.first().and_then(|&ui| units[ui].first().copied()))
+            .filter(|&i| !keep[i]);
+        if let Some(i) = best {
+            let (text, kept_hunks, total_hunks) = cut_section(&sections[i].1, max_chars - used);
             let partial_hunk = kept_hunks == 0 && text.lines().any(|l| l.starts_with("@@"));
             sections[i].1 = text;
             keep[i] = true;
@@ -1214,6 +1228,24 @@ mod tests {
                 total_hunks: 1
             })
         );
+    }
+
+    /// A preamble before the first `diff --git` fits on its own; it must not
+    /// stand in for the file, which is still cut into what budget is left.
+    #[test]
+    fn a_preamble_that_fits_does_not_stop_the_file_being_cut() {
+        let mut d = String::from("From: a@b\nSubject: reweight\n\n");
+        d.push_str("diff --git a/dict.yaml b/dict.yaml\n--- a/dict.yaml\n+++ b/dict.yaml\n");
+        for i in 0..50 {
+            d.push_str(&format!("@@ -{i},1 +{i},1 @@\n-x\t5{i}\n+x\t6{i}\n"));
+        }
+        let p = pack_diff(&d, 300);
+        assert!(p.diff.chars().count() <= 300, "{}", p.diff.chars().count());
+        assert!(p.diff.starts_with("From: a@b"), "the preamble stays");
+        let cut = p.cut.expect("the file is cut, not dropped");
+        assert_eq!(cut.path, "dict.yaml");
+        assert!(cut.kept_hunks > 0, "{cut:?}");
+        assert!(p.dropped.is_empty(), "{:?}", p.dropped);
     }
 
     /// A budget that ends inside the file header keeps no hunk at all, and the
