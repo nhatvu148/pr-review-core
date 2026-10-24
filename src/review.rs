@@ -1589,6 +1589,9 @@ pub(crate) fn omission_note(
             "{name} is larger than the size limit on its own: {shown}. The rest of its changes were NOT \
              reviewed — do not report anything as missing from the part that is not shown."
         ));
+        if let Some(digest) = &c.digest {
+            parts.push(digest.clone());
+        }
     }
 
     (!parts.is_empty()).then(|| parts.join(" "))
@@ -6039,12 +6042,32 @@ mod omission_note_tests {
             kept_hunks: 120,
             partial_hunk: false,
             total_hunks: 1585,
+            digest: None,
         };
         let note = omission_note(&[], &[], Some(&cut)).unwrap();
         assert!(note.contains("`dict.yaml`"), "{note}");
         assert!(note.contains("first 120 of 1585"), "{note}");
         assert!(note.contains("NOT"), "{note}");
         assert!(!note.contains("were omitted"), "{note}");
+    }
+
+    /// A cut file's digest of its whole change follows what the note says
+    /// about the part shown.
+    #[test]
+    fn a_cut_files_digest_is_in_the_note() {
+        let cut = crate::diff::CutFile {
+            path: "dict.yaml".into(),
+            kept_hunks: 157,
+            partial_hunk: false,
+            total_hunks: 1585,
+            digest: Some("Across all 1585 hunk(s), computed from the full diff: …".into()),
+        };
+        let note = omission_note(&[], &[], Some(&cut)).unwrap();
+        let shown = note.find("first 157 of 1585").expect("says what is shown");
+        let digest = note
+            .find("Across all 1585 hunk(s)")
+            .expect("carries the digest");
+        assert!(shown < digest, "{note}");
     }
 
     /// A budget that runs out in the file header shows none of the file's
@@ -6056,6 +6079,7 @@ mod omission_note_tests {
             kept_hunks: 0,
             partial_hunk: false,
             total_hunks: 3,
+            digest: None,
         };
         let note = omission_note(&[], &[], Some(&cut)).unwrap();
         assert!(note.contains("only its file header"), "{note}");
