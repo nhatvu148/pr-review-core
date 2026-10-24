@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.43.0
+
+**A file cut to fit the budget now comes with a digest of its whole change, so the reviewer can tell whether the hunks it was not shown look like the ones it was.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with no changes needed. `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (166, 191, 197 and 177 tests) and the client-org bot on its default build (106 tests).
+
+This release is minor rather than a patch because `diff::CutFile` gains a public field. It is also a behaviour change: the omission note every backend puts in its prompt grows by a few hundred characters whenever a file is cut.
 
 ### Added
 
