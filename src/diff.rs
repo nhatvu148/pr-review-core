@@ -1165,10 +1165,38 @@ pub fn diff_hygiene_with(diff: &str, vendored_globs: &[String]) -> Vec<HygieneIs
 #[cfg(test)]
 mod tests {
     use super::{
-        bundle_key, change_digest, diff_hygiene, diff_line_texts, filter_diff_by_globs,
-        is_vendored, pack_diff, pack_diff_bundled, parse_valid_lines, path_matches_globs,
-        split_diff_sections, CutFile, Packed,
+        bundle_key, change_digest, diff_hygiene, diff_line_texts, file_priority,
+        filter_diff_by_globs, is_vendored, pack_diff, pack_diff_bundled, parse_valid_lines,
+        path_matches_globs, plain_number, split_diff_sections, CutFile, Packed,
     };
+
+    #[test]
+    fn file_priority_ranks_source_above_tests_above_docs_and_config() {
+        assert_eq!(file_priority("src/lib.rs"), 2);
+        assert_eq!(file_priority("src/diff_tests.rs"), 1);
+        assert_eq!(file_priority("__tests__/a.ts"), 1);
+        assert_eq!(file_priority("src/foo.snap"), 1);
+        assert_eq!(file_priority("fixtures/sample.json"), 1);
+        assert_eq!(file_priority("README.md"), 0);
+        assert_eq!(file_priority("docs/guide.txt"), 0);
+        assert_eq!(file_priority("Cargo.lock"), 0);
+        assert_eq!(file_priority("package.json"), 0);
+        // A root-relative config name with a slash is not the bare-root case.
+        assert_eq!(file_priority("src/config.json"), 2);
+        // Empty (preamble/unknown) path is preserved at the highest priority.
+        assert_eq!(file_priority(""), 2);
+    }
+
+    #[test]
+    fn plain_number_accepts_signed_and_decimal_tokens_but_not_junk() {
+        assert_eq!(plain_number("42"), Some("42"));
+        assert_eq!(plain_number(" -3.5 "), Some("-3.5"));
+        assert_eq!(plain_number("+7"), Some("+7"));
+        assert_eq!(plain_number("1e10"), Some("1e10"));
+        assert_eq!(plain_number("abc"), None);
+        assert_eq!(plain_number(""), None);
+        assert_eq!(plain_number("-"), None);
+    }
 
     #[test]
     fn hygiene_flags_an_added_binary_file() {

@@ -479,3 +479,53 @@ pub async fn post_review(
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{auth_header, clone_url, pr_base};
+    use crate::config::Config;
+
+    fn cfg(email: &str, token: &str) -> Config {
+        let mut c = Config::from_env();
+        c.bitbucket_email = email.to_string();
+        c.bitbucket_token = token.to_string();
+        c
+    }
+
+    #[test]
+    fn auth_header_base64_encodes_email_and_token_as_basic_auth() {
+        let header = auth_header(&cfg("dev@example.com", "secret")).unwrap();
+        assert_eq!(header, "Basic ZGV2QGV4YW1wbGUuY29tOnNlY3JldA==");
+    }
+
+    #[test]
+    fn auth_header_fails_closed_when_credentials_are_missing() {
+        assert!(auth_header(&cfg("", "secret")).is_err());
+        assert!(auth_header(&cfg("dev@example.com", "")).is_err());
+    }
+
+    #[test]
+    fn pr_base_builds_the_pull_request_url_from_the_api_base() {
+        let mut c = cfg("dev@example.com", "secret");
+        c.bitbucket_api_base = "https://api.bitbucket.org/2.0".to_string();
+        assert_eq!(
+            pr_base(&c, "owner/repo", 42),
+            "https://api.bitbucket.org/2.0/repositories/owner/repo/pullrequests/42"
+        );
+    }
+
+    #[test]
+    fn clone_url_uses_the_fixed_token_username_not_the_email() {
+        let url = clone_url(&cfg("dev@example.com", "secret"), "owner/repo").unwrap();
+        assert_eq!(
+            url,
+            "https://x-bitbucket-api-token-auth:secret@bitbucket.org/owner/repo.git"
+        );
+        assert!(!url.contains("dev@example.com"));
+    }
+
+    #[test]
+    fn clone_url_fails_closed_when_credentials_are_missing() {
+        assert!(clone_url(&cfg("", ""), "owner/repo").is_err());
+    }
+}

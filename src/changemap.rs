@@ -718,6 +718,26 @@ mod tests {
     }
 
     #[test]
+    fn grade_for_bands_at_the_documented_thresholds() {
+        assert_eq!(grade_for(0), 'A');
+        assert_eq!(grade_for(5), 'A');
+        assert_eq!(grade_for(6), 'B');
+        assert_eq!(grade_for(10), 'B');
+        assert_eq!(grade_for(11), 'C');
+        assert_eq!(grade_for(15), 'C');
+        assert_eq!(grade_for(16), 'D');
+        assert_eq!(grade_for(25), 'D');
+        assert_eq!(grade_for(26), 'F');
+    }
+
+    #[test]
+    fn mermaid_label_strips_characters_that_break_the_parser() {
+        assert_eq!(mermaid_label("plain"), "plain");
+        assert_eq!(mermaid_label(r#"say "hi""#), "say 'hi'");
+        assert_eq!(mermaid_label("Vec<T>[0]{x}(y)"), "Vec<T>0xy");
+    }
+
+    #[test]
     fn span_text_slices_the_inclusive_line_range() {
         let c = "one\ntwo\nthree\nfour\n";
         assert_eq!(span_text(c, 2, 3), "two\nthree");
