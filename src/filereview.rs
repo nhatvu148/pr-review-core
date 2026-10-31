@@ -587,6 +587,7 @@ mod render_tests {
             suggestion: None,
             existing_code: None,
             end_line: None,
+            samples: None,
         }
     }
 
