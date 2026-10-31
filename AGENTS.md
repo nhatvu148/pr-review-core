@@ -8,15 +8,16 @@ A **library**, not a bot. It carries no identity of its own: consumers (bot bina
 
 ## Before you claim anything works
 
-CI's `check` job runs exactly these three and they must be clean. `clippy` runs with `-D warnings`, so a warning is a failure:
+CI's `check` job runs exactly these four and they must be clean. `clippy` runs with `-D warnings`, so a warning is a failure:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-features --all-targets -- -D warnings
 cargo test --all-features
+cargo test --all-features --examples
 ```
 
-Run them. A change that has not been through all three is not finished, however obviously correct it looks.
+Run them. A change that has not been through all four is not finished, however obviously correct it looks.
 
 Three further jobs gate a PR, and they are the ones a docs-or-packaging change trips: `package` (`cargo package`), `downstream` (a consumer still compiles), and `packaging`, which re-runs the generators with `--check` — README config table vs the engine's spec (`scripts/sync-config-docs.mjs`), generated client types vs `--schema` (`packaging/generate-types.mjs`), npm version vs the crate, the installer parsing as POSIX sh, and the client/example tests. If you touched config, a public type, or anything under `packaging/`, run that generator locally rather than discovering it in CI.
 

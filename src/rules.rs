@@ -228,7 +228,8 @@ pub fn local(base: &Config, repo_root: Option<&std::path::Path>) -> EffectiveRul
 
 /// Resolve the effective rules for a pull request.
 ///
-/// Fetches the PR's metadata and its head `.prbot.toml`, so it needs the provider
+/// Fetches the PR's metadata and its base branch's `.prbot.toml` (the copy a
+/// review applies — never the head's), so it needs the provider
 /// token — but still no model key, because nothing here calls a model.
 ///
 /// # Errors

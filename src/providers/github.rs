@@ -331,6 +331,11 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         body: Option<String>,
         base: Option<Ref>,
         head: Option<Ref>,
+        user: Option<User>,
+    }
+    #[derive(Deserialize)]
+    struct User {
+        login: Option<String>,
     }
 
     let res = gh(client.get(pr_url(cfg, repo, pr)), cfg).send().await?;
@@ -343,6 +348,17 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
     }
     let pr_data: Pr = res.json().await?;
     let head_sha = pr_data.head.and_then(|h| h.sha);
+    // Fail closed: an author whose permission cannot be established is not
+    // trusted with a clone. The review still runs, diff-only.
+    let author_permission = match pr_data.user.and_then(|u| u.login) {
+        Some(login) => get_author_permission(client, cfg, repo, &login)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!("could not fetch {login}'s permission on {repo}: {e:#}");
+                "unknown".to_string()
+            }),
+        None => "unknown".to_string(),
+    };
     // Fail-open: CI status is context, never a precondition for reviewing.
     let ci_status = match head_sha.as_ref().filter(|_| cfg.ci_status) {
         Some(sha) => get_check_status(client, cfg, repo, sha)
@@ -361,7 +377,48 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         head_sha,
         body: pr_data.body,
         ci_status,
+        author_permission: Some(author_permission),
     })
+}
+
+/// `login`'s effective permission on `repo`: `admin`, `write`, `read` or `none`.
+///
+/// Asked of the collaborator-permission endpoint rather than read off the PR's
+/// `author_association`, which describes a relationship, not access: a
+/// `COLLABORATOR` can be read-only and a `MEMBER` may have no write access to
+/// this repository, and an org member with private membership comes back as
+/// `CONTRIBUTOR`. A 404 (not a collaborator, or no such user) is `none`.
+///
+/// # Errors
+/// If the request fails or the response can't be decoded.
+pub async fn get_author_permission(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    login: &str,
+) -> Result<String> {
+    #[derive(Deserialize)]
+    struct Permission {
+        permission: Option<String>,
+    }
+    let url = format!(
+        "{}/repos/{repo}/collaborators/{}/permission",
+        cfg.github_api_base,
+        enc_path(login)
+    );
+    let res = gh(client.get(url), cfg).send().await?;
+    if res.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok("none".to_string());
+    }
+    if !res.status().is_success() {
+        let status = res.status();
+        anyhow::bail!(
+            "GitHub collaborator permission {status}: {}",
+            clip(&res.text().await.unwrap_or_default(), 300)
+        );
+    }
+    let p: Permission = res.json().await?;
+    Ok(p.permission.unwrap_or_else(|| "unknown".to_string()))
 }
 
 /// Fetch the check runs for a commit and render them one per line.

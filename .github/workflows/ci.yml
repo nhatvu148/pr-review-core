@@ -26,10 +26,17 @@ jobs:
       components: rustfmt, clippy
       # --all-features so the agentic path compiles too, and doc-tests run: the
       # rustdoc examples are part of the public API contract.
+      #
+      # `--examples` is its own line because nothing above compiles an example's
+      # `#[cfg(test)]` module: `cargo test` builds examples as plain binaries and
+      # `clippy --all-targets` does the same. In 0.38.0 a struct literal in
+      # examples/multiround.rs's tests broke and every check here stayed green;
+      # only `cargo test --example multiround` saw it.
       commands: |
         cargo fmt --check
         cargo clippy --all-features --all-targets -- -D warnings
         cargo test --all-features
+        cargo test --all-features --examples
 
   package:
     name: cargo package

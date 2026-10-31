@@ -1,7 +1,7 @@
 //! Orchestrator: fetch the diff, run the structured AI review, anchor findings
 //! to diff lines, render a summary, and (unless dry-run) post the review.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Serialize;
 
 use crate::agent::agentic_review;
@@ -24,6 +24,35 @@ pub struct RunReviewInput {
     /// the PR shows instant feedback (used on the webhook path). Ignored on dry-run.
     pub placeholder: bool,
 }
+
+/// The review had nothing to look at: the diff was empty, or every file in it
+/// was removed by `EXCLUDE_GLOBS` (a lockfile-only change, say), and nothing
+/// stood in for it — no diff-hygiene finding and, on the PR path, no dependency
+/// advisory (either of those posts a no-review summary instead).
+///
+/// Returned as the error of [`run_review`] and [`run_review_local`] so a caller
+/// can tell this outcome from a failure: `err.downcast_ref::<NothingToReview>()`.
+/// It is a finished answer, not a fault — retrying gets the same empty diff —
+/// so a queue should settle the job rather than retry it, and an alert should
+/// not fire. The `Display` text is unchanged from when this was a plain error,
+/// so anything that matched on the message keeps working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NothingToReview {
+    /// `true` for a local review, which says "Diff" rather than "PR diff".
+    pub local: bool,
+}
+
+impl std::fmt::Display for NothingToReview {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = if self.local { "Diff" } else { "PR diff" };
+        write!(
+            f,
+            "{what} is empty (all files excluded by globs, or no changes) — nothing to review."
+        )
+    }
+}
+
+impl std::error::Error for NothingToReview {}
 
 /// Result of one review run (serialized as the HTTP/CLI response).
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -424,6 +453,13 @@ fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
             .max_by_key(|(i, f)| (severity_rank(&f.severity), std::cmp::Reverse(*i)))
             .map_or(0, |(i, _)| i);
         let mut rep = group.remove(best);
+        // No count survives a collapse. How many samples reported the claim is not
+        // recoverable from the members' counts: three samples each reporting it in
+        // a different file give three members at 1 — the claim was seen by three,
+        // the max says one, the sum would double-count a sample that reported two
+        // files. Absent beats wrong in data meant to settle REVIEW_SAMPLES, and a
+        // burst is rare enough that the gap costs little.
+        rep.samples = None;
 
         // Name enough files that the reader can check the pattern themselves; the
         // cap only exists to keep one comment from becoming a file listing.
@@ -729,6 +765,67 @@ fn reanchor(
     None
 }
 
+/// Whether a pull request's author is trusted to have it cloned.
+///
+/// Trusted: an author with `admin` or `write` permission on the repository —
+/// someone who could push without a PR, so the clone gives them nothing they
+/// lacked. Everyone else (`read`, `none`, and `unknown` when the lookup failed,
+/// which fails closed) gets a diff-only review; see
+/// [`ReviewContext::may_clone`] for why the clone is the part worth withholding.
+///
+/// A provider that reports no association (`None`: Bitbucket, GitLab) is
+/// trusted. That keeps their reviews unchanged, and it is a gap: on those hosts
+/// nothing here stops an outsider's PR being cloned.
+///
+/// ```
+/// use pr_review_core::providers::PrMeta;
+/// use pr_review_core::review::author_may_clone;
+///
+/// let meta = |a: Option<&str>| PrMeta {
+///     repo: "o/r".into(), pr: 1, title: None, base_branch: None, head_sha: None,
+///     body: None, ci_status: None, author_permission: a.map(String::from),
+/// };
+/// assert!(author_may_clone(&meta(Some("write"))));
+/// assert!(!author_may_clone(&meta(Some("read"))));
+/// assert!(!author_may_clone(&meta(Some("unknown"))));
+/// assert!(author_may_clone(&meta(None)));
+/// ```
+pub fn author_may_clone(meta: &PrMeta) -> bool {
+    match meta.author_permission.as_deref() {
+        None => true,
+        Some(p) => matches!(
+            p.to_ascii_lowercase().as_str(),
+            "admin" | "maintain" | "write"
+        ),
+    }
+}
+
+/// Appended to the summary of a review that withheld the clone. A reader
+/// comparing it with a deeper review on another PR deserves to know why.
+const DIFF_ONLY_FOR_AUTHOR_NOTE: &str = "\n\n_This PR's author does not have write \
+     access to this repository, so the review read the diff only: no clone, no \
+     repository tools. Cross-file effects may be missed._";
+
+/// Appended when the PR edits `.prbot.toml`, which is read from the base branch.
+const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Reviews read \
+     it from the base branch, so this review ran on the current settings and the \
+     change takes effect once merged._";
+
+/// Whether a unified diff adds, removes, changes or renames the root
+/// `.prbot.toml`. A pure rename has no `---`/`+++` lines, only the
+/// `rename from`/`rename to` headers.
+fn diff_touches_repo_config(diff: &str) -> bool {
+    diff.lines().any(|l| {
+        matches!(
+            l,
+            "--- a/.prbot.toml"
+                | "+++ b/.prbot.toml"
+                | "rename from .prbot.toml"
+                | "rename to .prbot.toml"
+        )
+    })
+}
+
 /// The summary comment: overall + recommendation + any findings that couldn't be
 /// anchored to a diff line (line-anchored ones go inline).
 fn render_summary(
@@ -894,6 +991,7 @@ pub async fn post_review_queued(provider_name: &str, cfg: &Config, repo: &str, p
         head_sha: None,
         body: None,
         ci_status: None,
+        author_permission: None,
     };
     let post = ReviewPost {
         summary: render_queued(),
@@ -953,6 +1051,7 @@ pub async fn post_review_failure(
         head_sha: None,
         body: None,
         ci_status: None,
+        author_permission: None,
     };
     let post = ReviewPost {
         summary: render_failed(err),
@@ -1021,20 +1120,19 @@ pub(crate) async fn run_agentic(
 /// not predict the PR's findings is worth very little, and the divergence was
 /// invisible: both runs look like a normal review.
 ///
-/// **Read from the working tree, not from a base ref.** That mirrors the PR path,
-/// which fetches `.prbot.toml` from the PR *head* — the version the change itself
-/// proposes.
+/// **Read from the working tree, not from a base ref** — unlike the PR path,
+/// which reads the base branch ([`remote_repo_config_source`]).
 ///
 /// It does mean the change under review can weaken its own reviewer: exclude the
 /// files it touches, raise `min_confidence` past its own findings, or add
-/// `instructions` that talk the reviewer down. Raised in review on this function,
-/// and kept, because reading a base ref costs more than it buys here:
+/// `instructions` that talk the reviewer down. On the PR path that is a real
+/// exposure, because the author is not the operator, and it is why that path
+/// reads the base branch. Here it is kept, because reading a base ref costs more
+/// than it buys:
 ///
-/// - It is not a new exposure. The PR path already reads the *head* commit, so a
-///   contribution can do exactly this to the remote bot today. Matching that is
-///   the point of this function; diverging would make a local review disagree
-///   with the PR review of the same commit precisely when the change edits
-///   `.prbot.toml` — the one case where you most want them to agree.
+/// - The two paths now disagree on a change that edits `.prbot.toml`: a local
+///   review applies the edit, the PR review of the same commit does not (and says
+///   so in its summary). That is the price of the PR path not trusting its author.
 /// - On this path the "attacker" is whoever is running the review, over their own
 ///   checkout, with their own environment. Anyone who can write this file can
 ///   already set `EXCLUDE_GLOBS`, lower the confidence floor, or simply not run
@@ -1150,19 +1248,22 @@ pub(crate) async fn remote_repo_config_source(
 ) -> (Config, crate::rules::RepoConfigSource) {
     use crate::rules::RepoConfigSource;
 
-    // Prefer the exact head commit; fall back to the base branch when the provider
-    // didn't give us a head SHA (e.g. Bitbucket meta). If neither is available,
-    // there's nothing to fetch against — use the base config as-is.
-    let git_ref = match (meta.head_sha.as_deref(), meta.base_branch.as_deref()) {
-        (Some(sha), _) if !sha.is_empty() => sha,
-        (_, Some(branch)) if !branch.is_empty() => branch,
+    // The base branch, never the PR head. The head is the author's: read from
+    // there, a PR could set its own `exclude_globs`, `min_confidence` or
+    // `instructions` and review itself into silence. A PR that edits
+    // `.prbot.toml` is reviewed under the settings it would replace, and the
+    // summary says so (`REPO_CONFIG_CHANGE_NOTE`). No head fallback when the
+    // base branch is unknown: an author-controlled ref is exactly what this
+    // refuses to read.
+    let git_ref = match meta.base_branch.as_deref() {
+        Some(branch) if !branch.is_empty() => branch,
         _ => {
             return (
                 base.clone(),
                 RepoConfigSource::Unavailable {
                     reason: format!(
-                        "{repo} reported neither a head commit nor a base branch, so \
-                         there is no ref to read .prbot.toml from"
+                        "{repo} reported no base branch, so there is no trusted ref \
+                         to read .prbot.toml from"
                     ),
                 },
             )
@@ -1391,6 +1492,8 @@ struct PreparedDiff {
     /// because `EXCLUDE_GLOBS` defaults to `**/*.lock` — the exact conflation
     /// of "budget" and "configuration" the note itself is written to avoid.
     size_dropped: bool,
+    /// The one file the packer cut to fit, for the walkthrough to mark.
+    cut: Option<crate::diff::CutFile>,
 }
 
 /// Name at most `MAX` paths, then say how many more there were.
@@ -1435,7 +1538,11 @@ fn name_some(paths: &[String]) -> String {
 /// The glob clause says explicitly not to infer anything from the absence,
 /// because the failure mode is not the model lacking the file — it is the model
 /// drawing a conclusion from a gap it cannot see the edges of.
-pub(crate) fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) -> Option<String> {
+pub(crate) fn omission_note(
+    glob_dropped: &[String],
+    packed_dropped: &[String],
+    cut: Option<&crate::diff::CutFile>,
+) -> Option<String> {
     let mut parts = Vec::new();
 
     if !glob_dropped.is_empty() {
@@ -1456,6 +1563,37 @@ pub(crate) fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) 
         ));
     }
 
+    if let Some(c) = cut {
+        let shown = if c.kept_hunks == 0 && !c.partial_hunk {
+            format!(
+                "only its file header is shown, none of its {} changed hunk(s)",
+                c.total_hunks
+            )
+        } else if c.kept_hunks == 0 {
+            format!(
+                "only the start of the first of its {} changed hunk(s) is shown",
+                c.total_hunks
+            )
+        } else {
+            format!(
+                "only its first {} of {} changed hunk(s) are shown",
+                c.kept_hunks, c.total_hunks
+            )
+        };
+        let name = if c.path.is_empty() {
+            "The diff".to_string()
+        } else {
+            format!("`{}`", c.path)
+        };
+        parts.push(format!(
+            "{name} is larger than the size limit on its own: {shown}. The rest of its changes were NOT \
+             reviewed — do not report anything as missing from the part that is not shown."
+        ));
+        if let Some(digest) = &c.digest {
+            parts.push(digest.clone());
+        }
+    }
+
     (!parts.is_empty()).then(|| parts.join(" "))
 }
 
@@ -1466,7 +1604,7 @@ pub(crate) fn omission_note(glob_dropped: &[String], packed_dropped: &[String]) 
 /// kept a different set of files than the review did, and told the model a
 /// different list of what was omitted, while documenting that they saw the same
 /// diff as the reviewer.
-pub(crate) fn pack_to_budget(cfg: &Config, diff: &str) -> (String, Vec<String>) {
+pub(crate) fn pack_to_budget(cfg: &Config, diff: &str) -> crate::diff::Packed {
     if cfg.file_bundling {
         crate::diff::pack_diff_bundled(diff, cfg.max_diff_chars)
     } else {
@@ -1493,6 +1631,7 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
     let hygiene: Vec<Finding> = crate::diff::diff_hygiene_with(raw_diff, &cfg.vendored_globs)
         .into_iter()
         .map(|h| Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: h.severity.to_string(),
@@ -1510,13 +1649,26 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
             hygiene,
             omitted_note: None,
             size_dropped: false,
+            cut: None,
         };
     }
 
     // Smart size handling: keep whole files, dropping the lowest-priority ones
     // first, until the diff fits `max_diff_chars` — instead of a blunt mid-file
     // char cut. Applied ONCE here so every review path gets the same packed diff.
-    let (diff, packed_dropped) = pack_to_budget(cfg, &diff);
+    let crate::diff::Packed {
+        diff,
+        dropped: packed_dropped,
+        cut,
+    } = pack_to_budget(cfg, &diff);
+    if let Some(c) = &cut {
+        tracing::info!(
+            "packed diff: {} is over the budget alone, kept {} of {} hunk(s)",
+            c.path,
+            c.kept_hunks,
+            c.total_hunks
+        );
+    }
     if !packed_dropped.is_empty() {
         tracing::info!(
             "packed diff: omitted {} lower-priority file(s) to fit budget: {:?}",
@@ -1525,14 +1677,15 @@ fn prepare_diff(cfg: &Config, raw_diff: &str) -> PreparedDiff {
         );
     }
     // Surfaced to the model so it knows these files were NOT reviewed.
-    let omitted_note = omission_note(&glob_dropped, &packed_dropped);
-    let size_dropped = !packed_dropped.is_empty();
+    let omitted_note = omission_note(&glob_dropped, &packed_dropped, cut.as_ref());
+    let size_dropped = !packed_dropped.is_empty() || cut.is_some();
 
     PreparedDiff {
         diff,
         hygiene,
         omitted_note,
         size_dropped,
+        cut,
     }
 }
 
@@ -1666,7 +1819,15 @@ fn merge_samples(samples: &[Vec<Finding>], tolerance: u64, min_agreement: usize)
         findings: clusters
             .into_iter()
             .filter(|c| c.agreement >= min_agreement)
-            .map(|c| c.best)
+            .map(|c| Finding {
+                // Only when two or more samples survived to be compared. With
+                // REVIEW_SAMPLES=3 and two failing, every finding would read 1 —
+                // indistinguishable from "one sample in three saw it", the very
+                // signal this count exists to measure.
+                samples: (samples.len() > 1)
+                    .then(|| u32::try_from(c.agreement).unwrap_or(u32::MAX)),
+                ..c.best
+            })
             .collect(),
         agreement,
     }
@@ -1775,18 +1936,46 @@ async fn sampled_review(
 /// missing, which costs only the quote: the finding anchors by its typed line
 /// as it did before quotes existed.
 fn restore_quotes(kept: &mut [Finding], original: &[Finding]) {
+    for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
+        if let Some(o) = origin_of(k, original) {
+            k.existing_code = o.existing_code.clone();
+        }
+    }
+}
+
+/// The original a finding kept by the self-critique demonstrably is, by the rule
+/// [`restore_quotes`] documents: the only original at its `(file, line)`, or
+/// failing that the only one in its file. `None` when correspondence cannot be
+/// shown.
+fn origin_of<'a>(k: &Finding, original: &'a [Finding]) -> Option<&'a Finding> {
     fn only<'a>(mut it: impl Iterator<Item = &'a Finding>) -> Option<&'a Finding> {
         match (it.next(), it.next()) {
             (Some(o), None) => Some(o),
             _ => None,
         }
     }
-    for k in kept.iter_mut().filter(|k| k.existing_code.is_none()) {
-        let in_file = || original.iter().filter(|o| o.file == k.file);
-        let source = only(in_file().filter(|o| o.line == k.line)).or_else(|| only(in_file()));
-        if let Some(o) = source {
-            k.existing_code = o.existing_code.clone();
-        }
+    let in_file = || original.iter().filter(|o| o.file == k.file);
+    only(in_file().filter(|o| o.line == k.line)).or_else(|| only(in_file()))
+}
+
+/// Give back the sample count the self-critique pass cannot carry.
+///
+/// `Finding::samples` is skipped on input — no model may claim agreement — so
+/// every finding the critique returns comes back without it, every time, not
+/// just when the model drops a field. It is restored by the same
+/// correspondence rule as a quote; a kept finding that cannot be shown to be
+/// one original loses its count, which leaves the run log short one number
+/// rather than wrong by one.
+///
+/// Known limit, shared with [`restore_quotes`]: a critique that rewrites a
+/// finding's line onto another original's exact spot is matched to that other
+/// original and takes its count. Telling them apart would need the bodies
+/// compared, which the critique also rewrites. It needs SELF_CRITIQUE on and a
+/// moved line landing exactly on a neighbour, so it is left documented, not
+/// solved.
+fn restore_samples(kept: &mut [Finding], original: &[Finding]) {
+    for k in kept.iter_mut() {
+        k.samples = origin_of(k, original).and_then(|o| o.samples);
     }
 }
 
@@ -1815,6 +2004,7 @@ async fn finish_review(
         findings = match crate::llm::critique_findings(cfg, backend, meta, diff, &findings).await {
             Ok(mut kept) => {
                 restore_quotes(&mut kept, &findings);
+                restore_samples(&mut kept, &findings);
                 kept
             }
             Err(e) => {
@@ -1999,17 +2189,22 @@ pub async fn run_review_with(
 
     // Instant feedback: drop a "Reviewing…" summary comment before the slow LLM
     // call. It's upserted, so the real review updates this same comment.
+    // Whether a placeholder actually went up — not merely whether one was asked
+    // for. The nothing-to-review path below replaces it only if it exists, so a
+    // failed placeholder post must not turn into a comment on a silent PR.
+    let mut placeholder_posted = false;
     if input.placeholder && !input.dry_run {
         let pending = ReviewPost {
             summary: render_pending(),
             inline: Vec::new(),
         };
-        if let Err(e) = provider.post_review(&client, cfg, &meta, &pending).await {
-            tracing::warn!(
+        match provider.post_review(&client, cfg, &meta, &pending).await {
+            Ok(_) => placeholder_posted = true,
+            Err(e) => tracing::warn!(
                 "placeholder comment failed for {}#{}: {e:#}",
                 input.repo,
                 input.pr
-            );
+            ),
         }
     }
 
@@ -2075,15 +2270,33 @@ pub async fn run_review_with(
             );
             return Ok(out);
         }
-        anyhow::bail!(
-            "PR diff is empty (all files excluded by globs, or no changes) — nothing to review."
-        );
+        // The placeholder posted above would otherwise sit on the PR saying
+        // "Reviewing…" forever: a caller that settles NothingToReview, rather than
+        // retrying it, leaves nothing else to replace it. Only when we posted one,
+        // so a PR the engine never commented on stays silent.
+        //
+        // A failed replacement is returned as the error, not swallowed: returning
+        // NothingToReview would tell the caller to settle and leave exactly the
+        // stuck placeholder this exists to clear. As an ordinary error it gets
+        // retried, and the retry finds the same empty diff and tries again.
+        if placeholder_posted {
+            let note = ReviewPost {
+                summary: render_no_review_summary(&[], &[]),
+                inline: Vec::new(),
+            };
+            provider
+                .post_review(&client, cfg, &meta, &note)
+                .await
+                .context("nothing to review, but the placeholder could not be replaced")?;
+        }
+        return Err(NothingToReview { local: false }.into());
     }
     let PreparedDiff {
         diff,
         hygiene,
         omitted_note,
         size_dropped,
+        cut,
     } = prepared;
     // Recorded now: `diff` is what the backend is about to see (post-filter,
     // post-pack).
@@ -2102,7 +2315,7 @@ pub async fn run_review_with(
     // Ask for exactly what will be rendered and no more: the map costs a pass the
     // prompt block doesn't need, and edge linking costs a pairwise span scan only
     // the diagram reads.
-    let (structural, change_map) = if cfg.structural_context {
+    let (structural, mut change_map) = if cfg.structural_context {
         crate::structure::inner(
             &provider,
             &client,
@@ -2116,6 +2329,7 @@ pub async fn run_review_with(
     } else {
         (String::new(), crate::changemap::ChangeMap::default())
     };
+    change_map.mark_cut(cut.as_ref());
     if !structural.is_empty() {
         tracing::info!(
             "structural context for {}#{}: {} line(s)",
@@ -2140,6 +2354,15 @@ pub async fn run_review_with(
     // lazily by the first agentic sample and dropped with this scope, so the
     // temporary directory's lifetime is unchanged.
     let workspace = crate::backend::SharedWorkspace::new();
+    let may_clone = author_may_clone(&meta);
+    if !may_clone {
+        tracing::info!(
+            "{}#{}: author is {:?} on the repository, reviewing the diff only",
+            input.repo,
+            input.pr,
+            meta.author_permission
+        );
+    }
     let ctx = ReviewContext {
         client: &client,
         cfg,
@@ -2162,6 +2385,7 @@ pub async fn run_review_with(
             change_intent: None,
         },
         injected_rules: &injected_rules,
+        may_clone,
     };
     let Sampled {
         result,
@@ -2188,6 +2412,15 @@ pub async fn run_review_with(
         finished
             .summary
             .push_str(&crate::deps::render_advisories(&advisories));
+    }
+    // Only when a clone was actually withheld: with AGENTIC off, the built-in
+    // backend clones nobody's PR, and the note would blame the author for a
+    // depth no review got.
+    if !may_clone && backend.clones_when_allowed(cfg) {
+        finished.summary.push_str(DIFF_ONLY_FOR_AUTHOR_NOTE);
+    }
+    if diff_touches_repo_config(&raw_diff) {
+        finished.summary.push_str(REPO_CONFIG_CHANGE_NOTE);
     }
     // Derived renderings of the change, appended last: they describe what the PR
     // touched, which is context for the findings above rather than a finding
@@ -2343,6 +2576,7 @@ pub async fn run_review_local(
         head_sha: None,
         body: None,
         ci_status: None,
+        author_permission: None,
     };
 
     let prepared = prepare_diff(cfg, &input.diff);
@@ -2379,9 +2613,7 @@ pub async fn run_review_local(
                 usage: None,
             });
         }
-        anyhow::bail!(
-            "Diff is empty (all files excluded by globs, or no changes) — nothing to review."
-        );
+        return Err(NothingToReview { local: true }.into());
     }
     let PreparedDiff {
         diff,
@@ -2389,6 +2621,7 @@ pub async fn run_review_local(
         omitted_note,
         // The local path writes no run-log row, so it records no `diff_truncated`.
         size_dropped: _,
+        cut,
     } = prepared;
 
     // Structural context from the checkout when there is one; hunk headers (Tier A)
@@ -2403,6 +2636,7 @@ pub async fn run_review_local(
         (true, None) => crate::structure::hunk_context(&diff),
         (false, _) => String::new(),
     };
+    change_map.mark_cut(cut.as_ref());
     if !structural.is_empty() {
         tracing::info!(
             "structural context for {}: {} line(s)",
@@ -2440,6 +2674,8 @@ pub async fn run_review_local(
             change_intent: change_intent.as_deref(),
         },
         injected_rules: &injected_rules,
+        // A local diff is the caller's own work, never someone else's PR.
+        may_clone: true,
     };
     let Sampled {
         result,
@@ -2497,7 +2733,10 @@ mod local_review_tests {
     use anyhow::Result;
     use async_trait::async_trait;
 
-    use super::{pack_to_budget, prepare_diff, run_review_local, LocalReviewInput, LOCAL_PROVIDER};
+    use super::{
+        pack_to_budget, prepare_diff, run_review_local, LocalReviewInput, NothingToReview,
+        LOCAL_PROVIDER,
+    };
     use crate::backend::{ReviewBackend, ReviewContext};
     use crate::config::Config;
     use crate::llm::{Finding, Review, ReviewResult};
@@ -2562,6 +2801,7 @@ mod local_review_tests {
                     summary: "an accumulator replaced a fold".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "MEDIUM".to_string(),
@@ -2718,6 +2958,7 @@ mod local_review_tests {
                         summary: "s".to_string(),
                         recommendation: "APPROVE".to_string(),
                         findings: vec![Finding {
+                            samples: None,
                             existing_code: None,
                             end_line: None,
                             severity: "LOW".to_string(),
@@ -2786,6 +3027,49 @@ mod local_review_tests {
         );
         assert!(
             out.summary_markdown.contains("`fn total`"),
+            "{}",
+            out.summary_markdown
+        );
+    }
+
+    /// End to end: the packer's cut reaches the walkthrough row. Unit tests cover
+    /// the rendering; this covers `PreparedDiff` carrying the cut to the map.
+    #[tokio::test]
+    async fn a_cut_file_is_marked_partial_in_the_walkthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut file = String::new();
+        let mut diff =
+            String::from("diff --git a/dict.yaml b/dict.yaml\n--- a/dict.yaml\n+++ b/dict.yaml\n");
+        for i in 0..40 {
+            file.push_str(&format!("x\t6{i}\n\n\n\n\n\n\n\n"));
+            diff.push_str(&format!(
+                "@@ -{0},1 +{0},1 @@\n-x\t5{i}\n+x\t6{i}\n",
+                i * 8 + 1
+            ));
+        }
+        std::fs::write(dir.path().join("dict.yaml"), file).unwrap();
+
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.structural_context = true;
+        c.walkthrough = true;
+        c.max_diff_chars = 400;
+
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff,
+                repo_root: Some(dir.path().to_path_buf()),
+                label: "branch".to_string(),
+                change_intent: None,
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert!(
+            out.summary_markdown.contains("of 40 hunks)"),
             "{}",
             out.summary_markdown
         );
@@ -2911,6 +3195,11 @@ mod local_review_tests {
         .await
         .expect_err("an empty diff has nothing to review");
         assert!(err.to_string().contains("nothing to review"));
+        assert_eq!(
+            err.downcast_ref::<NothingToReview>(),
+            Some(&NothingToReview { local: true }),
+            "callers tell this outcome from a failure by its type"
+        );
     }
 
     /// The acceptance test for the feature: a backend that imports nothing from
@@ -3208,7 +3497,7 @@ mod orchestrator_tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use super::{run_review_with, RunReviewInput};
+    use super::{run_review_with, NothingToReview, RunReviewInput};
     use crate::backend::{ReviewBackend, ReviewContext};
     use crate::config::Config;
     use crate::llm::{Review, ReviewResult};
@@ -3256,6 +3545,229 @@ mod orchestrator_tests {
         github_stub_with(DIFF).await
     }
 
+    /// A backend that must never be reached.
+    struct Unreachable;
+
+    #[async_trait]
+    impl ReviewBackend for Unreachable {
+        async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            panic!("an all-excluded PR must not reach the backend");
+        }
+    }
+
+    /// The PR path's "nothing to review" is a typed outcome, the shape that a
+    /// lockfile-only PR (pr-review-core#150) takes. pr-review-bot's queue retried
+    /// it three times and dead-lettered it because it could not tell it from a
+    /// failure.
+    #[tokio::test]
+    async fn an_all_excluded_pr_is_typed_nothing_to_review() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        let err = run_review_with(&cfg_for(&srv.uri()), input(), &Unreachable)
+            .await
+            .expect_err("a lockfile-only PR has nothing to review");
+        assert_eq!(
+            err.downcast_ref::<NothingToReview>(),
+            Some(&NothingToReview { local: false })
+        );
+        assert_eq!(
+            err.to_string(),
+            "PR diff is empty (all files excluded by globs, or no changes) — nothing to review.",
+            "the message is unchanged from the plain error it replaces"
+        );
+    }
+
+    /// A lockfile-only PR that was given a "Reviewing…" placeholder must not leave
+    /// it there: the bot now settles NothingToReview instead of retrying, so
+    /// nothing else would ever replace it.
+    #[tokio::test]
+    async fn nothing_to_review_replaces_the_placeholder() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "html_url": "https://x/1" })),
+            )
+            .mount(&srv)
+            .await;
+        let mut live = input();
+        live.dry_run = false;
+        live.placeholder = true;
+
+        let err = run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("a lockfile-only PR has nothing to review");
+        assert!(err.downcast_ref::<NothingToReview>().is_some());
+
+        let posts: Vec<String> = srv
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == "POST" && r.url.path() == "/repos/o/r/issues/1/comments"
+            })
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .collect();
+        assert_eq!(
+            posts.len(),
+            2,
+            "the placeholder, then its replacement: {posts:?}"
+        );
+        assert!(
+            posts[0].contains("Reviewing"),
+            "first the placeholder: {}",
+            posts[0]
+        );
+        assert!(
+            posts[1].contains("No reviewable source changes"),
+            "then the note that replaces it: {}",
+            posts[1]
+        );
+    }
+
+    /// A replacement that fails is an ordinary, retryable error — not
+    /// NothingToReview, which would have the caller settle and keep the stuck
+    /// placeholder.
+    #[tokio::test]
+    async fn a_failed_placeholder_replacement_is_not_nothing_to_review() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&srv)
+            .await;
+        // The placeholder posts; the replacement then fails.
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "html_url": "https://x/1" })),
+            )
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&srv)
+            .await;
+        let mut live = input();
+        live.dry_run = false;
+        live.placeholder = true;
+
+        let err = run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("the replacement failed");
+        assert!(
+            err.downcast_ref::<NothingToReview>().is_none(),
+            "a caller must retry this, not settle it: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("placeholder could not be replaced"));
+    }
+
+    /// A placeholder that failed to post leaves nothing to replace, so the PR
+    /// stays silent: no "no reviewable changes" note appears from nowhere.
+    #[tokio::test]
+    async fn a_placeholder_that_never_posted_is_not_replaced() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&srv)
+            .await;
+        // The placeholder POST fails; any later POST would succeed.
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(serde_json::json!({ "html_url": "https://x/1" })),
+            )
+            .mount(&srv)
+            .await;
+        let mut live = input();
+        live.dry_run = false;
+        live.placeholder = true;
+
+        let err = run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("nothing to review");
+        assert!(err.downcast_ref::<NothingToReview>().is_some());
+        let comment_posts = srv
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .into_iter()
+            .filter(|r| {
+                r.method.as_str() == "POST" && r.url.path() == "/repos/o/r/issues/1/comments"
+            })
+            .count();
+        assert_eq!(
+            comment_posts, 1,
+            "only the failed placeholder attempt, no replacement"
+        );
+    }
+
+    /// The same PR without a placeholder stays silent: nothing is posted.
+    #[tokio::test]
+    async fn nothing_to_review_without_a_placeholder_posts_nothing() {
+        let lockfile = "diff --git a/Cargo.lock b/Cargo.lock\n\
+             --- a/Cargo.lock\n\
+             +++ b/Cargo.lock\n\
+             @@ -1,2 +1,3 @@\n\
+             \x20[[package]]\n\
+             +name = \"new-dep\"\n";
+        let srv = github_stub_with(lockfile).await;
+        let mut live = input();
+        live.dry_run = false;
+        run_review_with(&cfg_for(&srv.uri()), live, &Unreachable)
+            .await
+            .expect_err("nothing to review");
+        let posts = srv
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .into_iter()
+            .filter(|r| r.method.as_str() != "GET")
+            .count();
+        assert_eq!(posts, 0, "a PR the engine never commented on stays silent");
+    }
+
     /// [`github_stub`] over a caller-chosen diff, for tests that need particular
     /// line numbers on the new side.
     async fn github_stub_with(diff: &str) -> MockServer {
@@ -3301,6 +3813,193 @@ mod orchestrator_tests {
             .mount(&s)
             .await;
         s
+    }
+
+    /// A GitHub stub like [`github_stub_with`], with author `alice`, her
+    /// permission answer (a permission name, or `404` / `500` for the endpoint's
+    /// failure modes), and a `.prbot.toml` served per ref (base `main`, head
+    /// `deadbeef`), each setting a different `instructions` line.
+    async fn github_stub_trust(diff: &str, permission: &str) -> MockServer {
+        use base64::Engine as _;
+        use wiremock::matchers::query_param;
+        let s = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/1"))
+            .and(header("accept", "application/vnd.github.diff"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(diff.to_string()))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/pulls/1"))
+            .and(header("accept", "application/vnd.github+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "title": "a change",
+                "body": null,
+                "base": { "ref": "main" },
+                "head": { "sha": "deadbeef" },
+                "user": { "login": "alice" },
+            })))
+            .mount(&s)
+            .await;
+        let answer = match permission {
+            "404" => ResponseTemplate::new(404),
+            "500" => ResponseTemplate::new(500),
+            p => ResponseTemplate::new(200).set_body_json(serde_json::json!({ "permission": p })),
+        };
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/collaborators/alice/permission"))
+            .respond_with(answer)
+            .mount(&s)
+            .await;
+        for (git_ref, rule) in [("main", "BASE-RULE"), ("deadbeef", "HEAD-RULE")] {
+            let toml = format!("instructions = \"{rule}\"\n");
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/.prbot.toml"))
+                .and(query_param("ref", git_ref))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content": base64::engine::general_purpose::STANDARD.encode(toml),
+                    "encoding": "base64",
+                })))
+                .mount(&s)
+                .await;
+        }
+        s
+    }
+
+    /// Records whether each call was allowed to clone.
+    struct CloneSpy {
+        may_clone: Arc<Mutex<Vec<bool>>>,
+        prompts: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ReviewBackend for CloneSpy {
+        /// Stands in for an agent-CLI backend, which clones whatever `AGENTIC`
+        /// says (the test config has it off).
+        fn clones_when_allowed(&self, _cfg: &Config) -> bool {
+            true
+        }
+
+        async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.may_clone.lock().unwrap().push(ctx.may_clone);
+            self.prompts
+                .lock()
+                .unwrap()
+                .push(ctx.system_prompt("RUBRIC."));
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "nothing to report".to_string(),
+                    recommendation: "APPROVE".to_string(),
+                    findings: Vec::new(),
+                },
+                model: "spy".to_string(),
+                usage: None,
+            })
+        }
+    }
+
+    async fn review_as(diff: &str, permission: &str) -> (Vec<bool>, Vec<String>, String) {
+        let srv = github_stub_trust(diff, permission).await;
+        let spy = CloneSpy {
+            may_clone: Arc::default(),
+            prompts: Arc::default(),
+        };
+        let out = run_review_with(&cfg_for(&srv.uri()), input(), &spy)
+            .await
+            .expect("review");
+        let seen = spy.may_clone.lock().unwrap().clone();
+        let prompts = spy.prompts.lock().unwrap().clone();
+        (seen, prompts, out.summary_markdown)
+    }
+
+    /// Every attack on the reviewer found so far needs the clone, so a PR from
+    /// someone who could not push to the repository is reviewed without one, and
+    /// its summary says why the review is shallower. A permission that cannot be
+    /// established (the endpoint fails) fails closed.
+    #[tokio::test]
+    async fn an_outside_authors_pr_is_reviewed_without_a_clone() {
+        for permission in ["read", "none", "404", "500"] {
+            let (seen, _, summary) = review_as(DIFF, permission).await;
+            assert!(
+                !seen.is_empty() && seen.iter().all(|m| !m),
+                "{permission}: {seen:?}"
+            );
+            assert!(
+                summary.contains("read the diff only"),
+                "{permission}: {summary}"
+            );
+        }
+        for permission in ["admin", "maintain", "write"] {
+            let (seen, _, summary) = review_as(DIFF, permission).await;
+            assert!(
+                !seen.is_empty() && seen.iter().all(|m| *m),
+                "{permission}: {seen:?}"
+            );
+            assert!(!summary.contains("read the diff only"), "{permission}");
+        }
+    }
+
+    /// With AGENTIC off the built-in backend clones nobody's PR, so an outside
+    /// author's summary must not blame them for a depth no review got.
+    #[tokio::test]
+    async fn no_diff_only_note_when_the_backend_would_not_have_cloned() {
+        let srv = github_stub_trust(DIFF, "none").await;
+        let spy = SpyBackend {
+            seen: Arc::default(),
+            bodies: Arc::default(),
+        };
+        let out = run_review_with(&cfg_for(&srv.uri()), input(), &spy)
+            .await
+            .expect("review");
+        assert!(
+            !out.summary_markdown.contains("read the diff only"),
+            "{}",
+            out.summary_markdown
+        );
+    }
+
+    #[test]
+    fn a_rename_onto_or_off_prbot_toml_counts_as_a_change() {
+        for diff in [
+            "diff --git a/old.toml b/.prbot.toml\nsimilarity index 100%\nrename from old.toml\nrename to .prbot.toml\n",
+            "diff --git a/.prbot.toml b/old.toml\nsimilarity index 100%\nrename from .prbot.toml\nrename to old.toml\n",
+        ] {
+            assert!(super::diff_touches_repo_config(diff), "{diff}");
+        }
+        assert!(!super::diff_touches_repo_config(
+            "diff --git a/docs/.prbot.toml.md b/docs/.prbot.toml.md\n--- a/docs/.prbot.toml.md\n+++ b/docs/.prbot.toml.md\n"
+        ));
+    }
+
+    /// Read from the head, a PR could rewrite its own review settings — exclude
+    /// its files, raise the confidence floor, or tell the reviewer to report
+    /// nothing. The stub serves a different `instructions` per ref.
+    #[tokio::test]
+    async fn prbot_toml_is_read_from_the_base_branch_not_the_head() {
+        let (_, prompts, _) = review_as(DIFF, "write").await;
+        assert!(!prompts.is_empty());
+        for p in &prompts {
+            assert!(p.contains("BASE-RULE"), "base settings not applied: {p}");
+            assert!(!p.contains("HEAD-RULE"), "head settings applied: {p}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pr_that_edits_prbot_toml_is_told_its_change_applies_after_merge() {
+        let diff = format!(
+            "{DIFF}diff --git a/.prbot.toml b/.prbot.toml\n--- a/.prbot.toml\n+++ b/.prbot.toml\n\
+             @@ -1 +1 @@\n-instructions = \"BASE-RULE\"\n+instructions = \"HEAD-RULE\"\n"
+        );
+        let (_, _, summary) = review_as(&diff, "admin").await;
+        assert!(
+            summary.contains("This PR changes `.prbot.toml`"),
+            "{summary}"
+        );
+        let (_, _, summary) = review_as(DIFF, "admin").await;
+        assert!(
+            !summary.contains("This PR changes `.prbot.toml`"),
+            "{summary}"
+        );
     }
 
     fn cfg_for(base: &str) -> Config {
@@ -3436,6 +4135,7 @@ mod orchestrator_tests {
         async fn review(&self, _ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
             let f = |sev: &str, file: &str, line: Option<u64>, conf: u8, body: &str| {
                 crate::llm::Finding {
+                    samples: None,
                     existing_code: None,
                     end_line: None,
                     severity: sev.to_string(),
@@ -3526,6 +4226,12 @@ mod orchestrator_tests {
         assert_eq!(findings[2]["file"], "src/zzz.rs");
         assert_eq!(findings[2]["anchored"], false);
         assert!(findings[2]["anchored_line"].is_null());
+        // One sample: there is no agreement to report, so the key is absent and a
+        // single-sample record reads exactly as it did before the field existed.
+        assert!(
+            findings.iter().all(|f| f.get("samples").is_none()),
+            "a single-sample review writes no per-finding count"
+        );
     }
 
     /// Three partly-overlapping samples, each billing the same tokens.
@@ -3546,6 +4252,7 @@ mod orchestrator_tests {
                 *c
             };
             let f = |file: &str, line: u64, body: &str| crate::llm::Finding {
+                samples: None,
                 existing_code: None,
                 end_line: None,
                 severity: "MEDIUM".to_string(),
@@ -3661,6 +4368,90 @@ mod orchestrator_tests {
             serde_json::json!([1, 1, 1]),
             "one finding seen once, one twice, one by all three"
         );
+
+        // The same agreement, per posted finding — what the histogram cannot say
+        // is WHICH finding only one sample saw.
+        let mut counts: Vec<u64> = v["findings"]
+            .as_array()
+            .expect("findings array")
+            .iter()
+            .map(|f| {
+                f["samples"]
+                    .as_u64()
+                    .expect("every sampled finding has a count")
+            })
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![1, 2, 3], "one count per agreement level");
+    }
+
+    /// The sampled review, with a critique that keeps two of the three clusters and
+    /// records what it was shown.
+    struct SampledCritique {
+        sampling: SamplingBackend,
+        shown: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ReviewBackend for SampledCritique {
+        async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.sampling.review(ctx).await
+        }
+
+        async fn complete(&self, _cfg: &Config, _system: &str, user: &str) -> Result<String> {
+            self.shown.lock().unwrap().push(user.to_string());
+            Ok(r#"[
+                {"severity":"MEDIUM","file":"src/a.rs","line":2,"body":"every sample sees this","confidence":85},
+                {"severity":"MEDIUM","file":"src/c.rs","line":80,"body":"only the last sample sees this","confidence":85}
+            ]"#
+            .to_string())
+        }
+    }
+
+    /// Self-critique rewrites every finding from the model's JSON, and `samples` is
+    /// skipped on input — so without a restore, turning critique on would erase
+    /// every count. It must survive, and the critique must not be shown it.
+    #[tokio::test]
+    async fn sample_counts_survive_the_self_critique_it_never_sees() {
+        let srv = github_stub().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.review_samples = 3;
+        cfg.self_critique = true;
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let backend = SampledCritique {
+            sampling: SamplingBackend {
+                calls: Arc::new(Mutex::new(0)),
+            },
+            shown: Arc::clone(&shown),
+        };
+
+        run_review_with(&cfg, input(), &backend)
+            .await
+            .expect("the review runs");
+
+        let shown = shown.lock().unwrap();
+        assert_eq!(shown.len(), 1, "the critique ran once");
+        assert!(
+            !shown[0].contains("\"samples\""),
+            "the critique is not shown the agreement it might prune on"
+        );
+
+        let text = std::fs::read_to_string(&log).expect("a record was written");
+        let v: serde_json::Value = serde_json::from_str(text.trim()).expect("one JSON line");
+        let count = |file: &str| {
+            v["findings"]
+                .as_array()
+                .expect("findings")
+                .iter()
+                .find(|f| f["file"] == file)
+                .map(|f| f["samples"].clone())
+        };
+        assert_eq!(count("src/a.rs"), Some(serde_json::json!(3)));
+        assert_eq!(count("src/c.rs"), Some(serde_json::json!(1)));
+        assert_eq!(count("src/b.rs"), None, "the critique dropped it");
     }
 
     /// New-side lines: 1 is context, 2 and 3 are added. A finding that names
@@ -3679,6 +4470,7 @@ mod orchestrator_tests {
                     summary: "one drifted finding".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "HIGH".to_string(),
@@ -3745,6 +4537,7 @@ mod orchestrator_tests {
                     summary: "one quoted finding".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: Some(
                             "const subtotal = sum(items);\nreturn calcTotal(order, tax);"
                                 .to_string(),
@@ -3818,6 +4611,7 @@ mod orchestrator_tests {
                     summary: "drifted onto a blank line".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "HIGH".to_string(),
@@ -3881,6 +4675,7 @@ mod orchestrator_tests {
                     summary: "one finding with a fix".to_string(),
                     recommendation: "APPROVE WITH CHANGES".to_string(),
                     findings: vec![crate::llm::Finding {
+                        samples: None,
                         existing_code: None,
                         end_line: None,
                         severity: "HIGH".to_string(),
@@ -4026,6 +4821,7 @@ return calcTotal(order, tax, region);
 
     fn proposed(file: &str, body: &str) -> crate::llm::Finding {
         crate::llm::Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: "MEDIUM".to_string(),
@@ -4193,13 +4989,14 @@ mod tests {
     use super::{
         anchorable, burst_key, collapse_bursts, demote_falsified_build_claims,
         effective_recommendation, idents, line_symbols, merge_samples, reanchor,
-        render_no_review_summary, resolve_excerpt, restore_quotes,
+        render_no_review_summary, resolve_excerpt, restore_quotes, restore_samples,
     };
     use crate::llm::Finding;
     use std::collections::{HashMap, HashSet};
 
     fn f(severity: &str, file: &str, body: &str) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: severity.to_string(),
@@ -4227,6 +5024,37 @@ mod tests {
         // The unrelated finding is untouched.
         assert_eq!(out[1].file, "d.rs");
         assert!(!out[1].body.contains("other file(s)"));
+    }
+
+    /// A collapsed claim's agreement cannot be derived from its members' counts,
+    /// so it records none rather than a misleading one.
+    #[test]
+    fn a_collapsed_group_records_no_sample_count() {
+        let with = |mut x: Finding, n: u32| {
+            x.samples = Some(n);
+            x
+        };
+        let findings = vec![
+            with(
+                f("LOW", "a.cxx", "`a.cxx` adds 2192 lines in one new file."),
+                1,
+            ),
+            with(
+                f("LOW", "b.cxx", "`b.cxx` adds 1868 lines in one new file."),
+                3,
+            ),
+            with(
+                f("LOW", "c.cxx", "`c.cxx` adds 1268 lines in one new file."),
+                2,
+            ),
+        ];
+        let out = collapse_bursts(findings);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].file, "a.cxx",
+            "the first member represents the group"
+        );
+        assert_eq!(out[0].samples, None, "the group's agreement is unknowable");
     }
 
     #[test]
@@ -4418,6 +5246,7 @@ mod tests {
 
     fn at(file: &str, line: Option<u64>, sev: &str, conf: u8, body: &str) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: sev.to_string(),
@@ -4427,6 +5256,34 @@ mod tests {
             confidence: Some(conf),
             suggestion: None,
         }
+    }
+
+    /// Each merged finding carries how many samples reported it.
+    #[test]
+    fn merged_findings_carry_their_sample_count() {
+        let a = vec![
+            at("a.rs", Some(10), "MEDIUM", 60, "shared"),
+            at("c.rs", Some(5), "LOW", 30, "only a"),
+        ];
+        let b = vec![at("a.rs", Some(12), "MEDIUM", 55, "shared, reworded")];
+        let merged = merge_samples(&[a, b], 10, 1).findings;
+        let count = |file: &str| {
+            merged
+                .iter()
+                .find(|f| f.file == file)
+                .and_then(|f| f.samples)
+        };
+        assert_eq!(count("a.rs"), Some(2), "both samples reported it");
+        assert_eq!(count("c.rs"), Some(1), "one sample reported it");
+    }
+
+    /// One surviving sample measures no agreement, so it records none — a count of
+    /// 1 would read as "one sample in N saw it".
+    #[test]
+    fn a_lone_surviving_sample_records_no_count() {
+        let only = vec![at("a.rs", Some(10), "MEDIUM", 60, "x")];
+        let merged = merge_samples(std::slice::from_ref(&only), 10, 1).findings;
+        assert_eq!(merged[0].samples, None);
     }
 
     /// A single sample must come out exactly as it went in.
@@ -4575,6 +5432,7 @@ mod tests {
 
     fn finding(severity: &str) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: severity.to_string(),
@@ -4815,6 +5673,29 @@ mod tests {
     }
 
     #[test]
+    fn a_sample_count_comes_back_from_the_same_spot_or_not_at_all() {
+        let counted = |file: &str, line: u64, n: u32| {
+            let mut x = quoted(file, line, None);
+            x.samples = Some(n);
+            x
+        };
+        let original = [
+            counted("a.rs", 12, 3),
+            counted("b.rs", 4, 1),
+            counted("b.rs", 9, 2),
+        ];
+        let mut kept = [
+            quoted("a.rs", 12, None), // the only original at that spot
+            quoted("a.rs", 30, None), // line rewritten, but the only original in a.rs
+            quoted("b.rs", 6, None),  // two originals in b.rs, neither at line 6
+        ];
+        restore_samples(&mut kept, &original);
+        assert_eq!(kept[0].samples, Some(3));
+        assert_eq!(kept[1].samples, Some(3));
+        assert_eq!(kept[2].samples, None, "correspondence cannot be shown");
+    }
+
+    #[test]
     fn a_quote_the_critique_dropped_comes_back_from_the_same_spot() {
         let original = [quoted("a.rs", 12, Some("let t = 0;"))];
         let mut kept = [quoted("a.rs", 12, None)];
@@ -4919,6 +5800,7 @@ mod change_map_tests {
                     added: 3,
                     removed: 1,
                     symbols: vec![0],
+                    cut: None,
                     worst: None,
                 },
                 FileEntry {
@@ -4926,6 +5808,7 @@ mod change_map_tests {
                     added: 2,
                     removed: 0,
                     symbols: vec![1],
+                    cut: None,
                     worst: None,
                 },
             ],
@@ -4993,6 +5876,7 @@ mod change_map_tests {
     #[test]
     fn the_table_attributes_each_finding_to_its_file() {
         let findings = vec![Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: "BLOCKING".into(),
@@ -5104,7 +5988,7 @@ mod omission_note_tests {
     /// PRs, against a lockfile that was committed and pinned correctly.
     #[test]
     fn a_glob_excluded_file_is_named_to_the_model() {
-        let note = omission_note(&["Cargo.lock".to_string()], &[])
+        let note = omission_note(&["Cargo.lock".to_string()], &[], None)
             .expect("a glob-excluded file must produce a note");
         assert!(note.contains("Cargo.lock"), "{note}");
         assert!(
@@ -5125,7 +6009,7 @@ mod omission_note_tests {
     /// The budget wording is untouched when only the packer dropped something.
     #[test]
     fn a_packed_out_file_keeps_the_size_wording() {
-        let note = omission_note(&[], &["big/generated.rs".to_string()]).unwrap();
+        let note = omission_note(&[], &["big/generated.rs".to_string()], None).unwrap();
         assert!(note.contains("size limit"), "{note}");
         assert!(note.contains("big/generated.rs"), "{note}");
         assert!(
@@ -5137,7 +6021,8 @@ mod omission_note_tests {
     /// Both routes at once report both reasons, separately.
     #[test]
     fn the_two_reasons_are_reported_separately() {
-        let note = omission_note(&["Cargo.lock".to_string()], &["huge.rs".to_string()]).unwrap();
+        let note =
+            omission_note(&["Cargo.lock".to_string()], &["huge.rs".to_string()], None).unwrap();
         assert!(
             note.contains("configuration") && note.contains("size limit"),
             "{note}"
@@ -5148,17 +6033,70 @@ mod omission_note_tests {
         );
     }
 
+    /// A file cut to fit is named with how much of it the model can see, and is
+    /// not told it was omitted — part of it is right there in the diff.
+    #[test]
+    fn a_cut_file_says_how_much_of_it_is_shown() {
+        let cut = crate::diff::CutFile {
+            path: "dict.yaml".into(),
+            kept_hunks: 120,
+            partial_hunk: false,
+            total_hunks: 1585,
+            digest: None,
+        };
+        let note = omission_note(&[], &[], Some(&cut)).unwrap();
+        assert!(note.contains("`dict.yaml`"), "{note}");
+        assert!(note.contains("first 120 of 1585"), "{note}");
+        assert!(note.contains("NOT"), "{note}");
+        assert!(!note.contains("were omitted"), "{note}");
+    }
+
+    /// A cut file's digest of its whole change follows what the note says
+    /// about the part shown.
+    #[test]
+    fn a_cut_files_digest_is_in_the_note() {
+        let cut = crate::diff::CutFile {
+            path: "dict.yaml".into(),
+            kept_hunks: 157,
+            partial_hunk: false,
+            total_hunks: 1585,
+            digest: Some("Across all 1585 hunk(s), computed from the full diff: …".into()),
+        };
+        let note = omission_note(&[], &[], Some(&cut)).unwrap();
+        let shown = note.find("first 157 of 1585").expect("says what is shown");
+        let digest = note
+            .find("Across all 1585 hunk(s)")
+            .expect("carries the digest");
+        assert!(shown < digest, "{note}");
+    }
+
+    /// A budget that runs out in the file header shows none of the file's
+    /// changes, and the note must not claim part of a hunk is there.
+    #[test]
+    fn a_cut_inside_the_file_header_says_no_hunk_is_shown() {
+        let cut = crate::diff::CutFile {
+            path: "dict.yaml".into(),
+            kept_hunks: 0,
+            partial_hunk: false,
+            total_hunks: 3,
+            digest: None,
+        };
+        let note = omission_note(&[], &[], Some(&cut)).unwrap();
+        assert!(note.contains("only its file header"), "{note}");
+        assert!(!note.contains("start of the first"), "{note}");
+    }
+
     /// Nothing dropped, nothing said.
     #[test]
     fn no_omissions_produce_no_note() {
-        assert!(omission_note(&[], &[]).is_none());
+        assert!(omission_note(&[], &[], None).is_none());
     }
 
     /// A vendoring PR must not paste hundreds of paths into the prompt.
     #[test]
     fn a_long_list_is_capped_and_says_how_many_it_hid() {
         let many: Vec<String> = (0..25).map(|i| format!("vendor/f{i}.js")).collect();
-        let note = omission_note(&many, &[]).unwrap();
+        let note = omission_note(&many, &[], None).unwrap();
         assert!(note.contains("25 file(s)"), "the count stays exact: {note}");
         assert!(note.contains("and 15 more"), "the list is capped: {note}");
         assert!(

@@ -114,6 +114,7 @@ pub async fn get_meta(client: &Client, cfg: &Config, repo: &str, pr: u64) -> Res
         head_sha: None, // Bitbucket inline comments don't need a commit id
         body: pr_data.description,
         ci_status,
+        author_permission: None,
     })
 }
 

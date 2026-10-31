@@ -290,7 +290,9 @@ pub fn changed_packages(diff: &str) -> Vec<PackageQuery> {
             }
             "package-lock.json" => parse_package_lock(&hunk),
             "composer.lock" => parse_composer_lock(&hunk),
-            "yarn.lock" => parse_yarn_lock(&added),
+            "yarn.lock" => parse_yarn_lock(&hunk),
+            // pnpm keys carry the version (`/pkg@1.2.3:`), so this one really is
+            // single-line.
             "pnpm-lock.yaml" => parse_pnpm_lock(&added),
             "go.sum" => parse_go_sum(&added),
             "requirements.txt" => parse_requirements_txt(&added),
@@ -445,10 +447,24 @@ fn parse_package_lock(hunk: &[&str]) -> Vec<(String, String)> {
 
 /// `yarn.lock` (classic + berry): a non-indented `"pkg@range", ...:` header, then
 /// an indented `version "x"` (classic) or `version: x` (berry).
-fn parse_yarn_lock(added: &[&str]) -> Vec<(String, String)> {
+///
+/// A block format like the TOML ones: a bump within the declared range rewrites
+/// only the `version` line and leaves the header above it as context, so the
+/// name is resolved from the whole hunk. Emission is still gated on the version
+/// line being added.
+fn parse_yarn_lock(hunk: &[&str]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut pending: Option<String> = None;
-    for line in added {
+    for &raw in hunk {
+        if raw.starts_with("@@") {
+            pending = None;
+            continue;
+        }
+        let Some((added, line)) = hunk_line(raw) else {
+            continue;
+        };
+        // Indentation is read after the diff prefix is stripped: a context
+        // header arrives as " pkg@^1:", which is still a header.
         let is_indented = line.starts_with(' ') || line.starts_with('\t');
         let t = line.trim();
         if !is_indented && t.ends_with(':') && t.contains('@') {
@@ -471,10 +487,13 @@ fn parse_yarn_lock(added: &[&str]) -> Vec<(String, String)> {
                 t.strip_prefix("version:")
                     .map(|rest| unquote(rest).to_string())
             };
-            if let (Some(name), Some(v)) = (pending.clone(), v) {
-                if is_concrete_version(&v) {
-                    out.push((name, v));
-                    pending = None;
+            if let Some(v) = v {
+                // An unchanged version line still closes the block, so its
+                // header cannot bind to a version added further down.
+                if let Some(name) = pending.take() {
+                    if added && is_concrete_version(&v) {
+                        out.push((name, v));
+                    }
                 }
             }
         }
@@ -1164,6 +1183,71 @@ mod tests {
             ("Packagist", "monolog/monolog")
         );
         assert_eq!(p[0].version, "2.0.1");
+    }
+
+    /// `yarn upgrade` within the declared range leaves the `pkg@range:` header
+    /// untouched and rewrites only the version line, so the header arrives as
+    /// context. Both lockfile dialects.
+    #[test]
+    fn a_yarn_bump_under_an_unchanged_header_is_scanned() {
+        let classic = concat!(
+            "diff --git a/yarn.lock b/yarn.lock\n",
+            "+++ b/yarn.lock\n",
+            "@@ -1,3 +1,3 @@\n",
+            " lodash@^4.17.0:\n",
+            "-  version \"4.17.20\"\n",
+            "+  version \"4.17.21\"\n",
+            "   resolved \"https://registry.yarnpkg.com/lodash/-/lodash-4.17.21.tgz\"\n",
+        );
+        let p = changed_packages(classic);
+        assert_eq!(p.len(), 1, "classic: {p:?}");
+        assert_eq!(
+            (
+                p[0].ecosystem.as_str(),
+                p[0].name.as_str(),
+                p[0].version.as_str()
+            ),
+            ("npm", "lodash", "4.17.21")
+        );
+
+        let berry = concat!(
+            "diff --git a/yarn.lock b/yarn.lock\n",
+            "+++ b/yarn.lock\n",
+            "@@ -1,3 +1,3 @@\n",
+            " \"@babel/core@npm:^7.0.0\":\n",
+            "-  version: 7.1.1\n",
+            "+  version: 7.1.2\n",
+        );
+        let p = changed_packages(berry);
+        assert_eq!(p.len(), 1, "berry: {p:?}");
+        assert_eq!(
+            (p[0].name.as_str(), p[0].version.as_str()),
+            ("@babel/core", "7.1.2")
+        );
+    }
+
+    /// The control for the test above: reading context must not turn an
+    /// untouched pin into a report. Here `lodash` is unchanged context and only
+    /// `left-pad` is bumped, so `left-pad` alone comes back.
+    #[test]
+    fn an_unchanged_yarn_pin_in_context_is_not_reported() {
+        let d = concat!(
+            "diff --git a/yarn.lock b/yarn.lock\n",
+            "+++ b/yarn.lock\n",
+            "@@ -1,6 +1,6 @@\n",
+            " lodash@^4.17.0:\n",
+            "   version \"4.17.20\"\n",
+            " \n",
+            " left-pad@^1.0.0:\n",
+            "-  version \"1.0.0\"\n",
+            "+  version \"1.3.0\"\n",
+        );
+        let p = changed_packages(d);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert_eq!(
+            (p[0].name.as_str(), p[0].version.as_str()),
+            ("left-pad", "1.3.0")
+        );
     }
 
     /// A removed name belongs to the pre-image. It must never bind to a version

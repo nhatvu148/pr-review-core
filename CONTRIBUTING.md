@@ -17,12 +17,13 @@ or a reproducible diff.
 
 ## The local loop
 
-CI's `check` job runs exactly these three, and they must be clean:
+CI's `check` job runs exactly these four, and they must be clean:
 
 ```sh
 cargo fmt --check
 cargo clippy --all-features --all-targets -- -D warnings
 cargo test --all-features
+cargo test --all-features --examples
 ```
 
 `clippy` runs with `-D warnings`, so a warning is a failure.
@@ -75,6 +76,13 @@ absence means the last change was released — not that the convention is unused
 
 If the change has a known limit or leaves a gap, say so in the entry. An
 overclaim discovered later costs more than the gap ever did.
+
+Never name the client-org consumer, its organisation or its repositories here,
+in a release note, a code comment or a workflow. Call it "the client-org bot",
+and a PR of theirs "a client-org PR". The CHANGELOG becomes the public release
+notes and ships inside every published crate, where it cannot be edited. The
+rule keeps the name out of new releases only: versions already on crates.io and the
+git history still carry it.
 
 ## Pull requests
 

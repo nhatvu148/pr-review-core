@@ -115,6 +115,7 @@ impl Case {
             head_sha: None,
             body: None,
             ci_status: None,
+            author_permission: None,
         }
     }
 }
@@ -625,6 +626,7 @@ mod tests {
             suggestion: None,
             existing_code: None,
             end_line: None,
+            samples: None,
         }
     }
 

@@ -172,7 +172,7 @@ pub fn injected_rules(cfg: &Config) -> String {
 /// version of this function applied it, reasoning that every other prompt in the
 /// crate honours the consumer's injected block and this one silently did not.
 /// That consistency argument was wrong, and what showed it was looking at what a
-/// real consumer actually puts there: a *review rubric*. The deployed SIMCEL block
+/// real consumer actually puts there: a *review rubric*. The deployed client-org block
 /// is a hundred lines whose opening instruction is "weigh these project-specific
 /// conventions and RAISE a finding when the diff violates one". Handing that to a
 /// prompt whose job is to describe a change invites descriptions that read like
@@ -651,7 +651,7 @@ mod describe_prompt_tests {
         assert_eq!(describe_system_prompt(&cfg()), DESCRIBE_SYSTEM_PROMPT);
     }
 
-    /// `extra_system_prompt` is a REVIEW rubric in practice — the deployed SIMCEL
+    /// `extra_system_prompt` is a REVIEW rubric in practice — the deployed client-org
     /// block opens with "RAISE a finding when the diff violates one" — so it must
     /// not reach a prompt whose job is to describe a change. An earlier version of
     /// this function applied it, and would have made descriptions read like reviews.
@@ -718,6 +718,7 @@ mod tests {
             head_sha: None,
             body: None,
             ci_status: ci.map(str::to_string),
+            author_permission: None,
         }
     }
 
@@ -1243,6 +1244,7 @@ mod finding_shape_tests {
     /// Every key of a fully populated `Finding`, as it serializes.
     fn finding_keys() -> Vec<String> {
         let f = Finding {
+            samples: None,
             severity: "HIGH".into(),
             file: "a.rs".into(),
             line: Some(1),

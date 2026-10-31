@@ -203,6 +203,22 @@ pub struct LoggedFinding {
     /// is what a human replies to and what the reconciler later deletes.
     pub anchored_line: Option<u64>,
     pub body: String,
+    /// How many samples reported this finding (`Finding::samples`), out of
+    /// `Funnel::samples` — the samples that actually succeeded, not the configured
+    /// `REVIEW_SAMPLES`. `Funnel::sample_agreement` is the histogram over every
+    /// cluster; this is the count for each one posted.
+    ///
+    /// Absent when no agreement was measured for the finding:
+    /// - fewer than two samples survived (a single-sample review, or the extra
+    ///   samples failed);
+    /// - it was added outside the merge (a diff-hygiene finding);
+    /// - it is a collapsed burst, whose agreement its members' counts cannot give;
+    /// - the self-critique kept it but it could not be matched to one original.
+    ///
+    /// So absent means "not measured", never "zero"; an analysis of lone-sample
+    /// findings should count only findings that carry a value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples: Option<u32>,
 }
 
 /// One review run.
@@ -328,6 +344,7 @@ pub fn logged_findings(findings: &[Finding], anchors: &[Option<u64>]) -> Vec<Log
                 anchored: anchored_line.is_some(),
                 anchored_line,
                 body: f.body.clone(),
+                samples: f.samples,
             }
         })
         .collect()
@@ -445,6 +462,7 @@ mod tests {
                 quote_resolved: 0,
             },
             findings: vec![LoggedFinding {
+                samples: None,
                 typed_line: None,
                 severity: "HIGH".into(),
                 file: "src/a.rs".into(),
@@ -494,6 +512,7 @@ mod tests {
 
     fn finding(file: &str, line: Option<u64>) -> Finding {
         Finding {
+            samples: None,
             existing_code: None,
             end_line: None,
             severity: "HIGH".into(),
