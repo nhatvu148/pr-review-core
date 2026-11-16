@@ -37,10 +37,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macos-15, not 14: GitHub retired the macos-14 image, and a job on a
+          # retired label is cancelled before it starts, which skips every publish
+          # job behind it. Rust's own deployment target, not the runner, sets the
+          # oldest macOS the binary runs on.
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-15
           # 22.04, not latest: the glibc a binary is LINKED against is the oldest
           # it can run on, so building on the newest runner silently narrows who
           # can install this. The npm/PyPI audience is not on the newest distro.
@@ -277,8 +281,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin, runner: macos-14 }
-          - { target: x86_64-apple-darwin, runner: macos-14 }
+          - { target: aarch64-apple-darwin, runner: macos-15 }
+          - { target: x86_64-apple-darwin, runner: macos-15 }
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
           - { target: x86_64-pc-windows-msvc, runner: windows-latest }
