@@ -26,12 +26,27 @@ struct ChatReq {
     messages: Vec<Msg>,
 }
 
-/// Token accounting echoed back by OpenRouter.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+/// Token and cost accounting for a review, as the backend reported it.
+///
+/// Every field is optional and absent means "not reported", never zero. The
+/// cache counts are kept apart from `prompt_tokens` on purpose: a backend that
+/// folded them in reported an input several times larger than what was billed
+/// at the full rate, and no cost could be worked out from it afterwards.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Usage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+    /// Input tokens served from the prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u32>,
+    /// Input tokens written to the prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_tokens: Option<u32>,
+    /// What the run cost in US dollars, when the backend says (an agent CLI does;
+    /// most HTTP APIs return tokens only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// Severity assumed when the model omits the field. Deliberately not `LOW`:
@@ -873,11 +888,20 @@ pub fn add_usage(review: Option<Usage>, repair: Option<Usage>) -> Option<Usage> 
             (only, None) | (None, only) => only,
         }
     }
+    fn add_cost(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a + b),
+            (only, None) | (None, only) => only,
+        }
+    }
     match (review, repair) {
         (Some(r), Some(p)) => Some(Usage {
             prompt_tokens: add(r.prompt_tokens, p.prompt_tokens),
             completion_tokens: add(r.completion_tokens, p.completion_tokens),
             total_tokens: add(r.total_tokens, p.total_tokens),
+            cache_read_tokens: add(r.cache_read_tokens, p.cache_read_tokens),
+            cache_creation_tokens: add(r.cache_creation_tokens, p.cache_creation_tokens),
+            cost_usd: add_cost(r.cost_usd, p.cost_usd),
         }),
         (only, None) | (None, only) => only,
     }
@@ -1056,11 +1080,33 @@ mod salvage_tests {
         )
     }
 
+    /// Cache counts and cost add up across the review and its repair pass like
+    /// the token counts do, and one side's absent figure keeps the other's.
+    #[test]
+    fn cost_and_cache_tokens_are_summed_across_passes() {
+        let a = Usage {
+            cache_read_tokens: Some(100),
+            cost_usd: Some(0.25),
+            ..Default::default()
+        };
+        let b = Usage {
+            cache_read_tokens: Some(50),
+            cache_creation_tokens: Some(7),
+            cost_usd: Some(0.5),
+            ..Default::default()
+        };
+        let sum = add_usage(Some(a), Some(b)).unwrap();
+        assert_eq!(sum.cache_read_tokens, Some(150));
+        assert_eq!(sum.cache_creation_tokens, Some(7));
+        assert_eq!(sum.cost_usd, Some(0.75));
+    }
+
     fn usage(prompt: Option<u32>, completion: Option<u32>, total: Option<u32>) -> Usage {
         Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
             total_tokens: total,
+            ..Default::default()
         }
     }
 

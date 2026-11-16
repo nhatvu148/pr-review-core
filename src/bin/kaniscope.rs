@@ -1506,6 +1506,7 @@ mod tests {
             comment_url: None,
             summary_markdown: String::new(),
             usage: None,
+            reused: false,
         }
     }
 

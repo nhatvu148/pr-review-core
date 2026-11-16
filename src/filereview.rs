@@ -222,7 +222,10 @@ pub async fn review_content(
     });
     findings.truncate(cfg.max_findings);
 
-    let summary_markdown = render(path, &review, &findings);
+    let mut summary_markdown = render(path, &review, &findings);
+    // Same provenance line as a diff review, so a finding a rule file caused can
+    // be traced to it here too.
+    summary_markdown.push_str(&crate::repo_rules::rules_note(cfg));
     Ok(FileReviewOutput {
         path: path.to_string(),
         source,
@@ -258,7 +261,8 @@ pub async fn review_local(
     // reviewed on a pull request. It also meant `min_confidence`, `max_findings`
     // and `model` came from the deployment rather than the repository, which is
     // the parity Phase 1 established for diff reviews and this path never got.
-    let effective = crate::review::local_repo_config_source(cfg, Some(repo_root)).0;
+    let mut effective = crate::review::local_review_config_source(cfg, Some(repo_root)).0;
+    crate::repo_rules::apply_path_instructions(&mut effective, &[path.to_string()]);
     let cfg = &effective;
 
     let full = match resolve_repo_file(cfg, repo_root, path) {
@@ -311,7 +315,10 @@ pub async fn review_pr_file(
     };
     // The repository's own rules govern what may be read — so they are loaded
     // before the filter check, not after it.
-    let effective = crate::review::load_repo_config(&provider, &client, cfg, repo, &meta).await;
+    let mut effective = crate::review::review_config_source(&provider, &client, cfg, repo, &meta)
+        .await
+        .0;
+    crate::repo_rules::apply_path_instructions(&mut effective, &[path.to_string()]);
 
     let git_ref = match (meta.head_sha.as_deref(), meta.base_branch.as_deref()) {
         (Some(s), _) if !s.is_empty() => s.to_string(),
@@ -412,7 +419,7 @@ pub(crate) fn render(
             s.push_str(&format!(
                 "\n- {} **{}** — `{path}`{loc} — {}",
                 crate::review::severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
+                crate::review::severity_label(&f.severity),
                 f.body.trim()
             ));
         }

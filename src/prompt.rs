@@ -21,7 +21,7 @@ Return ONLY a JSON object — no markdown fences, no prose around it — with ex
   "recommendation": "BLOCK" | "APPROVE WITH CHANGES" | "APPROVE",
   "findings": [
     {
-      "severity": "BLOCKING" | "HIGH" | "MEDIUM" | "LOW",
+      "severity": "BLOCKING" | "HIGH" | "MEDIUM" | "LOW" | "PRE-EXISTING",
       "file": "<path EXACTLY as it appears in the diff, new side>",
       "line": <integer line number in the NEW version of the file, or null if not line-specific>,
       "existing_code": "<the line(s) this finding is about, copied verbatim from the diff's new side, or null>",
@@ -79,6 +79,7 @@ Severity is blast radius × how silently it fails — NOT how confident or annoy
 - HIGH: a correctness or security bug that will reach users or callers.
 - MEDIUM: a bug on a reachable path — anything that throws, corrupts state, or degrades behaviour — or a real maintainability hazard. A bug that THROWS is never LOW.
 - LOW: latent risk, an observation, or a nit. If it costs nothing to ignore, it is LOW.
+- PRE-EXISTING: a real defect that this change did NOT introduce — it was already there in code the change touches or depends on. Report it so it is not lost, but it is not the change's fault: it never justifies BLOCK or APPROVE WITH CHANGES on its own. Use it only when you can see the defect predates the change; a bug the change makes newly reachable is the change's, and gets a normal severity.
 
 ## Verify before you assert
 
@@ -223,7 +224,7 @@ pub fn review_system_prompt(cfg: &Config) -> String {
 /// System prompt for the optional second-pass self-critique. Given the diff and a
 /// JSON array of proposed findings, the model prunes noise and re-scores what it
 /// keeps, returning ONLY a JSON array of the surviving findings.
-pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence, suggestion, existing_code}. Carry `existing_code` through UNCHANGED on a finding you keep — it is the quoted code that places the finding, and without it the finding falls back to a guessed line. Carry `suggestion` through UNCHANGED on a finding you keep — it is replacement code that was checked against the diff, and silently dropping or rewriting it here loses work the review already did. Set it to null only if the suggestion itself is what makes the finding wrong. If all should be dropped, return []."#;
+pub const CRITIQUE_SYSTEM_PROMPT: &str = r#"You are a skeptical senior reviewer doing a second pass. Given the diff and a JSON array of proposed findings, REMOVE false positives, duplicates, out-of-scope nits, and anything not clearly actionable. For each finding you KEEP, set an honest `confidence` 0–100. Return ONLY a JSON array of the kept findings, each with the same shape {severity, file, line, body, confidence, suggestion, existing_code}. Carry `existing_code` through UNCHANGED on a finding you keep — it is the quoted code that places the finding, and without it the finding falls back to a guessed line. Carry `suggestion` through UNCHANGED on a finding you keep — it is replacement code that was checked against the diff, and silently dropping or rewriting it here loses work the review already did. Set it to null only if the suggestion itself is what makes the finding wrong. Keep a real PRE-EXISTING finding (a defect the change did not introduce): it is already labelled as not the change's fault, so being outside the change is not a reason to drop it. If all should be dropped, return []."#;
 
 /// System prompt for the `/ask` command: answer a free-form question about the
 /// PR, grounded strictly in its diff.

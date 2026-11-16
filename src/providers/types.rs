@@ -63,10 +63,15 @@ pub struct InlineComment {
 /// A rendered review ready to post: one summary comment plus zero or more
 /// inline comments. Bodies are final markdown (the provider adds the dedupe
 /// marker).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ReviewPost {
     pub summary: String,
     pub inline: Vec<InlineComment>,
+    /// Findings this round kept out of `inline` by the severity floor. Never
+    /// posted, but a provider that reconciles prior threads treats them as still
+    /// flagged: a finding that was posted inline before the floor applied is the
+    /// same finding, not a fix. Matched by fingerprint, then by nearby line.
+    pub held: Vec<InlineComment>,
 }
 
 /// An issue the pull request says it closes, as the host links it.

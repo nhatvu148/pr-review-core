@@ -20,6 +20,8 @@ export interface RunReviewOutput {
   provider: string;
   recommendation: string;
   repo: string;
+  /** True when no model ran because the PR's changed lines, settings and rules were identical to the last review's, so that review was left in place. */
+  reused?: boolean;
   summaryMarkdown: string;
   usage?: Usage | null;
 }
@@ -69,9 +71,15 @@ export interface InlineComment {
 /** How far a dependency scan got — what an empty advisory list actually means. */
 export type ScanStatus = "disabled" | "no_lockfiles" | "complete" | "truncated" | "failed";
 
-/** Token accounting echoed back by OpenRouter. */
+/** Token and cost accounting for a review, as the backend reported it. */
 export interface Usage {
+  /** Input tokens written to the prompt cache. */
+  cache_creation_tokens?: number | null;
+  /** Input tokens served from the prompt cache. */
+  cache_read_tokens?: number | null;
   completion_tokens?: number | null;
+  /** What the run cost in US dollars, when the backend says (an agent CLI does; most HTTP APIs return tokens only). */
+  cost_usd?: number | null;
   prompt_tokens?: number | null;
   total_tokens?: number | null;
 }
@@ -138,6 +146,14 @@ export interface EffectiveRules {
   warnings: string[];
 }
 
+/** Instructions that apply only when the PR changes a file matching `paths`. */
+export interface PathInstruction {
+  /** Plain-language instructions for the reviewer. */
+  instructions: string;
+  /** Globs, matched against changed file paths. */
+  paths: string[];
+}
+
 /** Per-repo review overrides parsed from a `.prbot.toml`. */
 export interface RepoConfig {
   agentic?: boolean | null;
@@ -155,6 +171,8 @@ export interface RepoConfig {
   /** Let the agentic reviewer's `grep` return context lines around each match, for this repo. */
   grep_context?: boolean | null;
   include_globs?: string[] | null;
+  /** Lowest severity posted inline for this repo; below it, summary only. */
+  inline_min_severity?: string | null;
   /** Extra review instructions in plain language, appended to the system prompt. */
   instructions?: string | null;
   /** Toggle giving the reviewer the issues the PR closes, for this repo. */
@@ -163,12 +181,16 @@ export interface RepoConfig {
   min_confidence?: number | null;
   model?: string | null;
   model_explore?: string | null;
+  /** Instructions applied only when the PR changes a file matching their globs — see [`crate::repo_rules::PathInstruction`]. */
+  path_instructions?: PathInstruction[] | null;
   /** Pass this repo's PR descriptions to the reviewer as a statement of intent to check the diff against. */
   pr_body?: boolean | null;
   /** Cap on the description handed to the reviewer, for this repo. */
   pr_body_max_chars?: number | null;
   /** Toggle re-anchoring a finding that drifted just off a diff line to the nearest matching diff line (else it folds to the summary), for this repo. */
   reanchor_findings?: boolean | null;
+  /** Toggle reading `REVIEW.md`, `.cursor/BUGBOT.md` and the review section of `AGENTS.md` from the base branch, for this repo. */
+  repo_rules?: boolean | null;
   self_critique?: boolean | null;
   /** Toggle committable suggestion blocks on findings, for this repo. */
   suggestions?: boolean | null;
@@ -226,6 +248,8 @@ export interface ReviewSettings {
   fileBundling: boolean;
   grepContext: boolean;
   includeGlobs: string[];
+  /** The inline severity floor in force, or `None` when every finding posts inline. */
+  inlineMinSeverity?: string | null;
   /** Whether the issues a PR closes are given to the reviewer. */
   linkedIssues: boolean;
   maxDiffChars: number;
@@ -236,10 +260,16 @@ export interface ReviewSettings {
   minConfidence: number;
   model: string;
   modelExplore: string;
+  /** Path-scoped instructions configured in `.prbot.toml`. */
+  pathInstructions: PathInstruction[];
   prBody: boolean;
   prBodyMaxChars: number;
   reanchorFindings: boolean;
+  /** Whether the repo's own rule files are read (`REPO_RULES` / `repo_rules`). */
+  repoRules: boolean;
   reviewSamples: number;
+  /** The rule sources merged into the prompt below, as the summary names them. */
+  ruleSources: string[];
   sampleLineTolerance: number;
   sampleMinAgreement: number;
   selfCritique: boolean;

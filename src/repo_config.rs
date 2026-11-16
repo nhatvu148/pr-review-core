@@ -39,6 +39,9 @@ pub struct RepoConfig {
     pub min_confidence: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_findings: Option<usize>,
+    /// Lowest severity posted inline for this repo; below it, summary only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_min_severity: Option<String>,
     /// Toggle giving the reviewer the issues the PR closes, for this repo.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub linked_issues: Option<bool>,
@@ -93,6 +96,14 @@ pub struct RepoConfig {
     /// Extra review instructions in plain language, appended to the system prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Instructions applied only when the PR changes a file matching their
+    /// globs — see [`crate::repo_rules::PathInstruction`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_instructions: Option<Vec<crate::repo_rules::PathInstruction>>,
+    /// Toggle reading `REVIEW.md`, `.cursor/BUGBOT.md` and the review section of
+    /// `AGENTS.md` from the base branch, for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_rules: Option<bool>,
     /// Instructions shaping the `/describe` output specifically — a house PR
     /// description layout, release-notes sections, a contributor table. Kept
     /// separate from `instructions` because that one governs what the reviewer

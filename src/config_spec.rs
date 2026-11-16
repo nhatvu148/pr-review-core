@@ -217,6 +217,13 @@ pub const SPEC: &[ConfigVar] = &[
         doc: "Keep related files (a source and its test, i18n siblings) adjacent when packing, so the model reviews them together.",
     },
     ConfigVar {
+        env: "FIX_PROMPT",
+        aliases: &[],
+        kind: ConfigKind::Bool,
+        default: Some("false"),
+        doc: "Append a collapsed, copyable prompt that hands every posted finding to a coding agent (fix what is right, reply to what is not).",
+    },
+    ConfigVar {
         env: "GH_API_BASE",
         aliases: &[],
         kind: ConfigKind::Str,
@@ -271,6 +278,13 @@ pub const SPEC: &[ConfigVar] = &[
         kind: ConfigKind::Globs,
         default: None,
         doc: "If set, ONLY files matching these globs are reviewed.",
+    },
+    ConfigVar {
+        env: "INLINE_MIN_SEVERITY",
+        aliases: &[],
+        kind: ConfigKind::Str,
+        default: None,
+        doc: "Lowest severity posted as an inline comment (BLOCKING, HIGH, MEDIUM, LOW). Findings below it are listed in the summary instead. Unset posts everything inline.",
     },
     ConfigVar {
         env: "LINKED_ISSUES",
@@ -432,6 +446,20 @@ pub const SPEC: &[ConfigVar] = &[
         kind: ConfigKind::Bool,
         default: Some("true"),
         doc: "Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary.",
+    },
+    ConfigVar {
+        env: "REPO_RULES",
+        aliases: &[],
+        kind: ConfigKind::Bool,
+        default: Some("true"),
+        doc: "Read the review rules a repo already has (REVIEW.md, .cursor/BUGBOT.md, the review section of AGENTS.md) from the base branch, and list them in the summary.",
+    },
+    ConfigVar {
+        env: "REUSE_UNCHANGED_REVIEW",
+        aliases: &[],
+        kind: ConfigKind::Bool,
+        default: Some("true"),
+        doc: "Skip the model on an automatic re-review that would see the same changed lines under the same settings and rules (a rebase, an empty commit), and leave the last review in place. An explicit /review always runs.",
     },
     ConfigVar {
         env: "REVIEW_ON_UPDATE",
