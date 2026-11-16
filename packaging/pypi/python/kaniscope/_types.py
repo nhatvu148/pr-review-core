@@ -171,6 +171,7 @@ class RepoConfig(_RepoConfigRequired, total=False):
     file_bundling: Optional[bool]
     grep_context: Optional[bool]
     include_globs: Optional[List[str]]
+    inline_min_severity: Optional[str]
     instructions: Optional[str]
     max_findings: Optional[int]
     min_confidence: Optional[int]
@@ -218,9 +219,7 @@ class RepoConfigSourceInvalid(TypedDict):
 RepoConfigSource = Union[RepoConfigSourceUnavailable, RepoConfigSourceAbsent, RepoConfigSourceApplied, RepoConfigSourceInvalid]
 
 
-class ReviewSettings(TypedDict):
-    """The review-relevant configuration, after merging repo overrides."""
-
+class _ReviewSettingsRequired(TypedDict):
     agentic: bool
     blastMaxRefs: int
     blastMaxSymbols: int
@@ -260,6 +259,12 @@ class ReviewSettings(TypedDict):
     vendoredGlobs: List[str]
     walkthrough: bool
     walkthroughMaxSymbols: int
+
+
+class ReviewSettings(_ReviewSettingsRequired, total=False):
+    """The review-relevant configuration, after merging repo overrides."""
+
+    inlineMinSeverity: Optional[str]
 
 
 class RulesScopeLocal(TypedDict):

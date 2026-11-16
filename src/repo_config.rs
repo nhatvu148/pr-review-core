@@ -39,6 +39,9 @@ pub struct RepoConfig {
     pub min_confidence: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_findings: Option<usize>,
+    /// Lowest severity posted inline for this repo; below it, summary only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inline_min_severity: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_critique: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

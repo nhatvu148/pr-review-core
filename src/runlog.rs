@@ -154,6 +154,9 @@ pub struct Funnel {
     pub anchored: usize,
     /// The rest, folded into the summary because no diff line would take them.
     pub unanchored: usize,
+    /// Kept out of inline comments by `INLINE_MIN_SEVERITY` and listed in the
+    /// summary instead. `anchored + unanchored + held_back == posted_findings`.
+    pub held_back: usize,
     /// Of the anchored ones, how many carried a committable suggestion block.
     ///
     /// The gap between this and `anchored` is the question the feature is judged
@@ -457,6 +460,7 @@ mod tests {
                 posted_findings: 4,
                 anchored: 3,
                 unanchored: 1,
+                held_back: 0,
                 suggested: 0,
                 quoted: 0,
                 quote_resolved: 0,
