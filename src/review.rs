@@ -214,7 +214,7 @@ mod severity_and_recommendation_tests {
             "{p}"
         );
         assert!(p.contains("2. [LOW] src/a.rs\n"), "{p}");
-        assert!(p.contains("say why in a reply"), "{p}");
+        assert!(p.contains("in a reply to its review"), "{p}");
         assert!(
             p.starts_with("<details>") && p.ends_with("</details>"),
             "{p}"
@@ -931,10 +931,12 @@ fn map_detail(cfg: &Config) -> crate::changemap::MapDetail {
     }
 }
 
-/// Append the change map's renderings to a summary comment.
+/// Append the derived blocks to a summary comment: the coding-agent prompt
+/// (`FIX_PROMPT`), then the walkthrough and the change diagram.
 ///
-/// Both are opt-in and both are *derived* — nothing here asks a model anything, so
-/// a reader can check every row and every arrow against the code. Each render
+/// All three are opt-in and all are *derived* — nothing here asks a model
+/// anything, so a reader can check every line, row and arrow against the code
+/// and the findings. Each render
 /// returns an empty string when it has nothing worth showing (no files; no edges),
 /// and an empty render appends nothing rather than an empty `<details>`.
 fn append_change_map(
@@ -985,8 +987,10 @@ pub(crate) fn render_fix_prompt(findings: &[Finding]) -> String {
     let mut body = String::from(
         "Address these code review findings on this pull request. For each one: \
          check it against the code first; if it is right, fix it; if it is wrong or \
-         not worth changing, leave the code and say why in a reply to that finding. \
-         Then push and wait for the next review.\n",
+         not worth changing, leave the code and say why: in a reply to its review \
+         thread when it has one, otherwise in one comment on the pull request (or, \
+         with no pull request, in your summary of the work). Then push and wait for \
+         the next review.\n",
     );
     for (i, f) in findings.iter().enumerate() {
         let loc = match (f.line, f.end_line) {
