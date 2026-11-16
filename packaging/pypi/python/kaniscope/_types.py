@@ -155,6 +155,13 @@ class EffectiveRules(TypedDict):
     warnings: List[str]
 
 
+class PathInstruction(TypedDict):
+    """Instructions that apply only when the PR changes a file matching `paths`."""
+
+    instructions: str
+    paths: List[str]
+
+
 class _RepoConfigRequired(TypedDict):
     pass
 
@@ -176,9 +183,11 @@ class RepoConfig(_RepoConfigRequired, total=False):
     min_confidence: Optional[int]
     model: Optional[str]
     model_explore: Optional[str]
+    path_instructions: Optional[List[PathInstruction]]
     pr_body: Optional[bool]
     pr_body_max_chars: Optional[int]
     reanchor_findings: Optional[bool]
+    repo_rules: Optional[bool]
     self_critique: Optional[bool]
     suggestions: Optional[bool]
     vendored: Optional[List[str]]
@@ -246,10 +255,13 @@ class ReviewSettings(TypedDict):
     minConfidence: int
     model: str
     modelExplore: str
+    pathInstructions: List[PathInstruction]
     prBody: bool
     prBodyMaxChars: int
     reanchorFindings: bool
+    repoRules: bool
     reviewSamples: int
+    ruleSources: List[str]
     sampleLineTolerance: int
     sampleMinAgreement: int
     selfCritique: bool
@@ -425,6 +437,7 @@ __all__ = [
     "HandoffAction",
     "InlineComment",
     "OutstandingFinding",
+    "PathInstruction",
     "RepoConfig",
     "RepoConfigSource",
     "ResolveOutput",

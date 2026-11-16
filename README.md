@@ -81,6 +81,19 @@ prompt through [`Config`].
   free-text review `instructions`. On a pull request it is read from the base
   branch, never the PR's head, so a PR cannot change the settings it is reviewed
   under; a PR that edits the file is told its change applies once merged.
+- **Path-scoped instructions**: `[[path_instructions]]` in `.prbot.toml` apply only
+  when the PR changes a file matching their globs:
+
+  ```toml
+  [[path_instructions]]
+  paths = ["migrations/**"]
+  instructions = "Every migration must be reversible."
+  ```
+- **Rules the repo already wrote**: `REVIEW.md`, `.cursor/BUGBOT.md` and the review
+  section of `AGENTS.md` (a heading such as `## Code Review Rules`) are read from the
+  base branch and applied, each capped at 4,000 characters and 8,000 together. The
+  summary ends with the rule sources it used. `REPO_RULES=false`, or
+  `repo_rules = false` in `.prbot.toml`, turns this off.
 - **Untrusted authors get a diff-only review**: on GitHub, a PR from anyone without
   write access to the repository (by its collaborator permission) is reviewed
   without cloning it, so nothing in the PR's tree reaches the reviewer's tools. A
@@ -342,6 +355,7 @@ The tables in this section and the next cover the knobs worth a paragraph. This 
 | `PR_BODY_MAX_CHARS` | `12000` | Cap on the description handed to the reviewer. A clipped one is marked truncated, so absence is not read as out-of-scope. |
 | `CHANGE_INTENT_MAX_CHARS` | `12000` | Cap on the stated change intent handed to the reviewer on a local review. A clipped one is marked truncated, so absence is not read as out-of-scope. |
 | `REANCHOR_FINDINGS` | `true` | Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. |
+| `REPO_RULES` | `true` | Read the review rules a repo already has (REVIEW.md, .cursor/BUGBOT.md, the review section of AGENTS.md) from the base branch, and list them in the summary. |
 | `REVIEW_ON_UPDATE` | `false` | Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. |
 | `REVIEW_SAMPLES` | `1` | Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. |
 | `SAMPLE_LINE_TOLERANCE` | `10` | How far apart two samples may anchor the same issue and still merge. Set from measurement: the same issue was observed 1, 7, 10, 12 and 39 lines from where another run reported it. The reconciler uses the same window for the same reason, since both answer whether two descriptions are one issue. |

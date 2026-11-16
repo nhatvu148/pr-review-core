@@ -109,6 +109,8 @@ export interface ReviewConfig {
   changeIntentMaxChars?: number;
   /** Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. Default: `true`. (`REANCHOR_FINDINGS`) */
   reanchorFindings?: boolean;
+  /** Read the review rules a repo already has (REVIEW.md, .cursor/BUGBOT.md, the review section of AGENTS.md) from the base branch, and list them in the summary. Default: `true`. (`REPO_RULES`) */
+  repoRules?: boolean;
   /** Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. Default: `false`. (`REVIEW_ON_UPDATE`) */
   reviewOnUpdate?: boolean;
   /** Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. Default: `1`. (`REVIEW_SAMPLES`) */

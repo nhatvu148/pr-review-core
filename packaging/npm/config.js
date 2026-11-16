@@ -55,6 +55,7 @@ const CONFIG_ENV = {
   prBodyMaxChars: ["PR_BODY_MAX_CHARS", "Int"],
   changeIntentMaxChars: ["CHANGE_INTENT_MAX_CHARS", "Int"],
   reanchorFindings: ["REANCHOR_FINDINGS", "Bool"],
+  repoRules: ["REPO_RULES", "Bool"],
   reviewOnUpdate: ["REVIEW_ON_UPDATE", "Bool"],
   reviewSamples: ["REVIEW_SAMPLES", "Int"],
   sampleLineTolerance: ["SAMPLE_LINE_TOLERANCE", "Int"],

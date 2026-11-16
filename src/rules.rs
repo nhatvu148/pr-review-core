@@ -96,6 +96,13 @@ pub struct ReviewSettings {
     pub self_critique: bool,
     pub min_confidence: u8,
     pub max_findings: usize,
+    /// Whether the repo's own rule files are read (`REPO_RULES` / `repo_rules`).
+    pub repo_rules: bool,
+    /// Path-scoped instructions configured in `.prbot.toml`. Which apply depends
+    /// on the files a PR changes, so all of them are listed here.
+    pub path_instructions: Vec<crate::repo_rules::PathInstruction>,
+    /// The rule sources merged into the prompt below, as the summary names them.
+    pub rule_sources: Vec<String>,
     pub review_samples: usize,
     pub sample_min_agreement: usize,
     pub sample_line_tolerance: u64,
@@ -145,6 +152,9 @@ impl ReviewSettings {
             self_critique: cfg.self_critique,
             min_confidence: cfg.min_confidence,
             max_findings: cfg.max_findings,
+            repo_rules: cfg.repo_rules,
+            path_instructions: cfg.path_instructions.clone(),
+            rule_sources: cfg.rule_sources.clone(),
             review_samples: cfg.review_samples,
             sample_min_agreement: cfg.sample_min_agreement,
             sample_line_tolerance: cfg.sample_line_tolerance,

@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The review rules a repository already wrote are applied, and the summary says which.** Teams write review guidance for whichever tool they adopted first: `REVIEW.md` (Claude Code Review), `.cursor/BUGBOT.md` (Cursor Bugbot), a "Code Review Rules" section of `AGENTS.md` (Codex). The engine read only `.prbot.toml`, so that guidance had to be restated or was lost. It now reads those files from the base branch, the same trusted ref as `.prbot.toml`, so a PR cannot rewrite the rules it is reviewed under. A PR that edits one is told its change applies once merged. From `AGENTS.md` only a section under a review heading (`Review`, `Code Review`, `Review Rules`, `Code Review Rules`, `Review Guidelines`) is taken, because the rest of that file is instructions for a coding agent and would spend the prompt on a different job. Each source is capped at 4,000 characters and all of them at 8,000. A missing file or a fetch error is skipped. On by default: `REPO_RULES=false`, or `repo_rules = false` in `.prbot.toml`, turns it off.
+- **Path-scoped instructions: `[[path_instructions]]` in `.prbot.toml`.** Each entry has `paths` (globs) and `instructions`, and applies only when the PR changes a file matching one of the globs, among the files the include and exclude globs let through. An invalid glob matches nothing, so a typo cannot apply an instruction to every file.
+- **The summary names the rules in force.** It ends with "Repository rules applied:" followed by each source: `.prbot.toml` instructions, each rule file, and each path instruction that matched. A rule that keeps producing bad findings can be traced to where it was written. `get-rules` reports `repo_rules`, the configured `path_instructions` and `rule_sources`.
+
+Known limits: only root-level rule files are read. Nested `AGENTS.md` / `BUGBOT.md` files and `.claude/rules/` (which needs a directory listing) are not. Three extra file fetches run per review when the feature is on.
+
 ## 0.43.0
 
 **A file cut to fit the budget now comes with a digest of its whole change, so the reviewer can tell whether the hunks it was not shown look like the ones it was.**

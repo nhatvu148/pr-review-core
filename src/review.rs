@@ -811,6 +811,45 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
+/// The rule file note's twin: a PR editing a review rule file is reviewed under
+/// the base branch's copy, for the same reason.
+const RULE_FILE_CHANGE_NOTE: &str = "\n\n_This PR changes a review rule file. Rules are \
+     read from the base branch, so this review applied the current ones and the \
+     change takes effect once merged._";
+
+/// Whether a diff touches one of the [`crate::repo_rules::RULE_FILES`].
+fn diff_touches_rule_file(diff: &str) -> bool {
+    crate::repo_rules::RULE_FILES.iter().any(|f| {
+        diff.lines().any(|l| {
+            [
+                format!("--- a/{}", f.path),
+                format!("+++ b/{}", f.path),
+                format!("rename from {}", f.path),
+                format!("rename to {}", f.path),
+            ]
+            .iter()
+            .any(|m| l == m)
+        })
+    })
+}
+
+/// The changed paths a path instruction can apply to: every file in the diff
+/// that the include/exclude globs let through to review.
+fn reviewed_paths(cfg: &Config, raw_diff: &str) -> Vec<String> {
+    crate::diff::split_diff_sections(raw_diff)
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|p| crate::diff::path_matches_globs(p, &cfg.include_globs, &cfg.exclude_globs))
+        .collect()
+}
+
+/// `cfg` with the path instructions that apply to this diff merged in.
+fn scoped_to_diff(cfg: &Config, raw_diff: &str) -> Config {
+    let mut scoped = cfg.clone();
+    crate::repo_rules::apply_path_instructions(&mut scoped, &reviewed_paths(cfg, raw_diff));
+    scoped
+}
+
 /// Whether a unified diff adds, removes, changes or renames the root
 /// `.prbot.toml`. A pure rename has no `---`/`+++` lines, only the
 /// `rename from`/`rename to` headers.
@@ -1157,6 +1196,22 @@ pub(crate) fn local_repo_config_source(
     base: &Config,
     repo_root: Option<&std::path::Path>,
 ) -> (Config, crate::rules::RepoConfigSource) {
+    let (mut cfg, source) = local_prbot_toml_source(base, repo_root);
+    // Rule files are read after `.prbot.toml` is merged, so `repo_rules = false`
+    // there turns them off. The local operator owns the checkout, so its working
+    // tree is the trusted copy, as it is for `.prbot.toml`.
+    if cfg.repo_rules {
+        if let Some(root) = repo_root {
+            crate::repo_rules::apply_rule_files(&mut cfg, crate::repo_rules::read_local(root));
+        }
+    }
+    (cfg, source)
+}
+
+fn local_prbot_toml_source(
+    base: &Config,
+    repo_root: Option<&std::path::Path>,
+) -> (Config, crate::rules::RepoConfigSource) {
     use crate::rules::RepoConfigSource;
 
     // No checkout means no file to read. The diff may have come from stdin with no
@@ -1240,6 +1295,55 @@ pub(crate) async fn load_repo_config(
 /// [`local_repo_config_source`], and shared with `kaniscope get-rules` for the
 /// same reason.
 pub(crate) async fn remote_repo_config_source(
+    provider: &Provider,
+    client: &reqwest::Client,
+    base: &Config,
+    repo: &str,
+    meta: &PrMeta,
+) -> (Config, crate::rules::RepoConfigSource) {
+    let (mut cfg, source) = remote_prbot_toml_source(provider, client, base, repo, meta).await;
+    if cfg.repo_rules {
+        let found = remote_rule_files(provider, client, &cfg, repo, meta).await;
+        crate::repo_rules::apply_rule_files(&mut cfg, found);
+    }
+    (cfg, source)
+}
+
+/// The rule files present on the PR's base branch, as `(label, text)`.
+///
+/// The base branch for the same reason as `.prbot.toml`: a rule file the PR
+/// edits must not govern its own review. No base branch, no rules. Every fetch
+/// error is skipped: a repository without these files is the normal case.
+async fn remote_rule_files(
+    provider: &Provider,
+    client: &reqwest::Client,
+    cfg: &Config,
+    repo: &str,
+    meta: &PrMeta,
+) -> Vec<(String, String)> {
+    let Some(git_ref) = meta.base_branch.as_deref().filter(|b| !b.is_empty()) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for f in crate::repo_rules::RULE_FILES {
+        match provider
+            .get_file_contents(client, cfg, repo, git_ref, f.path)
+            .await
+        {
+            Ok(Some(raw)) => {
+                if let Some(text) = crate::repo_rules::rule_text(f, &raw) {
+                    tracing::info!("repo rules: read {repo}@{git_ref}:{}", f.path);
+                    found.push((crate::repo_rules::label_for(f), text));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!("repo rules: {repo}@{git_ref}:{} not read: {e:#}", f.path),
+        }
+    }
+    found
+}
+
+async fn remote_prbot_toml_source(
     provider: &Provider,
     client: &reqwest::Client,
     base: &Config,
@@ -2225,6 +2329,10 @@ pub async fn run_review_with(
         );
     }
 
+    // Path instructions need the changed files, so they are merged here rather
+    // than with the rest of `.prbot.toml`.
+    let scoped = scoped_to_diff(cfg, &raw_diff);
+    let cfg = &scoped;
     let prepared = prepare_diff(cfg, &raw_diff);
 
     // If every changed file was filtered out (e.g. a lockfile-only PR) there's
@@ -2422,6 +2530,12 @@ pub async fn run_review_with(
     if diff_touches_repo_config(&raw_diff) {
         finished.summary.push_str(REPO_CONFIG_CHANGE_NOTE);
     }
+    if cfg.repo_rules && diff_touches_rule_file(&raw_diff) {
+        finished.summary.push_str(RULE_FILE_CHANGE_NOTE);
+    }
+    finished
+        .summary
+        .push_str(&crate::repo_rules::rules_note(cfg));
     // Derived renderings of the change, appended last: they describe what the PR
     // touched, which is context for the findings above rather than a finding
     // itself. Both collapse into `<details>`, so a reader who wants only the
@@ -2579,6 +2693,8 @@ pub async fn run_review_local(
         author_permission: None,
     };
 
+    let scoped = scoped_to_diff(cfg, &input.diff);
+    let cfg = &scoped;
     let prepared = prepare_diff(cfg, &input.diff);
     if prepared.diff.trim().is_empty() {
         // No LLM review is possible, but a hygiene finding on an excluded file (a
@@ -2688,6 +2804,9 @@ pub async fn run_review_local(
     finished.funnel.samples = samples;
     finished.funnel.sample_total = sample_total;
     finished.funnel.sample_agreement = agreement;
+    finished
+        .summary
+        .push_str(&crate::repo_rules::rules_note(cfg));
     // Same feature on this path: a local review's deliverable *is* its
     // `summary_markdown`, so leaving it unwired made WALKTHROUGH/DIAGRAM silently
     // a no-op for every caller of this entry point.
@@ -3862,6 +3981,17 @@ mod orchestrator_tests {
                 })))
                 .mount(&s)
                 .await;
+            // A rule file, served per ref the same way: only the base's may apply.
+            let review_md = format!("{rule}-REVIEW-MD");
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/REVIEW.md"))
+                .and(query_param("ref", git_ref))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content": base64::engine::general_purpose::STANDARD.encode(review_md),
+                    "encoding": "base64",
+                })))
+                .mount(&s)
+                .await;
         }
         s
     }
@@ -3982,6 +4112,48 @@ mod orchestrator_tests {
             assert!(p.contains("BASE-RULE"), "base settings not applied: {p}");
             assert!(!p.contains("HEAD-RULE"), "head settings applied: {p}");
         }
+    }
+
+    /// `REVIEW.md` is a rule file the PR could edit, so it too is read from the
+    /// base branch only — and the summary names it as a rule source.
+    #[tokio::test]
+    async fn review_md_is_read_from_the_base_branch_and_named_in_the_summary() {
+        let (_, prompts, summary) = review_as(DIFF, "write").await;
+        for p in &prompts {
+            assert!(
+                p.contains("BASE-RULE-REVIEW-MD"),
+                "base REVIEW.md not applied: {p}"
+            );
+            assert!(
+                !p.contains("HEAD-RULE-REVIEW-MD"),
+                "head REVIEW.md applied: {p}"
+            );
+        }
+        assert!(
+            summary.contains("Repository rules applied: `.prbot.toml` instructions, `REVIEW.md`"),
+            "{summary}"
+        );
+    }
+
+    /// `repo_rules = false` in the base branch's `.prbot.toml` turns rule files off.
+    #[test]
+    fn repo_rules_can_be_turned_off_per_repo() {
+        let base = Config::from_env();
+        let rc = crate::repo_config::parse("repo_rules = false\n").unwrap();
+        assert!(!base.with_repo_overrides(&rc).repo_rules);
+    }
+
+    #[tokio::test]
+    async fn a_pr_that_edits_a_rule_file_is_told_its_change_applies_after_merge() {
+        let diff = format!(
+            "{DIFF}diff --git a/REVIEW.md b/REVIEW.md\n--- a/REVIEW.md\n+++ b/REVIEW.md\n\
+             @@ -1 +1 @@\n-old\n+new\n"
+        );
+        let (_, _, summary) = review_as(&diff, "admin").await;
+        assert!(
+            summary.contains("This PR changes a review rule file"),
+            "{summary}"
+        );
     }
 
     #[tokio::test]
