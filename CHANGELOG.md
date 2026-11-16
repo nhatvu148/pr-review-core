@@ -1,17 +1,27 @@
 # Changelog
 
-## Unreleased
+## 0.44.0
+
+**Re-review now tracks what actually changed: a finding is resolved only when its code moves, an unchanged PR reuses its last review, and the reviewer reads the rules and issues the repository already wrote.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing). Each needs the struct-literal changes in Migration and nothing else: with them, `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (180, 205, 211 and 191 tests) and the client-org bot on its default build (118 tests).
+
+This release is minor rather than a patch because five public types gain fields (see Migration). It also changes default behaviour in ways no compile will show, listed under the next heading.
+
+### Behaviour changes — these ship silently
+
+- **Findings stay open after a push unless their lines changed.** Previously any new commit resolved every finding the round did not repeat. A fix loop that counts resolved threads will see more open threads per round, and the acted-on measurement will drop: both were inflated.
+- **Rule files are read by default** (`REPO_RULES=true`): a repository with a `REVIEW.md`, `.cursor/BUGBOT.md` or a review section in `AGENTS.md` gets those rules in its prompt, three extra contents-API reads per review, and a "Repository rules applied" line in its summary.
+- **Linked issues are read by default** (`LINKED_ISSUES=true`) on GitHub: one GraphQL query per review, the issue text in the prompt, and a "Checked against the issues this PR closes" line.
+- **An unchanged PR is not re-reviewed by default** (`REUSE_UNCHANGED_REVIEW=true`) on GitHub. The diff fetch and dependency scan now run before the "Reviewing…" placeholder.
+- **The prompts offer a `PRE-EXISTING` severity**, so some findings that were filed at LOW or MEDIUM now arrive as pre-existing and no longer raise the recommendation.
+- **The GitHub and GitLab summary carries two hidden markers** (`kaniscope-verdict`, and on GitHub `kaniscope-review-key`). They are invisible where HTML comments are hidden, but appear in `summary_markdown`, so a consumer that prints it as plain text will show them.
 
 ### Added
 
 - **Quiet mode: `INLINE_MIN_SEVERITY`** (or `inline_min_severity` in `.prbot.toml`). Findings below the floor (`BLOCKING`, `HIGH`, `MEDIUM` or `LOW`) are no longer posted as inline comments. They are listed in a collapsed "N lower-severity finding(s), not posted inline" section of the summary instead, so nothing is dropped. Every finding posted inline was competing for the same attention, and a PR carrying eight LOW notes next to one HIGH buries the HIGH. Severity is used rather than `MIN_CONFIDENCE`, because confidence measured as a weak predictor of whether a finding is real (AUC 0.61 on the calibration set). Unset, the default, posts everything inline as before. An unrecognised value turns the floor off with a warning, rather than silently moving every finding to the summary. `get-rules` reports the floor in force.
 
 A held-back finding still counts as flagged when GitHub reconciles earlier threads. If it was posted inline in an earlier round (before the floor was set, or at a higher severity), its thread is kept rather than resolved as a fix. It pairs by fingerprint, then by nearby line, and only with threads no posted finding claimed. The run log's funnel gains `held_back`, so `anchored + unanchored + held_back` equals `posted_findings` again.
-
-| Change | What to do |
-|---|---|
-| `providers::ReviewPost` has a new public field, `held: Vec<InlineComment>`, and derives `Default` | Code that builds a `ReviewPost` with a struct literal must add `held: Vec::new()` (or use `..Default::default()`). |
-| `runlog::Funnel` has a new field, `held_back` | Struct literals add `held_back: 0`. Old run-log records still parse, because the struct is `#[serde(default)]`. |
 
 Known limit: a held-back finding is never posted, so a finding that only ever existed below the floor has no thread to track across rounds.
 
@@ -31,27 +41,15 @@ Known limits: only root-level rule files are read, and from `AGENTS.md` only the
 
 - **An automatic re-review of an unchanged PR reuses the last review instead of running the model again.** With re-review on push, a rebase, an empty commit or a clean merge from the base branch re-ran a full review of a change that had not changed. That cost a review, and because two runs agree on only 61–74% of their findings, it also churned the PR's threads for nothing. The summary now carries a hidden key: a hash of the diff the model is shown, context lines included (only hunk headers and blob ids are left out, which a rebase shifts), every review setting `get-rules` reports, the injected rules, the PR's title and description (when `PR_BODY` is on), whether its author may be cloned, and the text of any linked issues it is checked against. The dependency scan still runs first, and a review is reused only when that scan finished (or is off) and found nothing, because OSV can learn about a vulnerability with nothing in the PR changing. On an automatic run, if the PR's summary already carries the same key, the review is left in place: no model call, no placeholder, nothing posted. `RunReviewOutput.reused` is `true` and `summary_markdown` is the existing summary. A review salvaged from a truncated model response gets no key, so it is never reused. An explicit `/review` always runs fresh, because wanting another sample is a reason to ask. `REUSE_UNCHANGED_REVIEW=false` turns it off.
 
-| Change | What to do |
-|---|---|
-| `review::RunReviewOutput` has a new public field, `reused: bool` | Code that builds one with a struct literal adds `reused: false`. JSON consumers are unaffected (it defaults to `false`), and the generated Node and Python types include it. |
-
 Known limits: GitHub only, the one provider whose summary can be read back. An agentic review also reads files outside the diff, and a base-branch change there does not change the key. The diff fetch and the dependency scan now run before the "Reviewing…" placeholder is posted, so the placeholder appears that much later. CI results are not in the key, since they change on every push. A consumer that sends a `/review` comment straight to `run_review_with`, rather than through `command::run_command_with`, gets reuse on that path too, unless it clears `reuse_unchanged_review` itself.
 
 - **`FIX_PROMPT`: a copyable prompt that hands the review to a coding agent.** When on, the summary gains a collapsed "🤖 Prompt for a coding agent" section (after the findings, before the walkthrough and diagram) listing every posted finding with its severity, `file:line` and text, under one instruction: check each against the code, fix the ones that are right, and give a reason for the ones that are not (in the finding's thread, or in one PR comment for a finding with no thread), then push and wait for the next review. An agent fixing a PR in a loop no longer has to scrape the inline comments, and the reply instruction keeps it from silently skipping a finding it disagrees with. The prompt is built from the findings, not by a model, so it says exactly what the review said. It is fenced longer than any backtick run inside it, so a finding that quotes a code block cannot break out of it. Off by default, like `WALKTHROUGH` and `DIAGRAM`.
 
 Known limit: it covers the findings posted this round, not threads still open from earlier rounds.
 
-- **`Usage` can carry what a review cost, and its cache tokens apart from its input.** It gains `cost_usd`, `cache_read_tokens` and `cache_creation_tokens`, all optional and summed across a review and its repair pass like the token counts. An agent CLI reports its cost in dollars, and a consumer's backend had to discard it because `Usage` had nowhere to put it. The same backends folded cache reads and writes into `prompt_tokens`, reporting an input several times larger than what was billed at the full rate. Every run-log record and `--json` output carries the new fields when a backend fills them. No backend in this crate reports a cost yet: the OpenRouter path returns tokens only, so `cost_usd` stays absent there.
-
-| Change | What to do |
-|---|---|
-| `llm::Usage` has three new public fields and derives `Default` | Code that builds a `Usage` with a struct literal adds `..Default::default()`. JSON consumers are unaffected, and the generated Node and Python types include them. |
+- **`Usage` can carry what a review cost, and its cache tokens apart from its input.** It gains `cost_usd`, `cache_read_tokens` and `cache_creation_tokens`, all optional and summed across a review and its repair pass like the token counts. An agent CLI reports its cost in dollars, and a consumer's backend had to discard it because `Usage` had nowhere to put it. The same backends folded cache reads and writes into `prompt_tokens`, reporting an input several times larger than what was billed at the full rate. Every run-log record and `--json` output carries the new fields when a backend fills them. No backend in this crate reports a cost yet: the OpenRouter path returns tokens only, so `cost_usd` stays absent there. When only some passes of a review report a cost (an agent-CLI review repaired over OpenRouter, say), the sum covers those passes only.
 
 - **The reviewer checks the change against the issues it closes.** A PR description says what its author thinks the change does. The issue says what was asked for, and a requirement the diff quietly misses is a defect only that text can surface. On GitHub the engine now reads the PR's closing references (`Fixes #12` in the description, or an issue linked in the sidebar), at most five, each capped at 3,000 characters, and only those in the same repository. A PR author chooses what "Fixes …" points at, and the bot's token may read repositories the author cannot, so a private issue elsewhere could otherwise reach the model and come back out in the posted review. It hands them to every backend as an untrusted, fenced block next to the PR description, with the instruction that a requirement the diff misses or contradicts is a finding at a normal severity. A truncated issue carries the same warning as a truncated description, so the cap does not manufacture "missing requirement" findings. The summary names the issues the review was checked against. `LINKED_ISSUES` (default on), or `linked_issues` in `.prbot.toml`, controls it. A lookup failure skips the issues and the review runs as before.
-
-| Change | What to do |
-|---|---|
-| `prompt::UntrustedContext` has a new public field, `linked_issues: Option<&str>` | Code that builds one with a struct literal adds `linked_issues: None`. A backend that appends `ctx.untrusted.render()` gets the block with no other change. |
 
 Known limits: GitHub only. Issues in other repositories are never read. Jira and Linear links are not followed.
 
@@ -62,6 +60,17 @@ Known limits: GitHub only. Issues in other repositories are never read. Jira and
 
 Known limit: a fix made somewhere other than the lines a finding points at (a guard added in the caller, say) leaves that thread open until the code under it changes or someone resolves it. Keeping a fixed finding open is the cheaper mistake than closing an unfixed one. GitLab and Bitbucket reconciliation are unchanged, since they report `unsupported` and resolve nothing.
 
+### Migration — every consumer this breaks
+
+| Change | Touches | What to do |
+|---|---|---|
+| `llm::Usage` gains `cache_read_tokens`, `cache_creation_tokens`, `cost_usd`, and derives `Default` | both bots (their claude backends build one) | Add `..Default::default()` to the literal, or fill the fields from the CLI's usage envelope. |
+| `prompt::UntrustedContext` gains `linked_issues: Option<&str>` | both bots (backend tests build one) | Add `linked_issues: None`. A backend that appends `ctx.untrusted.render()` needs nothing else. |
+| `review::RunReviewOutput` gains `reused: bool` | `pr-review-bot` (its Telegram test builds one) | Add `reused: false`. JSON consumers are unaffected and the generated types include it. |
+| `providers::ReviewPost` gains `held: Vec<InlineComment>`, and derives `Default` | neither known consumer | Add `held: Vec::new()` or `..Default::default()`. |
+| `runlog::Funnel` gains `held_back` | neither known consumer | Add `held_back: 0`. Old run-log records still parse. |
+
+Consumers that send a `/review` comment straight to `run_review_with`, rather than through `command::run_command_with`, should clear `reuse_unchanged_review` on that path so an explicit `/review` still runs fresh. The client-org bot routes `/review` that way and needs this change when it moves to 0.44.
 
 ## 0.43.0
 
