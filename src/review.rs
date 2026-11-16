@@ -234,6 +234,13 @@ mod severity_and_recommendation_tests {
         assert_eq!(severity_label("high"), "HIGH");
     }
 
+    /// The whole-file review has no change to compare against, so it does not
+    /// offer the tier at all.
+    #[test]
+    fn the_whole_file_prompt_does_not_offer_pre_existing() {
+        assert!(!crate::prompt::FILE_REVIEW_SYSTEM_PROMPT.contains("PRE-EXISTING"));
+    }
+
     #[test]
     fn recommendation_rank_orders_block_above_changes_above_approve() {
         assert!(recommendation_rank("BLOCK") > recommendation_rank("APPROVE WITH CHANGES"));
@@ -2080,9 +2087,12 @@ async fn finish_review(
     // that states the count — before the sort, so the survivor competes on merit.
     findings = collapse_bursts(findings);
     funnel.after_collapse = findings.len();
+    // Pre-existing ranks with LOW but sorts after it, so under `MAX_FINDINGS` a
+    // defect the change did not introduce never pushes out one it did.
     findings.sort_by(|a, b| {
         severity_rank(&b.severity)
             .cmp(&severity_rank(&a.severity))
+            .then(is_pre_existing(&a.severity).cmp(&is_pre_existing(&b.severity)))
             .then(b.confidence.unwrap_or(0).cmp(&a.confidence.unwrap_or(0)))
     });
     // Recommendation reflects the *merged* findings (incl. deterministic hygiene the

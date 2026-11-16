@@ -255,7 +255,7 @@ Return ONLY a JSON object — no markdown fences, no prose around it — with ex
   "summary": "<1-2 sentence overall assessment of the file>",
   "recommendation": "BLOCK" | "APPROVE WITH CHANGES" | "APPROVE",
   "findings": [
-    { "severity": "BLOCKING" | "HIGH" | "MEDIUM" | "LOW" | "PRE-EXISTING",
+    { "severity": "BLOCKING" | "HIGH" | "MEDIUM" | "LOW",
       "file": "<the file path>",
       "line": <1-indexed line number in this file, or null>,
       "body": "<one sentence describing the problem, then ' Fix: ' and a concrete fix>",
