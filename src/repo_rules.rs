@@ -126,7 +126,11 @@ pub fn review_section(md: &str) -> Option<String> {
         .lines()
         .map(|l| {
             let t = l.trim_start();
-            let marker = ["```", "~~~"].into_iter().find(|m| t.starts_with(m));
+            // Indented four or more spaces, a backtick line is code content.
+            let indented = l.len() - l.trim_start_matches(' ').len() >= 4;
+            let marker = ["```", "~~~"]
+                .into_iter()
+                .find(|m| !indented && t.starts_with(m));
             // A closing fence is the marker character alone: ```` ```rust ```` inside
             // a fence opens nothing and closes nothing.
             let bare = |m: &str| {
@@ -350,6 +354,11 @@ mod tests {
         let md = "## Review\n- a\n    # install deps\n- b\n## Build\nmake";
         let got = review_section(md).unwrap();
         assert!(got.contains("- b") && !got.contains("make"), "{got}");
+        // An indented backtick line is code, so it opens no fence.
+        let md = "## Review\n    ```\n- a\n## Build\nmake";
+        // The section is trimmed, so the indent before the backticks goes; what
+        // matters is that `- a` stayed in and the fence did not swallow `## Build`.
+        assert_eq!(review_section(md).as_deref(), Some("```\n- a"));
     }
 
     #[test]
