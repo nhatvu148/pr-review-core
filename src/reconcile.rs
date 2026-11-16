@@ -886,7 +886,7 @@ async fn scan_bitbucket(
             .as_ref()
             .and_then(|r| r.full_name.as_deref())
             .unwrap_or(repo);
-        let (head_iso, head_at) = match bb_commit_date(
+        let head_at = match bb_commit_date(
             http,
             &auth,
             cfg,
@@ -911,7 +911,6 @@ async fn scan_bitbucket(
                 continue;
             }
         };
-        let _ = head_iso;
         if !within_lookback(head_at, now, rc.lookback_secs) {
             continue;
         }
@@ -945,7 +944,7 @@ async fn bb_commit_date(
     base: &str,
     repo: &str,
     hash: &str,
-) -> Result<(String, i64)> {
+) -> Result<i64> {
     let c: BbCommit = bb_get(
         http,
         auth,
@@ -953,9 +952,7 @@ async fn bb_commit_date(
         &format!("{base}/repositories/{repo}/commit/{hash}"),
     )
     .await?;
-    let at = epoch_from_rfc3339(&c.date)
-        .with_context(|| format!("unparsable commit date {:?}", c.date))?;
-    Ok((c.date, at))
+    epoch_from_rfc3339(&c.date).with_context(|| format!("unparsable commit date {:?}", c.date))
 }
 
 /// Newest comment of ours on this PR, if any.
