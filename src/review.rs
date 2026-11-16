@@ -880,7 +880,7 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
-/// The rule file note's twin: a PR editing a review rule file is reviewed under
+/// [`REPO_CONFIG_CHANGE_NOTE`]'s twin: a PR editing a review rule file is reviewed under
 /// the base branch's copy, for the same reason.
 const RULE_FILE_CHANGE_NOTE: &str = "\n\n_This PR changes a file the reviewer reads \
      rules from (`REVIEW.md`, `.cursor/BUGBOT.md`, or the review section of `AGENTS.md`). \
