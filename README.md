@@ -325,6 +325,7 @@ The tables in this section and the next cover the knobs worth a paragraph. This 
 | `EXTRA_SYSTEM_PROMPT` | *(unset)* | Appended to the built-in system prompts. Your conventions, in plain language. Set but empty is the same as unset: EXTRA_SYSTEM_PROMPT_FILE is consulted either way. |
 | `EXTRA_SYSTEM_PROMPT_FILE` | *(unset)* | Path whose contents are used when EXTRA_SYSTEM_PROMPT is unset OR empty. For baking a large conventions block into an image. |
 | `FILE_BUNDLING` | `true` | Keep related files (a source and its test, i18n siblings) adjacent when packing, so the model reviews them together. |
+| `FIX_PROMPT` | `false` | Append a collapsed, copyable prompt that hands every posted finding to a coding agent (fix what is right, reply to what is not). |
 | `GH_API_BASE` | `https://api.github.com` | GitHub API base. Point at a GitHub Enterprise host. |
 | `GH_TOKEN` | *(unset)* | GitHub token used to read the PR and post comments. |
 | `GITHUB_WEBHOOK_SECRET` | *(unset)* | HMAC secret GitHub signs webhook deliveries with. |

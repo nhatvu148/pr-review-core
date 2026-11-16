@@ -49,6 +49,8 @@ export interface ReviewConfig {
   extraSystemPromptFile?: string;
   /** Keep related files (a source and its test, i18n siblings) adjacent when packing, so the model reviews them together. Default: `true`. (`FILE_BUNDLING`) */
   fileBundling?: boolean;
+  /** Append a collapsed, copyable prompt that hands every posted finding to a coding agent (fix what is right, reply to what is not). Default: `false`. (`FIX_PROMPT`) */
+  fixPrompt?: boolean;
   /** GitHub API base. Point at a GitHub Enterprise host. Default: `https://api.github.com`. (`GH_API_BASE`) */
   ghApiBase?: string;
   /** GitHub token used to read the PR and post comments. (`GH_TOKEN`) */

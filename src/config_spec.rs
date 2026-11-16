@@ -217,6 +217,13 @@ pub const SPEC: &[ConfigVar] = &[
         doc: "Keep related files (a source and its test, i18n siblings) adjacent when packing, so the model reviews them together.",
     },
     ConfigVar {
+        env: "FIX_PROMPT",
+        aliases: &[],
+        kind: ConfigKind::Bool,
+        default: Some("false"),
+        doc: "Append a collapsed, copyable prompt that hands every posted finding to a coding agent (fix what is right, reply to what is not).",
+    },
+    ConfigVar {
         env: "GH_API_BASE",
         aliases: &[],
         kind: ConfigKind::Str,

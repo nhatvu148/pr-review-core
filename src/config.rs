@@ -229,6 +229,9 @@ pub struct Config {
     /// review in place. An explicit `/review` always runs. See
     /// `review::review_key`.
     pub reuse_unchanged_review: bool,
+    /// Append a collapsed, copyable prompt that hands the posted findings to a
+    /// coding agent. See `review::render_fix_prompt`.
+    pub fix_prompt: bool,
 
     /// Free-form instructions shaping the `/describe` output — release-notes
     /// sections, a contributor table, a house layout. Appended last to the
@@ -475,6 +478,7 @@ impl Config {
             reuse_unchanged_review: env_or("REUSE_UNCHANGED_REVIEW", "true")
                 .parse()
                 .unwrap_or(true),
+            fix_prompt: env_or("FIX_PROMPT", "false").parse().unwrap_or(false),
 
             describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
 

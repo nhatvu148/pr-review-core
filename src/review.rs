@@ -257,6 +257,57 @@ mod severity_and_recommendation_tests {
         assert!(!crate::prompt::FILE_REVIEW_SYSTEM_PROMPT.contains("PRE-EXISTING"));
     }
 
+    fn finding_at(sev: &str, line: Option<u64>, body: &str) -> Finding {
+        Finding {
+            severity: sev.into(),
+            file: "src/a.rs".into(),
+            line,
+            body: body.into(),
+            confidence: None,
+            suggestion: None,
+            existing_code: None,
+            end_line: None,
+            samples: None,
+        }
+    }
+
+    #[test]
+    fn no_findings_means_no_fix_prompt() {
+        assert_eq!(super::render_fix_prompt(&[]), "");
+    }
+
+    /// Every finding, in order, with where it is and what it says, and the
+    /// instruction to answer the ones the agent declines.
+    #[test]
+    fn the_fix_prompt_lists_each_finding_with_its_location() {
+        let p = super::render_fix_prompt(&[
+            finding_at("high", Some(12), "Off by one. Fix: use <."),
+            finding_at("LOW", None, "Rename it."),
+        ]);
+        assert!(
+            p.contains("1. [HIGH] src/a.rs:12\n   Off by one. Fix: use <."),
+            "{p}"
+        );
+        assert!(p.contains("2. [LOW] src/a.rs\n"), "{p}");
+        assert!(p.contains("in a reply to its review"), "{p}");
+        assert!(
+            p.starts_with("<details>") && p.ends_with("</details>"),
+            "{p}"
+        );
+    }
+
+    /// A finding that quotes a fenced block must not close the prompt's fence.
+    #[test]
+    fn the_fix_prompt_fence_outlasts_any_backticks_inside() {
+        let p = super::render_fix_prompt(&[finding_at(
+            "MEDIUM",
+            Some(1),
+            "Use this:\n```rust\nlet x = 1;\n```",
+        )]);
+        assert!(p.contains("````text\n"), "{p}");
+        assert!(p.contains("\n````\n"), "{p}");
+    }
+
     #[test]
     fn recommendation_rank_orders_block_above_changes_above_approve() {
         assert!(recommendation_rank("BLOCK") > recommendation_rank("APPROVE WITH CHANGES"));
@@ -1199,10 +1250,12 @@ fn map_detail(cfg: &Config) -> crate::changemap::MapDetail {
     }
 }
 
-/// Append the change map's renderings to a summary comment.
+/// Append the derived blocks to a summary comment: the coding-agent prompt
+/// (`FIX_PROMPT`), then the walkthrough and the change diagram.
 ///
-/// Both are opt-in and both are *derived* — nothing here asks a model anything, so
-/// a reader can check every row and every arrow against the code. Each render
+/// All three are opt-in and all are *derived* — nothing here asks a model
+/// anything, so a reader can check every line, row and arrow against the code
+/// and the findings. Each render
 /// returns an empty string when it has nothing worth showing (no files; no edges),
 /// and an empty render appends nothing rather than an empty `<details>`.
 fn append_change_map(
@@ -1212,6 +1265,13 @@ fn append_change_map(
     findings: &[Finding],
     summary: &mut String,
 ) {
+    if cfg.fix_prompt {
+        let p = render_fix_prompt(findings);
+        if !p.is_empty() {
+            summary.push_str("\n\n");
+            summary.push_str(&p);
+        }
+    }
     if cfg.walkthrough {
         let w = crate::changemap::render_walkthrough(map, findings, cfg.walkthrough_max_symbols);
         if !w.is_empty() {
@@ -1228,6 +1288,48 @@ fn append_change_map(
             summary.push_str(&d);
         }
     }
+}
+
+/// A collapsed, copyable prompt that hands every posted finding to a coding
+/// agent, or empty when there are none.
+///
+/// Built from the findings, never by a model, so it says exactly what the review
+/// said. It asks the agent to verify each finding before acting, and to answer
+/// the ones it declines rather than silently skip them: a review finding is a
+/// claim, not an instruction, and a finding's text is model output that a PR can
+/// influence. The fence is longer than any backtick run inside, so a finding
+/// that quotes a code block cannot close it early.
+pub(crate) fn render_fix_prompt(findings: &[Finding]) -> String {
+    if findings.is_empty() {
+        return String::new();
+    }
+    let mut body = String::from(
+        "Address these code review findings on this pull request. For each one: \
+         check it against the code first; if it is right, fix it; if it is wrong or \
+         not worth changing, leave the code and say why: in a reply to its review \
+         thread when it has one, otherwise in one comment on the pull request (or, \
+         with no pull request, in your summary of the work). Then push and wait for \
+         the next review.\n",
+    );
+    for (i, f) in findings.iter().enumerate() {
+        let loc = match (f.line, f.end_line) {
+            (Some(l), Some(e)) if e > l => format!("{}:{l}-{e}", f.file),
+            (Some(l), _) => format!("{}:{l}", f.file),
+            (None, _) => f.file.clone(),
+        };
+        body.push_str(&format!(
+            "\n{}. [{}] {loc}\n   {}\n",
+            i + 1,
+            f.severity.trim().to_uppercase(),
+            f.body.trim().replace('\n', "\n   ")
+        ));
+    }
+    let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    format!(
+        "<details>\n<summary>🤖 Prompt for a coding agent — {} finding(s)</summary>\n\n{fence}text\n{body}{fence}\n\n</details>",
+        findings.len()
+    )
 }
 
 /// Hidden marker on a summary comment that is **not** a finished review.

@@ -25,6 +25,7 @@ const CONFIG_ENV = {
   extraSystemPrompt: ["EXTRA_SYSTEM_PROMPT", "Str"],
   extraSystemPromptFile: ["EXTRA_SYSTEM_PROMPT_FILE", "Path"],
   fileBundling: ["FILE_BUNDLING", "Bool"],
+  fixPrompt: ["FIX_PROMPT", "Bool"],
   ghApiBase: ["GH_API_BASE", "Str"],
   ghToken: ["GH_TOKEN", "Secret"],
   githubWebhookSecret: ["GITHUB_WEBHOOK_SECRET", "Secret"],
