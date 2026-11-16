@@ -326,7 +326,8 @@ impl Config {
             "LOW" => None,
             other => {
                 tracing::warn!(
-                    "INLINE_MIN_SEVERITY={other:?} is not BLOCKING, HIGH, MEDIUM or LOW; \
+                    "inline severity floor {other:?} (INLINE_MIN_SEVERITY or \
+                     .prbot.toml inline_min_severity) is not BLOCKING, HIGH, MEDIUM or LOW; \
                      posting every finding inline"
                 );
                 None

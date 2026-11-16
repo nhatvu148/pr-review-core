@@ -2187,8 +2187,10 @@ async fn finish_review(
     // What reconciliation needs to keep a held-back finding's old thread: where
     // it is and what it says. The body is rendered the way an inline comment is,
     // because that rendering is what earlier threads were fingerprinted from; a
-    // raw model body would never match one. `line` 0 when the model gave none,
-    // which reconciliation pairs by fingerprint only.
+    // raw model body would never match one. It still includes the severity, so a
+    // finding posted as HIGH and now held as LOW (or posted with a suggestion)
+    // pairs by nearby line only. `line` 0 when the model gave none, which then
+    // pairs by fingerprint or not at all.
     let held: Vec<InlineComment> = quiet
         .iter()
         .map(|f| InlineComment {
