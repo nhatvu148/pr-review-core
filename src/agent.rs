@@ -45,7 +45,7 @@ When done, respond with ONLY a JSON object (no tools, no prose) of this shape:
   "summary": "<1-2 sentence overall summary>",
   "recommendation": "BLOCK" | "APPROVE WITH CHANGES" | "APPROVE",
   "findings": [
-    { "severity": "BLOCKING"|"HIGH"|"MEDIUM"|"LOW",
+    { "severity": "BLOCKING"|"HIGH"|"MEDIUM"|"LOW"|"PRE-EXISTING",
       "file": "<path exactly as in the diff>",
       "line": <new-side line number shown in the diff, or null>,
       "existing_code": "<the line(s) this finding is about, copied verbatim from the diff's new side, or null>",

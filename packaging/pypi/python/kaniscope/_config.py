@@ -69,6 +69,8 @@ class ReviewConfig(TypedDict, total=False):
     grep_context: bool
     # If set, ONLY files matching these globs are reviewed. (`INCLUDE_GLOBS`)
     include_globs: List[str]
+    # Lowest severity posted as an inline comment (BLOCKING, HIGH, MEDIUM, LOW). Findings below it are listed in the summary instead. Unset posts everything inline. (`INLINE_MIN_SEVERITY`)
+    inline_min_severity: str
     # OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 for Ollama. Default: `https://openrouter.ai/api/v1`. (`LLM_BASE_URL`)
     llm_base_url: str
     # Size budget for the packed diff. Beyond it, whole files are ranked and dropped rather than truncated mid-hunk. Default: `200000`. (`MAX_DIFF_CHARS`)
@@ -175,6 +177,7 @@ CONFIG_ENV: Dict[str, tuple] = {
     "gitlab_webhook_secret": ("GITLAB_WEBHOOK_SECRET", "Secret"),
     "grep_context": ("GREP_CONTEXT", "Bool"),
     "include_globs": ("INCLUDE_GLOBS", "Globs"),
+    "inline_min_severity": ("INLINE_MIN_SEVERITY", "Str"),
     "llm_base_url": ("LLM_BASE_URL", "Str"),
     "max_diff_chars": ("MAX_DIFF_CHARS", "Int"),
     "max_findings": ("MAX_FINDINGS", "Int"),

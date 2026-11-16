@@ -96,6 +96,8 @@ pub struct ReviewSettings {
     pub self_critique: bool,
     pub min_confidence: u8,
     pub max_findings: usize,
+    /// The inline severity floor in force, or `None` when every finding posts inline.
+    pub inline_min_severity: Option<String>,
     /// Whether the repo's own rule files are read (`REPO_RULES` / `repo_rules`).
     pub repo_rules: bool,
     /// Path-scoped instructions configured in `.prbot.toml`. Which apply depends
@@ -152,6 +154,9 @@ impl ReviewSettings {
             self_critique: cfg.self_critique,
             min_confidence: cfg.min_confidence,
             max_findings: cfg.max_findings,
+            inline_min_severity: cfg
+                .inline_floor()
+                .map(|r| crate::review::severity_name(r).to_string()),
             repo_rules: cfg.repo_rules,
             path_instructions: cfg.path_instructions.clone(),
             rule_sources: cfg.rule_sources.clone(),
