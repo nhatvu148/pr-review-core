@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Quiet mode: `INLINE_MIN_SEVERITY`** (or `inline_min_severity` in `.prbot.toml`). Findings below the floor (`BLOCKING`, `HIGH`, `MEDIUM` or `LOW`) are no longer posted as inline comments. They are listed in a collapsed "N lower-severity finding(s), not posted inline" section of the summary instead, so nothing is dropped. Every finding posted inline was competing for the same attention, and a PR carrying eight LOW notes next to one HIGH buries the HIGH. Severity is used rather than `MIN_CONFIDENCE`, because confidence measured as a weak predictor of whether a finding is real (AUC 0.61 on the calibration set). Unset, the default, posts everything inline as before. An unrecognised value turns the floor off with a warning, rather than silently moving every finding to the summary. `get-rules` reports the floor in force.
+
+Known limit: a finding held back this round is not an inline thread, so it is not tracked across rounds by fingerprint the way an inline finding is.
+
 ## 0.43.0
 
 **A file cut to fit the budget now comes with a digest of its whole change, so the reviewer can tell whether the hunks it was not shown look like the ones it was.**

@@ -320,6 +320,7 @@ The tables in this section and the next cover the knobs worth a paragraph. This 
 | `GITLAB_WEBHOOK_SECRET` | *(unset)* | Token GitLab sends as X-Gitlab-Token on webhook deliveries. |
 | `GREP_CONTEXT` | `true` | Let the agentic reviewer's grep request 1-8 lines of context per match, so it can judge a second site without a read_file round trip. |
 | `INCLUDE_GLOBS` | *(unset)* | If set, ONLY files matching these globs are reviewed. |
+| `INLINE_MIN_SEVERITY` | *(unset)* | Lowest severity posted as an inline comment (BLOCKING, HIGH, MEDIUM, LOW). Findings below it are listed in the summary instead. Unset posts everything inline. |
 | `LLM_BASE_URL` / `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 for Ollama. |
 | `MAX_DIFF_CHARS` | `200000` | Size budget for the packed diff. Beyond it, whole files are ranked and dropped rather than truncated mid-hunk. |
 | `MAX_FINDINGS` | `20` | Cap findings per PR, ranked by severity then confidence. |

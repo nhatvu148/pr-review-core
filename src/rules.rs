@@ -96,6 +96,8 @@ pub struct ReviewSettings {
     pub self_critique: bool,
     pub min_confidence: u8,
     pub max_findings: usize,
+    /// The inline severity floor in force, or `None` when every finding posts inline.
+    pub inline_min_severity: Option<String>,
     pub review_samples: usize,
     pub sample_min_agreement: usize,
     pub sample_line_tolerance: u64,
@@ -145,6 +147,9 @@ impl ReviewSettings {
             self_critique: cfg.self_critique,
             min_confidence: cfg.min_confidence,
             max_findings: cfg.max_findings,
+            inline_min_severity: cfg
+                .inline_floor()
+                .map(|r| crate::review::severity_name(r).to_string()),
             review_samples: cfg.review_samples,
             sample_min_agreement: cfg.sample_min_agreement,
             sample_line_tolerance: cfg.sample_line_tolerance,

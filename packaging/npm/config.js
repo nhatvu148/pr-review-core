@@ -33,6 +33,7 @@ const CONFIG_ENV = {
   gitlabWebhookSecret: ["GITLAB_WEBHOOK_SECRET", "Secret"],
   grepContext: ["GREP_CONTEXT", "Bool"],
   includeGlobs: ["INCLUDE_GLOBS", "Globs"],
+  inlineMinSeverity: ["INLINE_MIN_SEVERITY", "Str"],
   llmBaseUrl: ["LLM_BASE_URL", "Str"],
   maxDiffChars: ["MAX_DIFF_CHARS", "Int"],
   maxFindings: ["MAX_FINDINGS", "Int"],

@@ -155,6 +155,8 @@ export interface RepoConfig {
   /** Let the agentic reviewer's `grep` return context lines around each match, for this repo. */
   grep_context?: boolean | null;
   include_globs?: string[] | null;
+  /** Lowest severity posted inline for this repo; below it, summary only. */
+  inline_min_severity?: string | null;
   /** Extra review instructions in plain language, appended to the system prompt. */
   instructions?: string | null;
   max_findings?: number | null;
@@ -224,6 +226,8 @@ export interface ReviewSettings {
   fileBundling: boolean;
   grepContext: boolean;
   includeGlobs: string[];
+  /** The inline severity floor in force, or `None` when every finding posts inline. */
+  inlineMinSeverity?: string | null;
   maxDiffChars: number;
   maxFindings: number;
   maxHistoryChars: number;
