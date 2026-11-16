@@ -823,9 +823,21 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
 /// them, so it is not added there.
 ///
 /// ```text
-/// <!-- kaniscope-verdict: {"recommendation":"APPROVE WITH CHANGES","blocking":0,"high":1,"medium":2,"low":0,"other":0} -->
+/// <!-- kaniscope-verdict: {"recommendation":"APPROVE WITH CHANGES","blocking":0,"high":1,"medium":2,"low":0,"other":0,"capped":false} -->
 /// ```
-pub(crate) fn verdict_marker(recommendation: &str, findings: &[Finding]) -> String {
+///
+/// `recommendation` is always one of the three canonical values, never the
+/// model's own wording: free text could carry `-->` and end the comment early,
+/// and a PR can steer what the model writes. The counts are of the findings
+/// posted, after `MAX_FINDINGS`; `capped` is true when that cap cut some, in which
+/// case the counts understate and the recommendation (computed before the cap)
+/// does not.
+pub(crate) fn verdict_marker(recommendation: &str, findings: &[Finding], capped: bool) -> String {
+    let canonical = match recommendation_rank(recommendation) {
+        2 => "BLOCK",
+        1 => "APPROVE WITH CHANGES",
+        _ => "APPROVE",
+    };
     let mut counts = [0usize; 5]; // blocking, high, medium, low, other
     for f in findings {
         let i = match f.severity.trim().to_ascii_uppercase().as_str() {
@@ -838,12 +850,13 @@ pub(crate) fn verdict_marker(recommendation: &str, findings: &[Finding]) -> Stri
         counts[i] += 1;
     }
     let v = serde_json::json!({
-        "recommendation": recommendation.trim(),
+        "recommendation": canonical,
         "blocking": counts[0],
         "high": counts[1],
         "medium": counts[2],
         "low": counts[3],
         "other": counts[4],
+        "capped": capped,
     });
     format!("\n\n<!-- kaniscope-verdict: {v} -->")
 }
@@ -2489,7 +2502,8 @@ pub async fn run_review_with(
     let inline_count = inline.len();
     let mut summary = summary;
     if hides_html_comments(provider.name()) {
-        summary.push_str(&verdict_marker(&recommendation, &findings));
+        let capped = funnel.after_collapse > funnel.posted_findings;
+        summary.push_str(&verdict_marker(&recommendation, &findings, capped));
     }
     let post = ReviewPost {
         summary: summary.clone(),
@@ -4035,10 +4049,11 @@ mod orchestrator_tests {
     #[tokio::test]
     async fn a_github_summary_ends_with_a_machine_readable_verdict() {
         let (_, _, summary) = review_as(DIFF, "write").await;
-        let line = summary
-            .lines()
-            .find(|l| l.starts_with("<!-- kaniscope-verdict: "))
-            .unwrap_or_else(|| panic!("no verdict marker: {summary}"));
+        let line = summary.lines().last().unwrap_or_default();
+        assert!(
+            line.starts_with("<!-- kaniscope-verdict: "),
+            "the verdict must be the summary's last line: {summary}"
+        );
         let json = line
             .trim_start_matches("<!-- kaniscope-verdict: ")
             .trim_end_matches(" -->");
@@ -4062,7 +4077,12 @@ mod orchestrator_tests {
             end_line: None,
             samples: None,
         };
-        let m = super::verdict_marker("BLOCK", &[f("BLOCKING"), f("high"), f("HIGH"), f("odd")]);
+        let m = super::verdict_marker(
+            "BLOCK",
+            &[f("BLOCKING"), f("high"), f("HIGH"), f("odd")],
+            false,
+        );
+        assert!(m.contains(r#""capped":false"#), "{m}");
         assert!(
             m.contains(r#""blocking":1"#) && m.contains(r#""high":2"#),
             "{m}"
@@ -4072,6 +4092,20 @@ mod orchestrator_tests {
             "{m}"
         );
         assert!(!super::hides_html_comments("bitbucket"));
+    }
+
+    /// A model's free-text recommendation never reaches the marker: it could
+    /// close the HTML comment and spill the rest onto the PR.
+    #[test]
+    fn the_verdict_carries_only_a_canonical_recommendation() {
+        let m = super::verdict_marker("we should BLOCK --> <b>fake</b>", &[], true);
+        assert!(m.contains(r#""recommendation":"BLOCK""#), "{m}");
+        assert_eq!(
+            m.matches("-->").count(),
+            1,
+            "only the marker's own close: {m}"
+        );
+        assert!(m.contains(r#""capped":true"#));
     }
 
     #[tokio::test]
