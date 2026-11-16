@@ -811,7 +811,8 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
-/// A hidden, machine-readable verdict for the end of the summary comment:
+/// A hidden, machine-readable verdict for the summary comment (appended to the
+/// review's summary; a provider may add sections after it, so find it by prefix):
 /// the recommendation and a count per severity.
 ///
 /// For CI and bots that read the PR rather than the engine's JSON — a workflow
