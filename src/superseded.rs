@@ -99,6 +99,11 @@ pub fn same_commit(a: &str, b: &str) -> bool {
 /// `None` means review it: no recorded commit, a lookup that failed or timed out,
 /// a PR with no head SHA, or a head that still matches.
 ///
+/// The lookup authenticates with `cfg.github_token`, so pass the config the
+/// review itself will run with: for a GitHub App, the one carrying that
+/// installation's token for `repo`. A config with no token fails the lookup,
+/// which reviews (fails open) and logs a warning each time.
+///
 /// A skip trusts that the newer push's own webhook arrived and queued a review.
 /// If that delivery was lost, the newer head goes unreviewed until the next push
 /// or the boot sweep. Knowing for sure needs shared per-PR state, which neither

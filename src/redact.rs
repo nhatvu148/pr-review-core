@@ -22,6 +22,11 @@
 /// those — redacting the shape would blind every error that names a commit, to
 /// guard a format GitHub stopped issuing. Such a token in a clone URL is still
 /// caught by the userinfo pass; only a bare one would slip.
+/// Shortest colon-less URL userinfo treated as a credential rather than a
+/// username. GitHub and Atlassian tokens are 36+ characters; usernames are
+/// rarely past 20.
+const USERINFO_TOKEN_MIN: usize = 20;
+
 const TOKEN_PREFIXES: [&str; 8] = [
     "ghs_",
     "ghp_",
@@ -62,7 +67,12 @@ pub fn redact_secrets(s: &str) -> String {
             let auth_start = i + 3;
             let auth_end = bytes[auth_start..]
                 .iter()
-                .position(|&c| matches!(c, b'@' | b'/' | b'"' | b'\'' | b' ' | b'\n' | b'\t'))
+                .position(|&c| {
+                    matches!(
+                        c,
+                        b'@' | b'/' | b'?' | b'#' | b'"' | b'\'' | b' ' | b'\n' | b'\t'
+                    )
+                })
                 .map(|p| auth_start + p);
             if let Some(end) = auth_end {
                 if bytes[end] == b'@' {
@@ -72,10 +82,13 @@ pub fn redact_secrets(s: &str) -> String {
                         i = end;
                         continue;
                     }
-                    // No `:`: the whole userinfo is the credential, as in
-                    // `https://<token>@github.com/…`. An unprefixed token there
-                    // would slip past the prefix scan, so it all goes.
-                    if end > auth_start {
+                    // No `:`: the userinfo is either a username (`git@`,
+                    // `user@`) or the credential itself, as in
+                    // `https://<token>@github.com/…`, where an unprefixed token
+                    // would slip past the prefix scan. Every token format this
+                    // guards is far longer than a username, so length tells
+                    // them apart and a username stays readable.
+                    if end - auth_start >= USERINFO_TOKEN_MIN {
                         out.push_str(&s[i..auth_start]);
                         out.push_str(REDACTED);
                         i = end;
@@ -86,7 +99,13 @@ pub fn redact_secrets(s: &str) -> String {
         }
         // A bare token: keep the prefix (it names what leaked, which is what a
         // reader of the log actually needs) and drop the secret body.
-        if let Some(prefix) = TOKEN_PREFIXES.iter().find(|p| s[i..].starts_with(**p)) {
+        // Only at the start of a word: `highs_and_lows` contains `ghs_` but is an
+        // identifier, and redacting it would mangle the diagnosis.
+        let word_start = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+        if let Some(prefix) = TOKEN_PREFIXES
+            .iter()
+            .find(|p| word_start && s[i..].starts_with(**p))
+        {
             out.push_str(prefix);
             out.push_str(REDACTED);
             i += prefix.len();
@@ -145,6 +164,23 @@ mod tests {
             redact_secrets("tried ghp_AAAA1111 and ATATT9zz-yy, both 401"),
             "tried ghp_*** and ATATT***, both 401"
         );
+    }
+
+    #[test]
+    fn a_username_in_a_url_and_a_prefix_inside_a_word_are_left_alone() {
+        for msg in [
+            "fetch ssh://git@github.com/o/r.git failed",
+            "fetch https://user@host.example/x failed",
+            "highs_and_lows and rights_x are identifiers",
+        ] {
+            assert_eq!(redact_secrets(msg), msg);
+        }
+    }
+
+    #[test]
+    fn a_query_or_fragment_ends_the_authority() {
+        let msg = "GET https://host.example?next=me@example.com failed";
+        assert_eq!(redact_secrets(msg), msg);
     }
 
     #[test]
