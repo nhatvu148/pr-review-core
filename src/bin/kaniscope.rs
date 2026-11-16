@@ -1037,7 +1037,12 @@ fn as_rendered(md: &str) -> String {
     for line in md.lines() {
         // More than three spaces of indent is an indented code block (or a
         // continuation), never a fence or a top-level marker.
-        let indent = line.len() - line.trim_start_matches(' ').len();
+        // A tab counts as four, as CommonMark's tab stop makes it.
+        let indent: usize = line
+            .chars()
+            .take_while(|c| *c == ' ' || *c == '\t')
+            .map(|c| if c == '\t' { 4 } else { 1 })
+            .sum();
         let t = line.trim();
         if indent <= 3 {
             if let Some(c) = t.chars().next().filter(|c| *c == '`' || *c == '~') {
@@ -1372,7 +1377,7 @@ mod tests {
 
     #[test]
     fn indented_code_and_two_comments_on_one_line_are_not_markers() {
-        let md = "Text\n\n    <!-- code -->\n\n<!-- a --> text <!-- b -->";
+        let md = "Text\n\n    <!-- code -->\n\n\t<!-- tab -->\n\n<!-- a --> text <!-- b -->";
         assert_eq!(as_rendered(md), md);
     }
 
