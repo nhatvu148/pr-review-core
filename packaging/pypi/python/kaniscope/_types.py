@@ -239,6 +239,7 @@ class ReviewSettings(TypedDict):
     fileBundling: bool
     grepContext: bool
     includeGlobs: List[str]
+    linkedIssues: bool
     maxDiffChars: int
     maxFindings: int
     maxHistoryChars: int

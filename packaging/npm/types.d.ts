@@ -226,6 +226,8 @@ export interface ReviewSettings {
   fileBundling: boolean;
   grepContext: boolean;
   includeGlobs: string[];
+  /** Whether the issues a PR closes are given to the reviewer. */
+  linkedIssues: boolean;
   maxDiffChars: number;
   maxFindings: number;
   maxHistoryChars: number;

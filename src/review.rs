@@ -2369,7 +2369,9 @@ pub async fn run_review_with(
             .linked_issues(&client, cfg, &input.repo, input.pr)
             .await
             .unwrap_or_else(|e| {
-                tracing::debug!(
+                // WARN: on by default, so a token without Issues access would
+                // otherwise silently never use the feature.
+                tracing::warn!(
                     "linked issues not read for {}#{}: {e:#}",
                     input.repo,
                     input.pr

@@ -975,12 +975,13 @@ const LINKED_ISSUES_QUERY: &str = r#"
 query($owner:String!,$name:String!,$pr:Int!){
   repository(owner:$owner,name:$name){
     pullRequest(number:$pr){
-      closingIssuesReferences(first:5){ nodes{ number title body repository{ nameWithOwner } } }
+      closingIssuesReferences(first:10){ nodes{ number title body repository{ nameWithOwner } } }
     }
   }
 }"#;
 
-/// The issues this PR closes, by GitHub's closing references. At most five: a PR
+/// The issues this PR closes, by GitHub's closing references. At most five (of the
+/// first ten GitHub reports): a PR
 /// that closes more is a batch, and its intent is better read from its own
 /// description than from a pile of tickets.
 ///
@@ -1027,6 +1028,9 @@ pub async fn linked_issues(
                 body: n["body"].as_str().unwrap_or_default().to_string(),
             })
         })
+        // Ten fetched, five kept after the same-repository filter, so a PR that
+        // lists outside references first cannot crowd its own issues out.
+        .take(5)
         .collect())
 }
 

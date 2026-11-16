@@ -461,9 +461,13 @@ pub fn untrusted_linked_issues_block(issues: &[crate::providers::LinkedIssue]) -
     for i in issues {
         // Through `clip_untrusted`, like every untrusted input: it strips the
         // fence stem, so an issue author cannot close the fence early.
-        let title = clip_untrusted(&i.title, 200)
-            .map(|t| t.text)
-            .unwrap_or_default();
+        let title = match clip_untrusted(&i.title, 200) {
+            Some(t) => {
+                truncated |= t.truncated;
+                t.text
+            }
+            None => String::new(),
+        };
         let Some(body) = clip_untrusted(&i.body, LINKED_ISSUE_MAX_CHARS) else {
             text.push_str(&format!("### #{} — {title}\n\n", i.number));
             continue;
