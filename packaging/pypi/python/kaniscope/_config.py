@@ -53,6 +53,8 @@ class ReviewConfig(TypedDict, total=False):
     extra_system_prompt_file: str
     # Keep related files (a source and its test, i18n siblings) adjacent when packing, so the model reviews them together. Default: `true`. (`FILE_BUNDLING`)
     file_bundling: bool
+    # Append a collapsed, copyable prompt that hands every posted finding to a coding agent (fix what is right, reply to what is not). Default: `false`. (`FIX_PROMPT`)
+    fix_prompt: bool
     # GitHub API base. Point at a GitHub Enterprise host. Default: `https://api.github.com`. (`GH_API_BASE`)
     gh_api_base: str
     # GitHub token used to read the PR and post comments. (`GH_TOKEN`)
@@ -165,6 +167,7 @@ CONFIG_ENV: Dict[str, tuple] = {
     "extra_system_prompt": ("EXTRA_SYSTEM_PROMPT", "Str"),
     "extra_system_prompt_file": ("EXTRA_SYSTEM_PROMPT_FILE", "Path"),
     "file_bundling": ("FILE_BUNDLING", "Bool"),
+    "fix_prompt": ("FIX_PROMPT", "Bool"),
     "gh_api_base": ("GH_API_BASE", "Str"),
     "gh_token": ("GH_TOKEN", "Secret"),
     "github_webhook_secret": ("GITHUB_WEBHOOK_SECRET", "Secret"),

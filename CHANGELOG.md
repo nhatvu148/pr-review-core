@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`FIX_PROMPT`: a copyable prompt that hands the review to a coding agent.** When on, the summary ends with a collapsed "🤖 Prompt for a coding agent" section listing every posted finding with its severity, `file:line` and text, under one instruction: check each against the code, fix the ones that are right, and reply with a reason to the ones that are not, then push and wait for the next review. An agent fixing a PR in a loop no longer has to scrape the inline comments, and the reply instruction keeps it from silently skipping a finding it disagrees with. The prompt is built from the findings, not by a model, so it says exactly what the review said. It is fenced longer than any backtick run inside it, so a finding that quotes a code block cannot break out of it. Off by default, like `WALKTHROUGH` and `DIAGRAM`.
+
+Known limit: it covers the findings posted this round, not threads still open from earlier rounds.
+
 ## 0.43.0
 
 **A file cut to fit the budget now comes with a digest of its whole change, so the reviewer can tell whether the hunks it was not shown look like the ones it was.**

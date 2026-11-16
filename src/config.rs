@@ -209,6 +209,9 @@ pub struct Config {
     /// inject a large conventions block (e.g. via a file baked into its image)
     /// without changing the library.
     pub extra_system_prompt: String,
+    /// Append a collapsed, copyable prompt that hands the posted findings to a
+    /// coding agent. See `review::render_fix_prompt`.
+    pub fix_prompt: bool,
 
     /// Free-form instructions shaping the `/describe` output — release-notes
     /// sections, a contributor table, a house layout. Appended last to the
@@ -400,6 +403,7 @@ impl Config {
             ),
             x_title: env_or("OPENROUTER_X_TITLE", "pr-review"),
             extra_system_prompt: resolve_extra_system_prompt(),
+            fix_prompt: env_or("FIX_PROMPT", "false").parse().unwrap_or(false),
 
             describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
 
