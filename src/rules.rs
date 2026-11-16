@@ -103,6 +103,10 @@ pub struct ReviewSettings {
     /// Path-scoped instructions configured in `.prbot.toml`. Which apply depends
     /// on the files a PR changes, so all of them are listed here.
     pub path_instructions: Vec<crate::repo_rules::PathInstruction>,
+    /// `[[suppress]]` rules in force. Listed so that adding or removing one
+    /// changes the review key and an unchanged PR is reviewed again under it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppress: Vec<crate::suppress::Suppression>,
     /// The rule sources merged into the prompt below, as the summary names them.
     pub rule_sources: Vec<String>,
     /// Whether the issues a PR closes are given to the reviewer.
@@ -161,6 +165,7 @@ impl ReviewSettings {
                 .map(|r| crate::review::severity_name(r).to_string()),
             repo_rules: cfg.repo_rules,
             path_instructions: cfg.path_instructions.clone(),
+            suppress: cfg.suppress.clone(),
             rule_sources: cfg.rule_sources.clone(),
             linked_issues: cfg.linked_issues,
             review_samples: cfg.review_samples,

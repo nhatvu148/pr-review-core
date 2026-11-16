@@ -196,6 +196,7 @@ class RepoConfig(_RepoConfigRequired, total=False):
     repo_rules: Optional[bool]
     self_critique: Optional[bool]
     suggestions: Optional[bool]
+    suppress: Optional[List[Suppression]]
     vendored: Optional[List[str]]
 
 
@@ -283,6 +284,7 @@ class ReviewSettings(_ReviewSettingsRequired, total=False):
     """The review-relevant configuration, after merging repo overrides."""
 
     inlineMinSeverity: Optional[str]
+    suppress: List[Suppression]
 
 
 class RulesScopeLocal(TypedDict):
@@ -303,6 +305,17 @@ class RulesScopePr(TypedDict):
 
 # What the rules were resolved for.
 RulesScope = Union[RulesScopeLocal, RulesScopePr]
+
+
+class _SuppressionRequired(TypedDict):
+    contains: str
+    reason: str
+
+
+class Suppression(_SuppressionRequired, total=False):
+    """One `[[suppress]]` rule from `.prbot.toml`."""
+
+    paths: List[str]
 
 
 class _FindingsOutputRequired(TypedDict):
@@ -456,5 +469,6 @@ __all__ = [
     "RulesScope",
     "RunReviewOutput",
     "ScanStatus",
+    "Suppression",
     "Usage",
 ]

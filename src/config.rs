@@ -220,6 +220,9 @@ pub struct Config {
     /// `[[path_instructions]]` from `.prbot.toml`: applied when the PR changes a
     /// matching file. Never set from the environment.
     pub path_instructions: Vec<crate::repo_rules::PathInstruction>,
+    /// `[[suppress]]` from `.prbot.toml`: findings this repo has decided against.
+    /// Never set from the environment. See [`crate::suppress`].
+    pub suppress: Vec<crate::suppress::Suppression>,
     /// Where the rules injected for this review came from, for the summary's
     /// "Repository rules applied" line. Filled as rules are merged in, never from
     /// the environment.
@@ -477,6 +480,7 @@ impl Config {
             extra_system_prompt: resolve_extra_system_prompt(),
             repo_rules: env_or("REPO_RULES", "true").parse().unwrap_or(true),
             path_instructions: Vec::new(),
+            suppress: Vec::new(),
             rule_sources: Vec::new(),
             reuse_unchanged_review: env_or("REUSE_UNCHANGED_REVIEW", "true")
                 .parse()
@@ -618,6 +622,9 @@ impl Config {
         }
         if let Some(v) = &rc.path_instructions {
             cfg.path_instructions = v.clone();
+        }
+        if let Some(v) = &rc.suppress {
+            cfg.suppress = v.clone();
         }
         // REPLACES rather than appends, unlike `instructions` above. A layout is
         // not additive: a repo that asks for release-notes sections wants those
