@@ -209,6 +209,9 @@ pub struct Config {
     /// inject a large conventions block (e.g. via a file baked into its image)
     /// without changing the library.
     pub extra_system_prompt: String,
+    /// Give the reviewer the issues the PR closes, to check the diff does what
+    /// they ask. Overridable per repo via `linked_issues` in `.prbot.toml`.
+    pub linked_issues: bool,
 
     /// Free-form instructions shaping the `/describe` output — release-notes
     /// sections, a contributor table, a house layout. Appended last to the
@@ -400,6 +403,7 @@ impl Config {
             ),
             x_title: env_or("OPENROUTER_X_TITLE", "pr-review"),
             extra_system_prompt: resolve_extra_system_prompt(),
+            linked_issues: env_or("LINKED_ISSUES", "true").parse().unwrap_or(true),
 
             describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
 
@@ -484,6 +488,9 @@ impl Config {
         }
         if let Some(v) = rc.max_findings {
             cfg.max_findings = v;
+        }
+        if let Some(v) = rc.linked_issues {
+            cfg.linked_issues = v;
         }
         if let Some(v) = rc.self_critique {
             cfg.self_critique = v;

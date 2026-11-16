@@ -157,6 +157,8 @@ export interface RepoConfig {
   include_globs?: string[] | null;
   /** Extra review instructions in plain language, appended to the system prompt. */
   instructions?: string | null;
+  /** Toggle giving the reviewer the issues the PR closes, for this repo. */
+  linked_issues?: boolean | null;
   max_findings?: number | null;
   min_confidence?: number | null;
   model?: string | null;

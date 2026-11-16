@@ -68,3 +68,11 @@ pub struct ReviewPost {
     pub summary: String,
     pub inline: Vec<InlineComment>,
 }
+
+/// An issue the pull request says it closes, as the host links it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedIssue {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+}

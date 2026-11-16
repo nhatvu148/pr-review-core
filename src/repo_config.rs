@@ -39,6 +39,9 @@ pub struct RepoConfig {
     pub min_confidence: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_findings: Option<usize>,
+    /// Toggle giving the reviewer the issues the PR closes, for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_issues: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_critique: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

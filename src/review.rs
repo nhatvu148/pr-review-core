@@ -811,6 +811,19 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
+/// The summary line naming the linked issues the review read, or empty.
+fn linked_issues_note(issues: &[crate::providers::LinkedIssue]) -> String {
+    if issues.is_empty() {
+        return String::new();
+    }
+    let list = issues
+        .iter()
+        .map(|i| format!("#{}", i.number))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("\n\n_Checked against the issues this PR closes: {list}._")
+}
+
 /// Whether a unified diff adds, removes, changes or renames the root
 /// `.prbot.toml`. A pure rename has no `---`/`+++` lines, only the
 /// `rename from`/`rename to` headers.
@@ -2350,6 +2363,24 @@ pub async fn run_review_with(
     let injected_rules = crate::prompt::injected_rules(cfg);
     // Composed here, once, for every backend — see `ReviewContext::untrusted`.
     let pr_body = crate::prompt::pr_body_block(cfg, &meta);
+    // Fail open: a lookup error means the review runs without them, as before.
+    let issues = if cfg.linked_issues {
+        provider
+            .linked_issues(&client, cfg, &input.repo, input.pr)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::debug!(
+                    "linked issues not read for {}#{}: {e:#}",
+                    input.repo,
+                    input.pr
+                );
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
+    let issues_block = crate::prompt::untrusted_linked_issues_block(&issues);
+    let issues_block = (!issues_block.is_empty()).then_some(issues_block);
     // One clone for the whole review, however many samples it takes. Created
     // lazily by the first agentic sample and dropped with this scope, so the
     // temporary directory's lifetime is unchanged.
@@ -2378,6 +2409,7 @@ pub async fn run_review_with(
         structural_context: structural_opt,
         untrusted: crate::prompt::UntrustedContext {
             pr_body: pr_body.as_deref(),
+            linked_issues: issues_block.as_deref(),
             // A pull request states its intent in its description. `change_intent`
             // is the LOCAL path's equivalent, for a change that has no PR to carry
             // one — supplying both would hand the reviewer two statements of the
@@ -2422,6 +2454,9 @@ pub async fn run_review_with(
     if diff_touches_repo_config(&raw_diff) {
         finished.summary.push_str(REPO_CONFIG_CHANGE_NOTE);
     }
+    // Which issues the review checked the change against, so a finding that cites
+    // one can be traced, and a missing link can be noticed.
+    finished.summary.push_str(&linked_issues_note(&issues));
     // Derived renderings of the change, appended last: they describe what the PR
     // touched, which is context for the findings above rather than a finding
     // itself. Both collapse into `<details>`, so a reader who wants only the
@@ -2671,6 +2706,7 @@ pub async fn run_review_local(
         structural_context: (!structural.is_empty()).then_some(structural.as_str()),
         untrusted: crate::prompt::UntrustedContext {
             pr_body: pr_body.as_deref(),
+            linked_issues: None,
             change_intent: change_intent.as_deref(),
         },
         injected_rules: &injected_rules,
@@ -3982,6 +4018,75 @@ mod orchestrator_tests {
             assert!(p.contains("BASE-RULE"), "base settings not applied: {p}");
             assert!(!p.contains("HEAD-RULE"), "head settings applied: {p}");
         }
+    }
+
+    /// Captures the untrusted block every backend is handed.
+    struct UntrustedSpy(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl ReviewBackend for UntrustedSpy {
+        async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.0.lock().unwrap().push(ctx.untrusted.render());
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "s".into(),
+                    recommendation: "APPROVE".into(),
+                    findings: vec![],
+                },
+                model: "spy".into(),
+                usage: None,
+            })
+        }
+    }
+
+    /// The issue a PR closes reaches every backend, fenced, and the summary says
+    /// which issues the review was checked against.
+    #[tokio::test]
+    async fn the_issues_a_pr_closes_reach_the_reviewer_and_the_summary() {
+        let srv = github_stub_trust(DIFF, "write").await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "repository": { "pullRequest": { "closingIssuesReferences": {
+                    "nodes": [{ "number": 12, "title": "Retry on 5xx", "body": "At most 3 tries." }]
+                } } } }
+            })))
+            .mount(&srv)
+            .await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = run_review_with(
+            &cfg_for(&srv.uri()),
+            input(),
+            &UntrustedSpy(Arc::clone(&seen)),
+        )
+        .await
+        .expect("review");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter()
+                .all(|u| u.contains("#12 — Retry on 5xx") && u.contains("At most 3 tries.")),
+            "{seen:?}"
+        );
+        assert!(
+            out.summary_markdown
+                .contains("Checked against the issues this PR closes: #12."),
+            "{}",
+            out.summary_markdown
+        );
+
+        // Off, nothing is fetched or shown.
+        let mut off = cfg_for(&srv.uri());
+        off.linked_issues = false;
+        let seen2 = Arc::new(Mutex::new(Vec::new()));
+        let out = run_review_with(&off, input(), &UntrustedSpy(Arc::clone(&seen2)))
+            .await
+            .expect("review");
+        assert!(!out.summary_markdown.contains("Checked against the issues"));
+        assert!(seen2
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|u| !u.contains("Retry on 5xx")));
     }
 
     #[tokio::test]

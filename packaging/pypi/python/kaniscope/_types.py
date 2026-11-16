@@ -172,6 +172,7 @@ class RepoConfig(_RepoConfigRequired, total=False):
     grep_context: Optional[bool]
     include_globs: Optional[List[str]]
     instructions: Optional[str]
+    linked_issues: Optional[bool]
     max_findings: Optional[int]
     min_confidence: Optional[int]
     model: Optional[str]
