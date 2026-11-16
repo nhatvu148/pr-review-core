@@ -191,8 +191,8 @@ mod severity_and_recommendation_tests {
     //! A typo in a match arm here (e.g. "BLOKCING") would silently rank a finding
     //! as unknown/LOW rather than fail loudly, so it earns its own direct test.
     use super::{
-        effective_recommendation, is_pre_existing, recommendation_rank, severity_emoji,
-        severity_label, severity_rank, Finding,
+        effective_recommendation, is_pre_existing, recommendation_after_suppression,
+        recommendation_rank, severity_emoji, severity_label, severity_rank, Finding,
     };
 
     #[test]
@@ -315,6 +315,51 @@ mod severity_and_recommendation_tests {
     }
 
     #[test]
+    fn a_verdict_stronger_than_its_findings_survives_suppression() {
+        let low = Finding {
+            severity: "LOW".to_string(),
+            file: "a.rs".to_string(),
+            line: Some(1),
+            body: "nit".to_string(),
+            confidence: None,
+            suggestion: None,
+            existing_code: None,
+            end_line: None,
+            samples: None,
+        };
+        // Its findings justified APPROVE WITH CHANGES; it said BLOCK anyway.
+        assert_eq!(
+            recommendation_after_suppression(
+                "BLOCK",
+                "APPROVE WITH CHANGES",
+                1,
+                std::slice::from_ref(&low)
+            ),
+            "BLOCK"
+        );
+        // Its findings were its whole reason, and the rule removed them.
+        assert_eq!(
+            recommendation_after_suppression(
+                "APPROVE WITH CHANGES",
+                "APPROVE WITH CHANGES",
+                1,
+                std::slice::from_ref(&low)
+            ),
+            "APPROVE"
+        );
+        // Nothing suppressed: the model's verdict stands as before.
+        assert_eq!(
+            recommendation_after_suppression(
+                "APPROVE WITH CHANGES",
+                "APPROVE WITH CHANGES",
+                0,
+                &[low]
+            ),
+            "APPROVE WITH CHANGES"
+        );
+    }
+
+    #[test]
     fn recommendation_rank_matches_by_substring_not_exact_string() {
         // The model's own prose varies ("I recommend we BLOCK this PR"); the rank
         // must not require an exact match against the canonical verdict strings.
@@ -343,6 +388,28 @@ fn effective_recommendation(model_rec: &str, findings: &[Finding]) -> String {
         model_rec.trim().to_string()
     } else {
         floor.to_string()
+    }
+}
+
+/// The recommendation once `[[suppress]]` rules have removed `suppressed`
+/// findings, given the floor the findings set before they did.
+///
+/// The model's verdict is never softened, with one exception: when it is no
+/// stronger than its own findings justified (`floor_before`) and a rule removed
+/// some of them, those findings were its reason, so it is recomputed from what
+/// is left. Otherwise a review whose HIGHs the team rejected would still say
+/// "APPROVE WITH CHANGES" with nothing listed to change. A verdict stronger than
+/// its findings justified has a reason outside them, and stands.
+fn recommendation_after_suppression(
+    model_rec: &str,
+    floor_before: &str,
+    suppressed: usize,
+    findings: &[Finding],
+) -> String {
+    if suppressed > 0 && recommendation_rank(model_rec) <= recommendation_rank(floor_before) {
+        effective_recommendation("APPROVE", findings)
+    } else {
+        effective_recommendation(model_rec, findings)
     }
 }
 
@@ -2552,8 +2619,9 @@ async fn finish_review(
     // A local review carries no CI block, so this is a no-op there.
     demote_falsified_build_claims(&mut findings, meta.ci_status.as_deref());
     // Before the burst collapse, which rewrites a body to state a count and would
-    // stop a rule's text matching, and before the recommendation, so a finding
-    // the team has decided against cannot raise the verdict either.
+    // stop a rule's text matching. The floor the findings set before suppression
+    // is kept so the verdict can be judged against it below.
+    let floor_before = effective_recommendation("APPROVE", &findings);
     funnel.suppressed = crate::suppress::apply(&cfg.suppress, &mut findings);
     // Collapse a burst of one claim repeated across many files into a single finding
     // that states the count — before the sort, so the survivor competes on merit.
@@ -2571,7 +2639,12 @@ async fn finish_review(
     // model never saw), upgraded from — never softening — the model's own verdict.
     // Computed BEFORE the cap so a hygiene finding truncated out of the posted list
     // still can't leave the recommendation understating a real problem.
-    let recommendation = effective_recommendation(&result.review.recommendation, &findings);
+    let recommendation = recommendation_after_suppression(
+        &result.review.recommendation,
+        &floor_before,
+        funnel.suppressed,
+        &findings,
+    );
     findings.truncate(cfg.max_findings);
     funnel.posted_findings = findings.len();
 
@@ -5162,8 +5235,8 @@ mod orchestrator_tests {
     }
 
     /// A suppressed finding is gone from the posted review and from the run log's
-    /// findings, and is counted in the summary and the funnel so a rule matching
-    /// more than intended shows.
+    /// findings, is counted in the summary and the funnel so a rule matching more
+    /// than intended shows, and no longer holds up a verdict it was the reason for.
     #[tokio::test]
     async fn a_suppress_rule_removes_its_findings_and_says_how_many() {
         let srv = github_stub().await;
@@ -5184,6 +5257,11 @@ mod orchestrator_tests {
                 paths: Vec::new(),
                 reason: "bounds are checked by the caller".to_string(),
             },
+            crate::suppress::Suppression {
+                contains: "not in this diff".to_string(),
+                paths: Vec::new(),
+                reason: "out of scope".to_string(),
+            },
         ];
 
         let out = run_review_with(&cfg, input(), &FunnelBackend)
@@ -5192,14 +5270,17 @@ mod orchestrator_tests {
 
         assert!(
             out.summary_markdown
-                .contains("2 findings matched a `[[suppress]]` rule"),
+                .contains("3 findings matched a `[[suppress]]` rule"),
             "{}",
             out.summary_markdown
         );
         assert!(!out.summary_markdown.contains("a null deref"));
         let v: serde_json::Value =
             serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
-        assert_eq!(v["funnel"]["suppressed"], 2);
+        assert_eq!(v["funnel"]["suppressed"], 3);
+        // The spy said APPROVE WITH CHANGES because of the HIGHs and the MEDIUM;
+        // with those rejected only LOWs remain, so nothing is left to change.
+        assert_eq!(v["recommendation"], "APPROVE");
         let bodies: Vec<&str> = v["findings"]
             .as_array()
             .unwrap()

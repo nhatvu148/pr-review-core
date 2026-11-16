@@ -69,27 +69,47 @@ impl Suppression {
         if f.severity.eq_ignore_ascii_case("BLOCKING") || !self.usable() {
             return false;
         }
-        if !self.paths.is_empty() && !crate::diff::path_matches_globs_strict(&f.file, &self.paths) {
-            return false;
-        }
-        normalize(&f.body).contains(&normalize(&self.contains))
+        in_scope(self, &f.file) && normalize(&f.body).contains(&normalize(&self.contains))
     }
+}
+
+/// Whether `file` is inside the rule's `paths` (any file when it has none).
+fn in_scope(r: &Suppression, file: &str) -> bool {
+    r.paths.is_empty() || crate::diff::path_matches_globs_strict(file, &r.paths)
 }
 
 /// Remove the findings any rule matches, returning how many were removed.
 ///
-/// Warns once per call for each rule too short to apply, so a misconfigured
-/// rule shows up in the logs instead of silently doing nothing.
+/// Warns for each rule too short to apply, so a misconfigured rule shows up in
+/// the logs instead of silently doing nothing. Each text is normalized once here
+/// rather than per comparison, since every finding is checked against every rule.
 pub fn apply(rules: &[Suppression], findings: &mut Vec<Finding>) -> usize {
-    for r in rules.iter().filter(|r| !r.usable()) {
-        tracing::warn!(
-            "ignoring [[suppress]] rule {:?}: `contains` must be at least \
-             {MIN_CONTAINS_CHARS} characters so it names one finding, not most of them",
-            r.contains
-        );
+    let mut usable: Vec<(&Suppression, String)> = Vec::new();
+    for r in rules {
+        let needle = normalize(&r.contains);
+        if needle.chars().count() >= MIN_CONTAINS_CHARS {
+            usable.push((r, needle));
+        } else {
+            tracing::warn!(
+                "ignoring [[suppress]] rule {:?}: `contains` must be at least \
+                 {MIN_CONTAINS_CHARS} characters so it names one finding, not most of them",
+                r.contains
+            );
+        }
+    }
+    if usable.is_empty() {
+        return 0;
     }
     let before = findings.len();
-    findings.retain(|f| !rules.iter().any(|r| r.matches(f)));
+    findings.retain(|f| {
+        if f.severity.eq_ignore_ascii_case("BLOCKING") {
+            return true;
+        }
+        let body = normalize(&f.body);
+        !usable
+            .iter()
+            .any(|(r, needle)| in_scope(r, &f.file) && body.contains(needle.as_str()))
+    });
     before - findings.len()
 }
 
