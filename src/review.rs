@@ -820,13 +820,15 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
 /// Prefix of the hidden marker carrying a review's [`review_key`].
 const REVIEW_KEY_MARKER: &str = "<!-- kaniscope-review-key: ";
 
-/// A fingerprint of everything that decides what a review finds: the changed
-/// lines, every review setting, and the rules injected into the prompt.
+/// A fingerprint of everything that decides what a review finds: the diff the
+/// model is shown, every review setting, and the rules injected into the prompt.
 ///
-/// Hunk headers and `index` lines are left out, because a rebase onto a moved
-/// base shifts line numbers and blob ids without changing what the PR does —
-/// and that is exactly the re-review this exists to skip. File headers stay in,
-/// so the same hunk moved to another file is a different change. Settings come
+/// Only hunk headers and `index` lines are left out, because a rebase onto a
+/// moved base shifts line numbers and blob ids without changing what the PR
+/// shows — and that is exactly the re-review this exists to skip. Context lines
+/// stay in: they are part of the prompt, so changed surroundings are a new key.
+/// An agentic review also reads files outside the diff; a base change there is
+/// not seen by this key. Settings come
 /// from [`crate::rules::ReviewSettings`], the same allowlist `get-rules` shows,
 /// so a changed model, cap or floor is a new key.
 pub(crate) fn review_key(cfg: &Config, raw_diff: &str) -> String {
@@ -836,10 +838,10 @@ pub(crate) fn review_key(cfg: &Config, raw_diff: &str) -> String {
         if line.starts_with("@@") || line.starts_with("index ") {
             continue;
         }
-        if line.starts_with('+') || line.starts_with('-') || line.starts_with("diff --git ") {
-            h.update(line.as_bytes());
-            h.update(b"\n");
-        }
+        // Context lines count: they are in the prompt, so a rebase that changed
+        // the code around an edit is a different review even if the edit is not.
+        h.update(line.as_bytes());
+        h.update(b"\n");
     }
     h.update(b"\0settings\0");
     h.update(
@@ -4158,6 +4160,13 @@ mod orchestrator_tests {
         assert_ne!(
             super::review_key(&a, DIFF),
             super::review_key(&a, &format!("{DIFF}+added\n"))
+        );
+        // Changed surroundings are a different review.
+        let new_context = DIFF.replace(" fn alpha", " fn gamma");
+        assert_ne!(new_context, DIFF, "the fixture must have that context line");
+        assert_ne!(
+            super::review_key(&a, DIFF),
+            super::review_key(&a, &new_context)
         );
     }
 
