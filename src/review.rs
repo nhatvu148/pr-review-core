@@ -467,7 +467,7 @@ fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
         // Severity is part of the key, so a group is uniform by construction: two
         // findings that share a phrase but not a severity are, by the model's own
         // judgement, not the same claim — and merging them would hide that.
-        let key = format!("{}|{}", f.severity.to_uppercase(), burst_key(&f));
+        let key = format!("{}|{}", severity_label(&f.severity), burst_key(&f));
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, g)) => g.push(f),
             None => groups.push((key, vec![f])),
