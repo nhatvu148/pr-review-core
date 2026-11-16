@@ -47,6 +47,7 @@ pub mod providers;
 pub mod queue;
 pub mod repo;
 pub mod repo_config;
+pub mod repo_rules;
 pub mod review;
 pub mod rules;
 pub mod runlog;

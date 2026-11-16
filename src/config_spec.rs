@@ -273,6 +273,13 @@ pub const SPEC: &[ConfigVar] = &[
         doc: "If set, ONLY files matching these globs are reviewed.",
     },
     ConfigVar {
+        env: "INLINE_MIN_SEVERITY",
+        aliases: &[],
+        kind: ConfigKind::Str,
+        default: None,
+        doc: "Lowest severity posted as an inline comment (BLOCKING, HIGH, MEDIUM, LOW). Findings below it are listed in the summary instead. Unset posts everything inline.",
+    },
+    ConfigVar {
         env: "LLM_BASE_URL",
         aliases: &["OPENROUTER_BASE_URL"],
         kind: ConfigKind::Str,
@@ -425,6 +432,13 @@ pub const SPEC: &[ConfigVar] = &[
         kind: ConfigKind::Bool,
         default: Some("true"),
         doc: "Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary.",
+    },
+    ConfigVar {
+        env: "REPO_RULES",
+        aliases: &[],
+        kind: ConfigKind::Bool,
+        default: Some("true"),
+        doc: "Read the review rules a repo already has (REVIEW.md, .cursor/BUGBOT.md, the review section of AGENTS.md) from the base branch, and list them in the summary.",
     },
     ConfigVar {
         env: "REVIEW_ON_UPDATE",
