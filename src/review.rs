@@ -105,6 +105,16 @@ pub struct RunReviewOutput {
     pub usage: Option<Usage>,
 }
 
+/// Whether a severity marks a defect the change did not introduce.
+///
+/// Spelled several ways because models do: `PRE-EXISTING`, `PRE_EXISTING`,
+/// `PREEXISTING`. It ranks 0 like LOW, so it never raises the recommendation and
+/// a severity floor holds it back.
+pub(crate) fn is_pre_existing(sev: &str) -> bool {
+    let s: String = sev.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    s.eq_ignore_ascii_case("preexisting")
+}
+
 /// Rank a severity for sorting (higher = more urgent). Unknown severities rank 0.
 pub(crate) fn severity_rank(sev: &str) -> u8 {
     match sev.to_uppercase().as_str() {
@@ -116,7 +126,20 @@ pub(crate) fn severity_rank(sev: &str) -> u8 {
     }
 }
 
+/// A severity as shown on the PR: upper-cased, with every spelling of the
+/// pre-existing tier shown one way.
+pub(crate) fn severity_label(sev: &str) -> String {
+    if is_pre_existing(sev) {
+        "PRE-EXISTING".to_string()
+    } else {
+        sev.to_uppercase()
+    }
+}
+
 pub(crate) fn severity_emoji(sev: &str) -> &'static str {
+    if is_pre_existing(sev) {
+        return "🟣";
+    }
     match sev.to_uppercase().as_str() {
         "BLOCKING" => "🚨",
         "HIGH" => "⚠️",
@@ -151,7 +174,10 @@ mod severity_and_recommendation_tests {
     //! happen to exercise them (`effective_recommendation`, `collapse_bursts`).
     //! A typo in a match arm here (e.g. "BLOKCING") would silently rank a finding
     //! as unknown/LOW rather than fail loudly, so it earns its own direct test.
-    use super::{recommendation_rank, severity_emoji, severity_rank};
+    use super::{
+        effective_recommendation, is_pre_existing, recommendation_rank, severity_emoji,
+        severity_label, severity_rank, Finding,
+    };
 
     #[test]
     fn severity_rank_orders_known_severities_by_urgency() {
@@ -175,11 +201,37 @@ mod severity_and_recommendation_tests {
 
     #[test]
     fn severity_emoji_has_a_distinct_symbol_per_known_severity() {
-        let known = ["BLOCKING", "HIGH", "MEDIUM", "LOW"];
+        let known = ["BLOCKING", "HIGH", "MEDIUM", "LOW", "PRE-EXISTING"];
         let emojis: Vec<_> = known.iter().map(|s| severity_emoji(s)).collect();
         let unique: std::collections::HashSet<_> = emojis.iter().collect();
         assert_eq!(unique.len(), emojis.len(), "each severity reads distinctly");
         assert_eq!(severity_emoji("unknown"), "•");
+    }
+
+    /// A defect the change did not introduce is reported, but never the change's
+    /// fault: it ranks with LOW, so alone it leaves the recommendation at APPROVE.
+    #[test]
+    fn a_pre_existing_finding_never_raises_the_recommendation() {
+        for spelling in ["PRE-EXISTING", "pre_existing", "Preexisting"] {
+            assert!(is_pre_existing(spelling), "{spelling}");
+            assert_eq!(severity_rank(spelling), 0);
+            assert_eq!(severity_emoji(spelling), "🟣");
+        }
+        let f = Finding {
+            severity: "PRE-EXISTING".into(),
+            file: "a.rs".into(),
+            line: Some(1),
+            body: "already broken".into(),
+            confidence: Some(90),
+            suggestion: None,
+            existing_code: None,
+            end_line: None,
+            samples: None,
+        };
+        assert_eq!(effective_recommendation("APPROVE", &[f]), "APPROVE");
+        assert!(!is_pre_existing("LOW") && !is_pre_existing("HIGH"));
+        assert_eq!(severity_label("pre_existing"), "PRE-EXISTING");
+        assert_eq!(severity_label("high"), "HIGH");
     }
 
     #[test]
@@ -490,7 +542,7 @@ fn inline_body(f: &Finding) -> String {
     format!(
         "{} **{}** — {}",
         severity_emoji(&f.severity),
-        f.severity.to_uppercase(),
+        severity_label(&f.severity),
         f.body.trim()
     )
 }
@@ -856,7 +908,7 @@ fn render_summary(
             s.push_str(&format!(
                 "\n- {} **{}** — {loc} — {}",
                 severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
+                severity_label(&f.severity),
                 f.body.trim()
             ));
         }
@@ -1337,7 +1389,7 @@ fn render_no_review_summary(
             s.push_str(&format!(
                 "\n- {} **{}** — `{}` — {}",
                 severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
+                severity_label(&f.severity),
                 f.file,
                 f.body.trim()
             ));
