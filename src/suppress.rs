@@ -24,6 +24,9 @@
 //!
 //! Suppressed findings are counted in the summary and the run log rather than
 //! vanishing, so a rule that matches far more than intended is visible.
+//!
+//! Known limit: only the findings are filtered. The model is not told about the
+//! rules, so its own summary sentence can still mention a suppressed finding.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,18 +61,29 @@ fn normalize(s: &str) -> String {
 }
 
 impl Suppression {
-    /// Whether this rule is specific enough to apply at all.
-    fn usable(&self) -> bool {
-        normalize(&self.contains).chars().count() >= MIN_CONTAINS_CHARS
+    /// The rule's `contains`, normalized, or `None` when it is too short to
+    /// apply at all.
+    fn needle(&self) -> Option<String> {
+        let n = normalize(&self.contains);
+        (n.chars().count() >= MIN_CONTAINS_CHARS).then_some(n)
     }
 
     /// Whether this rule suppresses `f`. Never true for a `BLOCKING` finding.
     #[must_use]
     pub fn matches(&self, f: &Finding) -> bool {
-        if f.severity.eq_ignore_ascii_case("BLOCKING") || !self.usable() {
-            return false;
-        }
-        in_scope(self, &f.file) && normalize(&f.body).contains(&normalize(&self.contains))
+        self.needle()
+            .is_some_and(|needle| self.matches_normalized(&needle, f, &normalize(&f.body)))
+    }
+
+    /// The one matching rule, given the rule's needle and the finding's body
+    /// already normalized. [`apply`] calls this with both cached; [`matches`]
+    /// computes them, so the two cannot drift apart.
+    ///
+    /// [`matches`]: Self::matches
+    fn matches_normalized(&self, needle: &str, f: &Finding, body: &str) -> bool {
+        !f.severity.eq_ignore_ascii_case("BLOCKING")
+            && in_scope(self, &f.file)
+            && body.contains(needle)
     }
 }
 
@@ -86,15 +100,13 @@ fn in_scope(r: &Suppression, file: &str) -> bool {
 pub fn apply(rules: &[Suppression], findings: &mut Vec<Finding>) -> usize {
     let mut usable: Vec<(&Suppression, String)> = Vec::new();
     for r in rules {
-        let needle = normalize(&r.contains);
-        if needle.chars().count() >= MIN_CONTAINS_CHARS {
-            usable.push((r, needle));
-        } else {
-            tracing::warn!(
+        match r.needle() {
+            Some(needle) => usable.push((r, needle)),
+            None => tracing::warn!(
                 "ignoring [[suppress]] rule {:?}: `contains` must be at least \
                  {MIN_CONTAINS_CHARS} characters so it names one finding, not most of them",
                 r.contains
-            );
+            ),
         }
     }
     if usable.is_empty() {
@@ -102,13 +114,10 @@ pub fn apply(rules: &[Suppression], findings: &mut Vec<Finding>) -> usize {
     }
     let before = findings.len();
     findings.retain(|f| {
-        if f.severity.eq_ignore_ascii_case("BLOCKING") {
-            return true;
-        }
         let body = normalize(&f.body);
         !usable
             .iter()
-            .any(|(r, needle)| in_scope(r, &f.file) && body.contains(needle.as_str()))
+            .any(|(r, needle)| r.matches_normalized(needle, f, &body))
     });
     before - findings.len()
 }
@@ -192,13 +201,14 @@ mod tests {
     fn apply_removes_the_matches_and_counts_them() {
         let rules = vec![rule("unwrap on a poisoned mutex", &[])];
         let mut fs = vec![
+            finding("BLOCKING", "z.rs", "unwrap on a poisoned mutex"),
             finding("LOW", "a.rs", "unwrap on a poisoned mutex"),
             finding("HIGH", "b.rs", "SQL injection"),
             finding("MEDIUM", "c.rs", "an unwrap on a poisoned mutex again"),
         ];
         assert_eq!(apply(&rules, &mut fs), 2);
-        assert_eq!(fs.len(), 1);
-        assert_eq!(fs[0].file, "b.rs");
+        let left: Vec<&str> = fs.iter().map(|f| f.file.as_str()).collect();
+        assert_eq!(left, ["z.rs", "b.rs"], "BLOCKING is kept by apply too");
     }
 
     #[test]

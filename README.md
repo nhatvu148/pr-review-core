@@ -93,7 +93,7 @@ prompt through [`Config`].
   finding the team has already rejected from coming back on every PR. A rule
   matches the finding's text (case-insensitive, at least 10 characters), can be
   scoped to paths, and must say why. A `BLOCKING` finding is never suppressed, and
-  the summary says how many findings a rule removed:
+  the summary says how many findings a rule removed. Only the findings are filtered, so the model's own summary sentence can still mention one:
 
   ```toml
   [[suppress]]

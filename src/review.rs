@@ -2988,7 +2988,9 @@ pub async fn run_review_with(
         // retried, and the retry finds the same empty diff and tries again.
         if placeholder_posted {
             let note = ReviewPost {
-                summary: render_no_review_summary(&[], &[]),
+                // Says when a rule removed everything there was, so a rule that
+                // matched more than intended is visible on this path too.
+                summary: render_no_review_summary(&[], &[]) + &crate::suppress::note(suppressed),
                 inline: Vec::new(),
                 held: Vec::new(),
             };
