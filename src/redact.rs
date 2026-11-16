@@ -72,6 +72,15 @@ pub fn redact_secrets(s: &str) -> String {
                         i = end;
                         continue;
                     }
+                    // No `:`: the whole userinfo is the credential, as in
+                    // `https://<token>@github.com/…`. An unprefixed token there
+                    // would slip past the prefix scan, so it all goes.
+                    if end > auth_start {
+                        out.push_str(&s[i..auth_start]);
+                        out.push_str(REDACTED);
+                        i = end;
+                        continue;
+                    }
                 }
             }
         }
@@ -135,6 +144,16 @@ mod tests {
         assert_eq!(
             redact_secrets("tried ghp_AAAA1111 and ATATT9zz-yy, both 401"),
             "tried ghp_*** and ATATT***, both 401"
+        );
+    }
+
+    #[test]
+    fn a_token_used_as_the_whole_userinfo_is_redacted() {
+        assert_eq!(
+            redact_secrets(
+                "clone https://0123456789abcdef0123456789abcdef01234567@github.com/o/r.git"
+            ),
+            "clone https://***@github.com/o/r.git"
         );
     }
 

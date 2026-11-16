@@ -190,7 +190,8 @@ impl ReconcileConfig {
         let max_prs = env_num("RECONCILE_MAX_PRS").unwrap_or(5) as usize;
         Self {
             repos,
-            lookback_secs: lookback_mins * 60,
+            // Saturating: a huge value means "no limit", not a wrapped negative window.
+            lookback_secs: lookback_mins.saturating_mul(60),
             max_prs,
         }
     }
@@ -227,7 +228,11 @@ pub(crate) fn epoch_from_rfc3339(s: &str) -> Option<i64> {
     // marker. A *missing* zone is rejected rather than assumed: it's ambiguous,
     // both providers always send one, and guessing wrong shifts a coverage
     // comparison by hours.
-    let zone = s[19..].trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
+    // `get`, not indexing: byte 19 can fall inside a multi-byte character in a
+    // malformed timestamp, and a panic here would take the boot sweep down.
+    let zone = s
+        .get(19..)?
+        .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.');
     if !matches!(zone, "Z" | "z" | "+00:00" | "-00:00") {
         return None;
     }
@@ -445,8 +450,9 @@ async fn gh_open_numbers(
             &token,
             cfg,
             &format!(
-                "https://api.github.com/repos/{repo}/pulls\
-                 ?state=open&per_page=100&page={page}"
+                "{api}/repos/{repo}/pulls\
+                 ?state=open&per_page=100&page={page}",
+                api = api_base(cfg)
             ),
         )
         .await
@@ -562,8 +568,9 @@ async fn scan_github(
         &token,
         cfg,
         &format!(
-            "https://api.github.com/repos/{repo}/pulls\
-             ?state=open&sort=updated&direction=desc&per_page=30"
+            "{api}/repos/{repo}/pulls\
+             ?state=open&sort=updated&direction=desc&per_page=30",
+            api = api_base(cfg)
         ),
     )
     .await
@@ -635,7 +642,7 @@ async fn head_commit_date(
         http,
         token,
         cfg,
-        &format!("https://api.github.com/repos/{repo}/commits/{sha}"),
+        &format!("{api}/repos/{repo}/commits/{sha}", api = api_base(cfg)),
     )
     .await?;
     let iso = c.commit.committer.date;
@@ -677,8 +684,9 @@ async fn newest_bot_comment_at(
     let mut newest: Option<i64> = None;
     for page in 1..=MAX_PAGES {
         let mut url = format!(
-            "https://api.github.com/repos/{repo}/issues/{pr}/comments\
-             ?per_page={PER_PAGE}&page={page}"
+            "{api}/repos/{repo}/issues/{pr}/comments\
+             ?per_page={PER_PAGE}&page={page}",
+            api = api_base(cfg)
         );
         if let Some(since) = since {
             url.push_str(&format!("&since={since}"));
@@ -727,6 +735,12 @@ async fn newest_bot_comment_at(
         return Ok(Some(i64::MAX));
     }
     Ok(newest)
+}
+
+/// The GitHub API base, so the sweep reaches GitHub Enterprise when `GH_API_BASE`
+/// points there, as every other GitHub call in this crate does.
+fn api_base(cfg: &Config) -> &str {
+    cfg.github_api_base.trim_end_matches('/')
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(
@@ -1026,6 +1040,12 @@ async fn bb_get<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_malformed_timestamp_with_non_ascii_is_rejected_not_a_panic() {
+        assert_eq!(epoch_from_rfc3339("2026-08-02T01:06:0é+00:00"), None);
+        assert_eq!(epoch_from_rfc3339("2026-08-02T01:06:07é"), None);
+    }
 
     #[test]
     fn parses_github_timestamps() {
