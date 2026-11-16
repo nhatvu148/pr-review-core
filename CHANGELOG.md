@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`kaniscope` no longer prints hidden markers in its human-readable output.** `--human` and the dry-run and local summaries printed the summary comment's body verbatim, so they included lines like `<!-- kaniscope-verdict: {...} -->` and `<!-- kaniscope-review-key: ... -->` that GitHub and GitLab hide. Lines that are only an HTML comment are now dropped from that output. `--json` is unchanged and still carries the full body.
+
 ## 0.44.0
 
 **Re-review now tracks what actually changed: a finding is resolved only when its code moves, an unchanged PR reuses its last review, and the reviewer reads the rules and issues the repository already wrote.**

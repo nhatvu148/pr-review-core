@@ -734,7 +734,7 @@ async fn run_op(cfg: &Config, op: Op) -> anyhow::Result<()> {
                 }
             };
             if a.human {
-                println!("{}", out.summary_markdown);
+                println!("{}", as_rendered(&out.summary_markdown));
                 return Ok(());
             }
             emit(&out)
@@ -1020,6 +1020,33 @@ fn print_human(args: &Args, out: &RunReviewOutput) {
     print_review(out, args.local, args.dry_run);
 }
 
+/// `md` as a reader of the posted comment sees it: lines that are only a hidden
+/// HTML comment are dropped.
+///
+/// The summary carries machine-readable markers (the verdict, the review key,
+/// the status and upsert markers) on lines of their own. GitHub and GitLab hide
+/// them, but a terminal prints them verbatim, so the human and dry-run output
+/// opened with a line of JSON nobody asked for. Only whole-line comments go:
+/// one inside a sentence or a code fence is content, and is left alone.
+fn as_rendered(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut in_fence = false;
+    for line in md.lines() {
+        let t = line.trim();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && t.starts_with("<!--") && t.ends_with("-->") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // A marker at the end leaves the blank line that separated it behind.
+    out.truncate(out.trim_end().len());
+    out
+}
+
 /// The human-readable block: what would post, then the run's totals.
 ///
 /// Takes the two facts it actually uses rather than the whole `Args`, so the
@@ -1028,14 +1055,14 @@ fn print_human(args: &Args, out: &RunReviewOutput) {
 /// is the mode, not a withheld action.
 fn print_review(out: &RunReviewOutput, local: bool, dry_run: bool) {
     let rule = "─".repeat(60);
-    println!("\n{rule}\n{}\n{rule}", out.summary_markdown);
+    println!("\n{rule}\n{}\n{rule}", as_rendered(&out.summary_markdown));
 
     // `summary_markdown` is the *comment body*, which on the posting path omits
     // the findings that were anchored as inline comments — so a dry run could
     // print 2 of 7 findings and silently drop the rest, which makes the CLI
     // useless for checking whether a rule actually fires on a given PR. Print
-    // every finding here; the summary above stays as-is so what you see still
-    // matches what would be posted.
+    // every finding here; the summary above is otherwise as posted (less the
+    // hidden markers) so what you see still matches what a reader would see.
     //
     // Dry-run and local only: on a posting run these were just anchored onto the
     // PR, so reprinting them duplicates data that already has a durable home.
@@ -1289,12 +1316,27 @@ fn run_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        change_intent, enforce_gate, output_mode, settle, tmp_sibling, tripped_gate,
+        as_rendered, change_intent, enforce_gate, output_mode, settle, tmp_sibling, tripped_gate,
         unverified_gate, usable_branch, Args, FailOn, GateTripped, NothingToReview,
     };
     use clap::Parser;
     use pr_review_core::deps::ScanStatus;
     use std::path::Path;
+
+    #[test]
+    fn the_human_output_hides_the_markers_a_posted_comment_hides() {
+        let md = "<!-- prbot-summary -->\n**Recommendation:** APPROVE\n\nLooks fine.\n\n<!-- kaniscope-verdict: {\"recommendation\":\"APPROVE\"} -->\n<!-- kaniscope-review-key: abc -->\n";
+        assert_eq!(
+            as_rendered(md),
+            "**Recommendation:** APPROVE\n\nLooks fine."
+        );
+    }
+
+    #[test]
+    fn a_comment_inside_prose_or_a_code_fence_is_content_and_stays() {
+        let md = "Add `<!-- x -->` here.\n```html\n<!-- kept -->\n```";
+        assert_eq!(as_rendered(md), md);
+    }
 
     fn nothing() -> anyhow::Error {
         NothingToReview { local: true }.into()
