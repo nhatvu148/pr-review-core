@@ -813,9 +813,10 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
 
 /// The rule file note's twin: a PR editing a review rule file is reviewed under
 /// the base branch's copy, for the same reason.
-const RULE_FILE_CHANGE_NOTE: &str = "\n\n_This PR changes a review rule file. Rules are \
-     read from the base branch, so this review applied the current ones and the \
-     change takes effect once merged._";
+const RULE_FILE_CHANGE_NOTE: &str = "\n\n_This PR changes a file the reviewer reads \
+     rules from (`REVIEW.md`, `.cursor/BUGBOT.md`, or the review section of `AGENTS.md`). \
+     Rules are read from the base branch, so any rule change in it takes effect once \
+     merged._";
 
 /// Whether a diff touches one of the [`crate::repo_rules::RULE_FILES`].
 fn diff_touches_rule_file(diff: &str) -> bool {
@@ -1325,6 +1326,8 @@ async fn remote_rule_files(
     let Some(git_ref) = meta.base_branch.as_deref().filter(|b| !b.is_empty()) else {
         return Vec::new();
     };
+    // Sequential: three small contents-API calls, and running them concurrently
+    // would need a dependency (`futures`) this crate does not otherwise carry.
     let mut found = Vec::new();
     for f in crate::repo_rules::RULE_FILES {
         match provider
@@ -4156,7 +4159,7 @@ mod orchestrator_tests {
         );
         let (_, _, summary) = review_as(&diff, "admin").await;
         assert!(
-            summary.contains("This PR changes a review rule file"),
+            summary.contains("This PR changes a file the reviewer reads rules from"),
             "{summary}"
         );
     }
