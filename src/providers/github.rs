@@ -1008,7 +1008,9 @@ struct BotThread {
     /// it" — see `finding_could_have_been_fixed`.
     original_commit: Option<String>,
     /// GitHub's own verdict that the lines this thread points at have changed
-    /// since it was written. The only evidence, short of re-reviewing, that a
+    /// since it was written. It is GitHub's notion of a diff position no longer
+    /// applying, so an edit to nearby lines in the same hunk can set it too: looser
+    /// than "this exact line changed", but still evidence the code moved. The only evidence, short of re-reviewing, that a
     /// finding the model did not repeat might actually have been fixed.
     is_outdated: bool,
     /// Comments in the thread, the bot's own first one included. More than one
@@ -1149,7 +1151,9 @@ async fn bot_threads(
                     line: node["line"].as_u64(),
                     original_commit: first["originalCommit"]["oid"].as_str().map(str::to_string),
                     is_outdated: node["isOutdated"].as_bool().unwrap_or(false),
-                    comment_count: node["comments"]["totalCount"].as_u64().unwrap_or(1),
+                    // Unknown counts as "has replies": the guard it feeds must not
+                    // fail open on the one case it exists for.
+                    comment_count: node["comments"]["totalCount"].as_u64().unwrap_or(u64::MAX),
                     body: body.to_string(),
                 });
             }
@@ -1406,8 +1410,7 @@ async fn reconcile_inline(
                     "resolve thread failed on {} ({e:#}); deleting the comment instead",
                     t.path
                 );
-                delete_comment(client, cfg, &meta.repo, t.comment_id).await;
-                true
+                delete_comment(client, cfg, &meta.repo, t.comment_id).await
             }
             Err(e) => {
                 tracing::debug!(
@@ -1426,15 +1429,22 @@ async fn reconcile_inline(
 
 /// Best-effort delete of a review comment by its REST id (the fallback when the
 /// token can't resolve threads).
-async fn delete_comment(client: &Client, cfg: &Config, repo: &str, comment_id: u64) {
+///
+/// Returns whether the comment is actually gone, so a failed delete is never
+/// reported as a resolved finding.
+async fn delete_comment(client: &Client, cfg: &Config, repo: &str, comment_id: u64) -> bool {
     if comment_id == 0 {
-        return;
+        return false;
     }
     let url = format!(
         "{}/repos/{repo}/pulls/comments/{comment_id}",
         cfg.github_api_base
     );
-    let _ = gh(client.delete(url), cfg).send().await;
+    match gh(client.delete(url), cfg).send().await {
+        // 404: already gone, which is the outcome wanted.
+        Ok(r) => r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND,
+        Err(_) => false,
+    }
 }
 
 pub async fn post_review(
