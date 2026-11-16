@@ -89,6 +89,10 @@ pub struct PathInstruction {
 /// ```
 pub fn review_section(md: &str) -> Option<String> {
     let heading = |line: &str| -> Option<(usize, String)> {
+        // Four or more leading spaces make an indented code block, not a heading.
+        if line.len() - line.trim_start_matches(' ').len() >= 4 {
+            return None;
+        }
         let t = line.trim_start();
         let level = t.chars().take_while(|c| *c == '#').count();
         if level == 0 || level > 6 || !t[level..].starts_with(' ') {
@@ -123,12 +127,18 @@ pub fn review_section(md: &str) -> Option<String> {
         .map(|l| {
             let t = l.trim_start();
             let marker = ["```", "~~~"].into_iter().find(|m| t.starts_with(m));
+            // A closing fence is the marker character alone: ```` ```rust ```` inside
+            // a fence opens nothing and closes nothing.
+            let bare = |m: &str| {
+                let c = m.chars().next().unwrap_or('`');
+                t.trim_end().chars().all(|x| x == c)
+            };
             match (fence, marker) {
                 (None, Some(m)) => {
                     fence = Some(m);
                     return (l, None);
                 }
-                (Some(open), Some(m)) if open == m => {
+                (Some(open), Some(m)) if open == m && bare(m) => {
                     fence = None;
                     return (l, None);
                 }
@@ -331,6 +341,15 @@ mod tests {
         assert_eq!(review_section("```\n## Review\nx\n```\n"), None);
         // A ``` inside a ~~~ fence does not close it.
         assert_eq!(review_section("~~~\n```\n## Review\nx\n~~~\n"), None);
+        // A fence line with an info string does not close a fence.
+        assert_eq!(review_section("```\n```rust\n## Review\nx\n```\n"), None);
+    }
+
+    #[test]
+    fn a_line_indented_four_spaces_is_code_not_a_heading() {
+        let md = "## Review\n- a\n    # install deps\n- b\n## Build\nmake";
+        let got = review_section(md).unwrap();
+        assert!(got.contains("- b") && !got.contains("make"), "{got}");
     }
 
     #[test]

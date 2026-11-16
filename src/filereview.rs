@@ -222,7 +222,10 @@ pub async fn review_content(
     });
     findings.truncate(cfg.max_findings);
 
-    let summary_markdown = render(path, &review, &findings);
+    let mut summary_markdown = render(path, &review, &findings);
+    // Same provenance line as a diff review, so a finding a rule file caused can
+    // be traced to it here too.
+    summary_markdown.push_str(&crate::repo_rules::rules_note(cfg));
     Ok(FileReviewOutput {
         path: path.to_string(),
         source,
