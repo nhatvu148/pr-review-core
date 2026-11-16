@@ -2589,7 +2589,10 @@ pub async fn run_review_with(
     // GitHub only: it is the one provider whose summary can be read back, and
     // HTML comments are hidden there.
     let mut summary = summary;
-    if provider.name() == "github" {
+    // Not on a review salvaged from a truncated model response: it is partial by
+    // definition, and keyed it would be reused, partial, for as long as the PR
+    // stays unchanged.
+    if provider.name() == "github" && !truncated {
         summary.push_str(&format!("\n\n{REVIEW_KEY_MARKER}{key} -->"));
     }
     let post = ReviewPost {
