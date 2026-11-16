@@ -880,6 +880,70 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
+/// A hidden, machine-readable verdict for the summary comment (appended to the
+/// review's summary; a provider may add sections after it, so find it by prefix):
+/// the recommendation and a count per severity.
+///
+/// For CI and bots that read the PR rather than the engine's JSON — a workflow
+/// step can fetch the bot's comment and decide for itself whether, say, any HIGH
+/// should block. The engine itself never fails a check on it: a gate on a model's
+/// judgement fails a build on whatever one sample said, and re-running CI would
+/// become a way to make it pass (the same reason `--fail-on` accepts scanner
+/// results only). HTML comments are hidden on GitHub and GitLab; Bitbucket shows
+/// them, so it is not added there.
+///
+/// ```text
+/// <!-- kaniscope-verdict: {"recommendation":"APPROVE WITH CHANGES","blocking":0,"high":1,"medium":2,"low":0,"other":0,"pre_existing":0,"capped":false} -->
+/// ```
+///
+/// `recommendation` is always one of the three canonical values, never the
+/// model's own wording: free text could carry `-->` and end the comment early,
+/// and a PR can steer what the model writes. The counts are of the findings
+/// posted, after `MAX_FINDINGS`; `capped` is true when that cap cut some, in which
+/// case the counts understate and the recommendation (computed before the cap)
+/// does not.
+pub(crate) fn verdict_marker(recommendation: &str, findings: &[Finding], capped: bool) -> String {
+    let canonical = match recommendation_rank(recommendation) {
+        2 => "BLOCK",
+        1 => "APPROVE WITH CHANGES",
+        _ => "APPROVE",
+    };
+    let mut counts = [0usize; 6]; // blocking, high, medium, low, other, pre-existing
+    for f in findings {
+        if is_pre_existing(&f.severity) {
+            counts[5] += 1;
+            continue;
+        }
+        // Exactly as `severity_rank` reads it, so the marker can never count a
+        // finding as HIGH that the sort and the recommendation treated as LOW.
+        let i = match f.severity.to_uppercase().as_str() {
+            "BLOCKING" => 0,
+            "HIGH" => 1,
+            "MEDIUM" => 2,
+            "LOW" => 3,
+            _ => 4,
+        };
+        counts[i] += 1;
+    }
+    let v = serde_json::json!({
+        "recommendation": canonical,
+        "blocking": counts[0],
+        "high": counts[1],
+        "medium": counts[2],
+        "low": counts[3],
+        "other": counts[4],
+        "pre_existing": counts[5],
+        "capped": capped,
+    });
+    format!("\n\n<!-- kaniscope-verdict: {v} -->")
+}
+
+/// Whether a provider renders HTML comments invisibly, so a hidden marker can go
+/// in a comment without showing up as text.
+fn hides_html_comments(provider: &str) -> bool {
+    matches!(provider, "github" | "gitlab")
+}
+
 /// [`REPO_CONFIG_CHANGE_NOTE`]'s twin: a PR editing a review rule file is reviewed under
 /// the base branch's copy, for the same reason.
 const RULE_FILE_CHANGE_NOTE: &str = "\n\n_This PR changes a file the reviewer reads \
@@ -2694,6 +2758,11 @@ pub async fn run_review_with(
         anchors,
     } = finished;
     let inline_count = inline.len();
+    let mut summary = summary;
+    if hides_html_comments(provider.name()) {
+        let capped = funnel.after_collapse > funnel.posted_findings;
+        summary.push_str(&verdict_marker(&recommendation, &findings, capped));
+    }
     let post = ReviewPost {
         summary: summary.clone(),
         inline,
@@ -4303,6 +4372,69 @@ mod orchestrator_tests {
             assert!(p.contains("BASE-RULE"), "base settings not applied: {p}");
             assert!(!p.contains("HEAD-RULE"), "head settings applied: {p}");
         }
+    }
+
+    /// The verdict a CI step can read off the PR: hidden, and counted per severity.
+    #[tokio::test]
+    async fn a_github_summary_ends_with_a_machine_readable_verdict() {
+        let (_, _, summary) = review_as(DIFF, "write").await;
+        let line = summary.lines().last().unwrap_or_default();
+        assert!(
+            line.starts_with("<!-- kaniscope-verdict: "),
+            "the verdict must be the summary's last line: {summary}"
+        );
+        let json = line
+            .trim_start_matches("<!-- kaniscope-verdict: ")
+            .trim_end_matches(" -->");
+        let v: serde_json::Value = serde_json::from_str(json).expect("the verdict is JSON");
+        assert!(v["recommendation"].is_string());
+        for k in ["blocking", "high", "medium", "low", "other", "pre_existing"] {
+            assert!(v[k].is_u64(), "{k} missing: {v}");
+        }
+    }
+
+    #[test]
+    fn the_verdict_counts_each_severity() {
+        let f = |sev: &str| crate::llm::Finding {
+            severity: sev.into(),
+            file: "a.rs".into(),
+            line: Some(1),
+            body: "b".into(),
+            confidence: None,
+            suggestion: None,
+            existing_code: None,
+            end_line: None,
+            samples: None,
+        };
+        let m = super::verdict_marker(
+            "BLOCK",
+            &[f("BLOCKING"), f("high"), f("HIGH"), f("odd")],
+            false,
+        );
+        assert!(m.contains(r#""capped":false"#), "{m}");
+        assert!(
+            m.contains(r#""blocking":1"#) && m.contains(r#""high":2"#),
+            "{m}"
+        );
+        assert!(
+            m.contains(r#""other":1"#) && m.contains(r#""recommendation":"BLOCK""#),
+            "{m}"
+        );
+        assert!(!super::hides_html_comments("bitbucket"));
+    }
+
+    /// A model's free-text recommendation never reaches the marker: it could
+    /// close the HTML comment and spill the rest onto the PR.
+    #[test]
+    fn the_verdict_carries_only_a_canonical_recommendation() {
+        let m = super::verdict_marker("we should BLOCK --> <b>fake</b>", &[], true);
+        assert!(m.contains(r#""recommendation":"BLOCK""#), "{m}");
+        assert_eq!(
+            m.matches("-->").count(),
+            1,
+            "only the marker's own close: {m}"
+        );
+        assert!(m.contains(r#""capped":true"#));
     }
 
     /// `REVIEW.md` is a rule file the PR could edit, so it too is read from the
