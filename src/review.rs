@@ -103,6 +103,22 @@ pub struct RunReviewOutput {
     pub comment_url: Option<String>,
     pub summary_markdown: String,
     pub usage: Option<Usage>,
+    /// True when no model ran because the PR's changed lines, settings and rules
+    /// were identical to the last review's, so that review was left in place.
+    /// `summary_markdown` is then the existing summary, and the finding counts are
+    /// zero because nothing new was found, not because the PR is clean.
+    #[serde(default)]
+    pub reused: bool,
+}
+
+/// Whether a severity marks a defect the change did not introduce.
+///
+/// Spelled several ways because models do: `PRE-EXISTING`, `PRE_EXISTING`,
+/// `PREEXISTING`. It ranks 0 like LOW, so it never raises the recommendation and
+/// a severity floor holds it back.
+pub(crate) fn is_pre_existing(sev: &str) -> bool {
+    let s: String = sev.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    s.eq_ignore_ascii_case("preexisting")
 }
 
 /// Rank a severity for sorting (higher = more urgent). Unknown severities rank 0.
@@ -116,7 +132,30 @@ pub(crate) fn severity_rank(sev: &str) -> u8 {
     }
 }
 
+/// A severity as shown on the PR: upper-cased, with every spelling of the
+/// pre-existing tier shown one way.
+pub(crate) fn severity_label(sev: &str) -> String {
+    if is_pre_existing(sev) {
+        "PRE-EXISTING".to_string()
+    } else {
+        sev.to_uppercase()
+    }
+}
+
+/// The severity a [`severity_rank`] value names, for display.
+pub(crate) fn severity_name(rank: u8) -> &'static str {
+    match rank {
+        3 => "BLOCKING",
+        2 => "HIGH",
+        1 => "MEDIUM",
+        _ => "LOW",
+    }
+}
+
 pub(crate) fn severity_emoji(sev: &str) -> &'static str {
+    if is_pre_existing(sev) {
+        return "🟣";
+    }
     match sev.to_uppercase().as_str() {
         "BLOCKING" => "🚨",
         "HIGH" => "⚠️",
@@ -151,7 +190,10 @@ mod severity_and_recommendation_tests {
     //! happen to exercise them (`effective_recommendation`, `collapse_bursts`).
     //! A typo in a match arm here (e.g. "BLOKCING") would silently rank a finding
     //! as unknown/LOW rather than fail loudly, so it earns its own direct test.
-    use super::{recommendation_rank, severity_emoji, severity_rank, Finding};
+    use super::{
+        effective_recommendation, is_pre_existing, recommendation_rank, severity_emoji,
+        severity_label, severity_rank, Finding,
+    };
 
     #[test]
     fn severity_rank_orders_known_severities_by_urgency() {
@@ -175,11 +217,44 @@ mod severity_and_recommendation_tests {
 
     #[test]
     fn severity_emoji_has_a_distinct_symbol_per_known_severity() {
-        let known = ["BLOCKING", "HIGH", "MEDIUM", "LOW"];
+        let known = ["BLOCKING", "HIGH", "MEDIUM", "LOW", "PRE-EXISTING"];
         let emojis: Vec<_> = known.iter().map(|s| severity_emoji(s)).collect();
         let unique: std::collections::HashSet<_> = emojis.iter().collect();
         assert_eq!(unique.len(), emojis.len(), "each severity reads distinctly");
         assert_eq!(severity_emoji("unknown"), "•");
+    }
+
+    /// A defect the change did not introduce is reported, but never the change's
+    /// fault: it ranks with LOW, so alone it leaves the recommendation at APPROVE.
+    #[test]
+    fn a_pre_existing_finding_never_raises_the_recommendation() {
+        for spelling in ["PRE-EXISTING", "pre_existing", "Preexisting"] {
+            assert!(is_pre_existing(spelling), "{spelling}");
+            assert_eq!(severity_rank(spelling), 0);
+            assert_eq!(severity_emoji(spelling), "🟣");
+        }
+        let f = Finding {
+            severity: "PRE-EXISTING".into(),
+            file: "a.rs".into(),
+            line: Some(1),
+            body: "already broken".into(),
+            confidence: Some(90),
+            suggestion: None,
+            existing_code: None,
+            end_line: None,
+            samples: None,
+        };
+        assert_eq!(effective_recommendation("APPROVE", &[f]), "APPROVE");
+        assert!(!is_pre_existing("LOW") && !is_pre_existing("HIGH"));
+        assert_eq!(severity_label("pre_existing"), "PRE-EXISTING");
+        assert_eq!(severity_label("high"), "HIGH");
+    }
+
+    /// The whole-file review has no change to compare against, so it does not
+    /// offer the tier at all.
+    #[test]
+    fn the_whole_file_prompt_does_not_offer_pre_existing() {
+        assert!(!crate::prompt::FILE_REVIEW_SYSTEM_PROMPT.contains("PRE-EXISTING"));
     }
 
     fn finding_at(sev: &str, line: Option<u64>, body: &str) -> Finding {
@@ -466,7 +541,7 @@ fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
         // Severity is part of the key, so a group is uniform by construction: two
         // findings that share a phrase but not a severity are, by the model's own
         // judgement, not the same claim — and merging them would hide that.
-        let key = format!("{}|{}", f.severity.to_uppercase(), burst_key(&f));
+        let key = format!("{}|{}", severity_label(&f.severity), burst_key(&f));
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, g)) => g.push(f),
             None => groups.push((key, vec![f])),
@@ -541,7 +616,7 @@ fn inline_body(f: &Finding) -> String {
     format!(
         "{} **{}** — {}",
         severity_emoji(&f.severity),
-        f.severity.to_uppercase(),
+        severity_label(&f.severity),
         f.body.trim()
     )
 }
@@ -862,6 +937,234 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
+/// Prefix of the hidden marker carrying a review's [`review_key`].
+const REVIEW_KEY_MARKER: &str = "<!-- kaniscope-review-key: ";
+
+/// A fingerprint of everything that decides what a review finds: the diff the
+/// model is shown, every review setting, and the rules injected into the prompt.
+///
+/// Only hunk headers and `index` lines are left out, because a rebase onto a
+/// moved base shifts line numbers and blob ids without changing what the PR
+/// shows — and that is exactly the re-review this exists to skip. Context lines
+/// stay in: they are part of the prompt, so changed surroundings are a new key.
+/// The PR's title, its description (when `PR_BODY` is on) and whether its author
+/// may be cloned are in too, since the reviewer is given all three. An agentic
+/// review also reads files outside the diff; a base change there is not seen by
+/// this key, nor is a change in CI results. Settings come
+/// from [`crate::rules::ReviewSettings`], the same allowlist `get-rules` shows,
+/// so a changed model, cap or floor is a new key.
+pub(crate) fn review_key(cfg: &Config, raw_diff: &str, meta: &PrMeta) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for line in raw_diff.lines() {
+        if line.starts_with("@@") || line.starts_with("index ") {
+            continue;
+        }
+        // Context lines count: they are in the prompt, so a rebase that changed
+        // the code around an edit is a different review even if the edit is not.
+        h.update(line.as_bytes());
+        h.update(b"\n");
+    }
+    // The engine itself: an upgrade can change the base prompt, calibration or
+    // rendering, and a review made by the old version is not this version's.
+    h.update(env!("CARGO_PKG_VERSION").as_bytes());
+    h.update(crate::prompt::SYSTEM_PROMPT.as_bytes());
+    h.update(b"\0settings\0");
+    h.update(
+        serde_json::to_string(&crate::rules::ReviewSettings::from_config(cfg))
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    h.update(b"\0rules\0");
+    h.update(crate::prompt::injected_rules(cfg).as_bytes());
+    // What the reviewer is told about the PR, and whether it may clone it. CI
+    // results are left out on purpose: they change on every push, so keying on
+    // them would mean nothing is ever reused.
+    h.update(b"\0meta\0");
+    h.update(meta.title.as_deref().unwrap_or_default().as_bytes());
+    h.update(b"\0");
+    if cfg.pr_body {
+        h.update(meta.body.as_deref().unwrap_or_default().as_bytes());
+    }
+    h.update(b"\0");
+    h.update(author_may_clone(meta).to_string().as_bytes());
+    hex::encode(&h.finalize()[..8])
+}
+
+/// The previous review, reused, when the PR's summary carries this exact key.
+///
+/// `None` (review normally) when there is no summary, it is a placeholder or a
+/// failure notice, its key differs, or it cannot be read. Only GitHub can read
+/// its summary back today, so elsewhere this is always `None`.
+async fn reusable_review(
+    provider: &Provider,
+    client: &reqwest::Client,
+    cfg: &Config,
+    input: &RunReviewInput,
+    key: &str,
+    scan_status: crate::deps::ScanStatus,
+) -> Option<RunReviewOutput> {
+    let body = match provider
+        .summary_body(client, cfg, &input.repo, input.pr)
+        .await
+    {
+        Ok(Some(b)) => b,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!("reuse check: summary not read ({e:#}); reviewing");
+            return None;
+        }
+    };
+    if is_incomplete_review(&body) || !body.contains(&format!("{REVIEW_KEY_MARKER}{key} -->")) {
+        return None;
+    }
+    tracing::info!(
+        "{}#{}: nothing changed since the last review (key {key}); leaving it in place",
+        input.repo,
+        input.pr
+    );
+    // Not parseable, not reused: reporting a guessed APPROVE for a review that
+    // said BLOCK would be worse than running it again.
+    // From the verdict marker when present: it is canonical and never model
+    // text. Otherwise the LAST recommendation line, because the model's own
+    // summary sits above the real one and could contain a line that looks like it.
+    let from_verdict = body
+        .lines()
+        .find_map(|l| l.strip_prefix("<!-- kaniscope-verdict: "))
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j.trim_end_matches(" -->")).ok())
+        .and_then(|v| v["recommendation"].as_str().map(str::to_string));
+    let Some(recommendation) = from_verdict
+        .or_else(|| {
+            body.lines()
+                .rev()
+                .find_map(|l| l.strip_prefix("**Recommendation:** "))
+                .map(|r| r.trim().to_string())
+        })
+        .filter(|r| !r.is_empty())
+    else {
+        tracing::debug!("reuse check: no recommendation line in the summary; reviewing");
+        return None;
+    };
+    Some(RunReviewOutput {
+        provider: provider.name().to_string(),
+        repo: input.repo.clone(),
+        pr: input.pr,
+        model: String::new(),
+        recommendation,
+        findings: 0,
+        findings_detail: Vec::new(),
+        inline_posted: 0,
+        inline_detail: Vec::new(),
+        advisories: Vec::new(),
+        // The scan that just ran this round, clean or disabled — reuse needs one
+        // of those. `None` would read as "no scan ran" to `--fail-on advisories`.
+        advisory_scan: Some(scan_status),
+        posted: false,
+        comment_url: None,
+        summary_markdown: body,
+        usage: None,
+        reused: true,
+    })
+}
+
+/// A hidden, machine-readable verdict for the summary comment (appended to the
+/// review's summary; a provider may add sections after it, so find it by prefix):
+/// the recommendation and a count per severity.
+///
+/// For CI and bots that read the PR rather than the engine's JSON — a workflow
+/// step can fetch the bot's comment and decide for itself whether, say, any HIGH
+/// should block. The engine itself never fails a check on it: a gate on a model's
+/// judgement fails a build on whatever one sample said, and re-running CI would
+/// become a way to make it pass (the same reason `--fail-on` accepts scanner
+/// results only). HTML comments are hidden on GitHub and GitLab; Bitbucket shows
+/// them, so it is not added there.
+///
+/// ```text
+/// <!-- kaniscope-verdict: {"recommendation":"APPROVE WITH CHANGES","blocking":0,"high":1,"medium":2,"low":0,"other":0,"pre_existing":0,"capped":false} -->
+/// ```
+///
+/// `recommendation` is always one of the three canonical values, never the
+/// model's own wording: free text could carry `-->` and end the comment early,
+/// and a PR can steer what the model writes. The counts are of the findings
+/// posted, after `MAX_FINDINGS`; `capped` is true when that cap cut some, in which
+/// case the counts understate and the recommendation (computed before the cap)
+/// does not.
+pub(crate) fn verdict_marker(recommendation: &str, findings: &[Finding], capped: bool) -> String {
+    let canonical = match recommendation_rank(recommendation) {
+        2 => "BLOCK",
+        1 => "APPROVE WITH CHANGES",
+        _ => "APPROVE",
+    };
+    let mut counts = [0usize; 6]; // blocking, high, medium, low, other, pre-existing
+    for f in findings {
+        if is_pre_existing(&f.severity) {
+            counts[5] += 1;
+            continue;
+        }
+        // Exactly as `severity_rank` reads it, so the marker can never count a
+        // finding as HIGH that the sort and the recommendation treated as LOW.
+        let i = match f.severity.to_uppercase().as_str() {
+            "BLOCKING" => 0,
+            "HIGH" => 1,
+            "MEDIUM" => 2,
+            "LOW" => 3,
+            _ => 4,
+        };
+        counts[i] += 1;
+    }
+    let v = serde_json::json!({
+        "recommendation": canonical,
+        "blocking": counts[0],
+        "high": counts[1],
+        "medium": counts[2],
+        "low": counts[3],
+        "other": counts[4],
+        "pre_existing": counts[5],
+        "capped": capped,
+    });
+    format!("\n\n<!-- kaniscope-verdict: {v} -->")
+}
+
+/// Whether a provider renders HTML comments invisibly, so a hidden marker can go
+/// in a comment without showing up as text.
+fn hides_html_comments(provider: &str) -> bool {
+    matches!(provider, "github" | "gitlab")
+}
+
+/// [`REPO_CONFIG_CHANGE_NOTE`]'s twin: a PR editing a review rule file is reviewed under
+/// the base branch's copy, for the same reason.
+const RULE_FILE_CHANGE_NOTE: &str = "\n\n_This PR changes a file the reviewer reads \
+     rules from (`REVIEW.md`, `.cursor/BUGBOT.md`, or the review section of `AGENTS.md`). \
+     Rules are read from the base branch, so any rule change in it takes effect once \
+     merged._";
+
+/// Whether a diff touches one of the [`crate::repo_rules::RULE_FILES`].
+fn diff_touches_rule_file(diff: &str) -> bool {
+    diff.lines().any(|l| {
+        ["--- a/", "+++ b/", "rename from ", "rename to "]
+            .iter()
+            .find_map(|prefix| l.strip_prefix(prefix))
+            .is_some_and(|p| crate::repo_rules::RULE_FILES.iter().any(|f| f.path == p))
+    })
+}
+
+/// The changed paths a path instruction can apply to: every file in the diff
+/// that the include/exclude globs let through to review.
+fn reviewed_paths(cfg: &Config, raw_diff: &str) -> Vec<String> {
+    crate::diff::split_diff_sections(raw_diff)
+        .into_iter()
+        .map(|(path, _)| path)
+        .filter(|p| crate::diff::path_matches_globs(p, &cfg.include_globs, &cfg.exclude_globs))
+        .collect()
+}
+
+/// `cfg` with the path instructions that apply to this diff merged in.
+fn scoped_to_diff(cfg: &Config, raw_diff: &str) -> Config {
+    let mut scoped = cfg.clone();
+    crate::repo_rules::apply_path_instructions(&mut scoped, &reviewed_paths(cfg, raw_diff));
+    scoped
+}
+
 /// Whether a unified diff adds, removes, changes or renames the root
 /// `.prbot.toml`. A pure rename has no `---`/`+++` lines, only the
 /// `rename from`/`rename to` headers.
@@ -878,11 +1181,13 @@ fn diff_touches_repo_config(diff: &str) -> bool {
 }
 
 /// The summary comment: overall + recommendation + any findings that couldn't be
-/// anchored to a diff line (line-anchored ones go inline).
+/// anchored to a diff line (line-anchored ones go inline), then the findings held
+/// back by the inline severity floor.
 fn render_summary(
     review: &Review,
     recommendation: &str,
     unanchored: &[&Finding],
+    quiet: &[&Finding],
     inline_count: usize,
 ) -> String {
     let mut s = format!(
@@ -894,26 +1199,40 @@ fn render_summary(
         s.push_str(&format!("\n\n_{inline_count} inline comment(s) below._"));
     }
     if unanchored.is_empty() {
-        if inline_count == 0 {
+        if inline_count == 0 && quiet.is_empty() {
             s.push_str("\n\nNo blocking issues found.");
         }
     } else {
         s.push_str("\n\n## Findings");
-        for f in unanchored {
-            let loc = match f.line {
-                Some(l) => format!("`{}` (~{l})", f.file),
-                None => format!("`{}`", f.file),
-            };
-            s.push_str(&format!(
-                "\n- {} **{}** — {loc} — {}",
-                severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
-                f.body.trim()
-            ));
-        }
+        push_finding_lines(&mut s, unanchored);
+    }
+    // Collapsed, because the point of the floor is that these do not compete for
+    // attention with what was posted inline. Still listed, so nothing is lost.
+    if !quiet.is_empty() {
+        s.push_str(&format!(
+            "\n\n<details>\n<summary>{} lower-severity finding(s), not posted inline</summary>\n",
+            quiet.len()
+        ));
+        push_finding_lines(&mut s, quiet);
+        s.push_str("\n\n</details>");
     }
     s.push_str("\n\n_Automated advisory review — a human still owns the merge decision._");
     s
+}
+
+fn push_finding_lines(s: &mut String, findings: &[&Finding]) {
+    for f in findings {
+        let loc = match f.line {
+            Some(l) => format!("`{}` (~{l})", f.file),
+            None => format!("`{}`", f.file),
+        };
+        s.push_str(&format!(
+            "\n- {} **{}** — {loc} — {}",
+            severity_emoji(&f.severity),
+            severity_label(&f.severity),
+            f.body.trim()
+        ));
+    }
 }
 
 /// How much of the change map this configuration will actually render.
@@ -1098,6 +1417,7 @@ pub async fn post_review_queued(provider_name: &str, cfg: &Config, repo: &str, p
     let post = ReviewPost {
         summary: render_queued(),
         inline: Vec::new(),
+        held: Vec::new(),
     };
     let client = reqwest::Client::new();
     if let Err(e) = provider.post_review(&client, cfg, &meta, &post).await {
@@ -1158,6 +1478,7 @@ pub async fn post_review_failure(
     let post = ReviewPost {
         summary: render_failed(err),
         inline: Vec::new(),
+        held: Vec::new(),
     };
     let client = reqwest::Client::new();
     if let Err(e) = provider.post_review(&client, cfg, &meta, &post).await {
@@ -1246,15 +1567,37 @@ pub(crate) async fn run_agentic(
 /// finding in its own right — on BOTH paths, since the PR path is where the risk
 /// is real. That is a separate change, not a reason to make this one asymmetric.
 fn load_local_repo_config(base: &Config, repo_root: Option<&std::path::Path>) -> Config {
-    local_repo_config_source(base, repo_root).0
+    local_review_config_source(base, repo_root).0
 }
 
-/// [`load_local_repo_config`], plus an account of what happened.
+/// [`local_repo_config_source`] plus the repository's own rule files: the config
+/// a review runs under, with an account of what happened.
 ///
 /// The review path wants only the merged config; `kaniscope get-rules` wants to
 /// say which file was read, or why none was. Both come from here so the answer a
 /// caller is given is the answer the review actually used — a second resolution
 /// written for the reporting path is a second thing to drift.
+///
+/// Commands that are not reviews (`/ask`, findings) use the plain `.prbot.toml`
+/// merge instead, so they neither fetch rule files nor carry review rubric text
+/// into prompts that do a different job.
+pub(crate) fn local_review_config_source(
+    base: &Config,
+    repo_root: Option<&std::path::Path>,
+) -> (Config, crate::rules::RepoConfigSource) {
+    let (mut cfg, source) = local_repo_config_source(base, repo_root);
+    // Rule files are read after `.prbot.toml` is merged, so `repo_rules = false`
+    // there turns them off. The local operator owns the checkout, so its working
+    // tree is the trusted copy, as it is for `.prbot.toml`.
+    if cfg.repo_rules {
+        if let Some(root) = repo_root {
+            crate::repo_rules::apply_rule_files(&mut cfg, crate::repo_rules::read_local(root));
+        }
+    }
+    (cfg, source)
+}
+
+/// The checkout's `.prbot.toml` merged over `base`, and what happened reading it.
 pub(crate) fn local_repo_config_source(
     base: &Config,
     repo_root: Option<&std::path::Path>,
@@ -1338,9 +1681,63 @@ pub(crate) async fn load_repo_config(
         .0
 }
 
-/// [`load_repo_config`], plus an account of what happened — the remote twin of
-/// [`local_repo_config_source`], and shared with `kaniscope get-rules` for the
-/// same reason.
+/// [`remote_repo_config_source`] plus the rule files on the base branch: the
+/// config a review runs under — the remote twin of [`local_review_config_source`],
+/// and shared with `kaniscope get-rules` for the same reason. See that function
+/// for why non-review commands do not use it.
+pub(crate) async fn review_config_source(
+    provider: &Provider,
+    client: &reqwest::Client,
+    base: &Config,
+    repo: &str,
+    meta: &PrMeta,
+) -> (Config, crate::rules::RepoConfigSource) {
+    let (mut cfg, source) = remote_repo_config_source(provider, client, base, repo, meta).await;
+    if cfg.repo_rules {
+        let found = remote_rule_files(provider, client, &cfg, repo, meta).await;
+        crate::repo_rules::apply_rule_files(&mut cfg, found);
+    }
+    (cfg, source)
+}
+
+/// The rule files present on the PR's base branch, as `(label, text)`.
+///
+/// The base branch for the same reason as `.prbot.toml`: a rule file the PR
+/// edits must not govern its own review. No base branch, no rules. Every fetch
+/// error is skipped: a repository without these files is the normal case.
+async fn remote_rule_files(
+    provider: &Provider,
+    client: &reqwest::Client,
+    cfg: &Config,
+    repo: &str,
+    meta: &PrMeta,
+) -> Vec<(String, String)> {
+    let Some(git_ref) = meta.base_branch.as_deref().filter(|b| !b.is_empty()) else {
+        return Vec::new();
+    };
+    // Sequential: three small contents-API calls, and running them concurrently
+    // would need a dependency (`futures`) this crate does not otherwise carry.
+    let mut found = Vec::new();
+    for f in crate::repo_rules::RULE_FILES {
+        match provider
+            .get_file_contents(client, cfg, repo, git_ref, f.path)
+            .await
+        {
+            Ok(Some(raw)) => {
+                if let Some(text) = crate::repo_rules::rule_text(f, &raw) {
+                    tracing::info!("repo rules: read {repo}@{git_ref}:{}", f.path);
+                    found.push((crate::repo_rules::label_for(f), text));
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::debug!("repo rules: {repo}@{git_ref}:{} not read: {e:#}", f.path),
+        }
+    }
+    found
+}
+
+/// [`load_repo_config`], plus an account of what happened: the base branch's
+/// `.prbot.toml` merged over `base`.
 pub(crate) async fn remote_repo_config_source(
     provider: &Provider,
     client: &reqwest::Client,
@@ -1439,7 +1836,7 @@ fn render_no_review_summary(
             s.push_str(&format!(
                 "\n- {} **{}** — `{}` — {}",
                 severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
+                severity_label(&f.severity),
                 f.file,
                 f.body.trim()
             ));
@@ -1473,6 +1870,7 @@ async fn post_advisory_only(
     let post = ReviewPost {
         summary: summary.clone(),
         inline: Vec::new(),
+        held: Vec::new(),
     };
     let mut out = RunReviewOutput {
         provider: provider.name().to_string(),
@@ -1490,6 +1888,7 @@ async fn post_advisory_only(
         comment_url: None,
         summary_markdown: summary,
         usage: None,
+        reused: false,
     };
     if !input.dry_run {
         out.comment_url = provider.post_review(client, cfg, meta, &post).await?;
@@ -1797,6 +2196,8 @@ struct FinishedReview {
     recommendation: String,
     summary: String,
     inline: Vec<InlineComment>,
+    /// Findings held back by the inline severity floor — see [`ReviewPost::held`].
+    held: Vec<InlineComment>,
     /// Per-stage survivor counts through the post-processing above. Collected
     /// here because this is the only place they exist: every stage consumes its
     /// predecessor's vector, so a caller holding only the final findings cannot
@@ -2130,9 +2531,12 @@ async fn finish_review(
     // that states the count — before the sort, so the survivor competes on merit.
     findings = collapse_bursts(findings);
     funnel.after_collapse = findings.len();
+    // Pre-existing ranks with LOW but sorts after it, so under `MAX_FINDINGS` a
+    // defect the change did not introduce never pushes out one it did.
     findings.sort_by(|a, b| {
         severity_rank(&b.severity)
             .cmp(&severity_rank(&a.severity))
+            .then(is_pre_existing(&a.severity).cmp(&is_pre_existing(&b.severity)))
             .then(b.confidence.unwrap_or(0).cmp(&a.confidence.unwrap_or(0)))
     });
     // Recommendation reflects the *merged* findings (incl. deterministic hygiene the
@@ -2179,8 +2583,16 @@ async fn finish_review(
     // rejects an out-of-diff anchor.
     let mut inline: Vec<InlineComment> = Vec::new();
     let mut unanchored: Vec<&Finding> = Vec::new();
+    // Below the inline floor: listed in the summary, never posted on a line.
+    let mut quiet: Vec<&Finding> = Vec::new();
+    let floor = cfg.inline_floor();
     let mut anchors: Vec<Option<u64>> = Vec::with_capacity(findings.len());
     for f in &findings {
+        if floor.is_some_and(|min| severity_rank(&f.severity) < min) {
+            anchors.push(None);
+            quiet.push(f);
+            continue;
+        }
         let mut anchor = f.line.filter(|l| {
             anchorable(
                 *l,
@@ -2236,16 +2648,40 @@ async fn finish_review(
     }
 
     // `recommendation` was computed from the pre-truncation findings above.
-    let summary = render_summary(&result.review, &recommendation, &unanchored, inline.len());
+    let summary = render_summary(
+        &result.review,
+        &recommendation,
+        &unanchored,
+        &quiet,
+        inline.len(),
+    );
 
     funnel.anchored = inline.len();
     funnel.unanchored = unanchored.len();
+    funnel.held_back = quiet.len();
+    // What reconciliation needs to keep a held-back finding's old thread: where
+    // it is and what it says. The body is rendered the way an inline comment is,
+    // because that rendering is what earlier threads were fingerprinted from; a
+    // raw model body would never match one. It still includes the severity, so a
+    // finding posted as HIGH and now held as LOW (or posted with a suggestion)
+    // pairs by nearby line only. `line` 0 when the model gave none, which then
+    // pairs by fingerprint or not at all.
+    let held: Vec<InlineComment> = quiet
+        .iter()
+        .map(|f| InlineComment {
+            path: f.file.clone(),
+            line: f.line.unwrap_or(0),
+            start_line: None,
+            body: inline_body(f),
+        })
+        .collect();
 
     FinishedReview {
         findings,
         recommendation,
         summary,
         inline,
+        held,
         funnel,
         typed_lines,
         anchors,
@@ -2286,34 +2722,16 @@ pub async fn run_review_with(
     // Merge an optional per-repo `.prbot.toml` (fetched from the PR head) over the
     // env config; shadow `cfg` so every step below — glob filter, model choice,
     // agentic decision, self-critique, caps, and prompt — honors the overrides.
-    let effective = load_repo_config(&provider, &client, cfg, &input.repo, &meta).await;
+    let effective = review_config_source(&provider, &client, cfg, &input.repo, &meta)
+        .await
+        .0;
     let cfg = &effective;
 
-    // Instant feedback: drop a "Reviewing…" summary comment before the slow LLM
-    // call. It's upserted, so the real review updates this same comment.
-    // Whether a placeholder actually went up — not merely whether one was asked
-    // for. The nothing-to-review path below replaces it only if it exists, so a
-    // failed placeholder post must not turn into a comment on a silent PR.
-    let mut placeholder_posted = false;
-    if input.placeholder && !input.dry_run {
-        let pending = ReviewPost {
-            summary: render_pending(),
-            inline: Vec::new(),
-        };
-        match provider.post_review(&client, cfg, &meta, &pending).await {
-            Ok(_) => placeholder_posted = true,
-            Err(e) => tracing::warn!(
-                "placeholder comment failed for {}#{}: {e:#}",
-                input.repo,
-                input.pr
-            ),
-        }
-    }
-
+    // Fetched before the placeholder, because the placeholder overwrites the
+    // summary — and the summary is where the last review's key is read from.
     let raw_diff = provider
         .get_diff(&client, cfg, &input.repo, input.pr)
         .await?;
-
     // Dependency vulnerability scan runs on the RAW diff: lockfiles are dropped
     // by the glob filter below (and never reach the LLM), so we must read added
     // dependency lines before that. Fully fail-open — returns [] on any error.
@@ -2325,6 +2743,47 @@ pub async fn run_review_with(
             input.repo,
             input.pr
         );
+    }
+
+    // Path instructions need the changed files, so they are merged here rather
+    // than with the rest of `.prbot.toml` — and before the key, since they change
+    // the prompt and so the review.
+    let scoped = scoped_to_diff(cfg, &raw_diff);
+    let cfg = &scoped;
+    let key = review_key(cfg, &raw_diff, &meta);
+    // Never reuse over an advisory: OSV learns about vulnerabilities after the
+    // last review ran, and the scan is the one part of a review that can change
+    // with nothing in the PR changing. An empty list only counts when the scan
+    // actually finished (or was turned off): a failed or truncated scan also
+    // returns nothing.
+    let scan_settled = scan_status.verified() || scan_status == crate::deps::ScanStatus::Disabled;
+    if cfg.reuse_unchanged_review && !input.dry_run && advisories.is_empty() && scan_settled {
+        if let Some(out) = reusable_review(&provider, &client, cfg, &input, &key, scan_status).await
+        {
+            return Ok(out);
+        }
+    }
+
+    // Instant feedback: drop a "Reviewing…" summary comment before the slow LLM
+    // call. It's upserted, so the real review updates this same comment.
+    // Whether a placeholder actually went up — not merely whether one was asked
+    // for. The nothing-to-review path below replaces it only if it exists, so a
+    // failed placeholder post must not turn into a comment on a silent PR.
+    let mut placeholder_posted = false;
+    if input.placeholder && !input.dry_run {
+        let pending = ReviewPost {
+            summary: render_pending(),
+            inline: Vec::new(),
+            held: Vec::new(),
+        };
+        match provider.post_review(&client, cfg, &meta, &pending).await {
+            Ok(_) => placeholder_posted = true,
+            Err(e) => tracing::warn!(
+                "placeholder comment failed for {}#{}: {e:#}",
+                input.repo,
+                input.pr
+            ),
+        }
     }
 
     let prepared = prepare_diff(cfg, &raw_diff);
@@ -2385,6 +2844,7 @@ pub async fn run_review_with(
             let note = ReviewPost {
                 summary: render_no_review_summary(&[], &[]),
                 inline: Vec::new(),
+                held: Vec::new(),
             };
             provider
                 .post_review(&client, cfg, &meta, &note)
@@ -2524,6 +2984,12 @@ pub async fn run_review_with(
     if diff_touches_repo_config(&raw_diff) {
         finished.summary.push_str(REPO_CONFIG_CHANGE_NOTE);
     }
+    if cfg.repo_rules && diff_touches_rule_file(&raw_diff) {
+        finished.summary.push_str(RULE_FILE_CHANGE_NOTE);
+    }
+    finished
+        .summary
+        .push_str(&crate::repo_rules::rules_note(cfg));
     // Derived renderings of the change, appended last: they describe what the PR
     // touched, which is context for the findings above rather than a finding
     // itself. Both collapse into `<details>`, so a reader who wants only the
@@ -2541,14 +3007,29 @@ pub async fn run_review_with(
         recommendation,
         summary,
         inline,
+        held,
         funnel,
         typed_lines,
         anchors,
     } = finished;
     let inline_count = inline.len();
+    let mut summary = summary;
+    if hides_html_comments(provider.name()) {
+        let capped = funnel.after_collapse > funnel.posted_findings;
+        summary.push_str(&verdict_marker(&recommendation, &findings, capped));
+    }
+    // Read back by the next automatic review to tell whether anything changed.
+    // GitHub only: it is the one provider whose summary can be read back, and
+    // HTML comments are hidden there. Not on a review salvaged from a truncated
+    // model response: it is partial by definition, and keyed it would be reused,
+    // partial, for as long as the PR stays unchanged.
+    if provider.name() == "github" && !truncated {
+        summary.push_str(&format!("\n\n{REVIEW_KEY_MARKER}{key} -->"));
+    }
     let post = ReviewPost {
         summary: summary.clone(),
         inline,
+        held,
     };
 
     let mut out = RunReviewOutput {
@@ -2567,6 +3048,7 @@ pub async fn run_review_with(
         comment_url: None,
         summary_markdown: summary,
         usage: result.usage,
+        reused: false,
     };
 
     if !input.dry_run {
@@ -2681,6 +3163,8 @@ pub async fn run_review_local(
         author_permission: None,
     };
 
+    let scoped = scoped_to_diff(cfg, &input.diff);
+    let cfg = &scoped;
     let prepared = prepare_diff(cfg, &input.diff);
     if prepared.diff.trim().is_empty() {
         // No LLM review is possible, but a hygiene finding on an excluded file (a
@@ -2713,6 +3197,7 @@ pub async fn run_review_local(
                 comment_url: None,
                 summary_markdown: summary,
                 usage: None,
+                reused: false,
             });
         }
         return Err(NothingToReview { local: true }.into());
@@ -2790,6 +3275,9 @@ pub async fn run_review_local(
     finished.funnel.samples = samples;
     finished.funnel.sample_total = sample_total;
     finished.funnel.sample_agreement = agreement;
+    finished
+        .summary
+        .push_str(&crate::repo_rules::rules_note(cfg));
     // Same feature on this path: a local review's deliverable *is* its
     // `summary_markdown`, so leaving it unwired made WALKTHROUGH/DIAGRAM silently
     // a no-op for every caller of this entry point.
@@ -2817,6 +3305,7 @@ pub async fn run_review_local(
         comment_url: None,
         summary_markdown: finished.summary,
         usage: result.usage,
+        reused: false,
     })
 }
 
@@ -3045,6 +3534,60 @@ mod local_review_tests {
             !seen[0].had_provider,
             "no provider is invented for a local diff"
         );
+    }
+
+    /// Quiet mode: a finding below the inline floor is listed in the summary and
+    /// never posted on a line, even though it anchors.
+    #[tokio::test]
+    async fn a_finding_below_the_inline_floor_goes_to_the_summary_only() {
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.inline_min_severity = "HIGH".into();
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: None,
+                label: "branch".to_string(),
+                change_intent: None,
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert_eq!(out.inline_posted, 0, "MEDIUM is below a HIGH floor");
+        assert!(out
+            .summary_markdown
+            .contains("1 lower-severity finding(s), not posted inline"));
+        assert!(out.summary_markdown.contains("can overflow on a long list"));
+        assert!(
+            !out.summary_markdown.contains("No blocking issues found"),
+            "a held-back finding is still a finding"
+        );
+        assert_eq!(out.findings_detail.len(), 1, "nothing is dropped");
+    }
+
+    /// At or above the floor, a finding posts inline exactly as before.
+    #[tokio::test]
+    async fn a_finding_at_the_inline_floor_still_posts_inline() {
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.inline_min_severity = "medium".into();
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: None,
+                label: "branch".to_string(),
+                change_intent: None,
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+        assert_eq!(out.inline_posted, 1);
+        assert!(!out.summary_markdown.contains("not posted inline"));
     }
 
     /// A finding on a line the diff doesn't contain must fold into the summary
@@ -3964,6 +4507,17 @@ mod orchestrator_tests {
                 })))
                 .mount(&s)
                 .await;
+            // A rule file, served per ref the same way: only the base's may apply.
+            let review_md = format!("{rule}-REVIEW-MD");
+            Mock::given(method("GET"))
+                .and(path("/repos/o/r/contents/REVIEW.md"))
+                .and(query_param("ref", git_ref))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "content": base64::engine::general_purpose::STANDARD.encode(review_md),
+                    "encoding": "base64",
+                })))
+                .mount(&s)
+                .await;
         }
         s
     }
@@ -4084,6 +4638,194 @@ mod orchestrator_tests {
             assert!(p.contains("BASE-RULE"), "base settings not applied: {p}");
             assert!(!p.contains("HEAD-RULE"), "head settings applied: {p}");
         }
+    }
+
+    /// An automatic re-review that would see exactly what the last one saw leaves
+    /// that review in place and runs no model. Nothing is posted: an unmocked
+    /// POST would fail the test.
+    #[tokio::test]
+    async fn an_unchanged_pr_reuses_its_last_review() {
+        let srv = github_stub_trust(DIFF, "write").await;
+        let cfg = cfg_for(&srv.uri());
+        let spy = CloneSpy {
+            may_clone: Arc::default(),
+            prompts: Arc::default(),
+        };
+        let first = run_review_with(&cfg, input(), &spy)
+            .await
+            .expect("first review");
+        assert!(first.summary_markdown.contains(super::REVIEW_KEY_MARKER));
+        let calls_after_first = spy.prompts.lock().unwrap().len();
+
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 7,
+                    "body": format!("{}\n\n_{}_", first.summary_markdown, cfg.comment_marker),
+                }])),
+            )
+            .mount(&srv)
+            .await;
+        let mut real = input();
+        real.dry_run = false;
+        let second = run_review_with(&cfg, real, &spy)
+            .await
+            .expect("reused review");
+        assert!(second.reused, "an identical PR must reuse its review");
+        assert!(!second.posted);
+        assert_eq!(
+            spy.prompts.lock().unwrap().len(),
+            calls_after_first,
+            "no model call on a reused review"
+        );
+    }
+
+    /// A changed setting is a different review, even on the same diff.
+    #[test]
+    fn the_review_key_follows_the_diff_and_the_settings() {
+        let m = crate::providers::PrMeta {
+            repo: "o/r".into(),
+            pr: 1,
+            title: Some("t".into()),
+            base_branch: Some("main".into()),
+            head_sha: Some("abc".into()),
+            body: Some("why".into()),
+            ci_status: None,
+            author_permission: Some("write".into()),
+        };
+        let key =
+            |c: &Config, d: &str, meta: &crate::providers::PrMeta| super::review_key(c, d, meta);
+        let a = Config::from_env();
+        let mut b = a.clone();
+        b.max_findings += 1;
+        assert_eq!(key(&a, DIFF, &m), key(&a, DIFF, &m));
+        assert_ne!(key(&a, DIFF, &m), key(&b, DIFF, &m));
+        // A rebase shifts hunk headers and blob ids, not the change.
+        let rebased = DIFF
+            .replace("@@ -1,", "@@ -40,")
+            .replace("index ", "index ff");
+        assert_eq!(key(&a, DIFF, &m), key(&a, &rebased, &m));
+        assert_ne!(key(&a, DIFF, &m), key(&a, &format!("{DIFF}+added\n"), &m));
+        // Changed surroundings are a different review.
+        let new_context = DIFF.replace(" fn alpha", " fn gamma");
+        assert_ne!(new_context, DIFF, "the fixture must have that context line");
+        assert_ne!(key(&a, DIFF, &m), key(&a, &new_context, &m));
+        // What the reviewer is told about the PR is part of the review.
+        let mut retitled = m.clone();
+        retitled.title = Some("other".into());
+        assert_ne!(key(&a, DIFF, &m), key(&a, DIFF, &retitled));
+        let mut outsider = m.clone();
+        outsider.author_permission = Some("read".into());
+        assert_ne!(key(&a, DIFF, &m), key(&a, DIFF, &outsider));
+    }
+
+    /// The verdict a CI step can read off the PR: hidden, and counted per severity.
+    #[tokio::test]
+    async fn a_github_summary_carries_a_machine_readable_verdict() {
+        let (_, _, summary) = review_as(DIFF, "write").await;
+        let line = summary
+            .lines()
+            .find(|l| l.starts_with("<!-- kaniscope-verdict: "))
+            .unwrap_or_default();
+        assert!(
+            line.starts_with("<!-- kaniscope-verdict: "),
+            "the summary must carry the verdict: {summary}"
+        );
+        let json = line
+            .trim_start_matches("<!-- kaniscope-verdict: ")
+            .trim_end_matches(" -->");
+        let v: serde_json::Value = serde_json::from_str(json).expect("the verdict is JSON");
+        assert!(v["recommendation"].is_string());
+        for k in ["blocking", "high", "medium", "low", "other", "pre_existing"] {
+            assert!(v[k].is_u64(), "{k} missing: {v}");
+        }
+    }
+
+    #[test]
+    fn the_verdict_counts_each_severity() {
+        let f = |sev: &str| crate::llm::Finding {
+            severity: sev.into(),
+            file: "a.rs".into(),
+            line: Some(1),
+            body: "b".into(),
+            confidence: None,
+            suggestion: None,
+            existing_code: None,
+            end_line: None,
+            samples: None,
+        };
+        let m = super::verdict_marker(
+            "BLOCK",
+            &[f("BLOCKING"), f("high"), f("HIGH"), f("odd")],
+            false,
+        );
+        assert!(m.contains(r#""capped":false"#), "{m}");
+        assert!(
+            m.contains(r#""blocking":1"#) && m.contains(r#""high":2"#),
+            "{m}"
+        );
+        assert!(
+            m.contains(r#""other":1"#) && m.contains(r#""recommendation":"BLOCK""#),
+            "{m}"
+        );
+        assert!(!super::hides_html_comments("bitbucket"));
+    }
+
+    /// A model's free-text recommendation never reaches the marker: it could
+    /// close the HTML comment and spill the rest onto the PR.
+    #[test]
+    fn the_verdict_carries_only_a_canonical_recommendation() {
+        let m = super::verdict_marker("we should BLOCK --> <b>fake</b>", &[], true);
+        assert!(m.contains(r#""recommendation":"BLOCK""#), "{m}");
+        assert_eq!(
+            m.matches("-->").count(),
+            1,
+            "only the marker's own close: {m}"
+        );
+        assert!(m.contains(r#""capped":true"#));
+    }
+
+    /// `REVIEW.md` is a rule file the PR could edit, so it too is read from the
+    /// base branch only — and the summary names it as a rule source.
+    #[tokio::test]
+    async fn review_md_is_read_from_the_base_branch_and_named_in_the_summary() {
+        let (_, prompts, summary) = review_as(DIFF, "write").await;
+        for p in &prompts {
+            assert!(
+                p.contains("BASE-RULE-REVIEW-MD"),
+                "base REVIEW.md not applied: {p}"
+            );
+            assert!(
+                !p.contains("HEAD-RULE-REVIEW-MD"),
+                "head REVIEW.md applied: {p}"
+            );
+        }
+        assert!(
+            summary.contains("Repository rules applied: `.prbot.toml` instructions, `REVIEW.md`"),
+            "{summary}"
+        );
+    }
+
+    /// `repo_rules = false` in the base branch's `.prbot.toml` turns rule files off.
+    #[test]
+    fn repo_rules_can_be_turned_off_per_repo() {
+        let base = Config::from_env();
+        let rc = crate::repo_config::parse("repo_rules = false\n").unwrap();
+        assert!(!base.with_repo_overrides(&rc).repo_rules);
+    }
+
+    #[tokio::test]
+    async fn a_pr_that_edits_a_rule_file_is_told_its_change_applies_after_merge() {
+        let diff = format!(
+            "{DIFF}diff --git a/REVIEW.md b/REVIEW.md\n--- a/REVIEW.md\n+++ b/REVIEW.md\n\
+             @@ -1 +1 @@\n-old\n+new\n"
+        );
+        let (_, _, summary) = review_as(&diff, "admin").await;
+        assert!(
+            summary.contains("This PR changes a file the reviewer reads rules from"),
+            "{summary}"
+        );
     }
 
     #[tokio::test]
@@ -6038,6 +6780,7 @@ mod placeholder_tests {
                 findings: vec![],
             },
             "APPROVE",
+            &[],
             &[],
             0,
         );

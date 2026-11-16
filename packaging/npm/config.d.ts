@@ -67,6 +67,8 @@ export interface ReviewConfig {
   grepContext?: boolean;
   /** If set, ONLY files matching these globs are reviewed. (`INCLUDE_GLOBS`) */
   includeGlobs?: string[];
+  /** Lowest severity posted as an inline comment (BLOCKING, HIGH, MEDIUM, LOW). Findings below it are listed in the summary instead. Unset posts everything inline. (`INLINE_MIN_SEVERITY`) */
+  inlineMinSeverity?: string;
   /** OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 for Ollama. Default: `https://openrouter.ai/api/v1`. (`LLM_BASE_URL`) */
   llmBaseUrl?: string;
   /** Size budget for the packed diff. Beyond it, whole files are ranked and dropped rather than truncated mid-hunk. Default: `200000`. (`MAX_DIFF_CHARS`) */
@@ -111,6 +113,10 @@ export interface ReviewConfig {
   changeIntentMaxChars?: number;
   /** Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. Default: `true`. (`REANCHOR_FINDINGS`) */
   reanchorFindings?: boolean;
+  /** Read the review rules a repo already has (REVIEW.md, .cursor/BUGBOT.md, the review section of AGENTS.md) from the base branch, and list them in the summary. Default: `true`. (`REPO_RULES`) */
+  repoRules?: boolean;
+  /** Skip the model on an automatic re-review that would see the same changed lines under the same settings and rules (a rebase, an empty commit), and leave the last review in place. An explicit /review always runs. Default: `true`. (`REUSE_UNCHANGED_REVIEW`) */
+  reuseUnchangedReview?: boolean;
   /** Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. Default: `false`. (`REVIEW_ON_UPDATE`) */
   reviewOnUpdate?: boolean;
   /** Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. Default: `1`. (`REVIEW_SAMPLES`) */
