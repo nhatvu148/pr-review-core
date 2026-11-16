@@ -974,10 +974,21 @@ async fn reusable_review(
     );
     // Not parseable, not reused: reporting a guessed APPROVE for a review that
     // said BLOCK would be worse than running it again.
-    let Some(recommendation) = body
+    // From the verdict marker when present: it is canonical and never model
+    // text. Otherwise the LAST recommendation line, because the model's own
+    // summary sits above the real one and could contain a line that looks like it.
+    let from_verdict = body
         .lines()
-        .find_map(|l| l.strip_prefix("**Recommendation:** "))
-        .map(|r| r.trim().to_string())
+        .find_map(|l| l.strip_prefix("<!-- kaniscope-verdict: "))
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j.trim_end_matches(" -->")).ok())
+        .and_then(|v| v["recommendation"].as_str().map(str::to_string));
+    let Some(recommendation) = from_verdict
+        .or_else(|| {
+            body.lines()
+                .filter_map(|l| l.strip_prefix("**Recommendation:** "))
+                .last()
+                .map(|r| r.trim().to_string())
+        })
         .filter(|r| !r.is_empty())
     else {
         tracing::debug!("reuse check: no recommendation line in the summary; reviewing");
