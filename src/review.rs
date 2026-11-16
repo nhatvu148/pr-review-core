@@ -827,11 +827,13 @@ const REVIEW_KEY_MARKER: &str = "<!-- kaniscope-review-key: ";
 /// moved base shifts line numbers and blob ids without changing what the PR
 /// shows — and that is exactly the re-review this exists to skip. Context lines
 /// stay in: they are part of the prompt, so changed surroundings are a new key.
-/// An agentic review also reads files outside the diff; a base change there is
-/// not seen by this key. Settings come
+/// The PR's title, its description (when `PR_BODY` is on) and whether its author
+/// may be cloned are in too, since the reviewer is given all three. An agentic
+/// review also reads files outside the diff; a base change there is not seen by
+/// this key, nor is a change in CI results. Settings come
 /// from [`crate::rules::ReviewSettings`], the same allowlist `get-rules` shows,
 /// so a changed model, cap or floor is a new key.
-pub(crate) fn review_key(cfg: &Config, raw_diff: &str) -> String {
+pub(crate) fn review_key(cfg: &Config, raw_diff: &str, meta: &PrMeta) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for line in raw_diff.lines() {
@@ -851,6 +853,17 @@ pub(crate) fn review_key(cfg: &Config, raw_diff: &str) -> String {
     );
     h.update(b"\0rules\0");
     h.update(crate::prompt::injected_rules(cfg).as_bytes());
+    // What the reviewer is told about the PR, and whether it may clone it. CI
+    // results are left out on purpose: they change on every push, so keying on
+    // them would mean nothing is ever reused.
+    h.update(b"\0meta\0");
+    h.update(meta.title.as_deref().unwrap_or_default().as_bytes());
+    h.update(b"\0");
+    if cfg.pr_body {
+        h.update(meta.body.as_deref().unwrap_or_default().as_bytes());
+    }
+    h.update(b"\0");
+    h.update(author_may_clone(meta).to_string().as_bytes());
     hex::encode(&h.finalize()[..8])
 }
 
@@ -2298,8 +2311,24 @@ pub async fn run_review_with(
     let raw_diff = provider
         .get_diff(&client, cfg, &input.repo, input.pr)
         .await?;
-    let key = review_key(cfg, &raw_diff);
-    if cfg.reuse_unchanged_review && !input.dry_run {
+    // Dependency vulnerability scan runs on the RAW diff: lockfiles are dropped
+    // by the glob filter below (and never reach the LLM), so we must read added
+    // dependency lines before that. Fully fail-open — returns [] on any error.
+    let (advisories, scan_status) = crate::deps::scan_with_status(&client, cfg, &raw_diff).await;
+    if !advisories.is_empty() {
+        tracing::info!(
+            "OSV: {} dependency advisor(y/ies) for {}#{}",
+            advisories.len(),
+            input.repo,
+            input.pr
+        );
+    }
+
+    let key = review_key(cfg, &raw_diff, &meta);
+    // Never reuse over an advisory: OSV learns about vulnerabilities after the
+    // last review ran, and the scan is the one part of a review that can change
+    // with nothing in the PR changing.
+    if cfg.reuse_unchanged_review && !input.dry_run && advisories.is_empty() {
         if let Some(out) = reusable_review(&provider, &client, cfg, &input, &key).await {
             return Ok(out);
         }
@@ -2319,19 +2348,6 @@ pub async fn run_review_with(
                 input.pr
             ),
         }
-    }
-
-    // Dependency vulnerability scan runs on the RAW diff: lockfiles are dropped
-    // by the glob filter below (and never reach the LLM), so we must read added
-    // dependency lines before that. Fully fail-open — returns [] on any error.
-    let (advisories, scan_status) = crate::deps::scan_with_status(&client, cfg, &raw_diff).await;
-    if !advisories.is_empty() {
-        tracing::info!(
-            "OSV: {} dependency advisor(y/ies) for {}#{}",
-            advisories.len(),
-            input.repo,
-            input.pr
-        );
     }
 
     let prepared = prepare_diff(cfg, &raw_diff);
@@ -4147,27 +4163,40 @@ mod orchestrator_tests {
     /// A changed setting is a different review, even on the same diff.
     #[test]
     fn the_review_key_follows_the_diff_and_the_settings() {
+        let m = crate::providers::PrMeta {
+            repo: "o/r".into(),
+            pr: 1,
+            title: Some("t".into()),
+            base_branch: Some("main".into()),
+            head_sha: Some("abc".into()),
+            body: Some("why".into()),
+            ci_status: None,
+            author_permission: Some("write".into()),
+        };
+        let key =
+            |c: &Config, d: &str, meta: &crate::providers::PrMeta| super::review_key(c, d, meta);
         let a = Config::from_env();
         let mut b = a.clone();
         b.max_findings += 1;
-        assert_eq!(super::review_key(&a, DIFF), super::review_key(&a, DIFF));
-        assert_ne!(super::review_key(&a, DIFF), super::review_key(&b, DIFF));
+        assert_eq!(key(&a, DIFF, &m), key(&a, DIFF, &m));
+        assert_ne!(key(&a, DIFF, &m), key(&b, DIFF, &m));
         // A rebase shifts hunk headers and blob ids, not the change.
         let rebased = DIFF
             .replace("@@ -1,", "@@ -40,")
             .replace("index ", "index ff");
-        assert_eq!(super::review_key(&a, DIFF), super::review_key(&a, &rebased));
-        assert_ne!(
-            super::review_key(&a, DIFF),
-            super::review_key(&a, &format!("{DIFF}+added\n"))
-        );
+        assert_eq!(key(&a, DIFF, &m), key(&a, &rebased, &m));
+        assert_ne!(key(&a, DIFF, &m), key(&a, &format!("{DIFF}+added\n"), &m));
         // Changed surroundings are a different review.
         let new_context = DIFF.replace(" fn alpha", " fn gamma");
         assert_ne!(new_context, DIFF, "the fixture must have that context line");
-        assert_ne!(
-            super::review_key(&a, DIFF),
-            super::review_key(&a, &new_context)
-        );
+        assert_ne!(key(&a, DIFF, &m), key(&a, &new_context, &m));
+        // What the reviewer is told about the PR is part of the review.
+        let mut retitled = m.clone();
+        retitled.title = Some("other".into());
+        assert_ne!(key(&a, DIFF, &m), key(&a, DIFF, &retitled));
+        let mut outsider = m.clone();
+        outsider.author_permission = Some("read".into());
+        assert_ne!(key(&a, DIFF, &m), key(&a, DIFF, &outsider));
     }
 
     #[tokio::test]
