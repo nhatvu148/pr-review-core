@@ -1049,7 +1049,9 @@ fn as_rendered(md: &str) -> String {
                 let run = t.chars().take_while(|x| *x == c).count();
                 if run >= 3 {
                     match fence {
-                        None => fence = Some((c, run)),
+                        // A backtick fence's info string cannot hold a backtick,
+                        // so a line like ```a``` b is inline code, not a fence.
+                        None if c == '~' || !t[run..].contains('`') => fence = Some((c, run)),
                         Some((open, len)) if open == c && run >= len && t.len() == run => {
                             fence = None
                         }
@@ -1373,6 +1375,14 @@ mod tests {
         ] {
             assert_eq!(as_rendered(md), md);
         }
+    }
+
+    #[test]
+    fn inline_code_that_starts_a_line_opens_no_fence() {
+        assert_eq!(
+            as_rendered("```a``` b\n<!-- hidden -->\nend"),
+            "```a``` b\nend"
+        );
     }
 
     #[test]
