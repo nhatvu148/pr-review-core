@@ -129,8 +129,12 @@ pub async fn run_command_with(
 ) -> Result<CommandOutcome> {
     match cmd {
         Command::Review => {
+            // Asked for by a person: always a fresh review, even on an unchanged
+            // PR — wanting another sample is a reason to ask.
+            let mut fresh = cfg.clone();
+            fresh.reuse_unchanged_review = false;
             let out = run_review_with(
-                cfg,
+                &fresh,
                 RunReviewInput {
                     provider: provider_name.to_string(),
                     repo: repo.to_string(),

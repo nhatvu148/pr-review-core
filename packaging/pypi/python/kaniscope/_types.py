@@ -25,6 +25,7 @@ class RunReviewOutput(_RunReviewOutputRequired, total=False):
     commentUrl: Optional[str]
     findingsDetail: List[Finding]
     inlineDetail: List[InlineComment]
+    reused: bool
     usage: Optional[Usage]
 
 

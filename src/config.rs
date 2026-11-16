@@ -224,6 +224,11 @@ pub struct Config {
     /// "Repository rules applied" line. Filled as rules are merged in, never from
     /// the environment.
     pub rule_sources: Vec<String>,
+    /// Skip the model when an automatic re-review would see exactly what the last
+    /// one saw (same changed lines, same settings and rules), and leave that
+    /// review in place. An explicit `/review` always runs. See
+    /// `review::review_key`.
+    pub reuse_unchanged_review: bool,
 
     /// Free-form instructions shaping the `/describe` output — release-notes
     /// sections, a contributor table, a house layout. Appended last to the
@@ -467,6 +472,9 @@ impl Config {
             repo_rules: env_or("REPO_RULES", "true").parse().unwrap_or(true),
             path_instructions: Vec::new(),
             rule_sources: Vec::new(),
+            reuse_unchanged_review: env_or("REUSE_UNCHANGED_REVIEW", "true")
+                .parse()
+                .unwrap_or(true),
 
             describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
 

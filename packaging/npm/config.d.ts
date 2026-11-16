@@ -113,6 +113,8 @@ export interface ReviewConfig {
   reanchorFindings?: boolean;
   /** Read the review rules a repo already has (REVIEW.md, .cursor/BUGBOT.md, the review section of AGENTS.md) from the base branch, and list them in the summary. Default: `true`. (`REPO_RULES`) */
   repoRules?: boolean;
+  /** Skip the model on an automatic re-review that would see the same changed lines under the same settings and rules (a rebase, an empty commit), and leave the last review in place. An explicit /review always runs. Default: `true`. (`REUSE_UNCHANGED_REVIEW`) */
+  reuseUnchangedReview?: boolean;
   /** Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. Default: `false`. (`REVIEW_ON_UPDATE`) */
   reviewOnUpdate?: boolean;
   /** Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. Default: `1`. (`REVIEW_SAMPLES`) */
