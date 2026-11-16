@@ -76,6 +76,11 @@
     "repo": {
       "type": "string"
     },
+    "reused": {
+      "description": "True when no model ran because the PR's changed lines, settings and rules\nwere identical to the last review's, so that review was left in place.\n`summary_markdown` is then the existing summary, and the finding counts are\nzero because nothing new was found, not because the PR is clean.",
+      "type": "boolean",
+      "default": false
+    },
     "summaryMarkdown": {
       "type": "string"
     },

@@ -158,6 +158,22 @@ impl Provider {
         }
     }
 
+    /// The bot's current summary comment on the PR, where the provider supports
+    /// reading it back. `Ok(None)` when there is none, or on a provider that does
+    /// not support it (Bitbucket, GitLab): callers treat that as "no prior review".
+    pub async fn summary_body(
+        &self,
+        client: &Client,
+        cfg: &Config,
+        repo: &str,
+        pr: u64,
+    ) -> Result<Option<String>> {
+        match self {
+            Provider::Github => github::summary_body(client, cfg, repo, pr).await,
+            Provider::Bitbucket | Provider::Gitlab => Ok(None),
+        }
+    }
+
     /// Fetch lightweight PR metadata (title, base branch, head SHA).
     pub async fn get_meta(
         &self,
