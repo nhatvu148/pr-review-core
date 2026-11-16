@@ -2185,15 +2185,17 @@ async fn finish_review(
     funnel.unanchored = unanchored.len();
     funnel.held_back = quiet.len();
     // What reconciliation needs to keep a held-back finding's old thread: where
-    // it is and what it says. `line` 0 when the model gave none, which only
-    // fingerprint matching can then pair.
+    // it is and what it says. The body is rendered the way an inline comment is,
+    // because that rendering is what earlier threads were fingerprinted from; a
+    // raw model body would never match one. `line` 0 when the model gave none,
+    // which reconciliation pairs by fingerprint only.
     let held: Vec<InlineComment> = quiet
         .iter()
         .map(|f| InlineComment {
             path: f.file.clone(),
             line: f.line.unwrap_or(0),
             start_line: None,
-            body: f.body.clone(),
+            body: inline_body(f),
         })
         .collect();
 
