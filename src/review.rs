@@ -105,6 +105,16 @@ pub struct RunReviewOutput {
     pub usage: Option<Usage>,
 }
 
+/// Whether a severity marks a defect the change did not introduce.
+///
+/// Spelled several ways because models do: `PRE-EXISTING`, `PRE_EXISTING`,
+/// `PREEXISTING`. It ranks 0 like LOW, so it never raises the recommendation and
+/// a severity floor holds it back.
+pub(crate) fn is_pre_existing(sev: &str) -> bool {
+    let s: String = sev.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    s.eq_ignore_ascii_case("preexisting")
+}
+
 /// Rank a severity for sorting (higher = more urgent). Unknown severities rank 0.
 pub(crate) fn severity_rank(sev: &str) -> u8 {
     match sev.to_uppercase().as_str() {
@@ -113,6 +123,16 @@ pub(crate) fn severity_rank(sev: &str) -> u8 {
         "MEDIUM" => 1,
         "LOW" => 0,
         _ => 0,
+    }
+}
+
+/// A severity as shown on the PR: upper-cased, with every spelling of the
+/// pre-existing tier shown one way.
+pub(crate) fn severity_label(sev: &str) -> String {
+    if is_pre_existing(sev) {
+        "PRE-EXISTING".to_string()
+    } else {
+        sev.to_uppercase()
     }
 }
 
@@ -127,6 +147,9 @@ pub(crate) fn severity_name(rank: u8) -> &'static str {
 }
 
 pub(crate) fn severity_emoji(sev: &str) -> &'static str {
+    if is_pre_existing(sev) {
+        return "🟣";
+    }
     match sev.to_uppercase().as_str() {
         "BLOCKING" => "🚨",
         "HIGH" => "⚠️",
@@ -161,7 +184,10 @@ mod severity_and_recommendation_tests {
     //! happen to exercise them (`effective_recommendation`, `collapse_bursts`).
     //! A typo in a match arm here (e.g. "BLOKCING") would silently rank a finding
     //! as unknown/LOW rather than fail loudly, so it earns its own direct test.
-    use super::{recommendation_rank, severity_emoji, severity_rank};
+    use super::{
+        effective_recommendation, is_pre_existing, recommendation_rank, severity_emoji,
+        severity_label, severity_rank, Finding,
+    };
 
     #[test]
     fn severity_rank_orders_known_severities_by_urgency() {
@@ -185,11 +211,44 @@ mod severity_and_recommendation_tests {
 
     #[test]
     fn severity_emoji_has_a_distinct_symbol_per_known_severity() {
-        let known = ["BLOCKING", "HIGH", "MEDIUM", "LOW"];
+        let known = ["BLOCKING", "HIGH", "MEDIUM", "LOW", "PRE-EXISTING"];
         let emojis: Vec<_> = known.iter().map(|s| severity_emoji(s)).collect();
         let unique: std::collections::HashSet<_> = emojis.iter().collect();
         assert_eq!(unique.len(), emojis.len(), "each severity reads distinctly");
         assert_eq!(severity_emoji("unknown"), "•");
+    }
+
+    /// A defect the change did not introduce is reported, but never the change's
+    /// fault: it ranks with LOW, so alone it leaves the recommendation at APPROVE.
+    #[test]
+    fn a_pre_existing_finding_never_raises_the_recommendation() {
+        for spelling in ["PRE-EXISTING", "pre_existing", "Preexisting"] {
+            assert!(is_pre_existing(spelling), "{spelling}");
+            assert_eq!(severity_rank(spelling), 0);
+            assert_eq!(severity_emoji(spelling), "🟣");
+        }
+        let f = Finding {
+            severity: "PRE-EXISTING".into(),
+            file: "a.rs".into(),
+            line: Some(1),
+            body: "already broken".into(),
+            confidence: Some(90),
+            suggestion: None,
+            existing_code: None,
+            end_line: None,
+            samples: None,
+        };
+        assert_eq!(effective_recommendation("APPROVE", &[f]), "APPROVE");
+        assert!(!is_pre_existing("LOW") && !is_pre_existing("HIGH"));
+        assert_eq!(severity_label("pre_existing"), "PRE-EXISTING");
+        assert_eq!(severity_label("high"), "HIGH");
+    }
+
+    /// The whole-file review has no change to compare against, so it does not
+    /// offer the tier at all.
+    #[test]
+    fn the_whole_file_prompt_does_not_offer_pre_existing() {
+        assert!(!crate::prompt::FILE_REVIEW_SYSTEM_PROMPT.contains("PRE-EXISTING"));
     }
 
     #[test]
@@ -425,7 +484,7 @@ fn collapse_bursts(findings: Vec<Finding>) -> Vec<Finding> {
         // Severity is part of the key, so a group is uniform by construction: two
         // findings that share a phrase but not a severity are, by the model's own
         // judgement, not the same claim — and merging them would hide that.
-        let key = format!("{}|{}", f.severity.to_uppercase(), burst_key(&f));
+        let key = format!("{}|{}", severity_label(&f.severity), burst_key(&f));
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, g)) => g.push(f),
             None => groups.push((key, vec![f])),
@@ -500,7 +559,7 @@ fn inline_body(f: &Finding) -> String {
     format!(
         "{} **{}** — {}",
         severity_emoji(&f.severity),
-        f.severity.to_uppercase(),
+        severity_label(&f.severity),
         f.body.trim()
     )
 }
@@ -885,7 +944,7 @@ fn push_finding_lines(s: &mut String, findings: &[&Finding]) {
         s.push_str(&format!(
             "\n- {} **{}** — {loc} — {}",
             severity_emoji(&f.severity),
-            f.severity.to_uppercase(),
+            severity_label(&f.severity),
             f.body.trim()
         ));
     }
@@ -1365,7 +1424,7 @@ fn render_no_review_summary(
             s.push_str(&format!(
                 "\n- {} **{}** — `{}` — {}",
                 severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
+                severity_label(&f.severity),
                 f.file,
                 f.body.trim()
             ));
@@ -2059,9 +2118,12 @@ async fn finish_review(
     // that states the count — before the sort, so the survivor competes on merit.
     findings = collapse_bursts(findings);
     funnel.after_collapse = findings.len();
+    // Pre-existing ranks with LOW but sorts after it, so under `MAX_FINDINGS` a
+    // defect the change did not introduce never pushes out one it did.
     findings.sort_by(|a, b| {
         severity_rank(&b.severity)
             .cmp(&severity_rank(&a.severity))
+            .then(is_pre_existing(&a.severity).cmp(&is_pre_existing(&b.severity)))
             .then(b.confidence.unwrap_or(0).cmp(&a.confidence.unwrap_or(0)))
     });
     // Recommendation reflects the *merged* findings (incl. deterministic hygiene the

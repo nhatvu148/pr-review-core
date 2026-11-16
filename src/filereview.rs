@@ -412,7 +412,7 @@ pub(crate) fn render(
             s.push_str(&format!(
                 "\n- {} **{}** — `{path}`{loc} — {}",
                 crate::review::severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
+                crate::review::severity_label(&f.severity),
                 f.body.trim()
             ));
         }
