@@ -22,11 +22,6 @@
 /// those — redacting the shape would blind every error that names a commit, to
 /// guard a format GitHub stopped issuing. Such a token in a clone URL is still
 /// caught by the userinfo pass; only a bare one would slip.
-/// Shortest colon-less URL userinfo treated as a credential rather than a
-/// username. GitHub and Atlassian tokens are 36+ characters; usernames are
-/// rarely past 20.
-const USERINFO_TOKEN_MIN: usize = 20;
-
 const TOKEN_PREFIXES: [&str; 8] = [
     "ghs_",
     "ghp_",
@@ -37,6 +32,11 @@ const TOKEN_PREFIXES: [&str; 8] = [
     "ATATT",
     "ATCTT",
 ];
+
+/// Shortest colon-less URL userinfo treated as a credential rather than a
+/// username. GitHub and Atlassian tokens are 36+ characters; usernames are
+/// rarely past 20.
+const USERINFO_TOKEN_MIN: usize = 20;
 
 /// Strip credentials out of `s`.
 ///

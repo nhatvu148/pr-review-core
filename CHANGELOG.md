@@ -17,6 +17,7 @@
 
 ### Fixed
 
+- **The Bitbucket coverage sweep reads an edited summary as recent.** It stopped at the bot's newest-created comment, but the engine edits its summary in place, so on a re-reviewed PR the comment with the newest activity is the oldest one created. A PR reviewed again after its latest push could look unreviewed and get a duplicate review. It now takes the latest created-or-updated time across every page it reads. Both bots carried this; it moved here with `reconcile`.
 - **`kaniscope` no longer prints hidden markers in its human-readable output.** `--human` and the dry-run and local summaries printed the summary comment's body verbatim, so they included lines like `<!-- kaniscope-verdict: {...} -->` and `<!-- kaniscope-review-key: ... -->` that GitHub and GitLab hide. Lines that are only an HTML comment are now dropped from that output. `--json` is unchanged and still carries the full body.
 
 ### Migration — every consumer this breaks

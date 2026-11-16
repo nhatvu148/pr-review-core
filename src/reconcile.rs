@@ -957,11 +957,13 @@ async fn bb_commit_date(
 
 /// Newest comment of ours on this PR, if any.
 ///
-/// Bitbucket has no `since` filter, but it *does* honour `sort=-created_on`, so
-/// the newest comment comes first and the first one of ours found is the answer
-/// — no need to read the rest. Pagination is bounded; running out of pages
-/// without finding ours is treated as covered rather than risking a duplicate
-/// review, same as the GitHub path.
+/// Bitbucket has no `since` filter. Every page up to the bound is read and the
+/// latest created-or-updated time among our coverage comments wins: the engine
+/// edits its summary comment in place, so the comment with the newest activity
+/// can be the oldest one created, and stopping at the first match in creation
+/// order read a re-reviewed PR as last reviewed before its head. Running out of
+/// pages before the end is treated as covered rather than risking a duplicate
+/// review, same as the GitHub path, since a newer edit may be on a page not read.
 async fn bb_newest_bot_comment_at(
     http: &reqwest::Client,
     auth: &str,
@@ -975,6 +977,7 @@ async fn bb_newest_bot_comment_at(
         "{base}/repositories/{repo}/pullrequests/{pr}/comments\
          ?pagelen=100&sort=-created_on"
     );
+    let mut newest: Option<i64> = None;
     for _ in 0..MAX_PAGES {
         let page: BbPage<BbComment> = bb_get(http, auth, cfg, &url).await?;
         for c in &page.values {
@@ -991,18 +994,19 @@ async fn bb_newest_bot_comment_at(
             // died still showed a placeholder newer than its head, and the sweep
             // read it as coverage.
             if counts_as_coverage(cfg, body) {
-                // Sorted newest-first, so the first match is the newest.
-                return Ok(comment_time(&c.created_on, c.updated_on.as_deref()));
+                if let Some(t) = comment_time(&c.created_on, c.updated_on.as_deref()) {
+                    newest = Some(newest.map_or(t, |n: i64| n.max(t)));
+                }
             }
         }
         match page.next {
             Some(n) if !n.is_empty() => url = n,
-            _ => return Ok(None),
+            _ => return Ok(newest),
         }
     }
     tracing::warn!(
-        "reconcile: {repo}#{pr} has more comments than we'll page through without \
-         finding one of ours; treating it as reviewed rather than risking a duplicate"
+        "reconcile: {repo}#{pr} has more comments than we'll page through; \
+         treating it as reviewed rather than risking a duplicate"
     );
     Ok(Some(i64::MAX))
 }
@@ -1037,6 +1041,45 @@ async fn bb_get<T: serde::de::DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The engine edits its summary in place, so on a re-reviewed PR the bot
+    /// comment with the newest activity is the oldest one created. Stopping at
+    /// the first match in creation order read that PR as last reviewed at 03:00
+    /// instead of 05:00, before a head pushed at 04:00.
+    #[tokio::test]
+    async fn the_bitbucket_scan_takes_the_newest_edit_not_the_newest_creation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let srv = MockServer::start().await;
+        let cfg = Arc::new(Config::from_env());
+        let ours = |s: &str| format!("{s}\n\n_{}_", cfg.comment_marker);
+        Mock::given(method("GET"))
+            .and(path("/repositories/w/r/pullrequests/1/comments"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "values": [
+                    { "content": { "raw": ours("a reply") },
+                      "created_on": "2026-08-02T03:00:00Z" },
+                    { "content": { "raw": "someone else" },
+                      "created_on": "2026-08-02T02:00:00Z" },
+                    { "content": { "raw": ours("the summary") },
+                      "created_on": "2026-08-02T01:00:00Z",
+                      "updated_on": "2026-08-02T05:00:00Z" }
+                ]
+            })))
+            .mount(&srv)
+            .await;
+        let got = bb_newest_bot_comment_at(
+            &reqwest::Client::new(),
+            "Bearer x",
+            &cfg,
+            &srv.uri(),
+            "w/r",
+            1,
+        )
+        .await
+        .expect("the scan runs");
+        assert_eq!(got, epoch_from_rfc3339("2026-08-02T05:00:00Z"));
+    }
 
     #[test]
     fn a_malformed_timestamp_with_non_ascii_is_rejected_not_a_panic() {

@@ -305,10 +305,13 @@ pub struct DeliveryRing {
 
 impl DeliveryRing {
     /// A ring remembering at most `capacity` ids; the oldest is forgotten first.
+    ///
+    /// A capacity of 0 is raised to 1: a ring that forgets each id as it is
+    /// inserted would accept every redelivery, silently turning dedup off.
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            capacity,
+            capacity: capacity.max(1),
             seen: std::sync::Mutex::new(Default::default()),
         }
     }
@@ -357,6 +360,13 @@ mod tests {
     };
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+
+    #[test]
+    fn a_zero_capacity_ring_still_drops_an_immediate_redelivery() {
+        let ring = DeliveryRing::new(0);
+        assert!(ring.claim("a"));
+        assert!(!ring.claim("a"), "dedup must not be silently off");
+    }
 
     #[test]
     fn a_redelivered_id_is_refused_and_a_new_one_accepted() {
