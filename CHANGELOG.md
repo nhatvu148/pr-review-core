@@ -69,6 +69,7 @@ Known limit: a fix made somewhere other than the lines a finding points at (a gu
 | `review::RunReviewOutput` gains `reused: bool` | `pr-review-bot` (its Telegram test builds one) | Add `reused: false`. JSON consumers are unaffected and the generated types include it. |
 | `providers::ReviewPost` gains `held: Vec<InlineComment>`, and derives `Default` | neither known consumer | Add `held: Vec::new()` or `..Default::default()`. |
 | `runlog::Funnel` gains `held_back` | neither known consumer | Add `held_back: 0`. Old run-log records still parse. |
+| `config::Config` gains `inline_min_severity`, `repo_rules`, `path_instructions`, `rule_sources`, `reuse_unchanged_review`, `fix_prompt` and `linked_issues` | neither known consumer (both build it with `Config::from_env`) | Code that builds `Config` with a struct literal, such as a test fixture, must add the fields. Building it with `Config::from_env` and then setting fields needs nothing. |
 
 Consumers that send a `/review` comment straight to `run_review_with`, rather than through `command::run_command_with`, should clear `reuse_unchanged_review` on that path so an explicit `/review` still runs fresh. The client-org bot routes `/review` that way and needs this change when it moves to 0.44.
 
