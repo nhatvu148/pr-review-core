@@ -224,7 +224,7 @@ pub struct EffectiveRules {
 /// ```
 #[must_use]
 pub fn local(base: &Config, repo_root: Option<&std::path::Path>) -> EffectiveRules {
-    let (effective, source) = crate::review::local_repo_config_source(base, repo_root);
+    let (effective, source) = crate::review::local_review_config_source(base, repo_root);
     finish(
         RulesScope::Local {
             repo_root: repo_root
@@ -254,7 +254,7 @@ pub async fn remote(
     let client = reqwest::Client::new();
     let meta = provider.get_meta(&client, base, repo, pr).await?;
     let (effective, source) =
-        crate::review::remote_repo_config_source(&provider, &client, base, repo, &meta).await;
+        crate::review::review_config_source(&provider, &client, base, repo, &meta).await;
     Ok(finish(
         RulesScope::Pr {
             provider: provider.name().to_string(),

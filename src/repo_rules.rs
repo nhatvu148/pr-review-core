@@ -75,8 +75,11 @@ pub struct PathInstruction {
 /// heading itself, or `None` when there is none.
 ///
 /// A review heading is one whose text is `Review`, `Code Review`, `Review Rules`,
-/// `Code Review Rules` or `Review Guidelines` (any case, any level). The section
-/// runs to the next heading at the same or a higher level.
+/// `Code Review Rules`, `Review Guidelines` or `Code Review Guidelines` (any
+/// case, any level). The section runs to the next heading at the same or a
+/// higher level. Lines inside a fenced code block (```` ``` ```` or `~~~`) are
+/// never headings: a `# install deps` comment in a shell example must not end
+/// the section.
 ///
 /// ```
 /// use pr_review_core::repo_rules::review_section;
@@ -111,15 +114,27 @@ pub fn review_section(md: &str) -> Option<String> {
                 | "code review guidelines"
         )
     };
-    let lines: Vec<&str> = md.lines().collect();
+    // Heading level per line, `None` for a non-heading or any line in a fence.
+    let mut in_fence = false;
+    let lines: Vec<(&str, Option<(usize, String)>)> = md
+        .lines()
+        .map(|l| {
+            let t = l.trim_start();
+            if t.starts_with("```") || t.starts_with("~~~") {
+                in_fence = !in_fence;
+                return (l, None);
+            }
+            (l, if in_fence { None } else { heading(l) })
+        })
+        .collect();
     let start = lines
         .iter()
-        .position(|l| heading(l).is_some_and(|(_, t)| is_review(&t)))?;
-    let level = heading(lines[start]).map(|(l, _)| l)?;
+        .position(|(_, h)| h.as_ref().is_some_and(|(_, t)| is_review(t)))?;
+    let level = lines[start].1.as_ref().map(|(l, _)| *l)?;
     let body: Vec<&str> = lines[start + 1..]
         .iter()
-        .take_while(|l| heading(l).is_none_or(|(l, _)| l > level))
-        .copied()
+        .take_while(|(_, h)| h.as_ref().is_none_or(|(l, _)| *l > level))
+        .map(|(l, _)| *l)
         .collect();
     let text = body.join("\n").trim().to_string();
     (!text.is_empty()).then_some(text)
@@ -288,8 +303,22 @@ mod tests {
     }
 
     #[test]
-    fn a_heading_inside_a_code_fence_style_line_without_a_space_is_not_a_heading() {
+    fn a_hash_without_a_space_is_not_a_heading() {
         assert_eq!(review_section("#Review\n- a"), None);
+    }
+
+    /// A shell comment in an example must not end the section, and a review
+    /// heading inside a fence must not start one.
+    #[test]
+    fn lines_inside_a_code_fence_are_never_headings() {
+        let md = "## Code Review Rules\n- run the tests:\n```bash\n# install deps\nnpm ci\n```\n- no unwrap\n## Build\nmake";
+        let got = review_section(md).unwrap();
+        assert!(
+            got.contains("# install deps") && got.contains("- no unwrap"),
+            "{got}"
+        );
+        assert!(!got.contains("make"), "{got}");
+        assert_eq!(review_section("```\n## Review\nx\n```\n"), None);
     }
 
     #[test]

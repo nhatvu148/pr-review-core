@@ -819,17 +819,11 @@ const RULE_FILE_CHANGE_NOTE: &str = "\n\n_This PR changes a review rule file. Ru
 
 /// Whether a diff touches one of the [`crate::repo_rules::RULE_FILES`].
 fn diff_touches_rule_file(diff: &str) -> bool {
-    crate::repo_rules::RULE_FILES.iter().any(|f| {
-        diff.lines().any(|l| {
-            [
-                format!("--- a/{}", f.path),
-                format!("+++ b/{}", f.path),
-                format!("rename from {}", f.path),
-                format!("rename to {}", f.path),
-            ]
+    diff.lines().any(|l| {
+        ["--- a/", "+++ b/", "rename from ", "rename to "]
             .iter()
-            .any(|m| l == m)
-        })
+            .find_map(|prefix| l.strip_prefix(prefix))
+            .is_some_and(|p| crate::repo_rules::RULE_FILES.iter().any(|f| f.path == p))
     })
 }
 
@@ -1183,20 +1177,25 @@ pub(crate) async fn run_agentic(
 /// finding in its own right — on BOTH paths, since the PR path is where the risk
 /// is real. That is a separate change, not a reason to make this one asymmetric.
 fn load_local_repo_config(base: &Config, repo_root: Option<&std::path::Path>) -> Config {
-    local_repo_config_source(base, repo_root).0
+    local_review_config_source(base, repo_root).0
 }
 
-/// [`load_local_repo_config`], plus an account of what happened.
+/// [`local_repo_config_source`] plus the repository's own rule files: the config
+/// a review runs under, with an account of what happened.
 ///
 /// The review path wants only the merged config; `kaniscope get-rules` wants to
 /// say which file was read, or why none was. Both come from here so the answer a
 /// caller is given is the answer the review actually used — a second resolution
 /// written for the reporting path is a second thing to drift.
-pub(crate) fn local_repo_config_source(
+///
+/// Commands that are not reviews (`/ask`, findings) use the plain `.prbot.toml`
+/// merge instead, so they neither fetch rule files nor carry review rubric text
+/// into prompts that do a different job.
+pub(crate) fn local_review_config_source(
     base: &Config,
     repo_root: Option<&std::path::Path>,
 ) -> (Config, crate::rules::RepoConfigSource) {
-    let (mut cfg, source) = local_prbot_toml_source(base, repo_root);
+    let (mut cfg, source) = local_repo_config_source(base, repo_root);
     // Rule files are read after `.prbot.toml` is merged, so `repo_rules = false`
     // there turns them off. The local operator owns the checkout, so its working
     // tree is the trusted copy, as it is for `.prbot.toml`.
@@ -1208,7 +1207,8 @@ pub(crate) fn local_repo_config_source(
     (cfg, source)
 }
 
-fn local_prbot_toml_source(
+/// The checkout's `.prbot.toml` merged over `base`, and what happened reading it.
+pub(crate) fn local_repo_config_source(
     base: &Config,
     repo_root: Option<&std::path::Path>,
 ) -> (Config, crate::rules::RepoConfigSource) {
@@ -1291,17 +1291,18 @@ pub(crate) async fn load_repo_config(
         .0
 }
 
-/// [`load_repo_config`], plus an account of what happened — the remote twin of
-/// [`local_repo_config_source`], and shared with `kaniscope get-rules` for the
-/// same reason.
-pub(crate) async fn remote_repo_config_source(
+/// [`remote_repo_config_source`] plus the rule files on the base branch: the
+/// config a review runs under — the remote twin of [`local_review_config_source`],
+/// and shared with `kaniscope get-rules` for the same reason. See that function
+/// for why non-review commands do not use it.
+pub(crate) async fn review_config_source(
     provider: &Provider,
     client: &reqwest::Client,
     base: &Config,
     repo: &str,
     meta: &PrMeta,
 ) -> (Config, crate::rules::RepoConfigSource) {
-    let (mut cfg, source) = remote_prbot_toml_source(provider, client, base, repo, meta).await;
+    let (mut cfg, source) = remote_repo_config_source(provider, client, base, repo, meta).await;
     if cfg.repo_rules {
         let found = remote_rule_files(provider, client, &cfg, repo, meta).await;
         crate::repo_rules::apply_rule_files(&mut cfg, found);
@@ -1343,7 +1344,9 @@ async fn remote_rule_files(
     found
 }
 
-async fn remote_prbot_toml_source(
+/// [`load_repo_config`], plus an account of what happened: the base branch's
+/// `.prbot.toml` merged over `base`.
+pub(crate) async fn remote_repo_config_source(
     provider: &Provider,
     client: &reqwest::Client,
     base: &Config,
@@ -2288,7 +2291,9 @@ pub async fn run_review_with(
     // Merge an optional per-repo `.prbot.toml` (fetched from the PR head) over the
     // env config; shadow `cfg` so every step below — glob filter, model choice,
     // agentic decision, self-critique, caps, and prompt — honors the overrides.
-    let effective = load_repo_config(&provider, &client, cfg, &input.repo, &meta).await;
+    let effective = review_config_source(&provider, &client, cfg, &input.repo, &meta)
+        .await
+        .0;
     let cfg = &effective;
 
     // Instant feedback: drop a "Reviewing…" summary comment before the slow LLM
