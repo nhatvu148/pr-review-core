@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.45.0
+
+**Findings a repository has decided against stay gone, and the code both bots duplicated now lives here, so a fix is made once.**
+
+Both consumers were compiled and their own suites run against this candidate before it was cut, per [Releasing](README.md#releasing), with their own copies of the moved code deleted in favour of the modules below: `pr-review-bot` passes on its default, `claude-code`, `claude-code,nats` and `codex` builds (141, 166, 172 and 152 tests) and the client-org bot on its default build (86 tests). Their counts are lower than at 0.44.0 because the tests for the moved code now run here.
+
+This release is minor rather than a patch because it adds public modules and public fields (see Migration).
+
+### Behaviour changes — these ship silently
+
+- **`redact_secrets` is stricter than either bot's copy was.** A consumer that moves to `redact::redact_secrets` from its own copy gets the union of both copies' token prefixes (the Atlassian `ATATT` and `ATCTT` reached only one bot before), a token prefix now matches only at the start of a word, a colon-less URL userinfo of 20 or more characters is treated as a bare token and redacted (shorter ones, like `git@`, are kept as usernames), and `?` and `#` end a URL's authority.
+- **The reconcile sweep reads `GH_API_BASE`** instead of a hardcoded `https://api.github.com` (the same URL by default), rejects a malformed timestamp instead of panicking, and saturates a huge `RECONCILE_LOOKBACK_MINS` instead of overflowing. `reconcile::ConfiguredToken` refuses an empty `GH_TOKEN`.
+- **`webhook::DeliveryRing::new(0)` remembers one id**, not none, so a zero capacity cannot silently turn dedup off.
 
 ### Added
 
