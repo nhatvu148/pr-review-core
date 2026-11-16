@@ -1022,6 +1022,7 @@ pub async fn post_review_queued(provider_name: &str, cfg: &Config, repo: &str, p
     let post = ReviewPost {
         summary: render_queued(),
         inline: Vec::new(),
+        held: Vec::new(),
     };
     let client = reqwest::Client::new();
     if let Err(e) = provider.post_review(&client, cfg, &meta, &post).await {
@@ -1082,6 +1083,7 @@ pub async fn post_review_failure(
     let post = ReviewPost {
         summary: render_failed(err),
         inline: Vec::new(),
+        held: Vec::new(),
     };
     let client = reqwest::Client::new();
     if let Err(e) = provider.post_review(&client, cfg, &meta, &post).await {
@@ -1397,6 +1399,7 @@ async fn post_advisory_only(
     let post = ReviewPost {
         summary: summary.clone(),
         inline: Vec::new(),
+        held: Vec::new(),
     };
     let mut out = RunReviewOutput {
         provider: provider.name().to_string(),
@@ -1721,6 +1724,8 @@ struct FinishedReview {
     recommendation: String,
     summary: String,
     inline: Vec<InlineComment>,
+    /// Findings held back by the inline severity floor — see [`ReviewPost::held`].
+    held: Vec<InlineComment>,
     /// Per-stage survivor counts through the post-processing above. Collected
     /// here because this is the only place they exist: every stage consumes its
     /// predecessor's vector, so a caller holding only the final findings cannot
@@ -2178,12 +2183,26 @@ async fn finish_review(
 
     funnel.anchored = inline.len();
     funnel.unanchored = unanchored.len();
+    funnel.held_back = quiet.len();
+    // What reconciliation needs to keep a held-back finding's old thread: where
+    // it is and what it says. `line` 0 when the model gave none, which only
+    // fingerprint matching can then pair.
+    let held: Vec<InlineComment> = quiet
+        .iter()
+        .map(|f| InlineComment {
+            path: f.file.clone(),
+            line: f.line.unwrap_or(0),
+            start_line: None,
+            body: f.body.clone(),
+        })
+        .collect();
 
     FinishedReview {
         findings,
         recommendation,
         summary,
         inline,
+        held,
         funnel,
         typed_lines,
         anchors,
@@ -2237,6 +2256,7 @@ pub async fn run_review_with(
         let pending = ReviewPost {
             summary: render_pending(),
             inline: Vec::new(),
+            held: Vec::new(),
         };
         match provider.post_review(&client, cfg, &meta, &pending).await {
             Ok(_) => placeholder_posted = true,
@@ -2323,6 +2343,7 @@ pub async fn run_review_with(
             let note = ReviewPost {
                 summary: render_no_review_summary(&[], &[]),
                 inline: Vec::new(),
+                held: Vec::new(),
             };
             provider
                 .post_review(&client, cfg, &meta, &note)
@@ -2479,6 +2500,7 @@ pub async fn run_review_with(
         recommendation,
         summary,
         inline,
+        held,
         funnel,
         typed_lines,
         anchors,
@@ -2487,6 +2509,7 @@ pub async fn run_review_with(
     let post = ReviewPost {
         summary: summary.clone(),
         inline,
+        held,
     };
 
     let mut out = RunReviewOutput {

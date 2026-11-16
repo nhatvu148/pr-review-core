@@ -989,6 +989,7 @@ const RESOLVE_MUTATION: &str =
 const REPLY_MUTATION: &str = "mutation($tid:ID!,$body:String!){ addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$tid, body:$body}){ comment{ id } } }";
 
 /// One of the bot's existing review-comment threads on the PR.
+#[derive(Clone)]
 struct BotThread {
     id: String,
     /// REST id of the thread's first (top) comment — for the delete fallback.
@@ -1086,6 +1087,33 @@ pub(crate) async fn list_findings(
 /// refusing to ever clean those up would leave them on the PR forever.
 fn finding_could_have_been_fixed(thread: &BotThread, reviewing: &str) -> bool {
     thread.original_commit.as_deref() != Some(reviewing)
+}
+
+/// Mark the threads that findings held back by the severity floor pair with, so
+/// reconciliation leaves them alone.
+///
+/// Paired only against what the posted findings left unclaimed: a posted finding
+/// keeps first claim on its thread. A held finding is still flagged, so a thread
+/// it pairs with is neither a fix nor a new post.
+fn claim_held(threads: &[BotThread], claimed: &mut [bool], held: &[InlineComment]) {
+    if held.is_empty() {
+        return;
+    }
+    let keys: Vec<(String, u64, String)> = held
+        .iter()
+        .map(|c| {
+            (
+                c.path.clone(),
+                c.line,
+                finding_fingerprint(&c.path, &c.body),
+            )
+        })
+        .collect();
+    let open: Vec<usize> = (0..threads.len()).filter(|i| !claimed[*i]).collect();
+    let rest: Vec<BotThread> = open.iter().map(|i| threads[*i].clone()).collect();
+    for slot in pair_findings(&rest, &keys).into_iter().flatten() {
+        claimed[open[slot]] = true;
+    }
 }
 
 /// List the bot's prior inline-comment threads (whose first comment carries the
@@ -1255,6 +1283,7 @@ async fn reconcile_inline(
     meta: &PrMeta,
     commit_id: &str,
     inline: &[InlineComment],
+    held: &[InlineComment],
 ) -> Result<Reconciled> {
     let (owner, name) = meta
         .repo
@@ -1290,6 +1319,7 @@ async fn reconcile_inline(
             None => pending.push((c, fp.clone())),
         }
     }
+    claim_held(&threads, &mut claimed, held);
 
     // One review for the whole round, falling back to one comment each if GitHub
     // refuses it — see `post_inline_review` for why the fallback is required
@@ -1418,7 +1448,7 @@ pub async fn post_review(
     };
     match &meta.head_sha {
         Some(sha) => {
-            outcome = reconcile_inline(client, cfg, meta, sha, &review.inline)
+            outcome = reconcile_inline(client, cfg, meta, sha, &review.inline, &review.held)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!(
@@ -1605,6 +1635,40 @@ mod tests {
             &thread_on(None),
             "687cfc8"
         ));
+    }
+
+    /// A finding held back by the severity floor is still flagged: the thread it
+    /// was posted on in an earlier round stays, rather than reading as a fix.
+    #[test]
+    fn a_held_back_finding_keeps_its_old_thread() {
+        let threads = vec![
+            thread("aaaa", "src/a.rs", Some(40)),
+            thread("bbbb", "src/b.rs", Some(9)),
+        ];
+        let mut claimed = vec![false, false];
+        let held = vec![crate::providers::InlineComment {
+            path: "src/a.rs".into(),
+            line: 42,
+            start_line: None,
+            body: "reworded, so only the line can pair it".into(),
+        }];
+        super::claim_held(&threads, &mut claimed, &held);
+        assert_eq!(claimed, vec![true, false]);
+    }
+
+    /// A posted finding keeps first claim on a thread over a held one.
+    #[test]
+    fn a_held_finding_never_takes_a_thread_a_posted_one_claimed() {
+        let threads = vec![thread("aaaa", "src/a.rs", Some(40))];
+        let mut claimed = vec![true];
+        let held = vec![crate::providers::InlineComment {
+            path: "src/a.rs".into(),
+            line: 40,
+            start_line: None,
+            body: "x".into(),
+        }];
+        super::claim_held(&threads, &mut claimed, &held);
+        assert_eq!(claimed, vec![true]);
     }
 
     /// The duplicate this widening removes, from a real pull request.
