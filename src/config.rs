@@ -325,11 +325,23 @@ impl Config {
             // LOW is the bottom, so a LOW floor is no floor.
             "LOW" => None,
             other => {
-                tracing::warn!(
-                    "inline severity floor {other:?} (INLINE_MIN_SEVERITY or \
-                     .prbot.toml inline_min_severity) is not BLOCKING, HIGH, MEDIUM or LOW; \
-                     posting every finding inline"
-                );
+                // Once per distinct value: this runs for every finding pass and
+                // for `get-rules`, and a long-running bot sees many repositories,
+                // each of which may have its own typo.
+                static WARNED: std::sync::LazyLock<
+                    std::sync::Mutex<std::collections::HashSet<String>>,
+                > = std::sync::LazyLock::new(Default::default);
+                let first = WARNED
+                    .lock()
+                    .map(|mut seen| seen.insert(other.to_string()))
+                    .unwrap_or(true);
+                if first {
+                    tracing::warn!(
+                        "inline severity floor {other:?} (INLINE_MIN_SEVERITY or \
+                         .prbot.toml inline_min_severity) is not BLOCKING, HIGH, MEDIUM or LOW; \
+                         posting every finding inline"
+                    );
+                }
                 None
             }
         }
