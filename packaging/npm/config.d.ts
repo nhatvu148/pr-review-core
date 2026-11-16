@@ -109,6 +109,8 @@ export interface ReviewConfig {
   changeIntentMaxChars?: number;
   /** Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. Default: `true`. (`REANCHOR_FINDINGS`) */
   reanchorFindings?: boolean;
+  /** Skip the model on an automatic re-review that would see the same changed lines under the same settings and rules (a rebase, an empty commit), and leave the last review in place. An explicit /review always runs. Default: `true`. (`REUSE_UNCHANGED_REVIEW`) */
+  reuseUnchangedReview?: boolean;
   /** Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. Default: `false`. (`REVIEW_ON_UPDATE`) */
   reviewOnUpdate?: boolean;
   /** Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. Default: `1`. (`REVIEW_SAMPLES`) */

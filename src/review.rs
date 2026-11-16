@@ -103,6 +103,12 @@ pub struct RunReviewOutput {
     pub comment_url: Option<String>,
     pub summary_markdown: String,
     pub usage: Option<Usage>,
+    /// True when no model ran because the PR's changed lines, settings and rules
+    /// were identical to the last review's, so that review was left in place.
+    /// `summary_markdown` is then the existing summary, and the finding counts are
+    /// zero because nothing new was found, not because the PR is clean.
+    #[serde(default)]
+    pub reused: bool,
 }
 
 /// Rank a severity for sorting (higher = more urgent). Unknown severities rank 0.
@@ -811,6 +817,98 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
+/// Prefix of the hidden marker carrying a review's [`review_key`].
+const REVIEW_KEY_MARKER: &str = "<!-- kaniscope-review-key: ";
+
+/// A fingerprint of everything that decides what a review finds: the changed
+/// lines, every review setting, and the rules injected into the prompt.
+///
+/// Hunk headers and `index` lines are left out, because a rebase onto a moved
+/// base shifts line numbers and blob ids without changing what the PR does —
+/// and that is exactly the re-review this exists to skip. File headers stay in,
+/// so the same hunk moved to another file is a different change. Settings come
+/// from [`crate::rules::ReviewSettings`], the same allowlist `get-rules` shows,
+/// so a changed model, cap or floor is a new key.
+pub(crate) fn review_key(cfg: &Config, raw_diff: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for line in raw_diff.lines() {
+        if line.starts_with("@@") || line.starts_with("index ") {
+            continue;
+        }
+        if line.starts_with('+') || line.starts_with('-') || line.starts_with("diff --git ") {
+            h.update(line.as_bytes());
+            h.update(b"\n");
+        }
+    }
+    h.update(b"\0settings\0");
+    h.update(
+        serde_json::to_string(&crate::rules::ReviewSettings::from_config(cfg))
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    h.update(b"\0rules\0");
+    h.update(crate::prompt::injected_rules(cfg).as_bytes());
+    hex::encode(&h.finalize()[..8])
+}
+
+/// The previous review, reused, when the PR's summary carries this exact key.
+///
+/// `None` (review normally) when there is no summary, it is a placeholder or a
+/// failure notice, its key differs, or it cannot be read. Only GitHub can read
+/// its summary back today, so elsewhere this is always `None`.
+async fn reusable_review(
+    provider: &Provider,
+    client: &reqwest::Client,
+    cfg: &Config,
+    input: &RunReviewInput,
+    key: &str,
+) -> Option<RunReviewOutput> {
+    let body = match provider
+        .summary_body(client, cfg, &input.repo, input.pr)
+        .await
+    {
+        Ok(Some(b)) => b,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!("reuse check: summary not read ({e:#}); reviewing");
+            return None;
+        }
+    };
+    if is_incomplete_review(&body) || !body.contains(&format!("{REVIEW_KEY_MARKER}{key} -->")) {
+        return None;
+    }
+    tracing::info!(
+        "{}#{}: nothing changed since the last review (key {key}); leaving it in place",
+        input.repo,
+        input.pr
+    );
+    let recommendation = body
+        .lines()
+        .find_map(|l| l.strip_prefix("**Recommendation:** "))
+        .unwrap_or("APPROVE")
+        .trim()
+        .to_string();
+    Some(RunReviewOutput {
+        provider: provider.name().to_string(),
+        repo: input.repo.clone(),
+        pr: input.pr,
+        model: String::new(),
+        recommendation,
+        findings: 0,
+        findings_detail: Vec::new(),
+        inline_posted: 0,
+        inline_detail: Vec::new(),
+        advisories: Vec::new(),
+        advisory_scan: None,
+        posted: false,
+        comment_url: None,
+        summary_markdown: body,
+        usage: None,
+        reused: true,
+    })
+}
+
 /// Whether a unified diff adds, removes, changes or renames the root
 /// `.prbot.toml`. A pure rename has no `---`/`+++` lines, only the
 /// `rename from`/`rename to` headers.
@@ -1388,6 +1486,7 @@ async fn post_advisory_only(
         comment_url: None,
         summary_markdown: summary,
         usage: None,
+        reused: false,
     };
     if !input.dry_run {
         out.comment_url = provider.post_review(client, cfg, meta, &post).await?;
@@ -2192,6 +2291,18 @@ pub async fn run_review_with(
     // Whether a placeholder actually went up — not merely whether one was asked
     // for. The nothing-to-review path below replaces it only if it exists, so a
     // failed placeholder post must not turn into a comment on a silent PR.
+    // Fetched before the placeholder, because the placeholder overwrites the
+    // summary — and the summary is where the last review's key is read from.
+    let raw_diff = provider
+        .get_diff(&client, cfg, &input.repo, input.pr)
+        .await?;
+    let key = review_key(cfg, &raw_diff);
+    if cfg.reuse_unchanged_review && !input.dry_run {
+        if let Some(out) = reusable_review(&provider, &client, cfg, &input, &key).await {
+            return Ok(out);
+        }
+    }
+
     let mut placeholder_posted = false;
     if input.placeholder && !input.dry_run {
         let pending = ReviewPost {
@@ -2207,10 +2318,6 @@ pub async fn run_review_with(
             ),
         }
     }
-
-    let raw_diff = provider
-        .get_diff(&client, cfg, &input.repo, input.pr)
-        .await?;
 
     // Dependency vulnerability scan runs on the RAW diff: lockfiles are dropped
     // by the glob filter below (and never reach the LLM), so we must read added
@@ -2444,6 +2551,13 @@ pub async fn run_review_with(
         anchors,
     } = finished;
     let inline_count = inline.len();
+    // Read back by the next automatic review to tell whether anything changed.
+    // GitHub only: it is the one provider whose summary can be read back, and
+    // HTML comments are hidden there.
+    let mut summary = summary;
+    if provider.name() == "github" {
+        summary.push_str(&format!("\n\n{REVIEW_KEY_MARKER}{key} -->"));
+    }
     let post = ReviewPost {
         summary: summary.clone(),
         inline,
@@ -2465,6 +2579,7 @@ pub async fn run_review_with(
         comment_url: None,
         summary_markdown: summary,
         usage: result.usage,
+        reused: false,
     };
 
     if !input.dry_run {
@@ -2611,6 +2726,7 @@ pub async fn run_review_local(
                 comment_url: None,
                 summary_markdown: summary,
                 usage: None,
+                reused: false,
             });
         }
         return Err(NothingToReview { local: true }.into());
@@ -2715,6 +2831,7 @@ pub async fn run_review_local(
         comment_url: None,
         summary_markdown: finished.summary,
         usage: result.usage,
+        reused: false,
     })
 }
 
@@ -3982,6 +4099,66 @@ mod orchestrator_tests {
             assert!(p.contains("BASE-RULE"), "base settings not applied: {p}");
             assert!(!p.contains("HEAD-RULE"), "head settings applied: {p}");
         }
+    }
+
+    /// An automatic re-review that would see exactly what the last one saw leaves
+    /// that review in place and runs no model. Nothing is posted: an unmocked
+    /// POST would fail the test.
+    #[tokio::test]
+    async fn an_unchanged_pr_reuses_its_last_review() {
+        let srv = github_stub_trust(DIFF, "write").await;
+        let cfg = cfg_for(&srv.uri());
+        let spy = CloneSpy {
+            may_clone: Arc::default(),
+            prompts: Arc::default(),
+        };
+        let first = run_review_with(&cfg, input(), &spy)
+            .await
+            .expect("first review");
+        assert!(first.summary_markdown.contains(super::REVIEW_KEY_MARKER));
+        let calls_after_first = spy.prompts.lock().unwrap().len();
+
+        Mock::given(method("GET"))
+            .and(path("/repos/o/r/issues/1/comments"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!([{
+                    "id": 7,
+                    "body": format!("{}\n\n_{}_", first.summary_markdown, cfg.comment_marker),
+                }])),
+            )
+            .mount(&srv)
+            .await;
+        let mut real = input();
+        real.dry_run = false;
+        let second = run_review_with(&cfg, real, &spy)
+            .await
+            .expect("reused review");
+        assert!(second.reused, "an identical PR must reuse its review");
+        assert!(!second.posted);
+        assert_eq!(
+            spy.prompts.lock().unwrap().len(),
+            calls_after_first,
+            "no model call on a reused review"
+        );
+    }
+
+    /// A changed setting is a different review, even on the same diff.
+    #[test]
+    fn the_review_key_follows_the_diff_and_the_settings() {
+        let a = Config::from_env();
+        let mut b = a.clone();
+        b.max_findings += 1;
+        assert_eq!(super::review_key(&a, DIFF), super::review_key(&a, DIFF));
+        assert_ne!(super::review_key(&a, DIFF), super::review_key(&b, DIFF));
+        // A rebase shifts hunk headers and blob ids, not the change.
+        let rebased = DIFF
+            .replace("@@ -1,", "@@ -40,")
+            .replace("index ", "index ff");
+        assert_eq!(super::review_key(&a, DIFF), super::review_key(&a, &rebased));
+        assert_ne!(
+            super::review_key(&a, DIFF),
+            super::review_key(&a, &format!("{DIFF}+added\n"))
+        );
     }
 
     #[tokio::test]

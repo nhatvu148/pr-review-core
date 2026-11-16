@@ -113,6 +113,8 @@ class ReviewConfig(TypedDict, total=False):
     change_intent_max_chars: int
     # Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. Default: `true`. (`REANCHOR_FINDINGS`)
     reanchor_findings: bool
+    # Skip the model on an automatic re-review that would see the same changed lines under the same settings and rules (a rebase, an empty commit), and leave the last review in place. An explicit /review always runs. Default: `true`. (`REUSE_UNCHANGED_REVIEW`)
+    reuse_unchanged_review: bool
     # Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. Default: `false`. (`REVIEW_ON_UPDATE`)
     review_on_update: bool
     # Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. Default: `1`. (`REVIEW_SAMPLES`)
@@ -195,6 +197,7 @@ CONFIG_ENV: Dict[str, tuple] = {
     "pr_body_max_chars": ("PR_BODY_MAX_CHARS", "Int"),
     "change_intent_max_chars": ("CHANGE_INTENT_MAX_CHARS", "Int"),
     "reanchor_findings": ("REANCHOR_FINDINGS", "Bool"),
+    "reuse_unchanged_review": ("REUSE_UNCHANGED_REVIEW", "Bool"),
     "review_on_update": ("REVIEW_ON_UPDATE", "Bool"),
     "review_samples": ("REVIEW_SAMPLES", "Int"),
     "sample_line_tolerance": ("SAMPLE_LINE_TOLERANCE", "Int"),

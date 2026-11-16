@@ -20,6 +20,8 @@ export interface RunReviewOutput {
   provider: string;
   recommendation: string;
   repo: string;
+  /** True when no model ran because the PR's changed lines, settings and rules were identical to the last review's, so that review was left in place. */
+  reused?: boolean;
   summaryMarkdown: string;
   usage?: Usage | null;
 }

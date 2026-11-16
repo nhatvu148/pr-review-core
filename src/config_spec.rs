@@ -427,6 +427,13 @@ pub const SPEC: &[ConfigVar] = &[
         doc: "Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary.",
     },
     ConfigVar {
+        env: "REUSE_UNCHANGED_REVIEW",
+        aliases: &[],
+        kind: ConfigKind::Bool,
+        default: Some("true"),
+        doc: "Skip the model on an automatic re-review that would see the same changed lines under the same settings and rules (a rebase, an empty commit), and leave the last review in place. An explicit /review always runs.",
+    },
+    ConfigVar {
         env: "REVIEW_ON_UPDATE",
         aliases: &[],
         kind: ConfigKind::Bool,

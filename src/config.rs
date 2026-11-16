@@ -209,6 +209,11 @@ pub struct Config {
     /// inject a large conventions block (e.g. via a file baked into its image)
     /// without changing the library.
     pub extra_system_prompt: String,
+    /// Skip the model when an automatic re-review would see exactly what the last
+    /// one saw (same changed lines, same settings and rules), and leave that
+    /// review in place. An explicit `/review` always runs. See
+    /// `review::review_key`.
+    pub reuse_unchanged_review: bool,
 
     /// Free-form instructions shaping the `/describe` output — release-notes
     /// sections, a contributor table, a house layout. Appended last to the
@@ -400,6 +405,9 @@ impl Config {
             ),
             x_title: env_or("OPENROUTER_X_TITLE", "pr-review"),
             extra_system_prompt: resolve_extra_system_prompt(),
+            reuse_unchanged_review: env_or("REUSE_UNCHANGED_REVIEW", "true")
+                .parse()
+                .unwrap_or(true),
 
             describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
 

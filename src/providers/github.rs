@@ -659,6 +659,28 @@ async fn find_summary_comment(
     repo: &str,
     pr: u64,
 ) -> Result<Option<u64>> {
+    Ok(find_summary(client, cfg, repo, pr).await?.map(|(id, _)| id))
+}
+
+/// The body of the bot's summary comment on the PR, if it has one.
+pub async fn summary_body(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+) -> Result<Option<String>> {
+    require(&cfg.github_token, "GH_TOKEN")?;
+    Ok(find_summary(client, cfg, repo, pr)
+        .await?
+        .map(|(_, body)| body))
+}
+
+async fn find_summary(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+) -> Result<Option<(u64, String)>> {
     #[derive(Deserialize)]
     struct C {
         id: u64,
@@ -684,7 +706,7 @@ async fn find_summary_comment(
             .into_iter()
             .find(|c| c.body.as_deref().is_some_and(|b| is_bot_comment(cfg, b)))
         {
-            return Ok(Some(c.id));
+            return Ok(Some((c.id, c.body.unwrap_or_default())));
         }
         if n < 100 {
             return Ok(None);
