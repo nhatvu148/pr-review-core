@@ -89,7 +89,8 @@ cli = ["dep:clap", "dep:dotenvy", "dep:tracing-subscriber"]
 # `sync` for `OnceCell` (the per-review shared clone). It resolves today without
 # being named, because a transitive dependency happens to enable it — which is a
 # build that breaks when something else changes its mind. Declare what we use.
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+# `time` for the head lookup's timeout (`superseded`) and the memory sampler.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

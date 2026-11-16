@@ -268,15 +268,125 @@ pub fn is_review_command(action: &str, is_pull_request: bool, body: &str) -> boo
     action == "created" && is_pull_request && body.trim() == "/review"
 }
 
+/// Recently-seen webhook delivery ids, for dropping a provider's redelivery.
+///
+/// Providers redeliver on a timeout or 5xx, and a redelivery costs a second LLM
+/// run plus a duplicate comment. Every delivery carries a unique id
+/// (`X-GitHub-Delivery`, `X-Request-UUID`), so remembering the recent ones is
+/// enough to drop the repeat.
+///
+/// Bounded by size, not time: retries land within minutes, so a process-local
+/// ring covers the realistic window without a store. It does not survive a
+/// restart, and it does not span instances — a redelivery routed to an instance
+/// that never saw the original gets through. Both are accepted; deduping across
+/// instances needs shared state, which is a bigger dependency than the duplicate
+/// comment it prevents.
+///
+/// **Claim an id immediately before starting the work, not at handler entry.**
+/// Not before the signature check, or anyone could poison the ring with forged
+/// ids and suppress real reviews. And not before the work is accepted: a handler
+/// that answers 5xx is asking the provider to redeliver, and an id claimed at
+/// entry would swallow that redelivery as a duplicate, losing the review.
+///
+/// ```
+/// use pr_review_core::webhook::DeliveryRing;
+/// let seen = DeliveryRing::new(512);
+/// assert!(seen.claim("abc"), "first sight");
+/// assert!(!seen.claim("abc"), "a redelivery");
+/// assert!(seen.claim(""), "no id is never evidence of a duplicate");
+/// ```
+pub struct DeliveryRing {
+    capacity: usize,
+    seen: std::sync::Mutex<(
+        std::collections::VecDeque<String>,
+        std::collections::HashSet<String>,
+    )>,
+}
+
+impl DeliveryRing {
+    /// A ring remembering at most `capacity` ids; the oldest is forgotten first.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            seen: std::sync::Mutex::new(Default::default()),
+        }
+    }
+
+    /// `true` the first time `id` is seen, `false` for a repeat.
+    ///
+    /// Atomic under the lock, which is what makes this an idempotency key rather
+    /// than a check: two concurrent copies of one delivery both reach it, and
+    /// exactly one wins. An empty id is always new and takes no capacity — a
+    /// missing header is not evidence of a duplicate, and dropping a real webhook
+    /// costs a review where letting one through costs at most a duplicate.
+    pub fn claim(&self, id: &str) -> bool {
+        if id.is_empty() {
+            return true;
+        }
+        // A panic elsewhere while holding the lock leaves the ring usable: its
+        // contents are a cache, and losing an entry costs at most one duplicate.
+        let mut guard = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let (queue, set) = &mut *guard;
+        if !set.insert(id.to_string()) {
+            return false;
+        }
+        queue.push_back(id.to_string());
+        if queue.len() > self.capacity {
+            if let Some(old) = queue.pop_front() {
+                set.remove(&old);
+            }
+        }
+        true
+    }
+
+    /// Whether `id` is currently remembered, without claiming it.
+    pub fn contains(&self, id: &str) -> bool {
+        let guard = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        guard.1.contains(id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         is_review_command, parse_bitbucket_comment_event, parse_gitlab_mr_event,
         parse_issue_comment_event, parse_pull_request_event, should_review,
         should_review_bitbucket, should_review_gitlab, verify_gitlab_token, verify_signature,
+        DeliveryRing,
     };
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+
+    #[test]
+    fn a_redelivered_id_is_refused_and_a_new_one_accepted() {
+        let ring = DeliveryRing::new(8);
+        assert!(ring.claim("abc"));
+        assert!(!ring.claim("abc"));
+        assert!(ring.claim("def"));
+        assert!(ring.contains("abc"));
+    }
+
+    #[test]
+    fn a_missing_delivery_id_is_always_new_and_takes_no_room() {
+        let ring = DeliveryRing::new(1);
+        assert!(ring.claim(""));
+        assert!(ring.claim(""));
+        assert!(ring.claim("x"));
+        assert!(!ring.claim("x"), "the empty ids did not evict it");
+    }
+
+    /// Eviction is what bounds the memory; the cost is that a very old id reads
+    /// as new again.
+    #[test]
+    fn the_ring_forgets_the_oldest_id_beyond_its_capacity() {
+        let ring = DeliveryRing::new(4);
+        for i in 0..10 {
+            assert!(ring.claim(&format!("id-{i}")));
+        }
+        assert!(ring.claim("id-0"), "evicted, so new again");
+        assert!(!ring.claim("id-9"), "still remembered");
+    }
 
     /// The doctest on `verify_signature` only shows the reject path (wrong or
     /// missing signature). The accept path — a correctly HMAC-signed body — is

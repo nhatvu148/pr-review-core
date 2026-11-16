@@ -42,9 +42,12 @@ pub mod filereview;
 pub mod findings;
 pub mod llm;
 pub mod mcp;
+pub mod memory;
 pub mod prompt;
 pub mod providers;
 pub mod queue;
+pub mod reconcile;
+pub mod redact;
 pub mod repo;
 pub mod repo_config;
 pub mod repo_rules;
@@ -53,6 +56,7 @@ pub mod rules;
 pub mod runlog;
 pub mod structure;
 pub mod suggest;
+pub mod superseded;
 pub mod webhook;
 
 /// Clip a string to at most `n` characters (char-safe — never splits a UTF-8

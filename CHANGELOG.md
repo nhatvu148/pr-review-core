@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Code both bots duplicated now lives here, so a fix is made once.** Each bot built on this crate carried its own copy of the same five pieces, and a fix to one (the superseded-review skip, most recently) had to be made twice. All five are public and fail open as before:
+  - `superseded`: `superseded_by` skips a review whose commit is no longer the PR's head, and `github_head_sha` reads that commit from a `pull_request` payload.
+  - `webhook::DeliveryRing`: the bounded, lock-protected ring that drops a provider's redelivery by its delivery id.
+  - `redact::redact_secrets`: strips URL userinfo and bare GitHub and Atlassian tokens from text about to leave the process. It is the union of the two copies, so the Atlassian prefixes one bot added now protect both.
+  - `reconcile`: the boot sweep that finds open PRs whose review was accepted but never posted, plus `open_pr_numbers`. The GitHub token comes through a `GithubTokens` trait, so a GitHub App can mint per-installation tokens and a token deployment uses `ConfiguredToken`. `ReconcileConfig::from_env` reads the same `RECONCILE_*` variables the bots did.
+  - `memory`: container (cgroup) and process memory readings and the `HighWater` peak sampler, with the MemTotal fallback for a VM with no cgroup limit.
+
+  Tokio's `time` feature is now enabled, for the head lookup's timeout and the sampler. No new dependency.
+
 ## 0.44.0
 
 **Re-review now tracks what actually changed: a finding is resolved only when its code moves, an unchanged PR reuses its last review, and the reviewer reads the rules and issues the repository already wrote.**
