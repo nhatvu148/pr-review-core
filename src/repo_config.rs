@@ -42,6 +42,9 @@ pub struct RepoConfig {
     /// Lowest severity posted inline for this repo; below it, summary only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inline_min_severity: Option<String>,
+    /// Toggle giving the reviewer the issues the PR closes, for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linked_issues: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub self_critique: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]

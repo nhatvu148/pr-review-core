@@ -12,7 +12,7 @@ mod github;
 mod gitlab;
 mod types;
 
-pub use types::{InlineComment, PrMeta, ProviderName, ReviewPost};
+pub use types::{InlineComment, LinkedIssue, PrMeta, ProviderName, ReviewPost};
 
 /// Whether a comment body was authored by this bot — matches the configured
 /// comment marker (the signature appended to every comment the bot posts).
@@ -155,6 +155,22 @@ impl Provider {
             Provider::Github => github::get_diff(client, cfg, repo, pr).await,
             Provider::Bitbucket => bitbucket::get_diff(client, cfg, repo, pr).await,
             Provider::Gitlab => gitlab::get_diff(client, cfg, repo, pr).await,
+        }
+    }
+
+    /// The issues the PR says it closes (GitHub's closing references: "Fixes #12"
+    /// in the description, or an issue linked in the sidebar). Empty on a provider
+    /// that has no such link.
+    pub async fn linked_issues(
+        &self,
+        client: &Client,
+        cfg: &Config,
+        repo: &str,
+        pr: u64,
+    ) -> Result<Vec<LinkedIssue>> {
+        match self {
+            Provider::Github => github::linked_issues(client, cfg, repo, pr).await,
+            Provider::Bitbucket | Provider::Gitlab => Ok(Vec::new()),
         }
     }
 

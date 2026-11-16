@@ -184,6 +184,7 @@ class RepoConfig(_RepoConfigRequired, total=False):
     include_globs: Optional[List[str]]
     inline_min_severity: Optional[str]
     instructions: Optional[str]
+    linked_issues: Optional[bool]
     max_findings: Optional[int]
     min_confidence: Optional[int]
     model: Optional[str]
@@ -250,6 +251,7 @@ class _ReviewSettingsRequired(TypedDict):
     fileBundling: bool
     grepContext: bool
     includeGlobs: List[str]
+    linkedIssues: bool
     maxDiffChars: int
     maxFindings: int
     maxHistoryChars: int

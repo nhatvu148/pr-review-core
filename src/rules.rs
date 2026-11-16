@@ -105,6 +105,8 @@ pub struct ReviewSettings {
     pub path_instructions: Vec<crate::repo_rules::PathInstruction>,
     /// The rule sources merged into the prompt below, as the summary names them.
     pub rule_sources: Vec<String>,
+    /// Whether the issues a PR closes are given to the reviewer.
+    pub linked_issues: bool,
     pub review_samples: usize,
     pub sample_min_agreement: usize,
     pub sample_line_tolerance: u64,
@@ -160,6 +162,7 @@ impl ReviewSettings {
             repo_rules: cfg.repo_rules,
             path_instructions: cfg.path_instructions.clone(),
             rule_sources: cfg.rule_sources.clone(),
+            linked_issues: cfg.linked_issues,
             review_samples: cfg.review_samples,
             sample_min_agreement: cfg.sample_min_agreement,
             sample_line_tolerance: cfg.sample_line_tolerance,

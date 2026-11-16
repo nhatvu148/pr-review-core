@@ -679,6 +679,7 @@ mod tests {
             None,
             crate::prompt::UntrustedContext {
                 pr_body: block.as_deref(),
+                linked_issues: None,
                 change_intent: None,
             },
             &ws,
@@ -734,6 +735,7 @@ mod tests {
             None,
             crate::prompt::UntrustedContext {
                 pr_body: block.as_deref(),
+                linked_issues: None,
                 change_intent: None,
             },
             &ws,

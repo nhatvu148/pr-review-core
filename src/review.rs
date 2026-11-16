@@ -937,6 +937,19 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
+/// The summary line naming the linked issues the review read, or empty.
+fn linked_issues_note(issues: &[crate::providers::LinkedIssue]) -> String {
+    if issues.is_empty() {
+        return String::new();
+    }
+    let list = issues
+        .iter()
+        .map(|i| format!("#{}", i.number))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("\n\n_Checked against the issues this PR closes: {list}._")
+}
+
 /// Prefix of the hidden marker carrying a review's [`review_key`].
 const REVIEW_KEY_MARKER: &str = "<!-- kaniscope-review-key: ";
 
@@ -953,7 +966,12 @@ const REVIEW_KEY_MARKER: &str = "<!-- kaniscope-review-key: ";
 /// this key, nor is a change in CI results. Settings come
 /// from [`crate::rules::ReviewSettings`], the same allowlist `get-rules` shows,
 /// so a changed model, cap or floor is a new key.
-pub(crate) fn review_key(cfg: &Config, raw_diff: &str, meta: &PrMeta) -> String {
+pub(crate) fn review_key(
+    cfg: &Config,
+    raw_diff: &str,
+    meta: &PrMeta,
+    issues: &[crate::providers::LinkedIssue],
+) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     for line in raw_diff.lines() {
@@ -988,6 +1006,12 @@ pub(crate) fn review_key(cfg: &Config, raw_diff: &str, meta: &PrMeta) -> String 
     }
     h.update(b"\0");
     h.update(author_may_clone(meta).to_string().as_bytes());
+    // The issues the change is checked against are part of the prompt too, so an
+    // edited issue is a new review.
+    h.update(b"\0issues\0");
+    for i in issues {
+        h.update(format!("{}\0{}\0{}\0", i.number, i.title, i.body).as_bytes());
+    }
     hex::encode(&h.finalize()[..8])
 }
 
@@ -2750,7 +2774,25 @@ pub async fn run_review_with(
     // the prompt and so the review.
     let scoped = scoped_to_diff(cfg, &raw_diff);
     let cfg = &scoped;
-    let key = review_key(cfg, &raw_diff, &meta);
+    // Fail open: a lookup error means the review runs without them, as before.
+    let issues = if cfg.linked_issues {
+        provider
+            .linked_issues(&client, cfg, &input.repo, input.pr)
+            .await
+            .unwrap_or_else(|e| {
+                // WARN: on by default, so a token without Issues access would
+                // otherwise silently never use the feature.
+                tracing::warn!(
+                    "linked issues not read for {}#{}: {e:#}",
+                    input.repo,
+                    input.pr
+                );
+                Vec::new()
+            })
+    } else {
+        Vec::new()
+    };
+    let key = review_key(cfg, &raw_diff, &meta, &issues);
     // Never reuse over an advisory: OSV learns about vulnerabilities after the
     // last review ran, and the scan is the one part of a review that can change
     // with nothing in the PR changing. An empty list only counts when the scan
@@ -2912,6 +2954,8 @@ pub async fn run_review_with(
     let injected_rules = crate::prompt::injected_rules(cfg);
     // Composed here, once, for every backend — see `ReviewContext::untrusted`.
     let pr_body = crate::prompt::pr_body_block(cfg, &meta);
+    let issues_block = crate::prompt::untrusted_linked_issues_block(&issues);
+    let issues_block = (!issues_block.is_empty()).then_some(issues_block);
     // One clone for the whole review, however many samples it takes. Created
     // lazily by the first agentic sample and dropped with this scope, so the
     // temporary directory's lifetime is unchanged.
@@ -2940,6 +2984,7 @@ pub async fn run_review_with(
         structural_context: structural_opt,
         untrusted: crate::prompt::UntrustedContext {
             pr_body: pr_body.as_deref(),
+            linked_issues: issues_block.as_deref(),
             // A pull request states its intent in its description. `change_intent`
             // is the LOCAL path's equivalent, for a change that has no PR to carry
             // one — supplying both would hand the reviewer two statements of the
@@ -2990,6 +3035,9 @@ pub async fn run_review_with(
     finished
         .summary
         .push_str(&crate::repo_rules::rules_note(cfg));
+    // Which issues the review checked the change against, so a finding that cites
+    // one can be traced, and a missing link can be noticed.
+    finished.summary.push_str(&linked_issues_note(&issues));
     // Derived renderings of the change, appended last: they describe what the PR
     // touched, which is context for the findings above rather than a finding
     // itself. Both collapse into `<details>`, so a reader who wants only the
@@ -3258,6 +3306,7 @@ pub async fn run_review_local(
         structural_context: (!structural.is_empty()).then_some(structural.as_str()),
         untrusted: crate::prompt::UntrustedContext {
             pr_body: pr_body.as_deref(),
+            linked_issues: None,
             change_intent: change_intent.as_deref(),
         },
         injected_rules: &injected_rules,
@@ -4409,6 +4458,12 @@ mod orchestrator_tests {
             .expect("recording is on")
             .into_iter()
             .filter(|r| r.method.as_str() != "GET")
+            // A GraphQL *query* (the linked-issue lookup) is a read sent as POST.
+            // A mutation would still count.
+            .filter(|r| {
+                !(r.url.path() == "/graphql"
+                    && !String::from_utf8_lossy(&r.body).contains("mutation"))
+            })
             .count();
         assert_eq!(posts, 0, "a PR the engine never commented on stays silent");
     }
@@ -4640,6 +4695,86 @@ mod orchestrator_tests {
         }
     }
 
+    /// Captures the untrusted block every backend is handed.
+    struct UntrustedSpy(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl ReviewBackend for UntrustedSpy {
+        async fn review(&self, ctx: &ReviewContext<'_>) -> Result<ReviewResult> {
+            self.0.lock().unwrap().push(ctx.untrusted.render());
+            Ok(ReviewResult {
+                review: Review {
+                    summary: "s".into(),
+                    recommendation: "APPROVE".into(),
+                    findings: vec![],
+                },
+                model: "spy".into(),
+                usage: None,
+            })
+        }
+    }
+
+    /// The issue a PR closes reaches every backend, fenced, and the summary says
+    /// which issues the review was checked against.
+    #[tokio::test]
+    async fn the_issues_a_pr_closes_reach_the_reviewer_and_the_summary() {
+        let srv = github_stub_trust(DIFF, "write").await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "repository": { "pullRequest": { "closingIssuesReferences": {
+                    "nodes": [
+                        { "number": 12, "title": "Retry on 5xx", "body": "At most 3 tries.",
+                          "repository": { "nameWithOwner": "o/r" } },
+                        // Another repository's issue: a PR author's pointer the
+                        // bot's token might be able to read. Never fetched in.
+                        { "number": 5, "title": "secret", "body": "PRIVATE-BODY",
+                          "repository": { "nameWithOwner": "other/private" } }
+                    ]
+                } } } }
+            })))
+            .mount(&srv)
+            .await;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let out = run_review_with(
+            &cfg_for(&srv.uri()),
+            input(),
+            &UntrustedSpy(Arc::clone(&seen)),
+        )
+        .await
+        .expect("review");
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|u| !u.contains("PRIVATE-BODY")),
+            "another repository's issue must never reach the reviewer: {seen:?}"
+        );
+        assert!(
+            seen.iter()
+                .all(|u| u.contains("#12 — Retry on 5xx") && u.contains("At most 3 tries.")),
+            "{seen:?}"
+        );
+        assert!(
+            out.summary_markdown
+                .contains("Checked against the issues this PR closes: #12."),
+            "{}",
+            out.summary_markdown
+        );
+
+        // Off, nothing is fetched or shown.
+        let mut off = cfg_for(&srv.uri());
+        off.linked_issues = false;
+        let seen2 = Arc::new(Mutex::new(Vec::new()));
+        let out = run_review_with(&off, input(), &UntrustedSpy(Arc::clone(&seen2)))
+            .await
+            .expect("review");
+        assert!(!out.summary_markdown.contains("Checked against the issues"));
+        assert!(seen2
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|u| !u.contains("Retry on 5xx")));
+    }
+
     /// An automatic re-review that would see exactly what the last one saw leaves
     /// that review in place and runs no model. Nothing is posted: an unmocked
     /// POST would fail the test.
@@ -4694,8 +4829,9 @@ mod orchestrator_tests {
             ci_status: None,
             author_permission: Some("write".into()),
         };
-        let key =
-            |c: &Config, d: &str, meta: &crate::providers::PrMeta| super::review_key(c, d, meta);
+        let key = |c: &Config, d: &str, meta: &crate::providers::PrMeta| {
+            super::review_key(c, d, meta, &[])
+        };
         let a = Config::from_env();
         let mut b = a.clone();
         b.max_findings += 1;
@@ -4718,6 +4854,16 @@ mod orchestrator_tests {
         let mut outsider = m.clone();
         outsider.author_permission = Some("read".into());
         assert_ne!(key(&a, DIFF, &m), key(&a, DIFF, &outsider));
+        // An edited linked issue is a different review.
+        let issue = |body: &str| crate::providers::LinkedIssue {
+            number: 12,
+            title: "t".into(),
+            body: body.into(),
+        };
+        assert_ne!(
+            super::review_key(&a, DIFF, &m, &[issue("one")]),
+            super::review_key(&a, DIFF, &m, &[issue("two")])
+        );
     }
 
     /// The verdict a CI step can read off the PR: hidden, and counted per severity.

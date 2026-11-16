@@ -232,6 +232,9 @@ pub struct Config {
     /// Append a collapsed, copyable prompt that hands the posted findings to a
     /// coding agent. See `review::render_fix_prompt`.
     pub fix_prompt: bool,
+    /// Give the reviewer the issues the PR closes, to check the diff does what
+    /// they ask. Overridable per repo via `linked_issues` in `.prbot.toml`.
+    pub linked_issues: bool,
 
     /// Free-form instructions shaping the `/describe` output — release-notes
     /// sections, a contributor table, a house layout. Appended last to the
@@ -479,6 +482,7 @@ impl Config {
                 .parse()
                 .unwrap_or(true),
             fix_prompt: env_or("FIX_PROMPT", "false").parse().unwrap_or(false),
+            linked_issues: env_or("LINKED_ISSUES", "true").parse().unwrap_or(true),
 
             describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
 
@@ -566,6 +570,9 @@ impl Config {
         }
         if let Some(v) = &rc.inline_min_severity {
             cfg.inline_min_severity = v.clone();
+        }
+        if let Some(v) = rc.linked_issues {
+            cfg.linked_issues = v;
         }
         if let Some(v) = rc.self_critique {
             cfg.self_critique = v;

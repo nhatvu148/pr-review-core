@@ -73,3 +73,11 @@ pub struct ReviewPost {
     /// same finding, not a fix. Matched by fingerprint, then by nearby line.
     pub held: Vec<InlineComment>,
 }
+
+/// An issue the pull request says it closes, as the host links it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkedIssue {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+}

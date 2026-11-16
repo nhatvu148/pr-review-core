@@ -287,6 +287,13 @@ pub const SPEC: &[ConfigVar] = &[
         doc: "Lowest severity posted as an inline comment (BLOCKING, HIGH, MEDIUM, LOW). Findings below it are listed in the summary instead. Unset posts everything inline.",
     },
     ConfigVar {
+        env: "LINKED_ISSUES",
+        aliases: &[],
+        kind: ConfigKind::Bool,
+        default: Some("true"),
+        doc: "Give the reviewer the issues the PR closes (GitHub closing references), fenced as untrusted, to check the diff does what they ask. The summary lists the issues read.",
+    },
+    ConfigVar {
         env: "LLM_BASE_URL",
         aliases: &["OPENROUTER_BASE_URL"],
         kind: ConfigKind::Str,

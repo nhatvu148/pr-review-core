@@ -69,6 +69,8 @@ export interface ReviewConfig {
   includeGlobs?: string[];
   /** Lowest severity posted as an inline comment (BLOCKING, HIGH, MEDIUM, LOW). Findings below it are listed in the summary instead. Unset posts everything inline. (`INLINE_MIN_SEVERITY`) */
   inlineMinSeverity?: string;
+  /** Give the reviewer the issues the PR closes (GitHub closing references), fenced as untrusted, to check the diff does what they ask. The summary lists the issues read. Default: `true`. (`LINKED_ISSUES`) */
+  linkedIssues?: boolean;
   /** OpenAI-compatible endpoint, e.g. http://localhost:11434/v1 for Ollama. Default: `https://openrouter.ai/api/v1`. (`LLM_BASE_URL`) */
   llmBaseUrl?: string;
   /** Size budget for the packed diff. Beyond it, whole files are ranked and dropped rather than truncated mid-hunk. Default: `200000`. (`MAX_DIFF_CHARS`) */

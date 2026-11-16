@@ -993,6 +993,69 @@ async fn graphql(
     Ok(v)
 }
 
+const LINKED_ISSUES_QUERY: &str = r#"
+query($owner:String!,$name:String!,$pr:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$pr){
+      closingIssuesReferences(first:10){ nodes{ number title body repository{ nameWithOwner } } }
+    }
+  }
+}"#;
+
+/// The issues this PR closes, by GitHub's closing references. At most five (of the
+/// first ten GitHub reports): a PR
+/// that closes more is a batch, and its intent is better read from its own
+/// description than from a pile of tickets.
+///
+/// **Same repository only.** A PR author chooses what "Fixes …" points at, and the
+/// bot's token may read repositories the author cannot. An issue in another
+/// repository could be private, and its body would go to the model and could come
+/// back out in the review posted on this PR.
+pub async fn linked_issues(
+    client: &Client,
+    cfg: &Config,
+    repo: &str,
+    pr: u64,
+) -> Result<Vec<super::LinkedIssue>> {
+    require(&cfg.github_token, "GH_TOKEN")?;
+    let (owner, name) = repo
+        .split_once('/')
+        .context("GitHub repo must be owner/name")?;
+    let v = graphql(
+        client,
+        cfg,
+        LINKED_ISSUES_QUERY,
+        serde_json::json!({ "owner": owner, "name": name, "pr": pr }),
+    )
+    .await?;
+    let nodes = v["data"]["repository"]["pullRequest"]["closingIssuesReferences"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Ok(nodes
+        .iter()
+        .filter(|n| {
+            let same = n["repository"]["nameWithOwner"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(repo));
+            if !same {
+                tracing::info!("{repo}#{pr}: ignoring a closing reference outside this repository");
+            }
+            same
+        })
+        .filter_map(|n| {
+            Some(super::LinkedIssue {
+                number: n["number"].as_u64()?,
+                title: n["title"].as_str().unwrap_or_default().to_string(),
+                body: n["body"].as_str().unwrap_or_default().to_string(),
+            })
+        })
+        // Ten fetched, five kept after the same-repository filter, so a PR that
+        // lists outside references first cannot crowd its own issues out.
+        .take(5)
+        .collect())
+}
+
 const THREADS_QUERY: &str = r#"
 query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
   repository(owner:$owner,name:$name){

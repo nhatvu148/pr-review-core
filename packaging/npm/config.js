@@ -35,6 +35,7 @@ const CONFIG_ENV = {
   grepContext: ["GREP_CONTEXT", "Bool"],
   includeGlobs: ["INCLUDE_GLOBS", "Globs"],
   inlineMinSeverity: ["INLINE_MIN_SEVERITY", "Str"],
+  linkedIssues: ["LINKED_ISSUES", "Bool"],
   llmBaseUrl: ["LLM_BASE_URL", "Str"],
   maxDiffChars: ["MAX_DIFF_CHARS", "Int"],
   maxFindings: ["MAX_FINDINGS", "Int"],

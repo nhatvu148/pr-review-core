@@ -175,6 +175,8 @@ export interface RepoConfig {
   inline_min_severity?: string | null;
   /** Extra review instructions in plain language, appended to the system prompt. */
   instructions?: string | null;
+  /** Toggle giving the reviewer the issues the PR closes, for this repo. */
+  linked_issues?: boolean | null;
   max_findings?: number | null;
   min_confidence?: number | null;
   model?: string | null;
@@ -248,6 +250,8 @@ export interface ReviewSettings {
   includeGlobs: string[];
   /** The inline severity floor in force, or `None` when every finding posts inline. */
   inlineMinSeverity?: string | null;
+  /** Whether the issues a PR closes are given to the reviewer. */
+  linkedIssues: boolean;
   maxDiffChars: number;
   maxFindings: number;
   maxHistoryChars: number;
