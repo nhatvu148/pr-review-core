@@ -4,13 +4,13 @@
 
 ### Added
 
-- **The reviewer checks the change against the issues it closes.** A PR description says what its author thinks the change does. The issue says what was asked for, and a requirement the diff quietly misses is a defect only that text can surface. On GitHub the engine now reads the PR's closing references (`Fixes #12` in the description, or an issue linked in the sidebar), at most five, each capped at 3,000 characters. It hands them to every backend as an untrusted, fenced block next to the PR description, with the instruction that a requirement the diff misses or contradicts is a finding at a normal severity. A truncated issue carries the same warning as a truncated description, so the cap does not manufacture "missing requirement" findings. The summary names the issues the review was checked against. `LINKED_ISSUES` (default on), or `linked_issues` in `.prbot.toml`, controls it. A lookup failure skips the issues and the review runs as before.
+- **The reviewer checks the change against the issues it closes.** A PR description says what its author thinks the change does. The issue says what was asked for, and a requirement the diff quietly misses is a defect only that text can surface. On GitHub the engine now reads the PR's closing references (`Fixes #12` in the description, or an issue linked in the sidebar), at most five, each capped at 3,000 characters, and only those in the same repository. A PR author chooses what "Fixes …" points at, and the bot's token may read repositories the author cannot, so a private issue elsewhere could otherwise reach the model and come back out in the posted review. It hands them to every backend as an untrusted, fenced block next to the PR description, with the instruction that a requirement the diff misses or contradicts is a finding at a normal severity. A truncated issue carries the same warning as a truncated description, so the cap does not manufacture "missing requirement" findings. The summary names the issues the review was checked against. `LINKED_ISSUES` (default on), or `linked_issues` in `.prbot.toml`, controls it. A lookup failure skips the issues and the review runs as before.
 
 | Change | What to do |
 |---|---|
 | `prompt::UntrustedContext` has a new public field, `linked_issues: Option<&str>` | Code that builds one with a struct literal adds `linked_issues: None`. A backend that appends `ctx.untrusted.render()` gets the block with no other change. |
 
-Known limits: GitHub only. Issues in another repository are read only when GitHub reports them as closing references. Jira and Linear links are not followed.
+Known limits: GitHub only. Issues in other repositories are never read. Jira and Linear links are not followed.
 
 ## 0.43.0
 

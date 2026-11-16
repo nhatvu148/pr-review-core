@@ -4048,7 +4048,14 @@ mod orchestrator_tests {
             .and(path("/graphql"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": { "repository": { "pullRequest": { "closingIssuesReferences": {
-                    "nodes": [{ "number": 12, "title": "Retry on 5xx", "body": "At most 3 tries." }]
+                    "nodes": [
+                        { "number": 12, "title": "Retry on 5xx", "body": "At most 3 tries.",
+                          "repository": { "nameWithOwner": "o/r" } },
+                        // Another repository's issue: a PR author's pointer the
+                        // bot's token might be able to read. Never fetched in.
+                        { "number": 5, "title": "secret", "body": "PRIVATE-BODY",
+                          "repository": { "nameWithOwner": "other/private" } }
+                    ]
                 } } } }
             })))
             .mount(&srv)
@@ -4062,6 +4069,10 @@ mod orchestrator_tests {
         .await
         .expect("review");
         let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|u| !u.contains("PRIVATE-BODY")),
+            "another repository's issue must never reach the reviewer: {seen:?}"
+        );
         assert!(
             seen.iter()
                 .all(|u| u.contains("#12 — Retry on 5xx") && u.contains("At most 3 tries.")),

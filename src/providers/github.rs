@@ -975,7 +975,7 @@ const LINKED_ISSUES_QUERY: &str = r#"
 query($owner:String!,$name:String!,$pr:Int!){
   repository(owner:$owner,name:$name){
     pullRequest(number:$pr){
-      closingIssuesReferences(first:5){ nodes{ number title body } }
+      closingIssuesReferences(first:5){ nodes{ number title body repository{ nameWithOwner } } }
     }
   }
 }"#;
@@ -983,6 +983,11 @@ query($owner:String!,$name:String!,$pr:Int!){
 /// The issues this PR closes, by GitHub's closing references. At most five: a PR
 /// that closes more is a batch, and its intent is better read from its own
 /// description than from a pile of tickets.
+///
+/// **Same repository only.** A PR author chooses what "Fixes …" points at, and the
+/// bot's token may read repositories the author cannot. An issue in another
+/// repository could be private, and its body would go to the model and could come
+/// back out in the review posted on this PR.
 pub async fn linked_issues(
     client: &Client,
     cfg: &Config,
@@ -1006,6 +1011,15 @@ pub async fn linked_issues(
         .unwrap_or_default();
     Ok(nodes
         .iter()
+        .filter(|n| {
+            let same = n["repository"]["nameWithOwner"]
+                .as_str()
+                .is_some_and(|r| r.eq_ignore_ascii_case(repo));
+            if !same {
+                tracing::info!("{repo}#{pr}: ignoring a closing reference outside this repository");
+            }
+            same
+        })
         .filter_map(|n| {
             Some(super::LinkedIssue {
                 number: n["number"].as_u64()?,
