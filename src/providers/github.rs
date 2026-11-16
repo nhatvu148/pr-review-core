@@ -999,7 +999,7 @@ query($owner:String!,$name:String!,$pr:Int!,$cursor:String){
     pullRequest(number:$pr){
       reviewThreads(first:100, after:$cursor){
         pageInfo{ hasNextPage endCursor }
-        nodes{ id isResolved path line comments(first:1){ nodes{ databaseId body originalCommit{ oid } } } }
+        nodes{ id isResolved isOutdated path line comments(first:1){ totalCount nodes{ databaseId body originalCommit{ oid } } } }
       }
     }
   }
@@ -1011,6 +1011,7 @@ const RESOLVE_MUTATION: &str =
 const REPLY_MUTATION: &str = "mutation($tid:ID!,$body:String!){ addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$tid, body:$body}){ comment{ id } } }";
 
 /// One of the bot's existing review-comment threads on the PR.
+#[derive(Clone)]
 struct BotThread {
     id: String,
     /// REST id of the thread's first (top) comment — for the delete fallback.
@@ -1029,6 +1030,15 @@ struct BotThread {
     /// is what separates "the author fixed it" from "this round did not sample
     /// it" — see `finding_could_have_been_fixed`.
     original_commit: Option<String>,
+    /// GitHub's own verdict that the lines this thread points at have changed
+    /// since it was written. It is GitHub's notion of a diff position no longer
+    /// applying, so an edit to nearby lines in the same hunk can set it too: looser
+    /// than "this exact line changed", but still evidence the code moved. The only evidence, short of re-reviewing, that a
+    /// finding the model did not repeat might actually have been fixed.
+    is_outdated: bool,
+    /// Comments in the thread, the bot's own first one included. More than one
+    /// means a person replied, and deleting the root would orphan them.
+    comment_count: u64,
     /// The comment's body as posted. Reconciliation only needs the fingerprint
     /// out of it, but `list_findings` returns the prose to a caller who is going
     /// to act on the finding and therefore has to read what it said.
@@ -1098,16 +1108,57 @@ pub(crate) async fn list_findings(
 /// consecutive reviews of a frozen commit shared 61–74% of their findings, and a
 /// HIGH at confidence 75/78 was missed outright by one run in three.
 ///
-/// When the review is looking at the same commit the thread was written against,
-/// nothing has been edited in between, so the finding cannot have been fixed and
-/// its absence is a sampling miss by definition. Resolving there states something
-/// known to be false — `✅ Resolved — no longer flagged as of <sha>`, on the sha
-/// it was found on.
+/// So "a new commit exists" is not enough. Before this, any push resolved every
+/// finding the round did not repeat, including ones in files the push never
+/// touched: a quarter to a third of real findings closed per round as "fixed",
+/// which is also what a converging fix loop and the acted-on metric then counted.
+/// The evidence required now is GitHub's `isOutdated`: the lines the thread
+/// points at changed. A thread whose code is untouched stays open, however many
+/// commits land elsewhere.
 ///
 /// Unknown provenance resolves as before. A legacy thread carries no commit, and
 /// refusing to ever clean those up would leave them on the PR forever.
 fn finding_could_have_been_fixed(thread: &BotThread, reviewing: &str) -> bool {
-    thread.original_commit.as_deref() != Some(reviewing)
+    match thread.original_commit.as_deref() {
+        None => true,
+        Some(c) if c == reviewing => false,
+        Some(_) => thread.is_outdated,
+    }
+}
+
+/// Whether the delete fallback may remove a thread's root comment.
+///
+/// Only when the bot's comment is alone. With replies under it, deleting the
+/// root leaves a person's words hanging off nothing; an unresolved thread that
+/// stays is the lesser harm.
+fn may_delete_thread(thread: &BotThread) -> bool {
+    thread.comment_count <= 1
+}
+
+/// Mark the threads that findings held back by the severity floor pair with, so
+/// reconciliation leaves them alone.
+///
+/// Paired only against what the posted findings left unclaimed: a posted finding
+/// keeps first claim on its thread. A held finding is still flagged, so a thread
+/// it pairs with is neither a fix nor a new post.
+fn claim_held(threads: &[BotThread], claimed: &mut [bool], held: &[InlineComment]) {
+    if held.is_empty() {
+        return;
+    }
+    // A held finding with no line (0) must pair by fingerprint only. Passed as 0,
+    // the positional pass would accept any thread on lines 1-10 of the file.
+    let keys: Vec<(String, u64, String)> = held
+        .iter()
+        .map(|c| {
+            let line = if c.line == 0 { u64::MAX } else { c.line };
+            (c.path.clone(), line, finding_fingerprint(&c.path, &c.body))
+        })
+        .collect();
+    let open: Vec<usize> = (0..threads.len()).filter(|i| !claimed[*i]).collect();
+    let rest: Vec<BotThread> = open.iter().map(|i| threads[*i].clone()).collect();
+    for slot in pair_findings(&rest, &keys).into_iter().flatten() {
+        claimed[open[slot]] = true;
+    }
 }
 
 /// List the bot's prior inline-comment threads (whose first comment carries the
@@ -1148,6 +1199,10 @@ async fn bot_threads(
                     path: node["path"].as_str().unwrap_or_default().to_string(),
                     line: node["line"].as_u64(),
                     original_commit: first["originalCommit"]["oid"].as_str().map(str::to_string),
+                    is_outdated: node["isOutdated"].as_bool().unwrap_or(false),
+                    // Unknown counts as "has replies": the guard it feeds must not
+                    // fail open on the one case it exists for.
+                    comment_count: node["comments"]["totalCount"].as_u64().unwrap_or(u64::MAX),
                     body: body.to_string(),
                 });
             }
@@ -1277,6 +1332,7 @@ async fn reconcile_inline(
     meta: &PrMeta,
     commit_id: &str,
     inline: &[InlineComment],
+    held: &[InlineComment],
 ) -> Result<Reconciled> {
     let (owner, name) = meta
         .repo
@@ -1312,6 +1368,7 @@ async fn reconcile_inline(
             None => pending.push((c, fp.clone())),
         }
     }
+    claim_held(&threads, &mut claimed, held);
 
     // One review for the whole round, falling back to one comment each if GitHub
     // refuses it — see `post_inline_review` for why the fallback is required
@@ -1365,18 +1422,19 @@ async fn reconcile_inline(
         if claimed[i] || t.is_resolved {
             continue;
         }
-        if !finding_could_have_been_fixed(t, commit_id) {
+        // A legacy thread (no fingerprint) can never match a finding, so it is
+        // migration cleanup, not a judgement about a fix: it goes on first sight.
+        if t.fp.is_some() && !finding_could_have_been_fixed(t, commit_id) {
             tracing::debug!(
-                "{}: still on {}, so this round not flagging it is a miss, not a fix",
+                "{}: code unchanged as of {}, so this round not flagging it is a miss, not a fix",
                 t.path,
                 short
             );
             continue;
         }
-        if t.fp.is_some() {
-            resolved.push(format!("`{}`", t.path));
-        }
-        match graphql(
+        // Reported only once it has actually gone: a thread kept open because
+        // someone replied must not be summarised as resolved.
+        let gone = match graphql(
             client,
             cfg,
             RESOLVE_MUTATION,
@@ -1396,14 +1454,25 @@ async fn reconcile_inline(
                     serde_json::json!({ "tid": t.id, "body": reply }),
                 )
                 .await;
+                true
             }
-            Err(e) => {
+            Err(e) if may_delete_thread(t) => {
                 tracing::debug!(
                     "resolve thread failed on {} ({e:#}); deleting the comment instead",
                     t.path
                 );
-                delete_comment(client, cfg, &meta.repo, t.comment_id).await;
+                delete_comment(client, cfg, &meta.repo, t.comment_id).await
             }
+            Err(e) => {
+                tracing::debug!(
+                    "resolve thread failed on {} ({e:#}); it has replies, so it stays",
+                    t.path
+                );
+                false
+            }
+        };
+        if gone && t.fp.is_some() {
+            resolved.push(format!("`{}`", t.path));
         }
     }
     Ok(Reconciled { resolved, dropped })
@@ -1411,15 +1480,22 @@ async fn reconcile_inline(
 
 /// Best-effort delete of a review comment by its REST id (the fallback when the
 /// token can't resolve threads).
-async fn delete_comment(client: &Client, cfg: &Config, repo: &str, comment_id: u64) {
+///
+/// Returns whether the comment is actually gone, so a failed delete is never
+/// reported as a resolved finding.
+async fn delete_comment(client: &Client, cfg: &Config, repo: &str, comment_id: u64) -> bool {
     if comment_id == 0 {
-        return;
+        return false;
     }
     let url = format!(
         "{}/repos/{repo}/pulls/comments/{comment_id}",
         cfg.github_api_base
     );
-    let _ = gh(client.delete(url), cfg).send().await;
+    match gh(client.delete(url), cfg).send().await {
+        // 404: already gone, which is the outcome wanted.
+        Ok(r) => r.status().is_success() || r.status() == reqwest::StatusCode::NOT_FOUND,
+        Err(_) => false,
+    }
 }
 
 pub async fn post_review(
@@ -1440,7 +1516,7 @@ pub async fn post_review(
     };
     match &meta.head_sha {
         Some(sha) => {
-            outcome = reconcile_inline(client, cfg, meta, sha, &review.inline)
+            outcome = reconcile_inline(client, cfg, meta, sha, &review.inline, &review.held)
                 .await
                 .unwrap_or_else(|e| {
                     tracing::warn!(
@@ -1573,6 +1649,8 @@ mod tests {
             path: path.to_string(),
             line,
             original_commit: None,
+            is_outdated: false,
+            comment_count: 1,
             body: String::new(),
         }
     }
@@ -1590,8 +1668,15 @@ mod tests {
             path: "src/a.rs".into(),
             line: Some(40),
             original_commit: commit.map(str::to_string),
+            is_outdated: false,
+            comment_count: 1,
             body: String::new(),
         }
+    }
+
+    fn outdated(mut t: super::BotThread) -> super::BotThread {
+        t.is_outdated = true;
+        t
     }
 
     /// The retraction this prevents, and it is not hypothetical.
@@ -1609,14 +1694,33 @@ mod tests {
         );
     }
 
-    /// Once the code moves, a missing finding is a fix again — the guard must not
-    /// leave stale threads on the PR forever.
+    /// Once the code it points at moves, a missing finding can be a fix again —
+    /// the guard must not leave stale threads on the PR forever.
     #[test]
-    fn a_thread_from_an_earlier_commit_still_resolves() {
+    fn a_thread_whose_lines_changed_resolves() {
         assert!(super::finding_could_have_been_fixed(
+            &outdated(thread_on(Some("687cfc8"))),
+            "9d20cad"
+        ));
+    }
+
+    /// A push elsewhere is not a fix here. Before this, any new commit resolved
+    /// every finding the round did not repeat, in files the push never touched.
+    #[test]
+    fn a_new_commit_that_left_the_thread_s_lines_alone_does_not_resolve_it() {
+        assert!(!super::finding_could_have_been_fixed(
             &thread_on(Some("687cfc8")),
             "9d20cad"
         ));
+    }
+
+    /// A person replied under the finding. Deleting the root would orphan them.
+    #[test]
+    fn a_thread_with_replies_is_never_deleted() {
+        let mut t = thread_on(Some("687cfc8"));
+        assert!(super::may_delete_thread(&t));
+        t.comment_count = 2;
+        assert!(!super::may_delete_thread(&t));
     }
 
     /// A legacy thread carries no commit. Refusing to clean those would strand
@@ -1627,6 +1731,56 @@ mod tests {
             &thread_on(None),
             "687cfc8"
         ));
+    }
+
+    /// A finding held back by the severity floor is still flagged: the thread it
+    /// was posted on in an earlier round stays, rather than reading as a fix.
+    #[test]
+    fn a_held_back_finding_keeps_its_old_thread() {
+        let threads = vec![
+            thread("aaaa", "src/a.rs", Some(40)),
+            thread("bbbb", "src/b.rs", Some(9)),
+        ];
+        let mut claimed = vec![false, false];
+        let held = vec![crate::providers::InlineComment {
+            path: "src/a.rs".into(),
+            line: 42,
+            start_line: None,
+            body: "reworded, so only the line can pair it".into(),
+        }];
+        super::claim_held(&threads, &mut claimed, &held);
+        assert_eq!(claimed, vec![true, false]);
+    }
+
+    /// A held finding with no line pairs by fingerprint or not at all, never by
+    /// being "near" the top of the file.
+    #[test]
+    fn a_held_finding_without_a_line_does_not_pair_by_position() {
+        let threads = vec![thread("aaaa", "src/a.rs", Some(3))];
+        let mut claimed = vec![false];
+        let held = vec![crate::providers::InlineComment {
+            path: "src/a.rs".into(),
+            line: 0,
+            start_line: None,
+            body: "unrelated".into(),
+        }];
+        super::claim_held(&threads, &mut claimed, &held);
+        assert_eq!(claimed, vec![false]);
+    }
+
+    /// A posted finding keeps first claim on a thread over a held one.
+    #[test]
+    fn a_held_finding_never_takes_a_thread_a_posted_one_claimed() {
+        let threads = vec![thread("aaaa", "src/a.rs", Some(40))];
+        let mut claimed = vec![true];
+        let held = vec![crate::providers::InlineComment {
+            path: "src/a.rs".into(),
+            line: 40,
+            start_line: None,
+            body: "x".into(),
+        }];
+        super::claim_held(&threads, &mut claimed, &held);
+        assert_eq!(claimed, vec![true]);
     }
 
     /// The duplicate this widening removes, from a real pull request.
