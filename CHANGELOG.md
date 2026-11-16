@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`Usage` can carry what a review cost, and its cache tokens apart from its input.** It gains `cost_usd`, `cache_read_tokens` and `cache_creation_tokens`, all optional and summed across a review and its repair pass like the token counts. An agent CLI reports its cost in dollars, and a consumer's backend had to discard it because `Usage` had nowhere to put it. The same backends folded cache reads and writes into `prompt_tokens`, reporting an input several times larger than what was billed at the full rate. Every run-log record and `--json` output carries the new fields when a backend fills them. No backend in this crate reports a cost yet: the OpenRouter path returns tokens only, so `cost_usd` stays absent there.
+
+| Change | What to do |
+|---|---|
+| `llm::Usage` has three new public fields and derives `Default` | Code that builds a `Usage` with a struct literal adds `..Default::default()`. JSON consumers are unaffected, and the generated Node and Python types include them. |
+
 ## 0.43.0
 
 **A file cut to fit the budget now comes with a digest of its whole change, so the reviewer can tell whether the hunks it was not shown look like the ones it was.**

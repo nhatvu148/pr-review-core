@@ -4283,6 +4283,7 @@ mod orchestrator_tests {
                     prompt_tokens: Some(100),
                     completion_tokens: Some(10),
                     total_tokens: Some(110),
+                    ..Default::default()
                 }),
             })
         }

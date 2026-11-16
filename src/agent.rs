@@ -439,6 +439,7 @@ pub async fn agentic_review(
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: Some(outcome.total_tokens),
+        ..Default::default()
     });
     // `outcome.model` is agent-core's honest attribution — "main (explore:
     // cheap)" when tiered, collapsing to one name when explore == synthesize.
