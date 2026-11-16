@@ -347,6 +347,19 @@ mod severity_and_recommendation_tests {
             ),
             "APPROVE"
         );
+        // A rule that removed nothing the verdict rested on keeps its wording.
+        assert_eq!(
+            recommendation_after_suppression(
+                "I recommend APPROVE WITH CHANGES",
+                "APPROVE WITH CHANGES",
+                1,
+                &[Finding {
+                    severity: "HIGH".to_string(),
+                    ..low.clone()
+                }]
+            ),
+            "I recommend APPROVE WITH CHANGES"
+        );
         // Nothing suppressed: the model's verdict stands as before.
         assert_eq!(
             recommendation_after_suppression(
@@ -396,8 +409,8 @@ fn effective_recommendation(model_rec: &str, findings: &[Finding]) -> String {
 ///
 /// The model's verdict is never softened, with one exception: when it is no
 /// stronger than its own findings justified (`floor_before`) and a rule removed
-/// some of them, those findings were its reason, so it is recomputed from what
-/// is left. Otherwise a review whose HIGHs the team rejected would still say
+/// enough of them to lower that floor, those findings were its reason, so it is
+/// recomputed from what is left. Otherwise a review whose HIGHs the team rejected would still say
 /// "APPROVE WITH CHANGES" with nothing listed to change. A verdict stronger than
 /// its findings justified has a reason outside them, and stands.
 fn recommendation_after_suppression(
@@ -406,9 +419,16 @@ fn recommendation_after_suppression(
     suppressed: usize,
     findings: &[Finding],
 ) -> String {
-    if suppressed > 0 && recommendation_rank(model_rec) <= recommendation_rank(floor_before) {
-        effective_recommendation("APPROVE", findings)
+    let floor_after = effective_recommendation("APPROVE", findings);
+    let floor_dropped = recommendation_rank(&floor_after) < recommendation_rank(floor_before);
+    if suppressed > 0
+        && floor_dropped
+        && recommendation_rank(model_rec) <= recommendation_rank(floor_before)
+    {
+        floor_after
     } else {
+        // Including when the rules removed nothing the verdict rested on: the
+        // model's own wording is kept rather than swapped for the bare label.
         effective_recommendation(model_rec, findings)
     }
 }
@@ -1947,9 +1967,10 @@ async fn post_advisory_only(
     meta: &PrMeta,
     input: &RunReviewInput,
     (advisories, scan_status): (Vec<crate::deps::DepAdvisory>, crate::deps::ScanStatus),
-    hygiene: Vec<Finding>,
+    (hygiene, suppressed): (Vec<Finding>, usize),
 ) -> Result<RunReviewOutput> {
-    let summary = render_no_review_summary(&advisories, &hygiene);
+    let mut summary = render_no_review_summary(&advisories, &hygiene);
+    summary.push_str(&crate::suppress::note(suppressed));
     // A CVE advisory always warrants changes; hygiene findings upgrade from there.
     let baseline = if advisories.is_empty() {
         "APPROVE"
@@ -2912,7 +2933,11 @@ pub async fn run_review_with(
     // nothing for the LLM to review — but a dependency advisory or a hygiene finding
     // on those files still deserves a comment. Post the no-review summary and return.
     if prepared.diff.trim().is_empty() {
-        if !advisories.is_empty() || !prepared.hygiene.is_empty() {
+        // Suppression applies here too: a rule silencing a hygiene finding must
+        // not stop working on the PR whose every file happens to be excluded.
+        let mut hygiene = prepared.hygiene;
+        let suppressed = crate::suppress::apply(&cfg.suppress, &mut hygiene);
+        if !advisories.is_empty() || !hygiene.is_empty() {
             let advisory_count = advisories.len();
             let out = post_advisory_only(
                 &provider,
@@ -2921,7 +2946,7 @@ pub async fn run_review_with(
                 &meta,
                 &input,
                 (advisories, scan_status),
-                prepared.hygiene,
+                (hygiene, suppressed),
             )
             .await?;
             // No model ran on this path, so most of the funnel is vacuous: every
@@ -2938,7 +2963,8 @@ pub async fn run_review_with(
                     advisories: advisory_count,
                     truncated_salvage: false,
                     funnel: crate::runlog::Funnel {
-                        hygiene_added: n,
+                        hygiene_added: n + suppressed,
+                        suppressed,
                         after_collapse: n,
                         posted_findings: n,
                         unanchored: n,
@@ -3295,9 +3321,12 @@ pub async fn run_review_local(
     if prepared.diff.trim().is_empty() {
         // No LLM review is possible, but a hygiene finding on an excluded file (a
         // swept-in binary) is still a real result — return it rather than erroring.
-        if !prepared.hygiene.is_empty() {
-            let summary = render_no_review_summary(&[], &prepared.hygiene);
-            let recommendation = effective_recommendation("APPROVE", &prepared.hygiene);
+        let mut hygiene = prepared.hygiene;
+        let suppressed = crate::suppress::apply(&cfg.suppress, &mut hygiene);
+        if !hygiene.is_empty() {
+            let mut summary = render_no_review_summary(&[], &hygiene);
+            summary.push_str(&crate::suppress::note(suppressed));
+            let recommendation = effective_recommendation("APPROVE", &hygiene);
             return Ok(RunReviewOutput {
                 provider: LOCAL_PROVIDER.to_string(),
                 repo: input.label,
@@ -3313,8 +3342,8 @@ pub async fn run_review_local(
                 // serialized response pr-review-bot consumes — a separate change.)
                 model: String::new(),
                 recommendation,
-                findings: prepared.hygiene.len(),
-                findings_detail: prepared.hygiene,
+                findings: hygiene.len(),
+                findings_detail: hygiene,
                 inline_posted: 0,
                 inline_detail: Vec::new(),
                 advisories: Vec::new(),
@@ -3693,6 +3722,43 @@ mod local_review_tests {
             "a held-back finding is still a finding"
         );
         assert_eq!(out.findings_detail.len(), 1, "nothing is dropped");
+    }
+
+    /// A change with nothing for the model to read still applies suppression to
+    /// its hygiene findings, so a rule does not stop working on the one PR whose
+    /// every file is excluded.
+    #[tokio::test]
+    async fn suppression_also_applies_when_only_hygiene_findings_exist() {
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.suppress = vec![crate::suppress::Suppression {
+            contains: "a binary file `assets/ime.zip`".to_string(),
+            paths: Vec::new(),
+            reason: "the IME bundle is shipped in the repo on purpose".to_string(),
+        }];
+        // Excluded, so no model sees it and only the hygiene path can report it.
+        c.exclude_globs.push("assets/**".to_string());
+        let diff = "diff --git a/assets/ime.zip b/assets/ime.zip\n\
+                    new file mode 100644\n\
+                    index 0000000..abc1234\n\
+                    Binary files /dev/null and b/assets/ime.zip differ\n";
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: diff.to_string(),
+                repo_root: None,
+                label: "branch".to_string(),
+                change_intent: None,
+            },
+            &backend,
+        )
+        .await;
+        // With the only finding suppressed there is nothing left to report.
+        assert!(
+            matches!(&out, Err(e) if e.is::<NothingToReview>()),
+            "{:?}",
+            out.as_ref().map(|o| &o.summary_markdown)
+        );
     }
 
     /// At or above the floor, a finding posts inline exactly as before.

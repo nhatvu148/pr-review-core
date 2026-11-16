@@ -158,7 +158,9 @@ pub struct Funnel {
     /// summary instead. `anchored + unanchored + held_back == posted_findings`.
     pub held_back: usize,
     /// Removed by a `[[suppress]]` rule in `.prbot.toml`, after the confidence
-    /// floor and before the cap. Absent on records from before suppression.
+    /// floor and the hygiene merge and before the burst collapse, so
+    /// `after_confidence + hygiene_added - suppressed` is what the collapse saw.
+    /// Absent on records from before suppression.
     #[serde(default)]
     pub suppressed: usize,
     /// Of the anchored ones, how many carried a committable suggestion block.
