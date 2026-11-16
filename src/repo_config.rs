@@ -100,6 +100,9 @@ pub struct RepoConfig {
     /// globs — see [`crate::repo_rules::PathInstruction`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_instructions: Option<Vec<crate::repo_rules::PathInstruction>>,
+    /// Findings this repo has decided against — see [`crate::suppress`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub suppress: Option<Vec<crate::suppress::Suppression>>,
     /// Toggle reading `REVIEW.md`, `.cursor/BUGBOT.md` and the review section of
     /// `AGENTS.md` from the base branch, for this repo.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,6 +134,19 @@ pub fn parse(toml_str: &str) -> anyhow::Result<RepoConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suppress_rules_parse_and_an_unknown_key_in_one_is_an_error() {
+        let rc = parse(
+            "[[suppress]]\ncontains = \"unwrap on a poisoned mutex\"\npaths = [\"src/**\"]\nreason = \"wanted\"\n",
+        )
+        .expect("parses");
+        let rules = rc.suppress.expect("present");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].paths, vec!["src/**".to_string()]);
+        // A typo'd key must fail loudly rather than leave a rule that never matches.
+        assert!(parse("[[suppress]]\ncontain = \"x\"\nreason = \"y\"\n").is_err());
+    }
 
     /// The knobs this incident produced are per-repo, like every other
     /// reviewer-shaping knob here.

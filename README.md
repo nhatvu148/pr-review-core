@@ -89,6 +89,18 @@ prompt through [`Config`].
   paths = ["migrations/**"]
   instructions = "Every migration must be reversible."
   ```
+- **Findings the repo has decided against**: `[[suppress]]` in `.prbot.toml` stops a
+  finding the team has already rejected from coming back on every PR. A rule
+  matches the finding's text (case-insensitive, at least 10 characters), can be
+  scoped to paths, and must say why. A `BLOCKING` finding is never suppressed, and
+  the summary says how many findings a rule removed:
+
+  ```toml
+  [[suppress]]
+  contains = "unwrap on a poisoned mutex"
+  paths = ["src/legacy/**"]
+  reason = "a poisoned lock is a bug we want to crash on"
+  ```
 - **Rules the repo already wrote**: `REVIEW.md`, `.cursor/BUGBOT.md` and the review
   section of `AGENTS.md` (a heading such as `## Code Review Rules`) are read from the
   base branch and applied, each capped at 4,000 characters and 8,000 together. The

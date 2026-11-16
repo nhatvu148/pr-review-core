@@ -2551,6 +2551,10 @@ async fn finish_review(
     // A claim that CI has already falsified is capped at LOW — see the function.
     // A local review carries no CI block, so this is a no-op there.
     demote_falsified_build_claims(&mut findings, meta.ci_status.as_deref());
+    // Before the burst collapse, which rewrites a body to state a count and would
+    // stop a rule's text matching, and before the recommendation, so a finding
+    // the team has decided against cannot raise the verdict either.
+    funnel.suppressed = crate::suppress::apply(&cfg.suppress, &mut findings);
     // Collapse a burst of one claim repeated across many files into a single finding
     // that states the count — before the sort, so the survivor competes on merit.
     findings = collapse_bursts(findings);
@@ -2672,13 +2676,14 @@ async fn finish_review(
     }
 
     // `recommendation` was computed from the pre-truncation findings above.
-    let summary = render_summary(
+    let mut summary = render_summary(
         &result.review,
         &recommendation,
         &unanchored,
         &quiet,
         inline.len(),
     );
+    summary.push_str(&crate::suppress::note(funnel.suppressed));
 
     funnel.anchored = inline.len();
     funnel.unanchored = unanchored.len();
@@ -5154,6 +5159,59 @@ mod orchestrator_tests {
                 usage: None,
             })
         }
+    }
+
+    /// A suppressed finding is gone from the posted review and from the run log's
+    /// findings, and is counted in the summary and the funnel so a rule matching
+    /// more than intended shows.
+    #[tokio::test]
+    async fn a_suppress_rule_removes_its_findings_and_says_how_many() {
+        let srv = github_stub().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("runs.jsonl");
+
+        let mut cfg = cfg_for(&srv.uri());
+        cfg.reanchor_findings = false;
+        cfg.run_log = Some(crate::runlog::RunLogSink::File(log.clone()));
+        cfg.suppress = vec![
+            crate::suppress::Suppression {
+                contains: "a null deref".to_string(),
+                paths: vec!["src/**".to_string()],
+                reason: "the type makes it impossible".to_string(),
+            },
+            crate::suppress::Suppression {
+                contains: "an unchecked index".to_string(),
+                paths: Vec::new(),
+                reason: "bounds are checked by the caller".to_string(),
+            },
+        ];
+
+        let out = run_review_with(&cfg, input(), &FunnelBackend)
+            .await
+            .expect("the review runs");
+
+        assert!(
+            out.summary_markdown
+                .contains("2 findings matched a `[[suppress]]` rule"),
+            "{}",
+            out.summary_markdown
+        );
+        assert!(!out.summary_markdown.contains("a null deref"));
+        let v: serde_json::Value =
+            serde_json::from_str(std::fs::read_to_string(&log).unwrap().trim()).unwrap();
+        assert_eq!(v["funnel"]["suppressed"], 2);
+        let bodies: Vec<&str> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["body"].as_str())
+            .collect();
+        assert!(
+            !bodies
+                .iter()
+                .any(|b| b.contains("null deref") || b.contains("unchecked index")),
+            "{bodies:?}"
+        );
     }
 
     /// The run log's reason to exist: the per-stage counts are the only record of

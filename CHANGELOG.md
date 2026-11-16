@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`[[suppress]]` in `.prbot.toml`: findings a repo has decided against stay gone.** Telling the reviewer a finding is wrong had no effect past that PR, so a team that rejects one rule saw it again on every change. A rule names the finding by text it contains (case-insensitive, whitespace-insensitive, at least 10 characters so it cannot match most of a review), optionally scopes it to `paths` globs, and must give a `reason`. Matching findings are removed after the confidence floor and before the burst collapse and the recommendation, so a rejected finding neither posts nor raises the verdict. The summary says how many were removed and the run log's funnel records it as `suppressed`. Rules are read from the base branch like the rest of `.prbot.toml`, so a PR cannot suppress the findings about itself, and a `BLOCKING` finding is never suppressed. The rules are part of the review key, so adding one re-reviews an unchanged PR.
+
+### Migration — every consumer this breaks
+
+| Change | Touches | What to do |
+|---|---|---|
+| `runlog::Funnel` gains `suppressed` | neither known consumer | Add `suppressed: 0`. Old run-log records still parse. |
+| `config::Config` gains `suppress` | neither known consumer (both build it with `Config::from_env`) | Struct literals add `suppress: Vec::new()`. |
+| `repo_config::RepoConfig` gains `suppress` | neither known consumer | Struct literals add `suppress: None`. |
+
 ## 0.44.0
 
 **Re-review now tracks what actually changed: a finding is resolved only when its code moves, an unchanged PR reuses its last review, and the reviewer reads the rules and issues the repository already wrote.**
