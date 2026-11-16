@@ -81,7 +81,9 @@ impl Suppression {
     ///
     /// [`matches`]: Self::matches
     fn matches_normalized(&self, needle: &str, f: &Finding, body: &str) -> bool {
-        !f.severity.eq_ignore_ascii_case("BLOCKING")
+        // The same ranking the rest of the pipeline uses, so whatever counts as
+        // BLOCKING there is exempt here.
+        crate::review::severity_rank(&f.severity) < 3
             && in_scope(self, &f.file)
             && body.contains(needle)
     }

@@ -192,7 +192,7 @@ mod severity_and_recommendation_tests {
     //! as unknown/LOW rather than fail loudly, so it earns its own direct test.
     use super::{
         effective_recommendation, is_pre_existing, recommendation_after_suppression,
-        recommendation_rank, severity_emoji, severity_label, severity_rank, Finding,
+        recommendation_rank, severity_emoji, severity_label, severity_rank, Finding, Floors,
     };
 
     #[test]
@@ -331,7 +331,10 @@ mod severity_and_recommendation_tests {
         assert_eq!(
             recommendation_after_suppression(
                 "BLOCK",
-                "APPROVE WITH CHANGES",
+                &Floors {
+                    model: "APPROVE WITH CHANGES",
+                    before: "APPROVE WITH CHANGES",
+                },
                 1,
                 std::slice::from_ref(&low)
             ),
@@ -341,7 +344,10 @@ mod severity_and_recommendation_tests {
         assert_eq!(
             recommendation_after_suppression(
                 "APPROVE WITH CHANGES",
-                "APPROVE WITH CHANGES",
+                &Floors {
+                    model: "APPROVE WITH CHANGES",
+                    before: "APPROVE WITH CHANGES",
+                },
                 1,
                 std::slice::from_ref(&low)
             ),
@@ -351,7 +357,10 @@ mod severity_and_recommendation_tests {
         assert_eq!(
             recommendation_after_suppression(
                 "I recommend APPROVE WITH CHANGES",
-                "APPROVE WITH CHANGES",
+                &Floors {
+                    model: "APPROVE WITH CHANGES",
+                    before: "APPROVE WITH CHANGES",
+                },
                 1,
                 &[Finding {
                     severity: "HIGH".to_string(),
@@ -360,11 +369,28 @@ mod severity_and_recommendation_tests {
             ),
             "I recommend APPROVE WITH CHANGES"
         );
+        // Its findings were LOWs; a hygiene MEDIUM it never saw raised the floor,
+        // and a rule removed that. Its verdict had its own reason and stands.
+        assert_eq!(
+            recommendation_after_suppression(
+                "APPROVE WITH CHANGES",
+                &Floors {
+                    model: "APPROVE",
+                    before: "APPROVE WITH CHANGES",
+                },
+                1,
+                std::slice::from_ref(&low)
+            ),
+            "APPROVE WITH CHANGES"
+        );
         // Nothing suppressed: the model's verdict stands as before.
         assert_eq!(
             recommendation_after_suppression(
                 "APPROVE WITH CHANGES",
-                "APPROVE WITH CHANGES",
+                &Floors {
+                    model: "APPROVE WITH CHANGES",
+                    before: "APPROVE WITH CHANGES",
+                },
                 0,
                 &[low]
             ),
@@ -404,26 +430,38 @@ fn effective_recommendation(model_rec: &str, findings: &[Finding]) -> String {
     }
 }
 
+/// The floors a verdict is judged against once `[[suppress]]` has run.
+struct Floors<'a> {
+    /// What the model's own findings justified, before hygiene was merged in.
+    /// The model never saw the hygiene findings, so its verdict cannot rest on
+    /// them, and judging it against a floor they raised would let suppressing
+    /// one soften a verdict that had a reason of its own.
+    model: &'a str,
+    /// What every finding justified, hygiene included, before suppression.
+    before: &'a str,
+}
+
 /// The recommendation once `[[suppress]]` rules have removed `suppressed`
-/// findings, given the floor the findings set before they did.
+/// findings.
 ///
 /// The model's verdict is never softened, with one exception: when it is no
-/// stronger than its own findings justified (`floor_before`) and a rule removed
-/// enough of them to lower that floor, those findings were its reason, so it is
-/// recomputed from what is left. Otherwise a review whose HIGHs the team rejected would still say
-/// "APPROVE WITH CHANGES" with nothing listed to change. A verdict stronger than
-/// its findings justified has a reason outside them, and stands.
+/// stronger than its own findings justified (`floors.model`) and a rule removed
+/// enough findings to lower the floor, those findings were its reason, so it is
+/// recomputed from what is left. Otherwise a review whose HIGHs the team
+/// rejected would still say "APPROVE WITH CHANGES" with nothing listed to
+/// change. A verdict stronger than its findings justified has a reason outside
+/// them, and stands.
 fn recommendation_after_suppression(
     model_rec: &str,
-    floor_before: &str,
+    floors: &Floors<'_>,
     suppressed: usize,
     findings: &[Finding],
 ) -> String {
     let floor_after = effective_recommendation("APPROVE", findings);
-    let floor_dropped = recommendation_rank(&floor_after) < recommendation_rank(floor_before);
+    let floor_dropped = recommendation_rank(&floor_after) < recommendation_rank(floors.before);
     if suppressed > 0
         && floor_dropped
-        && recommendation_rank(model_rec) <= recommendation_rank(floor_before)
+        && recommendation_rank(model_rec) <= recommendation_rank(floors.model)
     {
         floor_after
     } else {
@@ -2632,6 +2670,9 @@ async fn finish_review(
     findings.retain(|f| f.confidence.unwrap_or(100) >= cfg.min_confidence);
     funnel.after_confidence = findings.len();
     funnel.hygiene_added = hygiene.len();
+    // Before the hygiene merge: what the model's own findings justified, which is
+    // what its verdict is judged against if suppression lowers the floor.
+    let model_floor = effective_recommendation("APPROVE", &findings);
     // Merge the diff-hygiene findings. Added after self-critique/confidence-floor —
     // they're facts, not guesses — but before the severity sort + cap, so they
     // compete like any other finding.
@@ -2662,7 +2703,10 @@ async fn finish_review(
     // still can't leave the recommendation understating a real problem.
     let recommendation = recommendation_after_suppression(
         &result.review.recommendation,
-        &floor_before,
+        &Floors {
+            model: &model_floor,
+            before: &floor_before,
+        },
         funnel.suppressed,
         &findings,
     );
