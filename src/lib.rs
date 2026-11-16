@@ -57,6 +57,7 @@ pub mod runlog;
 pub mod structure;
 pub mod suggest;
 pub mod superseded;
+pub mod suppress;
 pub mod webhook;
 
 /// Clip a string to at most `n` characters (char-safe — never splits a UTF-8

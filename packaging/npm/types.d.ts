@@ -194,6 +194,8 @@ export interface RepoConfig {
   self_critique?: boolean | null;
   /** Toggle committable suggestion blocks on findings, for this repo. */
   suggestions?: boolean | null;
+  /** Findings this repo has decided against — see [`crate::suppress`]. */
+  suppress?: Suppression[] | null;
   /** Globs marking vendored third-party source (`thirdparty/**`, `vendor/**`, …). */
   vendored?: string[] | null;
 }
@@ -276,6 +278,8 @@ export interface ReviewSettings {
   structuralContext: boolean;
   structuralMaxFiles: number;
   suggestions: boolean;
+  /** `[[suppress]]` rules in force. */
+  suppress?: Suppression[];
   temperature: number;
   vendoredGlobs: string[];
   walkthrough: boolean;
@@ -299,6 +303,16 @@ export interface RulesScopePr {
 
 /** What the rules were resolved for. */
 export type RulesScope = RulesScopeLocal | RulesScopePr;
+
+/** One `[[suppress]]` rule from `.prbot.toml`. */
+export interface Suppression {
+  /** Text the finding must contain, matched case-insensitively with runs of whitespace treated as one space. */
+  contains: string;
+  /** Globs the finding's file must match. */
+  paths?: string[];
+  /** Why the team decided against this finding. */
+  reason: string;
+}
 
 /** The findings currently on one pull request. */
 export interface FindingsOutput {

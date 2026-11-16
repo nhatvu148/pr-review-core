@@ -4,6 +4,8 @@
 
 ### Added
 
+- **`[[suppress]]` in `.prbot.toml`: findings a repo has decided against stay gone.** Telling the reviewer a finding is wrong had no effect past that PR, so a team that rejects one rule saw it again on every change. A rule names the finding by text it contains (case-insensitive, whitespace-insensitive, at least 10 characters so it cannot match most of a review), optionally scopes it to `paths` globs, and must give a `reason`. Matching findings are removed after the confidence floor and before the burst collapse. When the model's verdict was no stronger than its own findings justified and a rule removed some of them, the verdict is recomputed from what is left, so a review whose HIGHs the team rejected does not still ask for changes. A verdict stronger than its findings justified has a reason outside them and stands. The summary says how many were removed and the run log's funnel records it as `suppressed`. Rules are read from the base branch like the rest of `.prbot.toml`, so a PR cannot suppress the findings about itself, and a `BLOCKING` finding is never suppressed. The rules are part of the review key, so adding one re-reviews an unchanged PR.
+
 - **Code both bots duplicated now lives here, so a fix is made once.** Each bot built on this crate carried its own copy of the same five pieces, and a fix to one (the superseded-review skip, most recently) had to be made twice. All five are public and fail open as before:
   - `superseded`: `superseded_by` skips a review whose commit is no longer the PR's head, and `github_head_sha` reads that commit from a `pull_request` payload.
   - `webhook::DeliveryRing`: the bounded, lock-protected ring that drops a provider's redelivery by its delivery id.
@@ -12,6 +14,18 @@
   - `memory`: container (cgroup) and process memory readings and the `HighWater` peak sampler, with the MemTotal fallback for a VM with no cgroup limit.
 
   Tokio's `time` feature is now enabled, for the head lookup's timeout and the sampler. No new dependency.
+
+### Fixed
+
+- **`kaniscope` no longer prints hidden markers in its human-readable output.** `--human` and the dry-run and local summaries printed the summary comment's body verbatim, so they included lines like `<!-- kaniscope-verdict: {...} -->` and `<!-- kaniscope-review-key: ... -->` that GitHub and GitLab hide. Lines that are only an HTML comment are now dropped from that output. `--json` is unchanged and still carries the full body.
+
+### Migration — every consumer this breaks
+
+| Change | Touches | What to do |
+|---|---|---|
+| `runlog::Funnel` gains `suppressed` | neither known consumer | Add `suppressed: 0`. Old run-log records still parse. |
+| `config::Config` gains `suppress` | neither known consumer (both build it with `Config::from_env`) | Struct literals add `suppress: Vec::new()`. |
+| `repo_config::RepoConfig` gains `suppress` | neither known consumer | Struct literals add `suppress: None`. |
 
 ## 0.44.0
 

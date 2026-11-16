@@ -31,6 +31,9 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    env:
+      # Empty off macOS, where nothing reads it.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
     strategy:
       # One platform failing must not cancel the others: a partial matrix is
       # still worth inspecting, and re-running one leg is cheaper than five.
@@ -39,12 +42,19 @@ jobs:
         include:
           # macos-15, not 14: GitHub retired the macos-14 image, and a job on a
           # retired label is cancelled before it starts, which skips every publish
-          # job behind it. Rust's own deployment target, not the runner, sets the
-          # oldest macOS the binary runs on.
+          # job behind it.
+          #
+          # `macos_target` is the oldest macOS the binary runs on, stated rather
+          # than inherited: left unset it is whatever the toolchain defaults to,
+          # which a Rust or Xcode upgrade can raise without anything here
+          # changing. These are Rust's defaults when they were pinned (rustc
+          # 1.99), so pinning moved no one. Keep the pypi matrix in step.
           - target: aarch64-apple-darwin
             runner: macos-15
+            macos_target: "11.0"
           - target: x86_64-apple-darwin
             runner: macos-15
+            macos_target: "10.12"
           # 22.04, not latest: the glibc a binary is LINKED against is the oldest
           # it can run on, so building on the newest runner silently narrows who
           # can install this. The npm/PyPI audience is not on the newest distro.
@@ -277,12 +287,17 @@ jobs:
     name: wheel ${{ matrix.target }}
     needs: build
     runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_target }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin, runner: macos-15 }
-          - { target: x86_64-apple-darwin, runner: macos-15 }
+          # Same `macos_target` as the build matrix: the wheel's platform tag is
+          # derived from it, and a wheel tagged newer than its binary needs is a
+          # wheel pip refuses on machines that could run it.
+          - { target: aarch64-apple-darwin, runner: macos-15, macos_target: "11.0" }
+          - { target: x86_64-apple-darwin, runner: macos-15, macos_target: "10.12" }
           - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
           - { target: x86_64-pc-windows-msvc, runner: windows-latest }
