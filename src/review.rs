@@ -985,8 +985,8 @@ async fn reusable_review(
     let Some(recommendation) = from_verdict
         .or_else(|| {
             body.lines()
-                .filter_map(|l| l.strip_prefix("**Recommendation:** "))
-                .last()
+                .rev()
+                .find_map(|l| l.strip_prefix("**Recommendation:** "))
                 .map(|r| r.trim().to_string())
         })
         .filter(|r| !r.is_empty())
