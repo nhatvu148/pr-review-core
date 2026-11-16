@@ -41,6 +41,12 @@ Known limits: GitHub only, the one provider whose summary can be read back. An a
 
 Known limit: it covers the findings posted this round, not threads still open from earlier rounds.
 
+- **`Usage` can carry what a review cost, and its cache tokens apart from its input.** It gains `cost_usd`, `cache_read_tokens` and `cache_creation_tokens`, all optional and summed across a review and its repair pass like the token counts. An agent CLI reports its cost in dollars, and a consumer's backend had to discard it because `Usage` had nowhere to put it. The same backends folded cache reads and writes into `prompt_tokens`, reporting an input several times larger than what was billed at the full rate. Every run-log record and `--json` output carries the new fields when a backend fills them. No backend in this crate reports a cost yet: the OpenRouter path returns tokens only, so `cost_usd` stays absent there.
+
+| Change | What to do |
+|---|---|
+| `llm::Usage` has three new public fields and derives `Default` | Code that builds a `Usage` with a struct literal adds `..Default::default()`. JSON consumers are unaffected, and the generated Node and Python types include them. |
+
 ### Fixed
 
 - **A push no longer resolves findings whose code it did not touch.** Re-review resolved every earlier finding the new round did not repeat, as long as the PR had a new commit, with `✅ Resolved — no longer flagged`. But a round does not repeat everything it found before: consecutive reviews of one frozen commit share 61–74% of their findings. So each push closed a quarter to a third of still-valid findings as fixed, including ones in files the push never changed. That also inflated anything that counts resolved threads, such as a fix loop deciding it has converged, or the acted-on measurement. A finding the round did not repeat is now resolved only when GitHub marks its thread outdated, meaning the lines it points at changed. Otherwise it stays open. Same-commit re-reviews were already protected and still are. Legacy threads without a fingerprint are still cleaned up on first sight.

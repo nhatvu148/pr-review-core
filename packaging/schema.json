@@ -281,9 +281,27 @@
       ]
     },
     "Usage": {
-      "description": "Token accounting echoed back by OpenRouter.",
+      "description": "Token and cost accounting for a review, as the backend reported it.\n\nEvery field is optional and absent means \"not reported\", never zero. The\ncache counts are kept apart from `prompt_tokens` on purpose: a backend that\nfolded them in reported an input several times larger than what was billed\nat the full rate, and no cost could be worked out from it afterwards.",
       "type": "object",
       "properties": {
+        "cache_creation_tokens": {
+          "description": "Input tokens written to the prompt cache.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
+        "cache_read_tokens": {
+          "description": "Input tokens served from the prompt cache.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        },
         "completion_tokens": {
           "type": [
             "integer",
@@ -291,6 +309,14 @@
           ],
           "format": "uint32",
           "minimum": 0
+        },
+        "cost_usd": {
+          "description": "What the run cost in US dollars, when the backend says (an agent CLI does;\nmost HTTP APIs return tokens only).",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
         },
         "prompt_tokens": {
           "type": [

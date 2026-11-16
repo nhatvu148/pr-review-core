@@ -82,9 +82,12 @@ class _UsageRequired(TypedDict):
 
 
 class Usage(_UsageRequired, total=False):
-    """Token accounting echoed back by OpenRouter."""
+    """Token and cost accounting for a review, as the backend reported it."""
 
+    cache_creation_tokens: Optional[int]
+    cache_read_tokens: Optional[int]
     completion_tokens: Optional[int]
+    cost_usd: Optional[float]
     prompt_tokens: Optional[int]
     total_tokens: Optional[int]
 

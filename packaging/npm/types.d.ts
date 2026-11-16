@@ -71,9 +71,15 @@ export interface InlineComment {
 /** How far a dependency scan got — what an empty advisory list actually means. */
 export type ScanStatus = "disabled" | "no_lockfiles" | "complete" | "truncated" | "failed";
 
-/** Token accounting echoed back by OpenRouter. */
+/** Token and cost accounting for a review, as the backend reported it. */
 export interface Usage {
+  /** Input tokens written to the prompt cache. */
+  cache_creation_tokens?: number | null;
+  /** Input tokens served from the prompt cache. */
+  cache_read_tokens?: number | null;
   completion_tokens?: number | null;
+  /** What the run cost in US dollars, when the backend says (an agent CLI does; most HTTP APIs return tokens only). */
+  cost_usd?: number | null;
   prompt_tokens?: number | null;
   total_tokens?: number | null;
 }
