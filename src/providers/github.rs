@@ -1377,10 +1377,9 @@ async fn reconcile_inline(
             );
             continue;
         }
-        if t.fp.is_some() {
-            resolved.push(format!("`{}`", t.path));
-        }
-        match graphql(
+        // Reported only once it has actually gone: a thread kept open because
+        // someone replied must not be summarised as resolved.
+        let gone = match graphql(
             client,
             cfg,
             RESOLVE_MUTATION,
@@ -1400,6 +1399,7 @@ async fn reconcile_inline(
                     serde_json::json!({ "tid": t.id, "body": reply }),
                 )
                 .await;
+                true
             }
             Err(e) if may_delete_thread(t) => {
                 tracing::debug!(
@@ -1407,13 +1407,18 @@ async fn reconcile_inline(
                     t.path
                 );
                 delete_comment(client, cfg, &meta.repo, t.comment_id).await;
+                true
             }
             Err(e) => {
                 tracing::debug!(
                     "resolve thread failed on {} ({e:#}); it has replies, so it stays",
                     t.path
                 );
+                false
             }
+        };
+        if gone && t.fp.is_some() {
+            resolved.push(format!("`{}`", t.path));
         }
     }
     Ok(Reconciled { resolved, dropped })
