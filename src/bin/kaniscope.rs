@@ -1030,13 +1030,34 @@ fn print_human(args: &Args, out: &RunReviewOutput) {
 /// one inside a sentence or a code fence is content, and is left alone.
 fn as_rendered(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
-    let mut in_fence = false;
+    // The open fence's character and run length: CommonMark closes a fence only
+    // on a run of the same character at least as long, so a ~~~ inside a ```
+    // block, or ``` inside ````, is content rather than the end of the block.
+    let mut fence: Option<(char, usize)> = None;
     for line in md.lines() {
+        // More than three spaces of indent is an indented code block (or a
+        // continuation), never a fence or a top-level marker.
+        let indent = line.len() - line.trim_start_matches(' ').len();
         let t = line.trim();
-        if t.starts_with("```") || t.starts_with("~~~") {
-            in_fence = !in_fence;
+        if indent <= 3 {
+            if let Some(c) = t.chars().next().filter(|c| *c == '`' || *c == '~') {
+                let run = t.chars().take_while(|x| *x == c).count();
+                if run >= 3 {
+                    match fence {
+                        None => fence = Some((c, run)),
+                        Some((open, len)) if open == c && run >= len && t.len() == run => {
+                            fence = None
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
-        if !in_fence && t.starts_with("<!--") && t.ends_with("-->") {
+        let marker_only = indent <= 3
+            && t.starts_with("<!--")
+            && t.ends_with("-->")
+            && t.matches("-->").count() == 1;
+        if fence.is_none() && marker_only {
             continue;
         }
         out.push_str(line);
@@ -1335,6 +1356,23 @@ mod tests {
     #[test]
     fn a_comment_inside_prose_or_a_code_fence_is_content_and_stays() {
         let md = "Add `<!-- x -->` here.\n```html\n<!-- kept -->\n```";
+        assert_eq!(as_rendered(md), md);
+    }
+
+    #[test]
+    fn only_a_matching_fence_closes_the_block_a_marker_sits_in() {
+        // A ~~~ inside ``` and a shorter ``` inside ```` are both content.
+        for md in [
+            "```\n~~~\n<!-- kept -->\n```",
+            "````\n```\n<!-- kept -->\n````",
+        ] {
+            assert_eq!(as_rendered(md), md);
+        }
+    }
+
+    #[test]
+    fn indented_code_and_two_comments_on_one_line_are_not_markers() {
+        let md = "Text\n\n    <!-- code -->\n\n<!-- a --> text <!-- b -->";
         assert_eq!(as_rendered(md), md);
     }
 
