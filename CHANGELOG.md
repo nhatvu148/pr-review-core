@@ -10,7 +10,7 @@
 
 Rule files and path instructions apply where a review is built: the PR review, `--local`, `/review-file` (path instructions matched against its one file) and `get-rules`. `/ask`, `/describe` and findings lookups keep reading `.prbot.toml` alone, so they make no extra fetches and get no review rubric in prompts that do a different job.
 
-Known limits: only root-level rule files are read. Nested `AGENTS.md` / `BUGBOT.md` files and `.claude/rules/` (which needs a directory listing) are not. Three extra file fetches run per review when the feature is on.
+Known limits: only root-level rule files are read, and from `AGENTS.md` only the first review section; setext headings (a title underlined with `===`) are not recognised. Nested `AGENTS.md` / `BUGBOT.md` files and `.claude/rules/` (which needs a directory listing) are not. Three extra file fetches run per review when the feature is on.
 
 ## 0.43.0
 
