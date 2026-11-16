@@ -2,12 +2,26 @@
 
 ## Unreleased
 
+### Added
+
+- **Quiet mode: `INLINE_MIN_SEVERITY`** (or `inline_min_severity` in `.prbot.toml`). Findings below the floor (`BLOCKING`, `HIGH`, `MEDIUM` or `LOW`) are no longer posted as inline comments. They are listed in a collapsed "N lower-severity finding(s), not posted inline" section of the summary instead, so nothing is dropped. Every finding posted inline was competing for the same attention, and a PR carrying eight LOW notes next to one HIGH buries the HIGH. Severity is used rather than `MIN_CONFIDENCE`, because confidence measured as a weak predictor of whether a finding is real (AUC 0.61 on the calibration set). Unset, the default, posts everything inline as before. An unrecognised value turns the floor off with a warning, rather than silently moving every finding to the summary. `get-rules` reports the floor in force.
+
+A held-back finding still counts as flagged when GitHub reconciles earlier threads. If it was posted inline in an earlier round (before the floor was set, or at a higher severity), its thread is kept rather than resolved as a fix. It pairs by fingerprint, then by nearby line, and only with threads no posted finding claimed. The run log's funnel gains `held_back`, so `anchored + unanchored + held_back` equals `posted_findings` again.
+
+| Change | What to do |
+|---|---|
+| `providers::ReviewPost` has a new public field, `held: Vec<InlineComment>`, and derives `Default` | Code that builds a `ReviewPost` with a struct literal must add `held: Vec::new()` (or use `..Default::default()`). |
+| `runlog::Funnel` has a new field, `held_back` | Struct literals add `held_back: 0`. Old run-log records still parse, because the struct is `#[serde(default)]`. |
+
+Known limit: a held-back finding is never posted, so a finding that only ever existed below the floor has no thread to track across rounds.
+
 ### Fixed
 
 - **A push no longer resolves findings whose code it did not touch.** Re-review resolved every earlier finding the new round did not repeat, as long as the PR had a new commit, with `✅ Resolved — no longer flagged`. But a round does not repeat everything it found before: consecutive reviews of one frozen commit share 61–74% of their findings. So each push closed a quarter to a third of still-valid findings as fixed, including ones in files the push never changed. That also inflated anything that counts resolved threads, such as a fix loop deciding it has converged, or the acted-on measurement. A finding the round did not repeat is now resolved only when GitHub marks its thread outdated, meaning the lines it points at changed. Otherwise it stays open. Same-commit re-reviews were already protected and still are. Legacy threads without a fingerprint are still cleaned up on first sight.
 - **The delete fallback no longer removes a thread someone replied to.** When the token cannot resolve threads (a common personal-access-token limit), reconciliation deleted the bot's comment instead, and any replies under it were left without their parent. It now deletes only a thread holding the bot's comment alone, and leaves a thread with replies open.
 
 Known limit: a fix made somewhere other than the lines a finding points at (a guard added in the caller, say) leaves that thread open until the code under it changes or someone resolves it. Keeping a fixed finding open is the cheaper mistake than closing an unfixed one. GitLab and Bitbucket reconciliation are unchanged, since they report `unsupported` and resolve nothing.
+
 
 ## 0.43.0
 

@@ -116,6 +116,16 @@ pub(crate) fn severity_rank(sev: &str) -> u8 {
     }
 }
 
+/// The severity a [`severity_rank`] value names, for display.
+pub(crate) fn severity_name(rank: u8) -> &'static str {
+    match rank {
+        3 => "BLOCKING",
+        2 => "HIGH",
+        1 => "MEDIUM",
+        _ => "LOW",
+    }
+}
+
 pub(crate) fn severity_emoji(sev: &str) -> &'static str {
     match sev.to_uppercase().as_str() {
         "BLOCKING" => "🚨",
@@ -827,11 +837,13 @@ fn diff_touches_repo_config(diff: &str) -> bool {
 }
 
 /// The summary comment: overall + recommendation + any findings that couldn't be
-/// anchored to a diff line (line-anchored ones go inline).
+/// anchored to a diff line (line-anchored ones go inline), then the findings held
+/// back by the inline severity floor.
 fn render_summary(
     review: &Review,
     recommendation: &str,
     unanchored: &[&Finding],
+    quiet: &[&Finding],
     inline_count: usize,
 ) -> String {
     let mut s = format!(
@@ -843,26 +855,40 @@ fn render_summary(
         s.push_str(&format!("\n\n_{inline_count} inline comment(s) below._"));
     }
     if unanchored.is_empty() {
-        if inline_count == 0 {
+        if inline_count == 0 && quiet.is_empty() {
             s.push_str("\n\nNo blocking issues found.");
         }
     } else {
         s.push_str("\n\n## Findings");
-        for f in unanchored {
-            let loc = match f.line {
-                Some(l) => format!("`{}` (~{l})", f.file),
-                None => format!("`{}`", f.file),
-            };
-            s.push_str(&format!(
-                "\n- {} **{}** — {loc} — {}",
-                severity_emoji(&f.severity),
-                f.severity.to_uppercase(),
-                f.body.trim()
-            ));
-        }
+        push_finding_lines(&mut s, unanchored);
+    }
+    // Collapsed, because the point of the floor is that these do not compete for
+    // attention with what was posted inline. Still listed, so nothing is lost.
+    if !quiet.is_empty() {
+        s.push_str(&format!(
+            "\n\n<details>\n<summary>{} lower-severity finding(s), not posted inline</summary>\n",
+            quiet.len()
+        ));
+        push_finding_lines(&mut s, quiet);
+        s.push_str("\n\n</details>");
     }
     s.push_str("\n\n_Automated advisory review — a human still owns the merge decision._");
     s
+}
+
+fn push_finding_lines(s: &mut String, findings: &[&Finding]) {
+    for f in findings {
+        let loc = match f.line {
+            Some(l) => format!("`{}` (~{l})", f.file),
+            None => format!("`{}`", f.file),
+        };
+        s.push_str(&format!(
+            "\n- {} **{}** — {loc} — {}",
+            severity_emoji(&f.severity),
+            f.severity.to_uppercase(),
+            f.body.trim()
+        ));
+    }
 }
 
 /// How much of the change map this configuration will actually render.
@@ -996,6 +1022,7 @@ pub async fn post_review_queued(provider_name: &str, cfg: &Config, repo: &str, p
     let post = ReviewPost {
         summary: render_queued(),
         inline: Vec::new(),
+        held: Vec::new(),
     };
     let client = reqwest::Client::new();
     if let Err(e) = provider.post_review(&client, cfg, &meta, &post).await {
@@ -1056,6 +1083,7 @@ pub async fn post_review_failure(
     let post = ReviewPost {
         summary: render_failed(err),
         inline: Vec::new(),
+        held: Vec::new(),
     };
     let client = reqwest::Client::new();
     if let Err(e) = provider.post_review(&client, cfg, &meta, &post).await {
@@ -1371,6 +1399,7 @@ async fn post_advisory_only(
     let post = ReviewPost {
         summary: summary.clone(),
         inline: Vec::new(),
+        held: Vec::new(),
     };
     let mut out = RunReviewOutput {
         provider: provider.name().to_string(),
@@ -1695,6 +1724,8 @@ struct FinishedReview {
     recommendation: String,
     summary: String,
     inline: Vec<InlineComment>,
+    /// Findings held back by the inline severity floor — see [`ReviewPost::held`].
+    held: Vec<InlineComment>,
     /// Per-stage survivor counts through the post-processing above. Collected
     /// here because this is the only place they exist: every stage consumes its
     /// predecessor's vector, so a caller holding only the final findings cannot
@@ -2077,8 +2108,16 @@ async fn finish_review(
     // rejects an out-of-diff anchor.
     let mut inline: Vec<InlineComment> = Vec::new();
     let mut unanchored: Vec<&Finding> = Vec::new();
+    // Below the inline floor: listed in the summary, never posted on a line.
+    let mut quiet: Vec<&Finding> = Vec::new();
+    let floor = cfg.inline_floor();
     let mut anchors: Vec<Option<u64>> = Vec::with_capacity(findings.len());
     for f in &findings {
+        if floor.is_some_and(|min| severity_rank(&f.severity) < min) {
+            anchors.push(None);
+            quiet.push(f);
+            continue;
+        }
         let mut anchor = f.line.filter(|l| {
             anchorable(
                 *l,
@@ -2134,16 +2173,40 @@ async fn finish_review(
     }
 
     // `recommendation` was computed from the pre-truncation findings above.
-    let summary = render_summary(&result.review, &recommendation, &unanchored, inline.len());
+    let summary = render_summary(
+        &result.review,
+        &recommendation,
+        &unanchored,
+        &quiet,
+        inline.len(),
+    );
 
     funnel.anchored = inline.len();
     funnel.unanchored = unanchored.len();
+    funnel.held_back = quiet.len();
+    // What reconciliation needs to keep a held-back finding's old thread: where
+    // it is and what it says. The body is rendered the way an inline comment is,
+    // because that rendering is what earlier threads were fingerprinted from; a
+    // raw model body would never match one. It still includes the severity, so a
+    // finding posted as HIGH and now held as LOW (or posted with a suggestion)
+    // pairs by nearby line only. `line` 0 when the model gave none, which then
+    // pairs by fingerprint or not at all.
+    let held: Vec<InlineComment> = quiet
+        .iter()
+        .map(|f| InlineComment {
+            path: f.file.clone(),
+            line: f.line.unwrap_or(0),
+            start_line: None,
+            body: inline_body(f),
+        })
+        .collect();
 
     FinishedReview {
         findings,
         recommendation,
         summary,
         inline,
+        held,
         funnel,
         typed_lines,
         anchors,
@@ -2197,6 +2260,7 @@ pub async fn run_review_with(
         let pending = ReviewPost {
             summary: render_pending(),
             inline: Vec::new(),
+            held: Vec::new(),
         };
         match provider.post_review(&client, cfg, &meta, &pending).await {
             Ok(_) => placeholder_posted = true,
@@ -2283,6 +2347,7 @@ pub async fn run_review_with(
             let note = ReviewPost {
                 summary: render_no_review_summary(&[], &[]),
                 inline: Vec::new(),
+                held: Vec::new(),
             };
             provider
                 .post_review(&client, cfg, &meta, &note)
@@ -2439,6 +2504,7 @@ pub async fn run_review_with(
         recommendation,
         summary,
         inline,
+        held,
         funnel,
         typed_lines,
         anchors,
@@ -2447,6 +2513,7 @@ pub async fn run_review_with(
     let post = ReviewPost {
         summary: summary.clone(),
         inline,
+        held,
     };
 
     let mut out = RunReviewOutput {
@@ -2943,6 +3010,60 @@ mod local_review_tests {
             !seen[0].had_provider,
             "no provider is invented for a local diff"
         );
+    }
+
+    /// Quiet mode: a finding below the inline floor is listed in the summary and
+    /// never posted on a line, even though it anchors.
+    #[tokio::test]
+    async fn a_finding_below_the_inline_floor_goes_to_the_summary_only() {
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.inline_min_severity = "HIGH".into();
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: None,
+                label: "branch".to_string(),
+                change_intent: None,
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+
+        assert_eq!(out.inline_posted, 0, "MEDIUM is below a HIGH floor");
+        assert!(out
+            .summary_markdown
+            .contains("1 lower-severity finding(s), not posted inline"));
+        assert!(out.summary_markdown.contains("can overflow on a long list"));
+        assert!(
+            !out.summary_markdown.contains("No blocking issues found"),
+            "a held-back finding is still a finding"
+        );
+        assert_eq!(out.findings_detail.len(), 1, "nothing is dropped");
+    }
+
+    /// At or above the floor, a finding posts inline exactly as before.
+    #[tokio::test]
+    async fn a_finding_at_the_inline_floor_still_posts_inline() {
+        let (backend, _seen) = spy();
+        let mut c = cfg();
+        c.inline_min_severity = "medium".into();
+        let out = run_review_local(
+            &c,
+            LocalReviewInput {
+                diff: DIFF.to_string(),
+                repo_root: None,
+                label: "branch".to_string(),
+                change_intent: None,
+            },
+            &backend,
+        )
+        .await
+        .expect("the local review runs");
+        assert_eq!(out.inline_posted, 1);
+        assert!(!out.summary_markdown.contains("not posted inline"));
     }
 
     /// A finding on a line the diff doesn't contain must fold into the summary
@@ -5936,6 +6057,7 @@ mod placeholder_tests {
                 findings: vec![],
             },
             "APPROVE",
+            &[],
             &[],
             0,
         );

@@ -68,6 +68,10 @@ pub struct Config {
     pub min_confidence: u8,
     /// Hard cap on the number of findings posted (after sorting by severity).
     pub max_findings: usize,
+    /// Lowest severity posted as an inline comment (`BLOCKING`, `HIGH`, `MEDIUM`
+    /// or `LOW`). Findings below it are listed in the summary instead. Empty, the
+    /// default, posts every anchorable finding inline. See [`Config::inline_floor`].
+    pub inline_min_severity: String,
     /// How many times to ask the backend for a review before merging the answers.
     ///
     /// One by default, which is the historical behaviour. Above one, the model is
@@ -295,6 +299,54 @@ pub struct Config {
 }
 
 impl Config {
+    /// The inline severity floor as a [`severity_rank`](crate::review) value, or
+    /// `None` when every finding posts inline.
+    ///
+    /// An unrecognised value turns the floor off rather than guessing at it: a
+    /// typo that silently moved every finding to the summary would look like the
+    /// reviewer had gone quiet.
+    ///
+    /// ```
+    /// let mut cfg = pr_review_core::config::Config::from_env();
+    /// cfg.inline_min_severity = "high".into();
+    /// assert_eq!(cfg.inline_floor(), Some(2));
+    /// cfg.inline_min_severity = "".into();
+    /// assert_eq!(cfg.inline_floor(), None);
+    /// cfg.inline_min_severity = "urgent".into();
+    /// assert_eq!(cfg.inline_floor(), None);
+    /// ```
+    pub fn inline_floor(&self) -> Option<u8> {
+        let v = self.inline_min_severity.trim().to_uppercase();
+        match v.as_str() {
+            "" => None,
+            "BLOCKING" => Some(3),
+            "HIGH" => Some(2),
+            "MEDIUM" => Some(1),
+            // LOW is the bottom, so a LOW floor is no floor.
+            "LOW" => None,
+            other => {
+                // Once per distinct value: this runs for every finding pass and
+                // for `get-rules`, and a long-running bot sees many repositories,
+                // each of which may have its own typo.
+                static WARNED: std::sync::LazyLock<
+                    std::sync::Mutex<std::collections::HashSet<String>>,
+                > = std::sync::LazyLock::new(Default::default);
+                let first = WARNED
+                    .lock()
+                    .map(|mut seen| seen.insert(other.to_string()))
+                    .unwrap_or(true);
+                if first {
+                    tracing::warn!(
+                        "inline severity floor {other:?} (INLINE_MIN_SEVERITY or \
+                         .prbot.toml inline_min_severity) is not BLOCKING, HIGH, MEDIUM or LOW; \
+                         posting every finding inline"
+                    );
+                }
+                None
+            }
+        }
+    }
+
     /// Build the config from environment variables, applying defaults.
     pub fn from_env() -> Self {
         Self {
@@ -365,6 +417,7 @@ impl Config {
             self_critique: env_or("SELF_CRITIQUE", "true").parse().unwrap_or(true),
             min_confidence: env_or("MIN_CONFIDENCE", "0").parse().unwrap_or(0),
             max_findings: env_or("MAX_FINDINGS", "20").parse().unwrap_or(20),
+            inline_min_severity: env_or("INLINE_MIN_SEVERITY", ""),
             review_samples: env_or("REVIEW_SAMPLES", "1").parse().unwrap_or(1).max(1),
             sample_min_agreement: env_or("SAMPLE_MIN_AGREEMENT", "1")
                 .parse()
@@ -484,6 +537,9 @@ impl Config {
         }
         if let Some(v) = rc.max_findings {
             cfg.max_findings = v;
+        }
+        if let Some(v) = &rc.inline_min_severity {
+            cfg.inline_min_severity = v.clone();
         }
         if let Some(v) = rc.self_critique {
             cfg.self_critique = v;

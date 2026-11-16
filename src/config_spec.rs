@@ -273,6 +273,13 @@ pub const SPEC: &[ConfigVar] = &[
         doc: "If set, ONLY files matching these globs are reviewed.",
     },
     ConfigVar {
+        env: "INLINE_MIN_SEVERITY",
+        aliases: &[],
+        kind: ConfigKind::Str,
+        default: None,
+        doc: "Lowest severity posted as an inline comment (BLOCKING, HIGH, MEDIUM, LOW). Findings below it are listed in the summary instead. Unset posts everything inline.",
+    },
+    ConfigVar {
         env: "LLM_BASE_URL",
         aliases: &["OPENROUTER_BASE_URL"],
         kind: ConfigKind::Str,
