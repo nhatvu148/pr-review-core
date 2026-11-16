@@ -841,7 +841,9 @@ pub(crate) fn verdict_marker(recommendation: &str, findings: &[Finding], capped:
     };
     let mut counts = [0usize; 5]; // blocking, high, medium, low, other
     for f in findings {
-        let i = match f.severity.trim().to_ascii_uppercase().as_str() {
+        // Exactly as `severity_rank` reads it, so the marker can never count a
+        // finding as HIGH that the sort and the recommendation treated as LOW.
+        let i = match f.severity.to_uppercase().as_str() {
             "BLOCKING" => 0,
             "HIGH" => 1,
             "MEDIUM" => 2,
