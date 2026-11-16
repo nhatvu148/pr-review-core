@@ -115,6 +115,8 @@ class ReviewConfig(TypedDict, total=False):
     change_intent_max_chars: int
     # Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary. Default: `true`. (`REANCHOR_FINDINGS`)
     reanchor_findings: bool
+    # Read the review rules a repo already has (REVIEW.md, .cursor/BUGBOT.md, the review section of AGENTS.md) from the base branch, and list them in the summary. Default: `true`. (`REPO_RULES`)
+    repo_rules: bool
     # Re-review automatically when a PR gets new commits. Off by default: pushing is the inner loop, and every round costs a full review. Default: `false`. (`REVIEW_ON_UPDATE`)
     review_on_update: bool
     # Ask the backend for N independent reviews and union the findings. One review pass is a sample, not a sweep: on a frozen commit consecutive reviews shared only 61-74% of their findings. Costs N times the tokens and wall clock; buys recall. Default: `1`. (`REVIEW_SAMPLES`)
@@ -198,6 +200,7 @@ CONFIG_ENV: Dict[str, tuple] = {
     "pr_body_max_chars": ("PR_BODY_MAX_CHARS", "Int"),
     "change_intent_max_chars": ("CHANGE_INTENT_MAX_CHARS", "Int"),
     "reanchor_findings": ("REANCHOR_FINDINGS", "Bool"),
+    "repo_rules": ("REPO_RULES", "Bool"),
     "review_on_update": ("REVIEW_ON_UPDATE", "Bool"),
     "review_samples": ("REVIEW_SAMPLES", "Int"),
     "sample_line_tolerance": ("SAMPLE_LINE_TOLERANCE", "Int"),

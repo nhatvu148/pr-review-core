@@ -93,6 +93,14 @@ pub struct RepoConfig {
     /// Extra review instructions in plain language, appended to the system prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// Instructions applied only when the PR changes a file matching their
+    /// globs — see [`crate::repo_rules::PathInstruction`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_instructions: Option<Vec<crate::repo_rules::PathInstruction>>,
+    /// Toggle reading `REVIEW.md`, `.cursor/BUGBOT.md` and the review section of
+    /// `AGENTS.md` from the base branch, for this repo.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo_rules: Option<bool>,
     /// Instructions shaping the `/describe` output specifically — a house PR
     /// description layout, release-notes sections, a contributor table. Kept
     /// separate from `instructions` because that one governs what the reviewer

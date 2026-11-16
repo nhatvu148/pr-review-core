@@ -98,6 +98,13 @@ pub struct ReviewSettings {
     pub max_findings: usize,
     /// The inline severity floor in force, or `None` when every finding posts inline.
     pub inline_min_severity: Option<String>,
+    /// Whether the repo's own rule files are read (`REPO_RULES` / `repo_rules`).
+    pub repo_rules: bool,
+    /// Path-scoped instructions configured in `.prbot.toml`. Which apply depends
+    /// on the files a PR changes, so all of them are listed here.
+    pub path_instructions: Vec<crate::repo_rules::PathInstruction>,
+    /// The rule sources merged into the prompt below, as the summary names them.
+    pub rule_sources: Vec<String>,
     pub review_samples: usize,
     pub sample_min_agreement: usize,
     pub sample_line_tolerance: u64,
@@ -150,6 +157,9 @@ impl ReviewSettings {
             inline_min_severity: cfg
                 .inline_floor()
                 .map(|r| crate::review::severity_name(r).to_string()),
+            repo_rules: cfg.repo_rules,
+            path_instructions: cfg.path_instructions.clone(),
+            rule_sources: cfg.rule_sources.clone(),
             review_samples: cfg.review_samples,
             sample_min_agreement: cfg.sample_min_agreement,
             sample_line_tolerance: cfg.sample_line_tolerance,
@@ -219,7 +229,7 @@ pub struct EffectiveRules {
 /// ```
 #[must_use]
 pub fn local(base: &Config, repo_root: Option<&std::path::Path>) -> EffectiveRules {
-    let (effective, source) = crate::review::local_repo_config_source(base, repo_root);
+    let (effective, source) = crate::review::local_review_config_source(base, repo_root);
     finish(
         RulesScope::Local {
             repo_root: repo_root
@@ -249,7 +259,7 @@ pub async fn remote(
     let client = reqwest::Client::new();
     let meta = provider.get_meta(&client, base, repo, pr).await?;
     let (effective, source) =
-        crate::review::remote_repo_config_source(&provider, &client, base, repo, &meta).await;
+        crate::review::review_config_source(&provider, &client, base, repo, &meta).await;
     Ok(finish(
         RulesScope::Pr {
             provider: provider.name().to_string(),

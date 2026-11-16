@@ -138,6 +138,14 @@ export interface EffectiveRules {
   warnings: string[];
 }
 
+/** Instructions that apply only when the PR changes a file matching `paths`. */
+export interface PathInstruction {
+  /** Plain-language instructions for the reviewer. */
+  instructions: string;
+  /** Globs, matched against changed file paths. */
+  paths: string[];
+}
+
 /** Per-repo review overrides parsed from a `.prbot.toml`. */
 export interface RepoConfig {
   agentic?: boolean | null;
@@ -163,12 +171,16 @@ export interface RepoConfig {
   min_confidence?: number | null;
   model?: string | null;
   model_explore?: string | null;
+  /** Instructions applied only when the PR changes a file matching their globs — see [`crate::repo_rules::PathInstruction`]. */
+  path_instructions?: PathInstruction[] | null;
   /** Pass this repo's PR descriptions to the reviewer as a statement of intent to check the diff against. */
   pr_body?: boolean | null;
   /** Cap on the description handed to the reviewer, for this repo. */
   pr_body_max_chars?: number | null;
   /** Toggle re-anchoring a finding that drifted just off a diff line to the nearest matching diff line (else it folds to the summary), for this repo. */
   reanchor_findings?: boolean | null;
+  /** Toggle reading `REVIEW.md`, `.cursor/BUGBOT.md` and the review section of `AGENTS.md` from the base branch, for this repo. */
+  repo_rules?: boolean | null;
   self_critique?: boolean | null;
   /** Toggle committable suggestion blocks on findings, for this repo. */
   suggestions?: boolean | null;
@@ -236,10 +248,16 @@ export interface ReviewSettings {
   minConfidence: number;
   model: string;
   modelExplore: string;
+  /** Path-scoped instructions configured in `.prbot.toml`. */
+  pathInstructions: PathInstruction[];
   prBody: boolean;
   prBodyMaxChars: number;
   reanchorFindings: boolean;
+  /** Whether the repo's own rule files are read (`REPO_RULES` / `repo_rules`). */
+  repoRules: boolean;
   reviewSamples: number;
+  /** The rule sources merged into the prompt below, as the summary names them. */
+  ruleSources: string[];
   sampleLineTolerance: number;
   sampleMinAgreement: number;
   selfCritique: boolean;

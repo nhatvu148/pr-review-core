@@ -213,6 +213,17 @@ pub struct Config {
     /// inject a large conventions block (e.g. via a file baked into its image)
     /// without changing the library.
     pub extra_system_prompt: String,
+    /// Read the review rule files a repository already has (`REVIEW.md`,
+    /// `.cursor/BUGBOT.md`, the review section of `AGENTS.md`) from the base
+    /// branch. See [`crate::repo_rules`].
+    pub repo_rules: bool,
+    /// `[[path_instructions]]` from `.prbot.toml`: applied when the PR changes a
+    /// matching file. Never set from the environment.
+    pub path_instructions: Vec<crate::repo_rules::PathInstruction>,
+    /// Where the rules injected for this review came from, for the summary's
+    /// "Repository rules applied" line. Filled as rules are merged in, never from
+    /// the environment.
+    pub rule_sources: Vec<String>,
 
     /// Free-form instructions shaping the `/describe` output — release-notes
     /// sections, a contributor table, a house layout. Appended last to the
@@ -453,6 +464,9 @@ impl Config {
             ),
             x_title: env_or("OPENROUTER_X_TITLE", "pr-review"),
             extra_system_prompt: resolve_extra_system_prompt(),
+            repo_rules: env_or("REPO_RULES", "true").parse().unwrap_or(true),
+            path_instructions: Vec::new(),
+            rule_sources: Vec::new(),
 
             describe_instructions: env_or("DESCRIBE_INSTRUCTIONS", ""),
 
@@ -576,7 +590,15 @@ impl Config {
                 } else {
                     cfg.extra_system_prompt = format!("{}\n{extra}", cfg.extra_system_prompt);
                 }
+                cfg.rule_sources
+                    .push("`.prbot.toml` instructions".to_string());
             }
+        }
+        if let Some(v) = rc.repo_rules {
+            cfg.repo_rules = v;
+        }
+        if let Some(v) = &rc.path_instructions {
+            cfg.path_instructions = v.clone();
         }
         // REPLACES rather than appends, unlike `instructions` above. A layout is
         // not additive: a repo that asks for release-notes sections wants those

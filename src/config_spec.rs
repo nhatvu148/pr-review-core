@@ -434,6 +434,13 @@ pub const SPEC: &[ConfigVar] = &[
         doc: "Snap a finding that drifted just off a diff line onto the nearest diff line sharing its code symbol, instead of folding it into the summary.",
     },
     ConfigVar {
+        env: "REPO_RULES",
+        aliases: &[],
+        kind: ConfigKind::Bool,
+        default: Some("true"),
+        doc: "Read the review rules a repo already has (REVIEW.md, .cursor/BUGBOT.md, the review section of AGENTS.md) from the base branch, and list them in the summary.",
+    },
+    ConfigVar {
         env: "REVIEW_ON_UPDATE",
         aliases: &[],
         kind: ConfigKind::Bool,
