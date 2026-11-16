@@ -811,6 +811,49 @@ const REPO_CONFIG_CHANGE_NOTE: &str = "\n\n_This PR changes `.prbot.toml`. Revie
      it from the base branch, so this review ran on the current settings and the \
      change takes effect once merged._";
 
+/// A hidden, machine-readable verdict for the end of the summary comment:
+/// the recommendation and a count per severity.
+///
+/// For CI and bots that read the PR rather than the engine's JSON — a workflow
+/// step can fetch the bot's comment and decide for itself whether, say, any HIGH
+/// should block. The engine itself never fails a check on it: a gate on a model's
+/// judgement fails a build on whatever one sample said, and re-running CI would
+/// become a way to make it pass (the same reason `--fail-on` accepts scanner
+/// results only). HTML comments are hidden on GitHub and GitLab; Bitbucket shows
+/// them, so it is not added there.
+///
+/// ```text
+/// <!-- kaniscope-verdict: {"recommendation":"APPROVE WITH CHANGES","blocking":0,"high":1,"medium":2,"low":0,"other":0} -->
+/// ```
+pub(crate) fn verdict_marker(recommendation: &str, findings: &[Finding]) -> String {
+    let mut counts = [0usize; 5]; // blocking, high, medium, low, other
+    for f in findings {
+        let i = match f.severity.trim().to_ascii_uppercase().as_str() {
+            "BLOCKING" => 0,
+            "HIGH" => 1,
+            "MEDIUM" => 2,
+            "LOW" => 3,
+            _ => 4,
+        };
+        counts[i] += 1;
+    }
+    let v = serde_json::json!({
+        "recommendation": recommendation.trim(),
+        "blocking": counts[0],
+        "high": counts[1],
+        "medium": counts[2],
+        "low": counts[3],
+        "other": counts[4],
+    });
+    format!("\n\n<!-- kaniscope-verdict: {v} -->")
+}
+
+/// Whether a provider renders HTML comments invisibly, so a hidden marker can go
+/// in a comment without showing up as text.
+fn hides_html_comments(provider: &str) -> bool {
+    matches!(provider, "github" | "gitlab")
+}
+
 /// Whether a unified diff adds, removes, changes or renames the root
 /// `.prbot.toml`. A pure rename has no `---`/`+++` lines, only the
 /// `rename from`/`rename to` headers.
@@ -2444,6 +2487,10 @@ pub async fn run_review_with(
         anchors,
     } = finished;
     let inline_count = inline.len();
+    let mut summary = summary;
+    if hides_html_comments(provider.name()) {
+        summary.push_str(&verdict_marker(&recommendation, &findings));
+    }
     let post = ReviewPost {
         summary: summary.clone(),
         inline,
@@ -3982,6 +4029,49 @@ mod orchestrator_tests {
             assert!(p.contains("BASE-RULE"), "base settings not applied: {p}");
             assert!(!p.contains("HEAD-RULE"), "head settings applied: {p}");
         }
+    }
+
+    /// The verdict a CI step can read off the PR: hidden, and counted per severity.
+    #[tokio::test]
+    async fn a_github_summary_ends_with_a_machine_readable_verdict() {
+        let (_, _, summary) = review_as(DIFF, "write").await;
+        let line = summary
+            .lines()
+            .find(|l| l.starts_with("<!-- kaniscope-verdict: "))
+            .unwrap_or_else(|| panic!("no verdict marker: {summary}"));
+        let json = line
+            .trim_start_matches("<!-- kaniscope-verdict: ")
+            .trim_end_matches(" -->");
+        let v: serde_json::Value = serde_json::from_str(json).expect("the verdict is JSON");
+        assert!(v["recommendation"].is_string());
+        for k in ["blocking", "high", "medium", "low", "other"] {
+            assert!(v[k].is_u64(), "{k} missing: {v}");
+        }
+    }
+
+    #[test]
+    fn the_verdict_counts_each_severity() {
+        let f = |sev: &str| crate::llm::Finding {
+            severity: sev.into(),
+            file: "a.rs".into(),
+            line: Some(1),
+            body: "b".into(),
+            confidence: None,
+            suggestion: None,
+            existing_code: None,
+            end_line: None,
+            samples: None,
+        };
+        let m = super::verdict_marker("BLOCK", &[f("BLOCKING"), f("high"), f("HIGH"), f("odd")]);
+        assert!(
+            m.contains(r#""blocking":1"#) && m.contains(r#""high":2"#),
+            "{m}"
+        );
+        assert!(
+            m.contains(r#""other":1"#) && m.contains(r#""recommendation":"BLOCK""#),
+            "{m}"
+        );
+        assert!(!super::hides_html_comments("bitbucket"));
     }
 
     #[tokio::test]

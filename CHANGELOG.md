@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The summary ends with a hidden, machine-readable verdict** on GitHub and GitLab: `<!-- kaniscope-verdict: {"recommendation":…,"blocking":0,"high":1,"medium":2,"low":0,"other":0} -->`. A CI step or bot that reads the PR, rather than the engine's JSON output, can decide from it whether a finding should hold a merge. The engine itself still never fails a check on a model's judgement, for the reason `--fail-on` gives: it would fail a build on whatever one sample said, and re-running CI would become a way to pass. This is the shape Claude Code Review uses (a check that never fails, with a severity line for teams to gate on themselves). Bitbucket renders HTML comments as text, so it gets no marker.
+
 ## 0.43.0
 
 **A file cut to fit the budget now comes with a digest of its whole change, so the reviewer can tell whether the hunks it was not shown look like the ones it was.**
