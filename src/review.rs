@@ -845,6 +845,10 @@ pub(crate) fn review_key(cfg: &Config, raw_diff: &str, meta: &PrMeta) -> String 
         h.update(line.as_bytes());
         h.update(b"\n");
     }
+    // The engine itself: an upgrade can change the base prompt, calibration or
+    // rendering, and a review made by the old version is not this version's.
+    h.update(env!("CARGO_PKG_VERSION").as_bytes());
+    h.update(crate::prompt::SYSTEM_PROMPT.as_bytes());
     h.update(b"\0settings\0");
     h.update(
         serde_json::to_string(&crate::rules::ReviewSettings::from_config(cfg))
@@ -878,6 +882,7 @@ async fn reusable_review(
     cfg: &Config,
     input: &RunReviewInput,
     key: &str,
+    scan_status: crate::deps::ScanStatus,
 ) -> Option<RunReviewOutput> {
     let body = match provider
         .summary_body(client, cfg, &input.repo, input.pr)
@@ -898,12 +903,17 @@ async fn reusable_review(
         input.repo,
         input.pr
     );
-    let recommendation = body
+    // Not parseable, not reused: reporting a guessed APPROVE for a review that
+    // said BLOCK would be worse than running it again.
+    let Some(recommendation) = body
         .lines()
         .find_map(|l| l.strip_prefix("**Recommendation:** "))
-        .unwrap_or("APPROVE")
-        .trim()
-        .to_string();
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+    else {
+        tracing::debug!("reuse check: no recommendation line in the summary; reviewing");
+        return None;
+    };
     Some(RunReviewOutput {
         provider: provider.name().to_string(),
         repo: input.repo.clone(),
@@ -915,7 +925,9 @@ async fn reusable_review(
         inline_posted: 0,
         inline_detail: Vec::new(),
         advisories: Vec::new(),
-        advisory_scan: None,
+        // The scan that just ran this round, clean or disabled — reuse needs one
+        // of those. `None` would read as "no scan ran" to `--fail-on advisories`.
+        advisory_scan: Some(scan_status),
         posted: false,
         comment_url: None,
         summary_markdown: body,
@@ -2301,11 +2313,6 @@ pub async fn run_review_with(
     let effective = load_repo_config(&provider, &client, cfg, &input.repo, &meta).await;
     let cfg = &effective;
 
-    // Instant feedback: drop a "Reviewing…" summary comment before the slow LLM
-    // call. It's upserted, so the real review updates this same comment.
-    // Whether a placeholder actually went up — not merely whether one was asked
-    // for. The nothing-to-review path below replaces it only if it exists, so a
-    // failed placeholder post must not turn into a comment on a silent PR.
     // Fetched before the placeholder, because the placeholder overwrites the
     // summary — and the summary is where the last review's key is read from.
     let raw_diff = provider
@@ -2332,11 +2339,17 @@ pub async fn run_review_with(
     // returns nothing.
     let scan_settled = scan_status.verified() || scan_status == crate::deps::ScanStatus::Disabled;
     if cfg.reuse_unchanged_review && !input.dry_run && advisories.is_empty() && scan_settled {
-        if let Some(out) = reusable_review(&provider, &client, cfg, &input, &key).await {
+        if let Some(out) = reusable_review(&provider, &client, cfg, &input, &key, scan_status).await
+        {
             return Ok(out);
         }
     }
 
+    // Instant feedback: drop a "Reviewing…" summary comment before the slow LLM
+    // call. It's upserted, so the real review updates this same comment.
+    // Whether a placeholder actually went up — not merely whether one was asked
+    // for. The nothing-to-review path below replaces it only if it exists, so a
+    // failed placeholder post must not turn into a comment on a silent PR.
     let mut placeholder_posted = false;
     if input.placeholder && !input.dry_run {
         let pending = ReviewPost {
