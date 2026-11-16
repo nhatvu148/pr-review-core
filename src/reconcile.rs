@@ -689,7 +689,8 @@ async fn newest_bot_comment_at(
             api = api_base(cfg)
         );
         if let Some(since) = since {
-            url.push_str(&format!("&since={since}"));
+            // A `+hh:mm` offset would otherwise reach GitHub as a space.
+            url.push_str(&format!("&since={}", since.replace('+', "%2B")));
         }
         let comments: Vec<IssueComment> = get_json(http, token, cfg, &url).await?;
         let count = comments.len();
