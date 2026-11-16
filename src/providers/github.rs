@@ -1099,14 +1099,13 @@ fn claim_held(threads: &[BotThread], claimed: &mut [bool], held: &[InlineComment
     if held.is_empty() {
         return;
     }
+    // A held finding with no line (0) must pair by fingerprint only. Passed as 0,
+    // the positional pass would accept any thread on lines 1-10 of the file.
     let keys: Vec<(String, u64, String)> = held
         .iter()
         .map(|c| {
-            (
-                c.path.clone(),
-                c.line,
-                finding_fingerprint(&c.path, &c.body),
-            )
+            let line = if c.line == 0 { u64::MAX } else { c.line };
+            (c.path.clone(), line, finding_fingerprint(&c.path, &c.body))
         })
         .collect();
     let open: Vec<usize> = (0..threads.len()).filter(|i| !claimed[*i]).collect();
@@ -1654,6 +1653,22 @@ mod tests {
         }];
         super::claim_held(&threads, &mut claimed, &held);
         assert_eq!(claimed, vec![true, false]);
+    }
+
+    /// A held finding with no line pairs by fingerprint or not at all, never by
+    /// being "near" the top of the file.
+    #[test]
+    fn a_held_finding_without_a_line_does_not_pair_by_position() {
+        let threads = vec![thread("aaaa", "src/a.rs", Some(3))];
+        let mut claimed = vec![false];
+        let held = vec![crate::providers::InlineComment {
+            path: "src/a.rs".into(),
+            line: 0,
+            start_line: None,
+            body: "unrelated".into(),
+        }];
+        super::claim_held(&threads, &mut claimed, &held);
+        assert_eq!(claimed, vec![false]);
     }
 
     /// A posted finding keeps first claim on a thread over a held one.
