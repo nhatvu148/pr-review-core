@@ -2327,8 +2327,11 @@ pub async fn run_review_with(
     let key = review_key(cfg, &raw_diff, &meta);
     // Never reuse over an advisory: OSV learns about vulnerabilities after the
     // last review ran, and the scan is the one part of a review that can change
-    // with nothing in the PR changing.
-    if cfg.reuse_unchanged_review && !input.dry_run && advisories.is_empty() {
+    // with nothing in the PR changing. An empty list only counts when the scan
+    // actually finished (or was turned off): a failed or truncated scan also
+    // returns nothing.
+    let scan_settled = scan_status.verified() || scan_status == crate::deps::ScanStatus::Disabled;
+    if cfg.reuse_unchanged_review && !input.dry_run && advisories.is_empty() && scan_settled {
         if let Some(out) = reusable_review(&provider, &client, cfg, &input, &key).await {
             return Ok(out);
         }
