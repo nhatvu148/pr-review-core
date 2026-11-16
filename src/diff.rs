@@ -1037,13 +1037,16 @@ pub fn path_matches_globs(path: &str, include: &[String], exclude: &[String]) ->
 /// assert!(!path_matches_globs_strict("src/a.rs", &["db/**".into()]));
 /// assert!(!path_matches_globs_strict("src/a.rs", &[]));
 /// assert!(!path_matches_globs_strict("src/a.rs", &["[".into()]));
+/// // One bad glob does not disable a good one beside it.
+/// assert!(path_matches_globs_strict("db/1.sql", &["[".into(), "db/**".into()]));
 /// ```
 #[must_use]
 pub fn path_matches_globs_strict(path: &str, globs: &[String]) -> bool {
-    if globs.is_empty() {
-        return false;
-    }
-    build_globset(globs).is_some_and(|set| set.is_match(path))
+    // One pattern at a time, so a typo in one glob disables only that glob and
+    // not the valid ones listed beside it.
+    globs
+        .iter()
+        .any(|g| build_globset(std::slice::from_ref(g)).is_some_and(|set| set.is_match(path)))
 }
 
 /// A deterministic "diff-hygiene" issue: a property of the *change set* (not the

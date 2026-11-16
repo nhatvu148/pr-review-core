@@ -115,16 +115,26 @@ pub fn review_section(md: &str) -> Option<String> {
         )
     };
     // Heading level per line, `None` for a non-heading or any line in a fence.
-    let mut in_fence = false;
+    // A fence closes only on the marker that opened it, so a ``` line inside a
+    // ~~~ block is content, not a close.
+    let mut fence: Option<&str> = None;
     let lines: Vec<(&str, Option<(usize, String)>)> = md
         .lines()
         .map(|l| {
             let t = l.trim_start();
-            if t.starts_with("```") || t.starts_with("~~~") {
-                in_fence = !in_fence;
-                return (l, None);
+            let marker = ["```", "~~~"].into_iter().find(|m| t.starts_with(m));
+            match (fence, marker) {
+                (None, Some(m)) => {
+                    fence = Some(m);
+                    return (l, None);
+                }
+                (Some(open), Some(m)) if open == m => {
+                    fence = None;
+                    return (l, None);
+                }
+                _ => {}
             }
-            (l, if in_fence { None } else { heading(l) })
+            (l, if fence.is_some() { None } else { heading(l) })
         })
         .collect();
     let start = lines
@@ -319,6 +329,8 @@ mod tests {
         );
         assert!(!got.contains("make"), "{got}");
         assert_eq!(review_section("```\n## Review\nx\n```\n"), None);
+        // A ``` inside a ~~~ fence does not close it.
+        assert_eq!(review_section("~~~\n```\n## Review\nx\n~~~\n"), None);
     }
 
     #[test]
