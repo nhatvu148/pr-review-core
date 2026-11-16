@@ -15,6 +15,14 @@ A held-back finding still counts as flagged when GitHub reconciles earlier threa
 
 Known limit: a held-back finding is never posted, so a finding that only ever existed below the floor has no thread to track across rounds.
 
+### Fixed
+
+- **A push no longer resolves findings whose code it did not touch.** Re-review resolved every earlier finding the new round did not repeat, as long as the PR had a new commit, with `✅ Resolved — no longer flagged`. But a round does not repeat everything it found before: consecutive reviews of one frozen commit share 61–74% of their findings. So each push closed a quarter to a third of still-valid findings as fixed, including ones in files the push never changed. That also inflated anything that counts resolved threads, such as a fix loop deciding it has converged, or the acted-on measurement. A finding the round did not repeat is now resolved only when GitHub marks its thread outdated, meaning the lines it points at changed. Otherwise it stays open. Same-commit re-reviews were already protected and still are. Legacy threads without a fingerprint are still cleaned up on first sight.
+- **The delete fallback no longer removes a thread someone replied to.** When the token cannot resolve threads (a common personal-access-token limit), reconciliation deleted the bot's comment instead, and any replies under it were left without their parent. It now deletes only a thread holding the bot's comment alone, and leaves a thread with replies open.
+
+Known limit: a fix made somewhere other than the lines a finding points at (a guard added in the caller, say) leaves that thread open until the code under it changes or someone resolves it. Keeping a fixed finding open is the cheaper mistake than closing an unfixed one. GitLab and Bitbucket reconciliation are unchanged, since they report `unsupported` and resolve nothing.
+
+
 ## 0.43.0
 
 **A file cut to fit the budget now comes with a digest of its whole change, so the reviewer can tell whether the hunks it was not shown look like the ones it was.**
